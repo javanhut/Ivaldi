@@ -20,8 +20,15 @@ import (
 
 // NetworkManager handles remote operations without git dependencies
 type NetworkManager struct {
-	client *http.Client
-	root   string // Repository root for loading config
+	client           *http.Client
+	root             string // Repository root for loading config
+	downloadProgress *downloadProgress
+}
+
+// downloadProgress tracks download progress
+type downloadProgress struct {
+	total      int
+	downloaded int
 }
 
 // NewNetworkManager creates a new network manager
@@ -93,9 +100,219 @@ func (nm *NetworkManager) DownloadIvaldiRepo(url, dest string) error {
 
 // downloadFromGitHub downloads from GitHub using their API
 func (nm *NetworkManager) downloadFromGitHub(url, dest string) error {
-	// Use GitHub API to download repository contents
-	fmt.Printf("Would download GitHub repo %s to %s using API\n", url, dest)
-	return nil // Placeholder
+	// Extract owner and repo from URL
+	urlParts := strings.Split(strings.TrimSuffix(url, ".git"), "/")
+	if len(urlParts) < 2 {
+		return fmt.Errorf("invalid GitHub URL format: %s", url)
+	}
+	
+	owner := urlParts[len(urlParts)-2]
+	repo := urlParts[len(urlParts)-1]
+	
+	fmt.Printf("Downloading repository: %s/%s\n", owner, repo)
+	
+	// Create destination directory
+	if err := os.MkdirAll(dest, 0755); err != nil {
+		return fmt.Errorf("failed to create directory: %v", err)
+	}
+	
+	// First, count total files for progress bar
+	fmt.Print("├─ Analyzing repository structure... ")
+	totalFiles, err := nm.countGitHubFiles(owner, repo, "")
+	if err != nil {
+		fmt.Println("Failed")
+		return fmt.Errorf("failed to analyze repository: %v", err)
+	}
+	fmt.Printf("Done (%d files)\n", totalFiles)
+	
+	// Initialize download progress tracking
+	nm.downloadProgress = &downloadProgress{
+		total:      totalFiles,
+		downloaded: 0,
+	}
+	
+	// Get repository contents from GitHub API
+	err = nm.downloadGitHubContents(owner, repo, dest, "")
+	if err != nil {
+		fmt.Println("\n└─ Download failed")
+		return err
+	}
+	
+	fmt.Printf("└─ Successfully downloaded %d files\n", totalFiles)
+	return nil
+}
+
+// downloadGitHubContents recursively downloads repository contents using GitHub API
+func (nm *NetworkManager) downloadGitHubContents(owner, repo, localPath, remotePath string) error {
+	// GitHub API endpoint for repository contents
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents", owner, repo)
+	if remotePath != "" {
+		apiURL += "/" + remotePath
+	}
+	
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return err
+	}
+	
+	// Add authentication if available
+	configMgr := config.NewConfigManager(nm.root)
+	if token, err := configMgr.GetGitHubToken(); err == nil && token != "" {
+		req.Header.Set("Authorization", "token "+token)
+	}
+	req.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
+	
+	resp, err := nm.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("GitHub API error (%d): %s", resp.StatusCode, string(body))
+	}
+	
+	var contents []struct {
+		Name        string `json:"name"`
+		Path        string `json:"path"`
+		Type        string `json:"type"`
+		DownloadURL string `json:"download_url"`
+		Content     string `json:"content"`
+		Encoding    string `json:"encoding"`
+	}
+	
+	if err := json.NewDecoder(resp.Body).Decode(&contents); err != nil {
+		return err
+	}
+	
+	// Process each item
+	for _, item := range contents {
+		localItemPath := filepath.Join(localPath, item.Name)
+		
+		if item.Type == "dir" {
+			// Create directory and recurse
+			if err := os.MkdirAll(localItemPath, 0755); err != nil {
+				return err
+			}
+			if err := nm.downloadGitHubContents(owner, repo, localItemPath, item.Path); err != nil {
+				return err
+			}
+		} else if item.Type == "file" {
+			// Download file
+			if item.DownloadURL != "" {
+				// Download from download URL
+				if err := nm.DownloadFile(item.DownloadURL, localItemPath); err != nil {
+					return fmt.Errorf("failed to download %s: %v", item.Path, err)
+				}
+			} else if item.Content != "" && item.Encoding == "base64" {
+				// Decode base64 content for small files
+				content, err := base64.StdEncoding.DecodeString(item.Content)
+				if err != nil {
+					return fmt.Errorf("failed to decode %s: %v", item.Path, err)
+				}
+				if err := os.WriteFile(localItemPath, content, 0644); err != nil {
+					return err
+				}
+			}
+			// Update progress instead of printing each file
+			if nm.downloadProgress != nil {
+				nm.downloadProgress.downloaded++
+				nm.showDownloadProgress()
+			}
+		}
+	}
+	
+	return nil
+}
+
+// countGitHubFiles counts total files in repository for progress tracking
+func (nm *NetworkManager) countGitHubFiles(owner, repo, remotePath string) (int, error) {
+	// GitHub API endpoint for repository contents
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents", owner, repo)
+	if remotePath != "" {
+		apiURL += "/" + remotePath
+	}
+	
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	
+	// Add authentication if available
+	configMgr := config.NewConfigManager(nm.root)
+	if token, err := configMgr.GetGitHubToken(); err == nil && token != "" {
+		req.Header.Set("Authorization", "token "+token)
+	}
+	req.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
+	
+	resp, err := nm.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("GitHub API error: %d", resp.StatusCode)
+	}
+	
+	var contents []struct {
+		Name string `json:"name"`
+		Path string `json:"path"`
+		Type string `json:"type"`
+	}
+	
+	if err := json.NewDecoder(resp.Body).Decode(&contents); err != nil {
+		return 0, err
+	}
+	
+	count := 0
+	for _, item := range contents {
+		if item.Type == "dir" {
+			// Recursively count files in subdirectories
+			subCount, err := nm.countGitHubFiles(owner, repo, item.Path)
+			if err != nil {
+				return 0, err
+			}
+			count += subCount
+		} else if item.Type == "file" {
+			count++
+		}
+	}
+	
+	return count, nil
+}
+
+// showDownloadProgress displays a visual progress bar
+func (nm *NetworkManager) showDownloadProgress() {
+	if nm.downloadProgress == nil {
+		return
+	}
+	
+	percentage := (nm.downloadProgress.downloaded * 100) / nm.downloadProgress.total
+	barLength := 30
+	filled := (barLength * nm.downloadProgress.downloaded) / nm.downloadProgress.total
+	
+	// Create progress bar
+	bar := "["
+	for i := 0; i < barLength; i++ {
+		if i < filled {
+			bar += "="
+		} else if i == filled {
+			bar += ">"
+		} else {
+			bar += " "
+		}
+	}
+	bar += "]"
+	
+	// Clear line and print progress
+	fmt.Printf("\r├─ Downloading files... %s %d%% (%d/%d)", bar, percentage, nm.downloadProgress.downloaded, nm.downloadProgress.total)
+	
+	// Add newline when complete
+	if nm.downloadProgress.downloaded == nm.downloadProgress.total {
+		fmt.Println()
+	}
 }
 
 // downloadFromGitLab downloads from GitLab using their API  

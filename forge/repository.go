@@ -92,20 +92,12 @@ func Initialize(root string) (*Repository, error) {
 }
 
 func Mirror(url, dest string) (*Repository, error) {
-	// Create destination directory
-	if err := os.MkdirAll(dest, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create directory: %v", err)
-	}
-
-	// Clone with git first
-	cmd := exec.Command("git", "clone", url, dest)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// Use git-independent download via network manager
+	networkMgr := network.NewNetworkManager(dest)
 	
-	if err := cmd.Run(); err != nil {
-		// Clean up on failure
-		os.RemoveAll(dest)
-		return nil, fmt.Errorf("failed to mirror repository: %v", err)
+	// Download repository contents using API
+	if err := networkMgr.DownloadIvaldiRepo(url, dest); err != nil {
+		return nil, fmt.Errorf("failed to download repository: %v", err)
 	}
 
 	// Initialize Ivaldi repository
@@ -119,9 +111,14 @@ func Mirror(url, dest string) (*Repository, error) {
 		return nil, fmt.Errorf("failed to add origin portal: %v", err)
 	}
 
-	// Import Git history to Ivaldi
-	if err := repo.importFromGitHistory(); err != nil {
-		return nil, fmt.Errorf("failed to import Git history: %v", err)
+	// Scan workspace to register downloaded files
+	if err := repo.workspace.Scan(); err != nil {
+		return nil, fmt.Errorf("failed to scan downloaded files: %v", err)
+	}
+
+	// Save initial workspace state
+	if err := repo.workspace.SaveState(repo.timeline.Current()); err != nil {
+		return nil, fmt.Errorf("failed to save workspace state: %v", err)
 	}
 
 	return repo, nil
@@ -494,28 +491,7 @@ func (r *Repository) AddPortal(name, url string) error {
 	
 	config.Portals[name] = url
 	
-	// Also initialize git if needed for GitHub compatibility
-	gitDir := filepath.Join(r.root, ".git")
-	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
-		cmd := exec.Command("git", "init")
-		cmd.Dir = r.root
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to initialize git: %v", err)
-		}
-	}
-	
-	// Add git remote
-	cmd := exec.Command("git", "remote", "add", name, url)
-	cmd.Dir = r.root
-	if err := cmd.Run(); err != nil {
-		// Try to update if it already exists
-		cmd = exec.Command("git", "remote", "set-url", name, url)
-		cmd.Dir = r.root
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("failed to add git remote: %v", err)
-		}
-	}
-	
+	// Save portal configuration (git-independent)
 	return r.savePortalConfig(config)
 }
 
@@ -527,11 +503,7 @@ func (r *Repository) RemovePortal(name string) error {
 	
 	delete(config.Portals, name)
 	
-	// Remove git remote
-	cmd := exec.Command("git", "remote", "remove", name)
-	cmd.Dir = r.root
-	cmd.Run() // Ignore error if remote doesn't exist
-	
+	// Save portal configuration (git-independent)
 	return r.savePortalConfig(config)
 }
 
