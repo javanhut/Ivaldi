@@ -488,7 +488,15 @@ func (nm *NetworkManager) uploadFilesBatchWithProgress(owner, repo, timeline str
 	currentSHA, err := nm.getCurrentCommitSHA(owner, repo, timeline)
 	if err != nil {
 		fmt.Printf("Creating new branch: %s\n", timeline)
-		currentSHA = ""
+		// For new branches, inherit from main branch to maintain history
+		mainSHA, mainErr := nm.getCurrentCommitSHA(owner, repo, "main")
+		if mainErr != nil {
+			// If even main doesn't exist, this is truly a new repository
+			currentSHA = ""
+		} else {
+			currentSHA = mainSHA
+			fmt.Printf("├─ Branching from main... Done\n")
+		}
 	} else {
 		fmt.Println("Done")
 	}
