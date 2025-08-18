@@ -599,7 +599,7 @@ func (r *Repository) Pull(portalName string) error {
 }
 
 // Sync performs Ivaldi-native synchronization with a remote portal
-func (r *Repository) Sync(portalName, remoteTimeline string) error {
+func (r *Repository) Sync(portalName, localTimeline, remoteTimeline string) error {
 	config, err := r.loadPortalConfig()
 	if err != nil {
 		return err
@@ -619,11 +619,16 @@ func (r *Repository) Sync(portalName, remoteTimeline string) error {
 		remoteTimeline = "main"
 	}
 	
+	// Use default local timeline if not specified
+	if localTimeline == "" {
+		localTimeline = r.timeline.Current()
+	}
+	
 	// Use Ivaldi-native sync
 	opts := sync.SyncOptions{
 		PortalName:     portalName,
 		RemoteTimeline: remoteTimeline,
-		LocalTimeline:  r.timeline.Current(),
+		LocalTimeline:  localTimeline,
 		Strategy:       0, // Auto strategy - will handle divergent branches properly
 		Force:          false,
 		DryRun:         false,

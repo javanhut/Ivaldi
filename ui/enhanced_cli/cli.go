@@ -966,7 +966,7 @@ Examples:
 
 			// Step 3: Sync with remote using Ivaldi-native sync (handles fetch and fuse automatically)
 			ec.output.Info("Step 3: Syncing with remote...")
-			err := ec.currentRepo.Sync(portalName, remoteBranch)
+			err := ec.currentRepo.Sync(portalName, localTimeline, remoteBranch)
 			if err != nil {
 				ec.output.Error("Failed to sync with remote", []string{
 					"Check network connection",
