@@ -202,7 +202,7 @@ func (nm *NetworkManager) uploadToGitHub(portalURL, timeline string, seals []*ob
 	fmt.Printf("%s %d files to GitHub repo: %s/%s\n", action, len(allFiles), owner, repo)
 	
 	latestSeal := seals[len(seals)-1]
-	err = nm.uploadCompleteRepositoryState(owner, repo, latestSeal, allFiles, changedFiles)
+	err = nm.uploadCompleteRepositoryState(owner, repo, timeline, latestSeal, allFiles, changedFiles)
 	if err != nil {
 		return err
 	}
@@ -340,7 +340,7 @@ func (nm *NetworkManager) createOrUpdateFile(owner, repo, path, content, message
 }
 
 // uploadCompleteRepositoryState uploads complete repo state but only reads changed files for efficiency
-func (nm *NetworkManager) uploadCompleteRepositoryState(owner, repo string, seal *objects.Seal, allFiles, changedFiles map[string]string) error {
+func (nm *NetworkManager) uploadCompleteRepositoryState(owner, repo, timeline string, seal *objects.Seal, allFiles, changedFiles map[string]string) error {
 	// Load ignore patterns
 	ignorePatterns, err := nm.loadIgnorePatterns()
 	if err != nil {
@@ -393,7 +393,7 @@ func (nm *NetworkManager) uploadCompleteRepositoryState(owner, repo string, seal
 	fmt.Printf("Repository state: %d total files, %d changed\n", len(allFiles), len(changedFiles))
 	
 	// Upload complete repository state with progress bar
-	return nm.uploadFilesBatchWithProgress(owner, repo, filesToUpload, seal)
+	return nm.uploadFilesBatchWithProgress(owner, repo, timeline, filesToUpload, seal)
 }
 
 type FileToUpload struct {
@@ -475,7 +475,7 @@ func (nm *NetworkManager) matchesPattern(filePath, pattern string) bool {
 }
 
 // uploadFilesBatchWithProgress uploads files with a progress bar - much more efficient than git
-func (nm *NetworkManager) uploadFilesBatchWithProgress(owner, repo string, files []FileToUpload, seal *objects.Seal) error {
+func (nm *NetworkManager) uploadFilesBatchWithProgress(owner, repo, timeline string, files []FileToUpload, seal *objects.Seal) error {
 	if len(files) == 0 {
 		return nil
 	}
@@ -485,9 +485,9 @@ func (nm *NetworkManager) uploadFilesBatchWithProgress(owner, repo string, files
 	
 	// Step 1: Get current commit (with progress)
 	fmt.Print("├─ Getting remote state... ")
-	currentSHA, err := nm.getCurrentCommitSHA(owner, repo, "main")
+	currentSHA, err := nm.getCurrentCommitSHA(owner, repo, timeline)
 	if err != nil {
-		fmt.Println("Creating new repository")
+		fmt.Printf("Creating new branch: %s\n", timeline)
 		currentSHA = ""
 	} else {
 		fmt.Println("Done")
@@ -524,7 +524,7 @@ func (nm *NetworkManager) uploadFilesBatchWithProgress(owner, repo string, files
 	
 	// Step 4: Create commit
 	fmt.Print("├─ Creating commit... ")
-	var parents []string
+	parents := []string{} // Initialize as empty slice, not nil
 	if currentSHA != "" {
 		parents = []string{currentSHA}
 	}
@@ -542,12 +542,12 @@ func (nm *NetworkManager) uploadFilesBatchWithProgress(owner, repo string, files
 	}
 	fmt.Println("Done")
 	
-	// Step 5: Update branch
-	fmt.Print("└─ Updating branch... ")
-	err = nm.updateReference(owner, repo, "heads/main", commitSHA)
+	// Step 5: Update or create branch
+	fmt.Printf("└─ Setting branch: %s... ", timeline)
+	err = nm.createOrUpdateReference(owner, repo, "heads/"+timeline, commitSHA)
 	if err != nil {
 		fmt.Println("Failed")
-		return fmt.Errorf("failed to update branch: %v", err)
+		return fmt.Errorf("failed to set branch: %v", err)
 	}
 	fmt.Println("Done")
 	
@@ -560,7 +560,7 @@ func (nm *NetworkManager) uploadFilesBatchWithProgress(owner, repo string, files
 
 // Legacy function kept for compatibility  
 func (nm *NetworkManager) uploadFilesBatch(owner, repo string, files []FileToUpload, seal *objects.Seal) error {
-	return nm.uploadFilesBatchWithProgress(owner, repo, files, seal)
+	return nm.uploadFilesBatchWithProgress(owner, repo, "main", files, seal)
 }
 
 // UploadState tracks what was last uploaded to avoid redundant uploads
@@ -940,6 +940,64 @@ func (nm *NetworkManager) updateReference(owner, repo, ref, sha string) error {
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("failed to update reference: %s - %s", resp.Status, string(body))
+	}
+	
+	return nil
+}
+
+// createOrUpdateReference creates a new reference or updates existing one via GitHub API
+func (nm *NetworkManager) createOrUpdateReference(owner, repo, ref, sha string) error {
+	// First try to update existing reference
+	err := nm.updateReference(owner, repo, ref, sha)
+	if err != nil {
+		// If update failed because reference doesn't exist, create it
+		if strings.Contains(err.Error(), "Reference does not exist") {
+			return nm.createReference(owner, repo, ref, sha)
+		}
+		return err
+	}
+	return nil
+}
+
+// createReference creates a new reference via GitHub API
+func (nm *NetworkManager) createReference(owner, repo, ref, sha string) error {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/git/refs", owner, repo)
+	
+	createData := map[string]interface{}{
+		"ref": "refs/" + ref,
+		"sha": sha,
+	}
+	
+	jsonData, err := json.Marshal(createData)
+	if err != nil {
+		return err
+	}
+	
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return err
+	}
+	
+	// Add authentication
+	configMgr := config.NewConfigManager(nm.root)
+	token, err := configMgr.GetGitHubToken()
+	if err != nil {
+		return err
+	}
+	
+	req.Header.Set("Authorization", "token "+token)
+	req.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
+	req.Header.Set("Content-Type", "application/json")
+	
+	resp, err := nm.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 201 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to create reference: %s - %s", resp.Status, string(body))
 	}
 	
 	return nil
