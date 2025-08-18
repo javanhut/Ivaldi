@@ -1,0 +1,49 @@
+# Ivaldi ignore patterns
+# Lines starting with # are comments
+# Build artifacts
+build/
+build/*
+*.o
+*.so
+*.dll
+*.exe
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.bak
+*.swp
+*.swo
+*~
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+# IDE files
+.vscode/*
+.idea/*
+*.sublime-*
+# Test artifacts
+coverage.out
+*.test
+# Demo and temp files
+DEMO_WORKFLOW.md
+IVALDI_USAGE.md
+# Claude AI assistant files
+.claude/
+.claude/*
+CLAUDE.md
+cleanup.sh
+# Added by ivaldi exclude command
+CLAUDE.md
+# Added by ivaldi exclude command
+build
+# Added by ivaldi exclude command
+test-repo
+
+# Added by ivaldi exclude command
+test-repo
