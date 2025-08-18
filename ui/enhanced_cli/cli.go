@@ -75,7 +75,7 @@ Workshop Commands:
   shelf                    Save work for later
   portal                   Manage remote connections
   upload [branch]          Upload current branch to portal
-  sync --with <branch>     Sync with remote branch automatically
+  sync <timeline> --with <remote>  Sync local timeline with remote timeline
   
 Natural Language Examples:
   jump to "yesterday before lunch"
@@ -874,43 +874,59 @@ Examples:
 
 func (ec *EnhancedCLI) createSyncCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "sync --with <branch> [portal-name]",
-		Short: "Sync with remote branch automatically",
-		Long: `Sync with a remote branch by pulling changes and fusing them into current timeline.
+		Use:   "sync <local-timeline> --with <remote-timeline> [portal-name]",
+		Short: "Sync local timeline with remote timeline automatically",
+		Long: `Sync a local timeline with a remote timeline by pulling changes and fusing them.
 
 This command performs the following steps automatically:
-1. Pulls latest changes from the remote branch
-2. Fuses those changes into the current timeline
-3. Preserves your local work with automatic conflict resolution
+1. Switches to the specified local timeline
+2. Pulls latest changes from the remote timeline
+3. Fuses those changes into the local timeline
+4. Preserves your local work with automatic conflict resolution
 
 Examples:
-  ivaldi sync --with main           # Sync with origin/main
-  ivaldi sync --with main upstream  # Sync with upstream/main
-  ivaldi sync --with develop        # Sync with origin/develop`,
+  ivaldi sync main --with main              # Sync local main with origin/main
+  ivaldi sync feature --with main           # Sync local feature with origin/main
+  ivaldi sync main --with main upstream     # Sync local main with upstream/main
+  ivaldi sync develop --with develop        # Sync local develop with origin/develop`,
+		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if ec.currentRepo == nil {
 				return fmt.Errorf("not in repository")
 			}
 
-			// Get the branch to sync with
-			syncBranch, _ := cmd.Flags().GetString("with")
-			if syncBranch == "" {
-				return fmt.Errorf("--with flag is required to specify branch to sync with")
+			// Get the local timeline to sync (required positional argument)
+			localTimeline := args[0]
+
+			// Get the remote branch to sync with
+			remoteBranch, _ := cmd.Flags().GetString("with")
+			if remoteBranch == "" {
+				return fmt.Errorf("--with flag is required to specify remote timeline to sync with")
 			}
 
 			// Default to origin portal
 			portalName := "origin"
-			if len(args) > 0 {
-				portalName = args[0]
+			if len(args) > 1 {
+				portalName = args[1]
 			}
 
 			currentTimeline := ec.currentRepo.GetCurrentTimeline()
 			
-			ec.output.Info(fmt.Sprintf("Syncing timeline '%s' with remote branch '%s' from portal '%s'", currentTimeline, syncBranch, portalName))
+			ec.output.Info(fmt.Sprintf("Syncing local timeline '%s' with remote timeline '%s' from portal '%s'", localTimeline, remoteBranch, portalName))
 
-			// Step 1: Handle any uncommitted changes first
+			// Step 1: Switch to the target local timeline if different from current
+			if currentTimeline != localTimeline {
+				ec.output.Info(fmt.Sprintf("Step 1: Switching to timeline '%s'...", localTimeline))
+				err := ec.currentRepo.SwitchTimeline(localTimeline)
+				if err != nil {
+					return fmt.Errorf("failed to switch to timeline '%s': %v", localTimeline, err)
+				}
+				ec.output.Success(fmt.Sprintf("Switched to timeline '%s'", localTimeline))
+			}
+
+			// Step 2: Handle any uncommitted changes first
 			if ec.currentRepo.GetWorkspace().HasUncommittedChanges() {
-				ec.output.Info("Step 1: Auto-sealing uncommitted changes...")
+				ec.output.Info("Step 2: Auto-sealing uncommitted changes...")
 				
 				// Auto-gather and seal uncommitted changes
 				err := ec.currentRepo.GetWorkspace().Scan()
@@ -923,7 +939,7 @@ Examples:
 					return fmt.Errorf("failed to gather changes: %v", err)
 				}
 				
-				_, err = ec.currentRepo.Seal(fmt.Sprintf("Auto-seal before sync with %s", syncBranch))
+				_, err = ec.currentRepo.Seal(fmt.Sprintf("Auto-seal before sync with %s", remoteBranch))
 				if err != nil {
 					return fmt.Errorf("failed to seal changes: %v", err)
 				}
@@ -948,20 +964,20 @@ Examples:
 				ec.output.Success("Auto-sealed uncommitted changes")
 			}
 
-			// Step 2: Sync with remote using Ivaldi-native sync (handles fetch and fuse automatically)
-			ec.output.Info("Step 2: Syncing with remote...")
-			err := ec.currentRepo.Sync(portalName, syncBranch)
+			// Step 3: Sync with remote using Ivaldi-native sync (handles fetch and fuse automatically)
+			ec.output.Info("Step 3: Syncing with remote...")
+			err := ec.currentRepo.Sync(portalName, remoteBranch)
 			if err != nil {
 				ec.output.Error("Failed to sync with remote", []string{
 					"Check network connection",
 					"Verify portal URL and credentials", 
-					"Ensure remote branch exists: " + syncBranch,
+					"Ensure remote timeline exists: " + remoteBranch,
 					"Try: portal add " + portalName + " <url> (if portal not configured)",
 				})
 				return err
 			}
 			
-			ec.output.Success(fmt.Sprintf("Successfully synced with %s/%s!", portalName, syncBranch))
+			ec.output.Success(fmt.Sprintf("Successfully synced local timeline '%s' with %s/%s!", localTimeline, portalName, remoteBranch))
 			ec.output.Info("Your timeline is now up-to-date with remote changes")
 			ec.output.Info("Next: Continue working or 'ivaldi upload' to push your changes")
 
@@ -969,7 +985,7 @@ Examples:
 		},
 	}
 
-	cmd.Flags().StringP("with", "w", "", "Branch to sync with (required)")
+	cmd.Flags().StringP("with", "w", "", "Remote timeline to sync with (required)")
 	cmd.MarkFlagRequired("with")
 
 	return cmd
