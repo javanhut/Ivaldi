@@ -8,7 +8,7 @@ GO_GET = $(GO_CMD) get
 GO_MOD = $(GO_CMD) mod
 MAIN_PATH = ./cmd/ivaldi
 BUILD_DIR = build
-VERSION ?= $(shell git log -1 --format=%h 2>/dev/null || echo "dev")
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS = -ldflags "-X main.Version=$(VERSION)"
 
 .PHONY: all build clean install uninstall test deps tidy help
