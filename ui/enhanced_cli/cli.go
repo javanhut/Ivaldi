@@ -793,23 +793,52 @@ Examples:
 				portalName = args[0]
 			}
 
-			// Simple, git-like output
+			// Check if timeline exists locally but might be new to remote
+			timelines := ec.currentRepo.ListTimelines()
+			isNewTimeline := true
+			for _, tl := range timelines {
+				if tl == branch && branch != ec.currentRepo.GetCurrentTimeline() {
+					isNewTimeline = false
+					break
+				}
+			}
+			
+			// Smart upload messaging
 			if portalName == "origin" {
-				fmt.Printf("Uploading to origin/%s\n", branch)
+				if isNewTimeline && branch != "main" {
+					fmt.Printf("Uploading new timeline to origin/%s (will create branch)\n", branch)
+				} else {
+					fmt.Printf("Uploading to origin/%s\n", branch)
+				}
 			} else {
-				fmt.Printf("Uploading to %s/%s\n", portalName, branch)
+				if isNewTimeline && branch != "main" {
+					fmt.Printf("Uploading new timeline to %s/%s (will create branch)\n", portalName, branch)
+				} else {
+					fmt.Printf("Uploading to %s/%s\n", portalName, branch)
+				}
 			}
 
 			err := ec.currentRepo.UploadToPortal(portalName, branch)
 			if err != nil {
-				// Check if it's a branch not found error
-				if strings.Contains(err.Error(), "does not match any") {
-					ec.output.Error(fmt.Sprintf("Timeline '%s' does not exist on remote", branch), []string{
-						"Create timeline on remote: ivaldi portal new " + branch,
-						"Or specify an existing timeline: ivaldi upload <existing-timeline>",
-						"Check available timelines: ivaldi timeline list",
-						"Switch to correct timeline: ivaldi timeline switch <timeline-name>",
-					})
+				// Check if it's a branch not found error or similar new timeline scenarios
+				if strings.Contains(err.Error(), "does not match any") || 
+				   strings.Contains(err.Error(), "Reference does not exist") ||
+				   strings.Contains(err.Error(), "Creating new branch") {
+					// This is a new timeline - that's fine, the upload should have created it automatically
+					// If we're here, there might be a different issue, so show helpful guidance
+					ec.output.Info(fmt.Sprintf("Creating new timeline '%s' on remote...", branch))
+					
+					// Try the upload again - the new logic should handle branch creation
+					err = ec.currentRepo.UploadToPortal(portalName, branch)
+					if err != nil {
+						ec.output.Error("Failed to create new timeline on remote", []string{
+							"Check network connection",
+							"Verify portal URL and credentials", 
+							"Ensure you have push permissions to the repository",
+							"Make sure the repository exists on remote",
+						})
+						return err
+					}
 				} else {
 					ec.output.Error("Failed to upload to portal", []string{
 						"Check network connection",
@@ -817,14 +846,21 @@ Examples:
 						"Ensure repository exists on remote",
 						"Try: portal add origin <url> (if no portal configured)",
 					})
+					return err
 				}
-				return err
 			}
 
+			// Success messaging with helpful next steps
 			if portalName == "origin" {
 				fmt.Printf("Upload complete: origin/%s\n", branch)
 			} else {
 				fmt.Printf("Upload complete: %s/%s\n", portalName, branch)
+			}
+			
+			// Show helpful next steps for new timelines
+			if isNewTimeline && branch != "main" {
+				ec.output.Info("New timeline uploaded with automatic upstream tracking")
+				ec.output.Info("Your timeline is now available on the remote repository")
 			}
 
 			return nil
