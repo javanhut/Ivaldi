@@ -2427,34 +2427,22 @@ Examples:
 func (ec *EnhancedCLI) createWhereAmICommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "whereami",
-		Short: "Show current branch and position",
-		Long: `Show current branch name and position information
+		Short: "Show current timeline and position",
+		Long: `Show current timeline and position information
 		
 This command displays:
-- Current branch name
 - Current timeline in Ivaldi
 - Current position/seal information
 - Portal tracking status
 
 Examples:
-  ivaldi whereami                    # Show current branch and position`,
+  ivaldi whereami                    # Show current timeline and position`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if ec.currentRepo == nil {
 				return fmt.Errorf("not in repository")
 			}
 
-			// Get current branch from git
-			branchCmd := exec.Command("git", "branch", "--show-current")
-			branchCmd.Dir = ec.currentRepo.Root()
-			branchOutput, err := branchCmd.Output()
-			var currentBranch string
-			if err != nil {
-				currentBranch = "unknown"
-			} else {
-				currentBranch = strings.TrimSpace(string(branchOutput))
-			}
-
-			// Get current timeline from Ivaldi
+			// Get current timeline and position from Ivaldi
 			currentTimeline := ec.currentRepo.GetCurrentTimeline()
 			currentPosition := ec.currentRepo.GetCurrentPosition()
 			
@@ -2465,16 +2453,24 @@ Examples:
 			}
 
 			ec.output.Info("Current Location:")
-			ec.output.Info(fmt.Sprintf("  Branch: %s", currentBranch))
 			ec.output.Info(fmt.Sprintf("  Timeline: %s", currentTimeline))
 			ec.output.Info(fmt.Sprintf("  Position: %s", memorableName))
 			
-			// Show tracking info if available
-			trackingCmd := exec.Command("git", "rev-parse", "--abbrev-ref", currentBranch+"@{upstream}")
-			trackingCmd.Dir = ec.currentRepo.Root()
-			if trackingOutput, err := trackingCmd.Output(); err == nil {
-				upstream := strings.TrimSpace(string(trackingOutput))
-				ec.output.Info(fmt.Sprintf("  Tracking: %s", upstream))
+			// Show portal tracking info
+			portals := ec.currentRepo.ListPortals()
+			if len(portals) > 0 {
+				// Default to origin if available, otherwise first portal
+				if originURL, hasOrigin := portals["origin"]; hasOrigin {
+					ec.output.Info(fmt.Sprintf("  Tracking: origin/%s", currentTimeline))
+					ec.output.Info(fmt.Sprintf("  Remote: %s", originURL))
+				} else {
+					// Show first available portal
+					for name, url := range portals {
+						ec.output.Info(fmt.Sprintf("  Tracking: %s/%s", name, currentTimeline))
+						ec.output.Info(fmt.Sprintf("  Remote: %s", url))
+						break
+					}
+				}
 			}
 
 			return nil
