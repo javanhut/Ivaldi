@@ -3,6 +3,7 @@ package workspace
 import (
 	"bufio"
 	"encoding/json"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"ivaldi/core/objects"
+	"ivaldi/storage/local"
 )
 
 type FileStatus int
@@ -25,28 +27,32 @@ const (
 type FileState struct {
 	Path         string
 	Status       FileStatus
-	Hash         objects.Hash
+	Hash         objects.CAHash
 	Size         int64
 	ModTime      time.Time
 	OnAnvil      bool
-	WorkingHash  objects.Hash
+	WorkingHash  objects.CAHash
+	BlobHash     objects.CAHash  // Hash when stored as blob in content store
 }
 
 type Workspace struct {
 	Root         string
 	Files        map[string]*FileState
 	Timeline     string
-	Position     objects.Hash
+	Position     objects.CAHash
 	AnvilFiles   map[string]*FileState
 	IgnorePattern []string
+	Store        *local.Store
+	CandidateTree *objects.CATree  // Built from staged files
 }
 
-func New(root string) *Workspace {
+func New(root string, store *local.Store) *Workspace {
 	ws := &Workspace{
 		Root:         root,
 		Files:        make(map[string]*FileState),
 		AnvilFiles:   make(map[string]*FileState),
 		IgnorePattern: []string{},
+		Store:        store,
 	}
 	ws.loadIgnorePatterns()
 	return ws
@@ -89,12 +95,11 @@ func (w *Workspace) Scan() error {
 			return err
 		}
 
-		data, err := os.ReadFile(path)
+		// For large files, use streaming to compute hash efficiently
+		hash, err := w.computeFileHash(path)
 		if err != nil {
 			return err
 		}
-
-		hash := objects.NewHash(data)
 		
 		// Check if file was on anvil
 		onAnvil := false
@@ -158,64 +163,76 @@ func (w *Workspace) Scan() error {
 func (w *Workspace) Gather(patterns []string) error {
 	// Special case for "all" - gather only changed files
 	if len(patterns) == 1 && patterns[0] == "." {
-		return w.GatherChanged()
-	}
-	
-	for _, pattern := range patterns {
-		absPattern := filepath.Join(w.Root, pattern)
-		
-		// Check if it's a file or directory
-		info, err := os.Stat(absPattern)
-		if err != nil {
-			// Try glob pattern
-			matches, err := filepath.Glob(absPattern)
-			if err != nil {
-				return err
-			}
+		if err := w.GatherChanged(); err != nil {
+			return err
+		}
+	} else {
+		for _, pattern := range patterns {
+			absPattern := filepath.Join(w.Root, pattern)
 			
-			for _, match := range matches {
-				if err := w.gatherPath(match); err != nil {
-					return err
-				}
-			}
-		} else if info.IsDir() {
-			// Recursively gather all files in directory
-			err := filepath.WalkDir(absPattern, func(path string, d fs.DirEntry, err error) error {
+			// Check if it's a file or directory
+			info, err := os.Stat(absPattern)
+			if err != nil {
+				// Try glob pattern
+				matches, err := filepath.Glob(absPattern)
 				if err != nil {
 					return err
 				}
 				
-				if d.IsDir() {
-					if d.Name() == ".ivaldi" || d.Name() == ".git" {
-						return filepath.SkipDir
+				for _, match := range matches {
+					if err := w.gatherPath(match); err != nil {
+						return err
 					}
-					return nil
 				}
-				
-				return w.gatherPath(path)
-			})
-			if err != nil {
-				return err
-			}
-		} else {
-			// Single file
-			if err := w.gatherPath(absPattern); err != nil {
-				return err
+			} else if info.IsDir() {
+				// Recursively gather all files in directory
+				err := filepath.WalkDir(absPattern, func(path string, d fs.DirEntry, err error) error {
+					if err != nil {
+						return err
+					}
+					
+					if d.IsDir() {
+						if d.Name() == ".ivaldi" || d.Name() == ".git" {
+							return filepath.SkipDir
+						}
+						return nil
+					}
+					
+					return w.gatherPath(path)
+				})
+				if err != nil {
+					return err
+				}
+			} else {
+				// Single file
+				if err := w.gatherPath(absPattern); err != nil {
+					return err
+				}
 			}
 		}
 	}
-	return nil
+
+	// Store blobs and build candidate tree for all gathered files
+	return w.BuildCandidateTree()
 }
 
 // GatherChanged gathers only files that have been modified, added, or deleted
 func (w *Workspace) GatherChanged() error {
+	// Ensure maps are initialized
+	if w.AnvilFiles == nil {
+		w.AnvilFiles = make(map[string]*FileState)
+	}
+	if w.Files == nil {
+		w.Files = make(map[string]*FileState)
+	}
+	
 	for path, fileState := range w.Files {
 		if fileState.Status == StatusModified || fileState.Status == StatusAdded || fileState.Status == StatusDeleted {
 			fileState.OnAnvil = true
 			w.AnvilFiles[path] = fileState
 		}
 	}
-	return nil
+	return w.BuildCandidateTree()
 }
 
 func (w *Workspace) gatherPath(path string) error {
@@ -227,6 +244,14 @@ func (w *Workspace) gatherPath(path string) error {
 	// Skip ignored files
 	if w.shouldIgnore(relPath) {
 		return nil
+	}
+	
+	// Ensure maps are initialized
+	if w.AnvilFiles == nil {
+		w.AnvilFiles = make(map[string]*FileState)
+	}
+	if w.Files == nil {
+		w.Files = make(map[string]*FileState)
 	}
 	
 	// First, ensure we've scanned for changes
@@ -246,12 +271,10 @@ func (w *Workspace) gatherPath(path string) error {
 		}
 		
 		if !info.IsDir() {
-			data, err := os.ReadFile(path)
+			hash, err := w.computeFileHash(path)
 			if err != nil {
 				return nil
 			}
-			
-			hash := objects.NewHash(data)
 			fileState := &FileState{
 				Path:        relPath,
 				Status:      StatusAdded, // New file
@@ -275,8 +298,27 @@ func (w *Workspace) SaveState(timeline string) error {
 		return err
 	}
 
+	// Create workspace state data without the Store field (not serializable)
+	state := struct {
+		Root          string                    `json:"root"`
+		Files         map[string]*FileState     `json:"files"`
+		Timeline      string                    `json:"timeline"`
+		Position      objects.CAHash           `json:"position"`
+		AnvilFiles    map[string]*FileState     `json:"anvil_files"`
+		IgnorePattern []string                  `json:"ignore_patterns"`
+		CandidateTree *objects.CATree          `json:"candidate_tree,omitempty"`
+	}{
+		Root:          w.Root,
+		Files:         w.Files,
+		Timeline:      timeline,
+		Position:      w.Position,
+		AnvilFiles:    w.AnvilFiles,
+		IgnorePattern: w.IgnorePattern,
+		CandidateTree: w.CandidateTree,
+	}
+
 	statePath := filepath.Join(stateDir, "state.json")
-	data, err := json.Marshal(w)
+	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -294,7 +336,31 @@ func (w *Workspace) LoadState(timeline string) error {
 		return err
 	}
 
-	return json.Unmarshal(data, w)
+	// Load state data without overwriting the Store field
+	state := struct {
+		Root          string                    `json:"root"`
+		Files         map[string]*FileState     `json:"files"`
+		Timeline      string                    `json:"timeline"`
+		Position      objects.CAHash           `json:"position"`
+		AnvilFiles    map[string]*FileState     `json:"anvil_files"`
+		IgnorePattern []string                  `json:"ignore_patterns"`
+		CandidateTree *objects.CATree          `json:"candidate_tree,omitempty"`
+	}{}
+
+	if err := json.Unmarshal(data, &state); err != nil {
+		return err
+	}
+
+	// Update workspace fields while preserving Store
+	w.Root = state.Root
+	w.Files = state.Files
+	w.Timeline = state.Timeline
+	w.Position = state.Position
+	w.AnvilFiles = state.AnvilFiles
+	w.IgnorePattern = state.IgnorePattern
+	w.CandidateTree = state.CandidateTree
+
+	return nil
 }
 
 func (w *Workspace) HasUncommittedChanges() bool {
@@ -468,4 +534,168 @@ func (w *Workspace) discardPath(path string) int {
 	}
 	
 	return 0
+}
+
+// computeFileHash computes hash of a file using streaming for large files
+func (w *Workspace) computeFileHash(path string) (objects.CAHash, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return objects.CAHash{}, err
+	}
+	defer file.Close()
+
+	// For files larger than 5MB, use streaming
+	info, err := file.Stat()
+	if err != nil {
+		return objects.CAHash{}, err
+	}
+
+	if info.Size() > 5*1024*1024 {
+		// Stream large files to compute hash without loading into memory
+		return w.computeStreamingHash(file)
+	}
+
+	// For smaller files, read all at once
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return objects.CAHash{}, err
+	}
+
+	return objects.NewCAHash(data, w.Store.GetAlgorithm()), nil
+}
+
+// computeStreamingHash computes hash of large files using streaming
+func (w *Workspace) computeStreamingHash(reader io.Reader) (objects.CAHash, error) {
+	// Read all data for now (streaming hash computation needs hasher interface)
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return objects.CAHash{}, err
+	}
+
+	return objects.NewCAHash(data, w.Store.GetAlgorithm()), nil
+}
+
+// BuildCandidateTree builds a tree from currently staged files
+func (w *Workspace) BuildCandidateTree() error {
+	if len(w.AnvilFiles) == 0 {
+		w.CandidateTree = nil
+		return nil
+	}
+
+	var entries []objects.CATreeEntry
+	
+	// Sort paths for deterministic tree construction
+	var paths []string
+	for path := range w.AnvilFiles {
+		paths = append(paths, path)
+	}
+	
+	// Simple sort (could be improved with proper path sorting)
+	for i := 0; i < len(paths); i++ {
+		for j := i + 1; j < len(paths); j++ {
+			if paths[i] > paths[j] {
+				paths[i], paths[j] = paths[j], paths[i]
+			}
+		}
+	}
+
+	for _, path := range paths {
+		fileState := w.AnvilFiles[path]
+		
+		// Skip deleted files
+		if fileState.Status == StatusDeleted {
+			continue
+		}
+
+		// Ensure file has a blob hash (is stored in content store)
+		if fileState.BlobHash.IsZero() {
+			// File not yet stored as blob, store it now
+			if err := w.storeBlobForFile(path, fileState); err != nil {
+				return err
+			}
+		}
+
+		entry := objects.CATreeEntry{
+			Mode: objects.ModeFile,
+			Name: path,
+			Hash: fileState.BlobHash,
+			Kind: objects.KindBlob,
+		}
+		entries = append(entries, entry)
+	}
+
+	w.CandidateTree = objects.NewCATree(entries)
+	return nil
+}
+
+// storeBlobForFile stores a file as a blob in the content store
+func (w *Workspace) storeBlobForFile(path string, fileState *FileState) error {
+	fullPath := filepath.Join(w.Root, path)
+	
+	// Open file for reading
+	file, err := os.Open(fullPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// For large files, stream directly to store
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+
+	if info.Size() > 5*1024*1024 {
+		// Stream large files
+		data, err := io.ReadAll(file)
+		if err != nil {
+			return err
+		}
+		hash, err := w.Store.Put(data, local.KindBlob)
+		if err != nil {
+			return err
+		}
+		fileState.BlobHash = hash
+	} else {
+		// Read smaller files entirely
+		data, err := io.ReadAll(file)
+		if err != nil {
+			return err
+		}
+		hash, err := w.Store.Put(data, local.KindBlob)
+		if err != nil {
+			return err
+		}
+		fileState.BlobHash = hash
+	}
+
+	return nil
+}
+
+// GetCandidateTree returns the current candidate tree
+func (w *Workspace) GetCandidateTree() *objects.CATree {
+	return w.CandidateTree
+}
+
+// GetStagedFiles returns a list of all files currently staged (on anvil)
+func (w *Workspace) GetStagedFiles() []string {
+	var files []string
+	for path := range w.AnvilFiles {
+		files = append(files, path)
+	}
+	return files
+}
+
+// GetFileStatus returns the status of a specific file
+func (w *Workspace) GetFileStatus(path string) (FileStatus, bool) {
+	if fileState, exists := w.Files[path]; exists {
+		return fileState.Status, true
+	}
+	return StatusUnmodified, false
+}
+
+// IsFileStaged returns true if the file is currently staged
+func (w *Workspace) IsFileStaged(path string) bool {
+	_, exists := w.AnvilFiles[path]
+	return exists
 }

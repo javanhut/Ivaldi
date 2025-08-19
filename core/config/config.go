@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"golang.org/x/term"
+	"ivaldi/core/objects"
 )
 
 // Credentials represents stored authentication credentials
@@ -20,6 +21,13 @@ type Credentials struct {
 	GitLabToken string `json:"gitlab_token,omitempty"`
 	UserName    string `json:"user_name,omitempty"`
 	UserEmail   string `json:"user_email,omitempty"`
+}
+
+// RepoConfig represents repository-specific configuration
+type RepoConfig struct {
+	HashAlgorithm string `json:"hash_algorithm"` // "blake3" or "sha256"
+	UserName      string `json:"user_name,omitempty"`
+	UserEmail     string `json:"user_email,omitempty"`
 }
 
 // ConfigManager handles Ivaldi configuration
@@ -353,4 +361,112 @@ func (cm *ConfigManager) GetGitHubTokenWithFallback() (string, error) {
 	}
 	
 	return "", fmt.Errorf("no GitHub token found in config or git credentials")
+}
+
+// LoadRepoConfig loads repository-specific configuration
+func (cm *ConfigManager) LoadRepoConfig() (*RepoConfig, error) {
+	repoConfigPath := filepath.Join(filepath.Dir(cm.configPath), "repo_config.json")
+	
+	data, err := os.ReadFile(repoConfigPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Return default config if file doesn't exist
+			return &RepoConfig{
+				HashAlgorithm: "blake3", // Default to BLAKE3
+			}, nil
+		}
+		return nil, err
+	}
+
+	var config RepoConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, err
+	}
+
+	// Validate hash algorithm
+	if _, err := objects.ParseHashAlgorithm(config.HashAlgorithm); err != nil {
+		config.HashAlgorithm = "blake3" // Fall back to default
+	}
+
+	return &config, nil
+}
+
+// SaveRepoConfig saves repository-specific configuration
+func (cm *ConfigManager) SaveRepoConfig(config *RepoConfig) error {
+	repoConfigPath := filepath.Join(filepath.Dir(cm.configPath), "repo_config.json")
+	
+	// Ensure directory exists
+	if err := os.MkdirAll(filepath.Dir(repoConfigPath), 0755); err != nil {
+		return err
+	}
+
+	// Validate hash algorithm before saving
+	if _, err := objects.ParseHashAlgorithm(config.HashAlgorithm); err != nil {
+		return fmt.Errorf("invalid hash algorithm: %s", config.HashAlgorithm)
+	}
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(repoConfigPath, data, 0644)
+}
+
+// GetHashAlgorithm returns the configured hash algorithm for the repository
+func (cm *ConfigManager) GetHashAlgorithm() (objects.HashAlgorithm, error) {
+	config, err := cm.LoadRepoConfig()
+	if err != nil {
+		return objects.BLAKE3, err
+	}
+	
+	return objects.ParseHashAlgorithm(config.HashAlgorithm)
+}
+
+// SetHashAlgorithm sets the hash algorithm for the repository
+func (cm *ConfigManager) SetHashAlgorithm(algo objects.HashAlgorithm) error {
+	config, err := cm.LoadRepoConfig()
+	if err != nil {
+		return err
+	}
+	
+	config.HashAlgorithm = algo.String()
+	return cm.SaveRepoConfig(config)
+}
+
+// GetRepoUserInfo returns the repository-specific user information
+func (cm *ConfigManager) GetRepoUserInfo() (string, string, error) {
+	config, err := cm.LoadRepoConfig()
+	if err != nil {
+		return "", "", err
+	}
+	
+	// Fall back to global credentials if repo config doesn't have user info
+	if config.UserName == "" || config.UserEmail == "" {
+		globalName, globalEmail, err := cm.GetUserInfo()
+		if err != nil {
+			return config.UserName, config.UserEmail, nil // Return what we have
+		}
+		
+		if config.UserName == "" {
+			config.UserName = globalName
+		}
+		if config.UserEmail == "" {
+			config.UserEmail = globalEmail
+		}
+	}
+	
+	return config.UserName, config.UserEmail, nil
+}
+
+// SetRepoUserInfo sets the repository-specific user information
+func (cm *ConfigManager) SetRepoUserInfo(name, email string) error {
+	config, err := cm.LoadRepoConfig()
+	if err != nil {
+		return err
+	}
+	
+	config.UserName = name
+	config.UserEmail = email
+	return cm.SaveRepoConfig(config)
 }

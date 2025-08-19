@@ -9,13 +9,13 @@ import (
 
 	"ivaldi/core/objects"
 	"ivaldi/core/overwrite"
+	"ivaldi/storage/local"
 	"ivaldi/core/position"
 	"ivaldi/core/preservation"
 	"ivaldi/core/references"
 	"ivaldi/core/timeline"
 	"ivaldi/core/workspace"
 	"ivaldi/storage/index"
-	"ivaldi/storage/local"
 )
 
 // EnhancedRepository integrates all revolutionary features
@@ -319,7 +319,11 @@ func EnhancedInitialize(root string) (*EnhancedRepository, error) {
 	}
 	
 	// Initialize core systems
-	ws := workspace.New(root)
+	store, err := local.NewStore(root, objects.BLAKE3)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create store: %v", err)
+	}
+	ws := workspace.New(root, store)
 	tm := timeline.NewManager(root)
 	pm := position.NewManager(root)
 	

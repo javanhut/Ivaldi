@@ -64,7 +64,11 @@ func Initialize(root string) (*Repository, error) {
 		return nil, err
 	}
 
-	ws := workspace.New(root)
+	store, err := local.NewStore(root, objects.BLAKE3)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create store: %v", err)
+	}
+	ws := workspace.New(root, store)
 	tm := timeline.NewManager(root)
 	pm := position.NewManager(root)
 	rm := references.NewReferenceManager(root)
@@ -136,7 +140,11 @@ func Open(root string) (*Repository, error) {
 		return nil, err
 	}
 
-	ws := workspace.New(root)
+	store, err := local.NewStore(root, objects.BLAKE3)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create store: %v", err)
+	}
+	ws := workspace.New(root, store)
 	tm := timeline.NewManager(root)
 	pm := position.NewManager(root)
 	rm := references.NewReferenceManager(root)
@@ -339,6 +347,9 @@ func (r *Repository) SwitchTimeline(name string) error {
 	if err != nil {
 		return fmt.Errorf("failed to get timeline head: %v", err)
 	}
+	
+	// Debug: check what hash we're getting
+	fmt.Printf("Debug: switching to timeline %s with HEAD: %s\n", name, targetHead.String())
 
 	// Switch timeline
 	if err := r.timeline.Switch(name); err != nil {
@@ -1132,8 +1143,18 @@ func (r *Repository) LoadState(timeline string) error {
 
 // RestoreWorkingDirectory restores the working directory to match a specific commit
 func (r *Repository) RestoreWorkingDirectory(targetHash objects.Hash) error {
-	// If target hash is empty (no commits yet), clear working directory
-	if targetHash == (objects.Hash{}) {
+	// Check if target hash is empty (no commits yet)
+	emptyHash := objects.Hash{}
+	hashString := targetHash.String()
+	
+	// If target hash is empty or all zeros, clear working directory
+	if targetHash == emptyHash || hashString == "0000000000000000000000000000000000000000000000000000000000000000" {
+		return r.clearWorkingDirectory()
+	}
+
+	// Check if the seal actually exists in storage
+	if !r.storage.Exists(targetHash) {
+		// Seal doesn't exist, treat as empty repository
 		return r.clearWorkingDirectory()
 	}
 
@@ -1142,6 +1163,9 @@ func (r *Repository) RestoreWorkingDirectory(targetHash objects.Hash) error {
 	if err != nil {
 		return fmt.Errorf("failed to load seal: %v", err)
 	}
+
+	// Debug: check the seal's position
+	fmt.Printf("Debug: seal position: %s\n", seal.Position.String())
 
 	// Load the tree from the seal's position
 	tree, err := r.storage.LoadTree(seal.Position)

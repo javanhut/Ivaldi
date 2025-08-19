@@ -17,7 +17,7 @@ type WorkspaceSnapshot struct {
 	ID          string                     `json:"id"`
 	Name        string                     `json:"name"`
 	Timeline    string                     `json:"timeline"`
-	Position    objects.Hash               `json:"position"`
+	Position    objects.CAHash             `json:"position"`
 	Timestamp   time.Time                  `json:"timestamp"`
 	Files       map[string]*FileSnapshot   `json:"files"`
 	AnvilFiles  map[string]*FileSnapshot   `json:"anvilFiles"`
@@ -82,7 +82,7 @@ func (pm *PreservationManager) AutoPreserve(ws *workspace.Workspace, fromTimelin
 				Path:    path,
 				Content: content,
 				Status:  int(fileState.Status),
-				Hash:    string(fileState.Hash[:]),
+				Hash:    fileState.Hash.String(),
 				ModTime: fileState.ModTime,
 				Size:    fileState.Size,
 			}
@@ -100,7 +100,7 @@ func (pm *PreservationManager) AutoPreserve(ws *workspace.Workspace, fromTimelin
 			Path:    path,
 			Content: content,
 			Status:  int(fileState.Status),
-			Hash:    string(fileState.Hash[:]),
+			Hash:    fileState.Hash.String(),
 			ModTime: fileState.ModTime,
 			Size:    fileState.Size,
 		}
@@ -138,8 +138,10 @@ func (pm *PreservationManager) RestoreWorkspace(snapshotID string, ws *workspace
 		}
 		
 		// Restore file state
-		var hash objects.Hash
-		copy(hash[:], fileSnapshot.Hash)
+		hash, err := objects.ParseCAHash(fileSnapshot.Hash)
+		if err != nil {
+			continue // Skip invalid hashes
+		}
 		
 		ws.Files[path] = &workspace.FileState{
 			Path:        path,
@@ -148,14 +150,17 @@ func (pm *PreservationManager) RestoreWorkspace(snapshotID string, ws *workspace
 			Size:        fileSnapshot.Size,
 			ModTime:     fileSnapshot.ModTime,
 			WorkingHash: hash,
+			BlobHash:    objects.CAHash{}, // Will be computed when needed
 		}
 	}
 	
 	// Restore anvil files
 	ws.AnvilFiles = make(map[string]*workspace.FileState)
 	for path, fileSnapshot := range snapshot.AnvilFiles {
-		var hash objects.Hash
-		copy(hash[:], fileSnapshot.Hash)
+		hash, err := objects.ParseCAHash(fileSnapshot.Hash)
+		if err != nil {
+			continue // Skip invalid hashes
+		}
 		
 		ws.AnvilFiles[path] = &workspace.FileState{
 			Path:        path,
@@ -164,6 +169,7 @@ func (pm *PreservationManager) RestoreWorkspace(snapshotID string, ws *workspace
 			Size:        fileSnapshot.Size,
 			ModTime:     fileSnapshot.ModTime,
 			WorkingHash: hash,
+			BlobHash:    objects.CAHash{}, // Will be computed when needed
 			OnAnvil:     true,
 		}
 	}
@@ -230,7 +236,7 @@ func (pm *PreservationManager) CreateNamedWorkspace(name string, ws *workspace.W
 				Path:    path,
 				Content: content,
 				Status:  int(fileState.Status),
-				Hash:    string(fileState.Hash[:]),
+				Hash:    fileState.Hash.String(),
 				ModTime: fileState.ModTime,
 				Size:    fileState.Size,
 			}
@@ -247,7 +253,7 @@ func (pm *PreservationManager) CreateNamedWorkspace(name string, ws *workspace.W
 			Path:    path,
 			Content: content,
 			Status:  int(fileState.Status),
-			Hash:    string(fileState.Hash[:]),
+			Hash:    fileState.Hash.String(),
 			ModTime: fileState.ModTime,
 			Size:    fileState.Size,
 		}

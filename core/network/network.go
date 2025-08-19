@@ -18,6 +18,7 @@ import (
 
 	"ivaldi/core/config"
 	"ivaldi/core/objects"
+	"ivaldi/storage/local"
 	"ivaldi/core/workspace"
 )
 
@@ -1101,7 +1102,11 @@ type UploadState struct {
 
 // getFilesForUpload returns changed files and all files for smart incremental upload
 func (nm *NetworkManager) getFilesForUpload(owner, repo string, seals []*objects.Seal) (map[string]string, map[string]string, bool, error) {
-	ws := workspace.New(nm.root)
+	store, err := local.NewStore(nm.root, objects.BLAKE3)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("failed to create store: %v", err)
+	}
+	ws := workspace.New(nm.root, store)
 	if err := ws.Scan(); err != nil {
 		return nil, nil, false, fmt.Errorf("failed to scan workspace: %v", err)
 	}
@@ -1195,7 +1200,11 @@ func (nm *NetworkManager) saveUploadState(owner, repo string, state *UploadState
 
 // saveUploadStateAfterUpload creates and saves upload state after successful upload
 func (nm *NetworkManager) saveUploadStateAfterUpload(owner, repo string, seal *objects.Seal, allFiles map[string]string) error {
-	ws := workspace.New(nm.root)
+	store, err := local.NewStore(nm.root, objects.BLAKE3)
+	if err != nil {
+		return fmt.Errorf("failed to create store: %v", err)
+	}
+	ws := workspace.New(nm.root, store)
 	if err := ws.Scan(); err != nil {
 		return err
 	}
@@ -1220,7 +1229,11 @@ func (nm *NetworkManager) saveUploadStateAfterUpload(owner, repo string, seal *o
 // getAllRepositoryFiles loads the workspace and returns ALL repository files 
 // This is used for initial uploads to ensure the remote has the complete repository state
 func (nm *NetworkManager) getAllRepositoryFiles() (map[string]string, error) {
-	ws := workspace.New(nm.root)
+	store, err := local.NewStore(nm.root, objects.BLAKE3)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create store: %v", err)
+	}
+	ws := workspace.New(nm.root, store)
 	if err := ws.Scan(); err != nil {
 		return nil, fmt.Errorf("failed to scan workspace: %v", err)
 	}
@@ -1241,7 +1254,11 @@ func (nm *NetworkManager) getAllRepositoryFiles() (map[string]string, error) {
 
 // getChangedFiles loads the workspace and returns only files that are staged for commit
 func (nm *NetworkManager) getChangedFiles() (map[string]string, error) {
-	ws := workspace.New(nm.root)
+	store, err := local.NewStore(nm.root, objects.BLAKE3)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create store: %v", err)
+	}
+	ws := workspace.New(nm.root, store)
 	if err := ws.Scan(); err != nil {
 		return nil, fmt.Errorf("failed to scan workspace: %v", err)
 	}
