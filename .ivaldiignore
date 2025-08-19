@@ -44,6 +44,8 @@ CLAUDE.md
 build
 # Added by ivaldi exclude command
 test-repo
-
 # Added by ivaldi exclude command
 test-repo
+
+# Added by ivaldi exclude command
+./ivaldi
