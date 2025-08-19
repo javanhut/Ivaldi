@@ -3,6 +3,7 @@ package forge
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -326,18 +327,37 @@ func (r *Repository) CreateTimeline(name, description string) error {
 }
 
 func (r *Repository) SwitchTimeline(name string) error {
+	// Save current workspace state if there are uncommitted changes
 	if r.workspace.HasUncommittedChanges() {
 		if err := r.workspace.SaveState(r.timeline.Current()); err != nil {
 			return fmt.Errorf("failed to save workspace state: %v", err)
 		}
 	}
 
+	// Get target timeline's HEAD commit before switching
+	targetHead, err := r.timeline.GetHead(name)
+	if err != nil {
+		return fmt.Errorf("failed to get timeline head: %v", err)
+	}
+
+	// Switch timeline
 	if err := r.timeline.Switch(name); err != nil {
 		return err
 	}
 
+	// Restore working directory to match target timeline's HEAD
+	if err := r.RestoreWorkingDirectory(targetHead); err != nil {
+		return fmt.Errorf("failed to restore working directory: %v", err)
+	}
+
+	// Load target timeline's workspace state
 	if err := r.workspace.LoadState(name); err != nil {
 		return fmt.Errorf("failed to load workspace state: %v", err)
+	}
+
+	// Rescan workspace to update file tracking after restoration
+	if err := r.workspace.Scan(); err != nil {
+		return fmt.Errorf("failed to scan workspace after switch: %v", err)
 	}
 
 	return nil
@@ -1108,4 +1128,117 @@ func (r *Repository) SaveState(timeline string) error {
 
 func (r *Repository) LoadState(timeline string) error {
 	return r.workspace.LoadState(timeline)
+}
+
+// RestoreWorkingDirectory restores the working directory to match a specific commit
+func (r *Repository) RestoreWorkingDirectory(targetHash objects.Hash) error {
+	// If target hash is empty (no commits yet), clear working directory
+	if targetHash == (objects.Hash{}) {
+		return r.clearWorkingDirectory()
+	}
+
+	// Load the target seal
+	seal, err := r.storage.LoadSeal(targetHash)
+	if err != nil {
+		return fmt.Errorf("failed to load seal: %v", err)
+	}
+
+	// Load the tree from the seal's position
+	tree, err := r.storage.LoadTree(seal.Position)
+	if err != nil {
+		return fmt.Errorf("failed to load tree: %v", err)
+	}
+
+	// Clear working directory first
+	if err := r.clearWorkingDirectory(); err != nil {
+		return err
+	}
+
+	// Restore files from tree
+	return r.restoreFromTree(tree, "")
+}
+
+// clearWorkingDirectory removes all tracked files from working directory
+func (r *Repository) clearWorkingDirectory() error {
+	// Get all files currently in the working directory (except ignored ones)
+	return filepath.WalkDir(r.root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if d.IsDir() {
+			// Skip special directories
+			if d.Name() == ".ivaldi" || d.Name() == ".git" || d.Name() == "build" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// Remove file if it's tracked (not ignored)
+		relPath, err := filepath.Rel(r.root, path)
+		if err != nil {
+			return err
+		}
+
+		if !r.isIgnored(relPath) {
+			return os.Remove(path)
+		}
+
+		return nil
+	})
+}
+
+// restoreFromTree recursively restores files from a tree object
+func (r *Repository) restoreFromTree(tree *objects.Tree, basePath string) error {
+	for _, entry := range tree.Entries {
+		entryPath := filepath.Join(basePath, entry.Name)
+		fullPath := filepath.Join(r.root, entryPath)
+
+		switch entry.Type {
+		case objects.ObjectTypeTree:
+			// Create directory and recurse
+			if err := os.MkdirAll(fullPath, 0755); err != nil {
+				return err
+			}
+			subTree, err := r.storage.LoadTree(entry.Hash)
+			if err != nil {
+				return err
+			}
+			if err := r.restoreFromTree(subTree, entryPath); err != nil {
+				return err
+			}
+
+		case objects.ObjectTypeBlob:
+			// Restore file
+			blob, err := r.storage.LoadBlob(entry.Hash)
+			if err != nil {
+				return err
+			}
+			
+			// Ensure directory exists
+			dir := filepath.Dir(fullPath)
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return err
+			}
+			
+			// Write file
+			if err := os.WriteFile(fullPath, blob.Data, os.FileMode(entry.Mode)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// isIgnored checks if a file path should be ignored
+func (r *Repository) isIgnored(path string) bool {
+	for _, pattern := range r.workspace.IgnorePattern {
+		if matched, _ := filepath.Match(pattern, path); matched {
+			return true
+		}
+		if matched, _ := filepath.Match(pattern, filepath.Base(path)); matched {
+			return true
+		}
+	}
+	return false
 }
