@@ -163,6 +163,13 @@ func Open(root string) (*Repository, error) {
 	if err := ws.LoadState(currentTimeline); err != nil {
 		// Ignore error if state doesn't exist yet
 	}
+	
+	// Ensure workspace has correct root path after loading state
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+	ws.Root = absRoot
 
 	// Create fuse manager
 	fuseMgr := fuse.NewFuseManager(storage, tm, ws)
