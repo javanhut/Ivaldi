@@ -110,7 +110,7 @@ Natural Language Examples:
 // Initialize repository and load enhanced features
 func (ec *EnhancedCLI) initializeRepository(cmd *cobra.Command, args []string) error {
 	// Skip repo check for init commands
-	if cmd.Name() == "forge" || cmd.Name() == "download" || cmd.Name() == "mirror" || cmd.Name() == "help" {
+	if cmd.Name() == "forge" || cmd.Name() == "download" || cmd.Name() == "mirror" || cmd.Name() == "config" || cmd.Name() == "help" {
 		return nil
 	}
 
@@ -1433,32 +1433,33 @@ func (ec *EnhancedCLI) createVersionCommand() *cobra.Command {
 func (ec *EnhancedCLI) createConfigCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "config",
-		Short: "Configuration management",
-		Long: `Configure Ivaldi settings and credentials
+		Short: "Global configuration management",
+		Long: `Configure Ivaldi global settings and credentials
 
 Interactive setup will guide you through configuring:
 - User information (name, email)
-- GitHub personal access token
+- GitHub personal access token (or detect from git credentials)
 - GitLab personal access token
 
+Configuration is stored globally at ~/.ivaldi/config.json and used by all repositories.
+
 Examples:
-  ivaldi config           # Interactive setup
+  ivaldi config           # Interactive global setup
   ivaldi config --show   # Show current configuration`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if ec.currentRepo == nil {
-				return fmt.Errorf("not in repository - please run 'ivaldi forge' or 'ivaldi download' first")
-			}
-
 			showConfig, _ := cmd.Flags().GetBool("show")
 
-			configMgr := config.NewConfigManager(ec.currentRepo.Root())
+			// Use global config manager
+			configMgr := config.NewGlobalConfigManager()
 
 			if showConfig {
 				return ec.showCurrentConfig(configMgr)
 			}
 
 			// Interactive setup
-			ec.output.Info("Starting interactive configuration...")
+			ec.output.Info("Starting interactive global configuration...")
+			ec.output.Info("This will be stored at ~/.ivaldi/config.json for all repositories")
+			
 			if err := configMgr.InteractiveSetup(); err != nil {
 				ec.output.Error("Configuration failed", []string{
 					err.Error(),
@@ -1467,6 +1468,8 @@ Examples:
 				return err
 			}
 
+			ec.output.Success("Global configuration saved!")
+			ec.output.Info("All repositories will now use these credentials")
 			return nil
 		},
 	}

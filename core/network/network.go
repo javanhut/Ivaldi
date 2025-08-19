@@ -8,9 +8,11 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"ivaldi/core/config"
@@ -29,6 +31,22 @@ type NetworkManager struct {
 type downloadProgress struct {
 	total      int
 	downloaded int
+	mutex      sync.Mutex
+}
+
+type downloadJob struct {
+	url      string
+	path     string
+	content  string
+	encoding string
+}
+
+type downloadWorker struct {
+	id       int
+	jobs     <-chan downloadJob
+	results  chan<- error
+	client   *http.Client
+	progress *downloadProgress
 }
 
 // NewNetworkManager creates a new network manager
@@ -39,6 +57,13 @@ func NewNetworkManager(root string) *NetworkManager {
 		},
 		root: root,
 	}
+}
+
+// getGitHubToken gets GitHub token with multiple fallback options
+func (nm *NetworkManager) getGitHubToken() (string, error) {
+	// Try local config first
+	configMgr := config.NewConfigManager(nm.root)
+	return configMgr.GetGitHubTokenWithFallback()
 }
 
 // RemoteRef represents a reference on the remote
@@ -125,14 +150,21 @@ func (nm *NetworkManager) downloadFromGitHub(url, dest string) error {
 	}
 	fmt.Printf("Done (%d files)\n", totalFiles)
 	
+	// Use tarball download for large repositories (faster)
+	if totalFiles > 100 {
+		fmt.Printf("├─ Large repository detected (%d files), using optimized download...\n", totalFiles)
+		return nm.downloadGitHubTarball(owner, repo, dest)
+	}
+	
 	// Initialize download progress tracking
 	nm.downloadProgress = &downloadProgress{
 		total:      totalFiles,
 		downloaded: 0,
+		mutex:      sync.Mutex{},
 	}
 	
-	// Get repository contents from GitHub API
-	err = nm.downloadGitHubContents(owner, repo, dest, "")
+	// Use optimized parallel download
+	err = nm.downloadGitHubContentsParallel(owner, repo, dest)
 	if err != nil {
 		fmt.Println("\n└─ Download failed")
 		return err
@@ -156,8 +188,7 @@ func (nm *NetworkManager) downloadGitHubContents(owner, repo, localPath, remoteP
 	}
 	
 	// Add authentication if available
-	configMgr := config.NewConfigManager(nm.root)
-	if token, err := configMgr.GetGitHubToken(); err == nil && token != "" {
+	if token, err := nm.getGitHubToken(); err == nil && token != "" {
 		req.Header.Set("Authorization", "token "+token)
 	}
 	req.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
@@ -240,8 +271,7 @@ func (nm *NetworkManager) countGitHubFiles(owner, repo, remotePath string) (int,
 	}
 	
 	// Add authentication if available
-	configMgr := config.NewConfigManager(nm.root)
-	if token, err := configMgr.GetGitHubToken(); err == nil && token != "" {
+	if token, err := nm.getGitHubToken(); err == nil && token != "" {
 		req.Header.Set("Authorization", "token "+token)
 	}
 	req.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
@@ -289,9 +319,15 @@ func (nm *NetworkManager) showDownloadProgress() {
 		return
 	}
 	
-	percentage := (nm.downloadProgress.downloaded * 100) / nm.downloadProgress.total
+	// Thread-safe progress reading
+	nm.downloadProgress.mutex.Lock()
+	downloaded := nm.downloadProgress.downloaded
+	total := nm.downloadProgress.total
+	nm.downloadProgress.mutex.Unlock()
+	
+	percentage := (downloaded * 100) / total
 	barLength := 30
-	filled := (barLength * nm.downloadProgress.downloaded) / nm.downloadProgress.total
+	filled := (barLength * downloaded) / total
 	
 	// Create progress bar
 	bar := "["
@@ -307,12 +343,286 @@ func (nm *NetworkManager) showDownloadProgress() {
 	bar += "]"
 	
 	// Clear line and print progress
-	fmt.Printf("\r├─ Downloading files... %s %d%% (%d/%d)", bar, percentage, nm.downloadProgress.downloaded, nm.downloadProgress.total)
+	fmt.Printf("\r├─ Downloading files... %s %d%% (%d/%d)", bar, percentage, downloaded, total)
 	
 	// Add newline when complete
-	if nm.downloadProgress.downloaded == nm.downloadProgress.total {
+	if downloaded == total {
 		fmt.Println()
 	}
+}
+
+// updateProgress safely increments the download counter
+func (nm *NetworkManager) updateProgress() {
+	if nm.downloadProgress == nil {
+		return
+	}
+	
+	nm.downloadProgress.mutex.Lock()
+	nm.downloadProgress.downloaded++
+	nm.downloadProgress.mutex.Unlock()
+	
+	nm.showDownloadProgress()
+}
+
+// downloadWorker processes download jobs concurrently
+func (dw *downloadWorker) start() {
+	for job := range dw.jobs {
+		var err error
+		
+		if job.url != "" {
+			// Download from URL
+			err = dw.downloadFromURL(job.url, job.path)
+		} else if job.content != "" && job.encoding == "base64" {
+			// Decode base64 content
+			err = dw.decodeBase64ToFile(job.content, job.path)
+		}
+		
+		if dw.progress != nil {
+			dw.progress.mutex.Lock()
+			dw.progress.downloaded++
+			dw.progress.mutex.Unlock()
+		}
+		
+		dw.results <- err
+	}
+}
+
+// downloadFromURL downloads a file from URL
+func (dw *downloadWorker) downloadFromURL(url, localPath string) error {
+	resp, err := dw.client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("HTTP %d downloading %s", resp.StatusCode, url)
+	}
+
+	// Ensure directory exists
+	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+		return err
+	}
+
+	file, err := os.Create(localPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	_, err = io.Copy(file, resp.Body)
+	return err
+}
+
+// decodeBase64ToFile decodes base64 content to a file
+func (dw *downloadWorker) decodeBase64ToFile(content, localPath string) error {
+	decoded, err := base64.StdEncoding.DecodeString(content)
+	if err != nil {
+		return err
+	}
+	
+	// Ensure directory exists
+	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+		return err
+	}
+	
+	return os.WriteFile(localPath, decoded, 0644)
+}
+
+// downloadGitHubContentsParallel downloads all files using parallel workers
+func (nm *NetworkManager) downloadGitHubContentsParallel(owner, repo, localPath string) error {
+	// First, collect all files to download  
+	fmt.Print("├─ Collecting file list... ")
+	fileJobs, err := nm.collectAllFiles(owner, repo, localPath, "")
+	if err != nil {
+		fmt.Println("Failed")
+		return err
+	}
+	fmt.Printf("Done (%d files)\n", len(fileJobs))
+	
+	// Update total count if different
+	if nm.downloadProgress != nil {
+		nm.downloadProgress.mutex.Lock()
+		nm.downloadProgress.total = len(fileJobs)
+		nm.downloadProgress.downloaded = 0
+		nm.downloadProgress.mutex.Unlock()
+	}
+	
+	// Start parallel download workers
+	const numWorkers = 8 // Configurable concurrency
+	jobs := make(chan downloadJob, len(fileJobs))
+	results := make(chan error, len(fileJobs))
+	
+	// Start workers
+	for i := 0; i < numWorkers; i++ {
+		worker := &downloadWorker{
+			id:       i,
+			jobs:     jobs,
+			results:  results,
+			client:   nm.client,
+			progress: nm.downloadProgress,
+		}
+		go worker.start()
+	}
+	
+	// Send jobs
+	for _, job := range fileJobs {
+		jobs <- job
+	}
+	close(jobs)
+	
+	// Collect results
+	var firstError error
+	for i := 0; i < len(fileJobs); i++ {
+		if err := <-results; err != nil && firstError == nil {
+			firstError = err
+		}
+		nm.showDownloadProgress()
+	}
+	
+	return firstError
+}
+
+// collectAllFiles recursively collects all files to download
+func (nm *NetworkManager) collectAllFiles(owner, repo, localPath, remotePath string) ([]downloadJob, error) {
+	var jobs []downloadJob
+	
+	// GitHub API endpoint for repository contents
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents", owner, repo)
+	if remotePath != "" {
+		apiURL += "/" + remotePath
+	}
+	
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Add authentication if available
+	if token, err := nm.getGitHubToken(); err == nil && token != "" {
+		req.Header.Set("Authorization", "token "+token)
+	}
+	req.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
+	
+	resp, err := nm.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GitHub API error (%d): %s", resp.StatusCode, string(body))
+	}
+	
+	var contents []struct {
+		Name        string `json:"name"`
+		Path        string `json:"path"`
+		Type        string `json:"type"`
+		DownloadURL string `json:"download_url"`
+		Content     string `json:"content"`
+		Encoding    string `json:"encoding"`
+	}
+	
+	if err := json.NewDecoder(resp.Body).Decode(&contents); err != nil {
+		return nil, err
+	}
+	
+	// Process each item
+	for _, item := range contents {
+		localItemPath := filepath.Join(localPath, item.Name)
+		
+		if item.Type == "dir" {
+			// Create directory
+			if err := os.MkdirAll(localItemPath, 0755); err != nil {
+				return nil, err
+			}
+			// Recurse into subdirectory
+			subJobs, err := nm.collectAllFiles(owner, repo, localItemPath, item.Path)
+			if err != nil {
+				return nil, err
+			}
+			jobs = append(jobs, subJobs...)
+		} else if item.Type == "file" {
+			// Add file to download jobs
+			job := downloadJob{
+				path:     localItemPath,
+				url:      item.DownloadURL,
+				content:  item.Content,
+				encoding: item.Encoding,
+			}
+			jobs = append(jobs, job)
+		}
+	}
+	
+	return jobs, nil
+}
+
+// downloadGitHubTarball downloads repository as a tarball for better performance on large repos
+func (nm *NetworkManager) downloadGitHubTarball(owner, repo, dest string) error {
+	// GitHub tarball endpoint
+	tarballURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/tarball", owner, repo)
+	
+	req, err := http.NewRequest("GET", tarballURL, nil)
+	if err != nil {
+		return err
+	}
+	
+	// Add authentication if available
+	if token, err := nm.getGitHubToken(); err == nil && token != "" {
+		req.Header.Set("Authorization", "token "+token)
+	}
+	req.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
+	
+	fmt.Print("├─ Downloading repository archive... ")
+	resp, err := nm.client.Do(req)
+	if err != nil {
+		fmt.Println("Failed")
+		return err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		fmt.Println("Failed")
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("GitHub API error (%d): %s", resp.StatusCode, string(body))
+	}
+	
+	// Create a temporary file for the tarball
+	tmpFile, err := os.CreateTemp("", "ivaldi-repo-*.tar.gz")
+	if err != nil {
+		fmt.Println("Failed")
+		return err
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+	
+	// Download the tarball
+	_, err = io.Copy(tmpFile, resp.Body)
+	if err != nil {
+		fmt.Println("Failed")
+		return err
+	}
+	fmt.Println("Done")
+	
+	// Extract the tarball
+	fmt.Print("├─ Extracting files... ")
+	err = nm.extractTarball(tmpFile.Name(), dest)
+	if err != nil {
+		fmt.Println("Failed")
+		return err
+	}
+	fmt.Println("Done")
+	
+	fmt.Printf("└─ Successfully downloaded repository using optimized method\n")
+	return nil
+}
+
+// extractTarball extracts a gzipped tarball to destination
+func (nm *NetworkManager) extractTarball(tarballPath, dest string) error {
+	// Use tar command for extraction (faster and more reliable)
+	cmd := exec.Command("tar", "-xzf", tarballPath, "-C", dest, "--strip-components=1")
+	return cmd.Run()
 }
 
 // downloadFromGitLab downloads from GitLab using their API  
@@ -480,8 +790,7 @@ func (nm *NetworkManager) createOrUpdateFile(owner, repo, path, content, message
 	}
 	
 	// Add authentication for GET request too
-	configMgr := config.NewConfigManager(nm.root)
-	token, err := configMgr.GetGitHubToken()
+	token, err := nm.getGitHubToken()
 	if err != nil {
 		return fmt.Errorf("failed to load GitHub token: %v", err)
 	}
@@ -530,8 +839,7 @@ func (nm *NetworkManager) createOrUpdateFile(owner, repo, path, content, message
 	putReq.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
 	
 	// Load and add authentication
-	configMgr2 := config.NewConfigManager(nm.root)
-	token2, err := configMgr2.GetGitHubToken()
+	token2, err := nm.getGitHubToken()
 	if err != nil {
 		return fmt.Errorf("failed to load GitHub token: %v", err)
 	}
@@ -1006,8 +1314,7 @@ func (nm *NetworkManager) getCurrentCommitSHA(owner, repo, branch string) (strin
 	}
 	
 	// Add authentication
-	configMgr := config.NewConfigManager(nm.root)
-	token, err := configMgr.GetGitHubToken()
+	token, err := nm.getGitHubToken()
 	if err != nil {
 		return "", err
 	}
@@ -1048,8 +1355,7 @@ func (nm *NetworkManager) createTree(owner, repo string, treeData []byte) (strin
 	}
 	
 	// Add authentication
-	configMgr := config.NewConfigManager(nm.root)
-	token, err := configMgr.GetGitHubToken()
+	token, err := nm.getGitHubToken()
 	if err != nil {
 		return "", err
 	}
@@ -1095,8 +1401,7 @@ func (nm *NetworkManager) createCommit(owner, repo string, commit GitHubCommit) 
 	}
 	
 	// Add authentication
-	configMgr := config.NewConfigManager(nm.root)
-	token, err := configMgr.GetGitHubToken()
+	token, err := nm.getGitHubToken()
 	if err != nil {
 		return "", err
 	}
@@ -1146,8 +1451,7 @@ func (nm *NetworkManager) updateReference(owner, repo, ref, sha string) error {
 	}
 	
 	// Add authentication
-	configMgr := config.NewConfigManager(nm.root)
-	token, err := configMgr.GetGitHubToken()
+	token, err := nm.getGitHubToken()
 	if err != nil {
 		return err
 	}
@@ -1204,8 +1508,7 @@ func (nm *NetworkManager) createReference(owner, repo, ref, sha string) error {
 	}
 	
 	// Add authentication
-	configMgr := config.NewConfigManager(nm.root)
-	token, err := configMgr.GetGitHubToken()
+	token, err := nm.getGitHubToken()
 	if err != nil {
 		return err
 	}

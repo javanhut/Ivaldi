@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -29,6 +30,19 @@ type ConfigManager struct {
 // NewConfigManager creates a new config manager
 func NewConfigManager(root string) *ConfigManager {
 	configPath := filepath.Join(root, ".ivaldi", "config.json")
+	return &ConfigManager{
+		configPath: configPath,
+	}
+}
+
+// NewGlobalConfigManager creates a config manager for global settings
+func NewGlobalConfigManager() *ConfigManager {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		// Fallback to current directory if home not available
+		homeDir = "."
+	}
+	configPath := filepath.Join(homeDir, ".ivaldi", "config.json")
 	return &ConfigManager{
 		configPath: configPath,
 	}
@@ -94,18 +108,44 @@ func (cm *ConfigManager) InteractiveSetup() error {
 
 	// GitHub token
 	fmt.Println()
-	fmt.Println("GitHub Personal Access Token:")
-	fmt.Println("  1. Go to https://github.com/settings/tokens")
-	fmt.Println("  2. Generate a new token with 'repo' permissions")
-	fmt.Println("  3. Copy the token and paste it here")
-	fmt.Printf("GitHub token [%s]: ", maskToken(creds.GitHubToken))
 	
-	token, err := cm.readSecureInput()
-	if err != nil {
-		return err
-	}
-	if strings.TrimSpace(token) != "" {
-		creds.GitHubToken = strings.TrimSpace(token)
+	// Try to detect existing git credentials
+	if gitToken, gitErr := cm.LoadGitCredentials(); gitErr == nil && gitToken != "" {
+		fmt.Println("🔍 Found GitHub token in git credentials!")
+		fmt.Printf("Use detected token? (y/N): ")
+		if input, _ := reader.ReadString('\n'); strings.ToLower(strings.TrimSpace(input)) == "y" {
+			creds.GitHubToken = gitToken
+			fmt.Println("✅ Using git credentials")
+		} else {
+			fmt.Println("📝 Manual token entry:")
+			fmt.Println("GitHub Personal Access Token:")
+			fmt.Println("  1. Go to https://github.com/settings/tokens")
+			fmt.Println("  2. Generate a new token with 'repo' permissions")
+			fmt.Println("  3. Copy the token and paste it here")
+			fmt.Printf("GitHub token [%s]: ", maskToken(creds.GitHubToken))
+			
+			token, err := cm.readSecureInput()
+			if err != nil {
+				return err
+			}
+			if strings.TrimSpace(token) != "" {
+				creds.GitHubToken = strings.TrimSpace(token)
+			}
+		}
+	} else {
+		fmt.Println("GitHub Personal Access Token:")
+		fmt.Println("  1. Go to https://github.com/settings/tokens")
+		fmt.Println("  2. Generate a new token with 'repo' permissions") 
+		fmt.Println("  3. Copy the token and paste it here")
+		fmt.Printf("GitHub token [%s]: ", maskToken(creds.GitHubToken))
+		
+		token, err := cm.readSecureInput()
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(token) != "" {
+			creds.GitHubToken = strings.TrimSpace(token)
+		}
 	}
 
 	// Validate GitHub token if provided
@@ -121,12 +161,12 @@ func (cm *ConfigManager) InteractiveSetup() error {
 	// GitLab token (optional)
 	fmt.Println()
 	fmt.Printf("GitLab token (optional) [%s]: ", maskToken(creds.GitLabToken))
-	token, err = cm.readSecureInput()
+	gitlabToken, err := cm.readSecureInput()
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(token) != "" {
-		creds.GitLabToken = strings.TrimSpace(token)
+	if strings.TrimSpace(gitlabToken) != "" {
+		creds.GitLabToken = strings.TrimSpace(gitlabToken)
 	}
 
 	// Validate GitLab token if provided
@@ -262,4 +302,50 @@ func (cm *ConfigManager) GetUserInfo() (name, email string, err error) {
 		return "", "", err
 	}
 	return creds.UserName, creds.UserEmail, nil
+}
+
+// LoadGitCredentials attempts to load GitHub token from git credential manager
+func (cm *ConfigManager) LoadGitCredentials() (string, error) {
+	// Try to get GitHub token from git credential manager
+	cmd := exec.Command("git", "credential", "fill")
+	cmd.Stdin = strings.NewReader("protocol=https\nhost=github.com\n\n")
+	
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to get git credentials: %v", err)
+	}
+	
+	// Parse the output for password (which is the token for GitHub)
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(line, "password=") {
+			token := strings.TrimPrefix(line, "password=")
+			if token != "" && (strings.HasPrefix(token, "ghp_") || strings.HasPrefix(token, "gho_")) {
+				return token, nil
+			}
+		}
+	}
+	
+	return "", fmt.Errorf("no GitHub token found in git credentials")
+}
+
+// GetGitHubTokenWithFallback gets token with multiple fallback options
+func (cm *ConfigManager) GetGitHubTokenWithFallback() (string, error) {
+	// 1. Try stored token first
+	if token, err := cm.GetGitHubToken(); err == nil && token != "" {
+		return token, nil
+	}
+	
+	// 2. Try git credentials
+	if token, err := cm.LoadGitCredentials(); err == nil && token != "" {
+		return token, nil
+	}
+	
+	// 3. Try global config
+	globalConfig := NewGlobalConfigManager()
+	if token, err := globalConfig.GetGitHubToken(); err == nil && token != "" {
+		return token, nil
+	}
+	
+	return "", fmt.Errorf("no GitHub token found in config or git credentials")
 }
