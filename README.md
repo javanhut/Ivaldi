@@ -136,23 +136,23 @@ ivaldi sync origin             # Sync with remote
 
 ## Features
 
-### 🎯 **Human-Friendly**
+###  **Human-Friendly**
 - Memorable commit names instead of SHA hashes
 - Natural language navigation and references
 - Workshop metaphor commands (forge, gather, seal, fuse)
 
-### 🛡️ **Data Protection**
+###  **Data Protection**
 - Automatic work preservation during timeline switches
 - Mathematical impossibility of data loss
 - Smart conflict resolution
 
-### 🚀 **GitHub Integration**
+###  **GitHub Integration**
 - Direct REST API integration (no git dependency)
 - Automatic branch creation for new timelines
 - Batch uploads for performance
 - Support for .ivaldiignore files
 
-### 🧠 **Intelligent**
+###  **Intelligent**
 - Auto-detects file changes
 - Smart timeline inheritance from main
 - Efficient content-based storage
