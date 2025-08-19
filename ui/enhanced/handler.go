@@ -157,6 +157,8 @@ func (ech *EnhancedCommandHandler) handleSeal(cmd *commands.ParsedCommand) error
 	}
 	
 	ech.output.Info("Sealing changes into history...")
+	ech.output.Info("*** DEBUG: Handler is about to call Seal ***")
+	fmt.Printf("*** HANDLER CALLING SEAL WITH MESSAGE: %s ***\n", message)
 	
 	seal, err := ech.repo.Seal(message)
 	if err != nil {

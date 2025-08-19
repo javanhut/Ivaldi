@@ -418,7 +418,61 @@ func (er *EnhancedRepository) ListTimelines() []string {
 
 // CreateTimeline creates a new timeline
 func (er *EnhancedRepository) CreateTimeline(name string) error {
-	return er.timeline.Create(name, "Feature timeline")
+	fmt.Printf("[DEBUG] EnhancedRepository.CreateTimeline called with name: %s\n", name)
+	
+	// Create the timeline first
+	if err := er.timeline.Create(name, "Feature timeline"); err != nil {
+		fmt.Printf("[DEBUG] Failed to create timeline: %v\n", err)
+		return err
+	}
+	
+	// Copy current workspace state to the new timeline
+	currentTimeline := er.timeline.Current()
+	fmt.Printf("[DEBUG] Current timeline: %s, copying workspace state to new timeline: %s\n", currentTimeline, name)
+	
+	// Save current workspace state first
+	if err := er.workspace.SaveState(currentTimeline); err != nil {
+		fmt.Printf("[DEBUG] Failed to save current workspace state: %v\n", err)
+		return fmt.Errorf("failed to save current workspace state: %v", err)
+	}
+	
+	// Copy workspace state from current timeline to new timeline
+	if err := er.copyWorkspaceState(currentTimeline, name); err != nil {
+		fmt.Printf("[DEBUG] Failed to copy workspace state: %v\n", err)
+		return fmt.Errorf("failed to copy workspace state: %v", err)
+	}
+	
+	fmt.Printf("[DEBUG] Successfully created timeline %s with workspace state copied from %s\n", name, currentTimeline)
+	return nil
+}
+
+// copyWorkspaceState copies workspace state from source to target timeline
+func (er *EnhancedRepository) copyWorkspaceState(sourceTimeline, targetTimeline string) error {
+	fmt.Printf("[DEBUG] Copying workspace state from %s to %s\n", sourceTimeline, targetTimeline)
+	
+	// Load the source workspace state
+	sourceWorkspace := workspace.New(er.root, er.workspace.Store)
+	if err := sourceWorkspace.LoadState(sourceTimeline); err != nil {
+		if os.IsNotExist(err) {
+			fmt.Printf("[DEBUG] Source workspace state doesn't exist for %s, creating empty state\n", sourceTimeline)
+			return nil
+		}
+		return err
+	}
+	
+	fmt.Printf("[DEBUG] Loaded source workspace with %d files\n", len(sourceWorkspace.Files))
+	for path, file := range sourceWorkspace.Files {
+		fmt.Printf("[DEBUG] Source file: %s (BlobHash: %s)\n", path, file.BlobHash)
+	}
+	
+	// Set the target timeline and save
+	sourceWorkspace.Timeline = targetTimeline
+	if err := sourceWorkspace.SaveState(targetTimeline); err != nil {
+		return err
+	}
+	
+	fmt.Printf("[DEBUG] Successfully saved workspace state for %s\n", targetTimeline)
+	return nil
 }
 
 // DeleteTimeline deletes a timeline

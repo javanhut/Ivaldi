@@ -280,6 +280,19 @@ func (r *Repository) Seal(message string) (*objects.Seal, error) {
 		return nil, fmt.Errorf("failed to store tree: %v", err)
 	}
 
+	// Step 2.5: Also store tree and blobs in legacy format for RestoreWorkingDirectory
+	legacyTree := r.convertCATreeToLegacyTree(candidateTree, treeHash)
+	legacyTreeHash, err := r.storage.StoreObject(legacyTree)
+	if err != nil {
+		return nil, fmt.Errorf("failed to store legacy tree: %v", err)
+	}
+	fmt.Printf("Debug: stored legacy tree with hash: %s\n", legacyTreeHash.String())
+
+	// Step 2.6: Store blobs in legacy format
+	if err := r.storeCABlobsAsLegacy(candidateTree); err != nil {
+		return nil, fmt.Errorf("failed to store legacy blobs: %v", err)
+	}
+
 	// Step 3: Determine parents (current head or empty for first seal)
 	var parents []objects.CAHash
 	currentHead, err := r.timeline.GetHead(r.timeline.Current())
@@ -323,9 +336,12 @@ func (r *Repository) Seal(message string) (*objects.Seal, error) {
 	name := r.generateMemorableName()
 	iteration := r.getNextIteration()
 	
+	// Use the actual hash returned by storing the legacy tree
+	fmt.Printf("Debug: creating seal with Position: %s\n", legacyTreeHash.String())
 	legacySeal := &objects.Seal{
 		Name:      name,
 		Iteration: iteration,
+		Position:  legacyTreeHash,  // Points to the actual stored legacy tree
 		Message:   message,
 		Author:    author,
 		Timestamp: caSeal.Timestamp,
@@ -359,6 +375,9 @@ func (r *Repository) Seal(message string) (*objects.Seal, error) {
 	if err := r.timeline.UpdateHead(r.timeline.Current(), legacySeal.Hash); err != nil {
 		return nil, fmt.Errorf("failed to update timeline head: %v", err)
 	}
+
+	// Update workspace Position to point to content-addressed seal for consistency
+	r.workspace.Position = sealHash
 
 	// Store the mapping between legacy and content-addressed seals for chaining
 	if err := r.storeSealMapping(legacySeal.Hash, sealHash); err != nil {
@@ -484,15 +503,44 @@ func (r *Repository) storeSealMapping(legacyHash objects.Hash, caHash objects.CA
 }
 
 func (r *Repository) CreateTimeline(name, description string) error {
-	return r.timeline.Create(name, description)
+	fmt.Printf("Creating timeline: %s\n", name)
+	
+	// Create the timeline
+	if err := r.timeline.Create(name, description); err != nil {
+		return err
+	}
+	
+	// Copy current workspace state to the new timeline
+	currentTimeline := r.timeline.Current()
+	fmt.Printf("Saving current workspace state for timeline: %s\n", currentTimeline)
+	if err := r.workspace.SaveState(currentTimeline); err != nil {
+		return fmt.Errorf("failed to save current workspace state: %v", err)
+	}
+	
+	// Copy workspace state from current timeline to new timeline
+	fmt.Printf("Copying workspace state from %s to %s\n", currentTimeline, name)
+	if err := r.copyWorkspaceState(currentTimeline, name); err != nil {
+		return fmt.Errorf("failed to copy workspace state to new timeline: %v", err)
+	}
+	
+	fmt.Printf("Timeline %s created successfully\n", name)
+	return nil
 }
 
 func (r *Repository) SwitchTimeline(name string) error {
-	// Save current workspace state if there are uncommitted changes
+	currentTimeline := r.timeline.Current()
+	
+	// Check for uncommitted changes and auto-shelve them
 	if r.workspace.HasUncommittedChanges() {
-		if err := r.workspace.SaveState(r.timeline.Current()); err != nil {
-			return fmt.Errorf("failed to save workspace state: %v", err)
+		fmt.Printf("Auto-shelving uncommitted changes from timeline '%s'\n", currentTimeline)
+		if err := r.shelveUncommittedChanges(currentTimeline); err != nil {
+			return fmt.Errorf("failed to shelve uncommitted changes: %v", err)
 		}
+	}
+	
+	// Save current workspace state before switching
+	if err := r.workspace.SaveState(currentTimeline); err != nil {
+		return fmt.Errorf("failed to save workspace state: %v", err)
 	}
 
 	// Get target timeline's HEAD commit before switching
@@ -509,17 +557,36 @@ func (r *Repository) SwitchTimeline(name string) error {
 		return err
 	}
 
+	// Clear workspace state to prepare for new timeline
+	r.workspace.Files = make(map[string]*workspace.FileState)
+	r.workspace.AnvilFiles = make(map[string]*workspace.FileState)
+	r.workspace.Timeline = name
+
 	// Restore working directory to match target timeline's HEAD
 	if err := r.RestoreWorkingDirectory(targetHead); err != nil {
-		return fmt.Errorf("failed to restore working directory: %v", err)
+		// Log error but don't fail the switch - timeline still switched
+		fmt.Printf("Warning: failed to restore working directory: %v\n", err)
 	}
 
 	// Load target timeline's workspace state
 	if err := r.workspace.LoadState(name); err != nil {
-		return fmt.Errorf("failed to load workspace state: %v", err)
+		// It's okay if state doesn't exist yet for new timelines
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("failed to load workspace state: %v", err)
+		}
 	}
 
-	// Rescan workspace to update file tracking after restoration
+	// If normal restoration failed (Position was 0), try to restore files from workspace state
+	if err := r.restoreFilesFromWorkspaceState(); err != nil {
+		fmt.Printf("Warning: failed to restore files from workspace state: %v\n", err)
+	}
+
+	// Restore any auto-shelved changes for this timeline
+	if err := r.restoreFromShelve(name); err != nil {
+		fmt.Printf("Warning: failed to restore shelved changes: %v\n", err)
+	}
+
+	// Force rescan to update file tracking after restoration
 	if err := r.workspace.Scan(); err != nil {
 		return fmt.Errorf("failed to scan workspace after switch: %v", err)
 	}
@@ -1320,6 +1387,13 @@ func (r *Repository) RestoreWorkingDirectory(targetHash objects.Hash) error {
 	// Debug: check the seal's position
 	fmt.Printf("Debug: seal position: %s\n", seal.Position.String())
 
+	// Check if seal has a valid position set
+	emptyPos := objects.Hash{}
+	if seal.Position == emptyPos {
+		// Seal has no tree stored - treat as empty repository
+		return r.clearWorkingDirectory()
+	}
+
 	// Load the tree from the seal's position
 	tree, err := r.storage.LoadTree(seal.Position)
 	if err != nil {
@@ -1389,7 +1463,18 @@ func (r *Repository) restoreFromTree(tree *objects.Tree, basePath string) error 
 			// Restore file
 			blob, err := r.storage.LoadBlob(entry.Hash)
 			if err != nil {
-				return err
+				// Try to find actual blob hash using mapping
+				actualHash, found := r.loadBlobHashMapping(entry.Hash)
+				if found {
+					blob, err = r.storage.LoadBlob(actualHash)
+					if err == nil {
+						fmt.Printf("Successfully loaded blob using hash mapping for file %s\n", entryPath)
+					}
+				}
+				
+				if err != nil {
+					return fmt.Errorf("failed to load blob %s for file %s: %v", entry.Hash.String(), entryPath, err)
+				}
 			}
 			
 			// Ensure directory exists
@@ -1418,4 +1503,358 @@ func (r *Repository) isIgnored(path string) bool {
 		}
 	}
 	return false
+}
+
+// convertCATreeToLegacyTree converts a content-addressed tree to legacy Tree format
+func (r *Repository) convertCATreeToLegacyTree(caTree *objects.CATree, treeHash objects.CAHash) *objects.Tree {
+	var entries []objects.TreeEntry
+	
+	for _, caEntry := range caTree.Entries {
+		// Convert CAHash to legacy Hash
+		var legacyHash objects.Hash
+		copy(legacyHash[:], caEntry.Hash.Bytes())
+		
+		// Convert ObjectKind to ObjectType
+		var objType objects.ObjectType
+		switch caEntry.Kind {
+		case objects.KindBlob:
+			objType = objects.ObjectTypeBlob
+		case objects.KindTree:
+			objType = objects.ObjectTypeTree
+		default:
+			objType = objects.ObjectTypeBlob // Default to blob
+		}
+		
+		entry := objects.TreeEntry{
+			Name: caEntry.Name,
+			Hash: legacyHash,
+			Mode: caEntry.Mode,
+			Type: objType,
+		}
+		entries = append(entries, entry)
+	}
+	
+	// Create legacy hash for tree
+	var legacyTreeHash objects.Hash
+	copy(legacyTreeHash[:], treeHash.Bytes())
+	
+	return &objects.Tree{
+		Hash:    legacyTreeHash,
+		Entries: entries,
+	}
+}
+
+// storeCABlobsAsLegacy stores all blobs from a CA tree in legacy format
+func (r *Repository) storeCABlobsAsLegacy(caTree *objects.CATree) error {
+	// Create a mapping to track hash conversions
+	r.createBlobHashMapping(caTree)
+	
+	for _, entry := range caTree.Entries {
+		if entry.Kind == objects.KindBlob {
+			// Load blob data from CA store
+			data, _, err := r.workspace.Store.Get(entry.Hash)
+			if err != nil {
+				return fmt.Errorf("failed to load CA blob %s: %v", entry.Hash.String(), err)
+			}
+
+			// Create legacy blob with the data
+			legacyBlob := objects.NewBlob(data)
+			
+			// Store using StoreObject which will compute hash
+			storedHash, err := r.storage.StoreObject(legacyBlob)
+			if err != nil {
+				return fmt.Errorf("failed to store legacy blob: %v", err)
+			}
+			
+			// Store the hash mapping for restoration
+			expectedHash := objects.Hash{}
+			copy(expectedHash[:], entry.Hash.Bytes())
+			if storedHash != expectedHash {
+				// Different hash due to different algorithms - store mapping
+				r.storeBlobHashMapping(expectedHash, storedHash, entry.Name)
+			}
+		}
+	}
+	return nil
+}
+
+// createBlobHashMapping initializes hash mapping storage
+func (r *Repository) createBlobHashMapping(caTree *objects.CATree) {
+	// Initialize blob hash mapping directory
+	mappingDir := filepath.Join(r.root, ".ivaldi", "blob_mappings")
+	os.MkdirAll(mappingDir, 0755)
+}
+
+// storeBlobHashMapping stores a mapping between expected and actual blob hashes
+func (r *Repository) storeBlobHashMapping(expectedHash, actualHash objects.Hash, filename string) {
+	mappingPath := filepath.Join(r.root, ".ivaldi", "blob_mappings", "mapping.json")
+	
+	type BlobMapping struct {
+		ExpectedToActual map[string]string `json:"expected_to_actual"`
+		ActualToExpected map[string]string `json:"actual_to_expected"`
+		FileNames        map[string]string `json:"file_names"`
+	}
+	
+	var mapping BlobMapping
+	if data, err := os.ReadFile(mappingPath); err == nil {
+		json.Unmarshal(data, &mapping)
+	} else {
+		mapping = BlobMapping{
+			ExpectedToActual: make(map[string]string),
+			ActualToExpected: make(map[string]string),
+			FileNames:        make(map[string]string),
+		}
+	}
+	
+	expectedStr := expectedHash.String()
+	actualStr := actualHash.String()
+	
+	mapping.ExpectedToActual[expectedStr] = actualStr
+	mapping.ActualToExpected[actualStr] = expectedStr
+	mapping.FileNames[expectedStr] = filename
+	
+	if data, err := json.MarshalIndent(mapping, "", "  "); err == nil {
+		os.WriteFile(mappingPath, data, 0644)
+	}
+}
+
+// loadBlobHashMapping loads the actual hash for an expected hash
+func (r *Repository) loadBlobHashMapping(expectedHash objects.Hash) (objects.Hash, bool) {
+	mappingPath := filepath.Join(r.root, ".ivaldi", "blob_mappings", "mapping.json")
+	
+	type BlobMapping struct {
+		ExpectedToActual map[string]string `json:"expected_to_actual"`
+		ActualToExpected map[string]string `json:"actual_to_expected"`
+		FileNames        map[string]string `json:"file_names"`
+	}
+	
+	data, err := os.ReadFile(mappingPath)
+	if err != nil {
+		return objects.Hash{}, false
+	}
+	
+	var mapping BlobMapping
+	if err := json.Unmarshal(data, &mapping); err != nil {
+		return objects.Hash{}, false
+	}
+	
+	expectedStr := expectedHash.String()
+	if actualStr, exists := mapping.ExpectedToActual[expectedStr]; exists {
+		// Parse actual hash string back to Hash
+		bytes, err := hex.DecodeString(actualStr)
+		if err != nil || len(bytes) != 32 {
+			return objects.Hash{}, false
+		}
+		
+		var actualHash objects.Hash
+		copy(actualHash[:], bytes)
+		return actualHash, true
+	}
+	
+	return objects.Hash{}, false
+}
+
+// copyWorkspaceState copies workspace state from source timeline to target timeline
+func (r *Repository) copyWorkspaceState(sourceTimeline, targetTimeline string) error {
+	// Load the source workspace state properly
+	sourceWorkspace := workspace.New(r.root, r.workspace.Store)
+	if err := sourceWorkspace.LoadState(sourceTimeline); err != nil {
+		if os.IsNotExist(err) {
+			// No state to copy, which is fine
+			return nil
+		}
+		return err
+	}
+	
+	// Update the timeline field and save as target timeline
+	sourceWorkspace.Timeline = targetTimeline
+	
+	// Save the complete workspace state to the target timeline
+	return sourceWorkspace.SaveState(targetTimeline)
+}
+
+// shelveUncommittedChanges saves uncommitted changes to a shelve for later restoration
+func (r *Repository) shelveUncommittedChanges(timeline string) error {
+	shelveDir := filepath.Join(r.root, ".ivaldi", "shelves", timeline)
+	if err := os.MkdirAll(shelveDir, 0755); err != nil {
+		return err
+	}
+	
+	// Create a shelve entry
+	shelveTime := time.Now()
+	shelveID := fmt.Sprintf("auto-shelve-%d", shelveTime.Unix())
+	
+	type ShelveEntry struct {
+		ID          string                        `json:"id"`
+		Timeline    string                        `json:"timeline"`
+		Timestamp   time.Time                     `json:"timestamp"`
+		Files       map[string]*workspace.FileState `json:"files"`
+		AnvilFiles  map[string]*workspace.FileState `json:"anvil_files"`
+		Description string                        `json:"description"`
+	}
+	
+	shelve := ShelveEntry{
+		ID:          shelveID,
+		Timeline:    timeline,
+		Timestamp:   shelveTime,
+		Files:       make(map[string]*workspace.FileState),
+		AnvilFiles:  make(map[string]*workspace.FileState),
+		Description: "Auto-shelved before timeline switch",
+	}
+	
+	// Copy uncommitted and anvil files
+	for path, fileState := range r.workspace.Files {
+		if fileState.Status != workspace.StatusUnmodified {
+			shelve.Files[path] = fileState
+		}
+	}
+	
+	for path, fileState := range r.workspace.AnvilFiles {
+		shelve.AnvilFiles[path] = fileState
+	}
+	
+	// Save shelve to file
+	shelveData, err := json.MarshalIndent(shelve, "", "  ")
+	if err != nil {
+		return err
+	}
+	
+	shelveFile := filepath.Join(shelveDir, shelveID+".json")
+	return os.WriteFile(shelveFile, shelveData, 0644)
+}
+
+// restoreFromShelve restores the latest auto-shelve for a timeline
+func (r *Repository) restoreFromShelve(timeline string) error {
+	shelveDir := filepath.Join(r.root, ".ivaldi", "shelves", timeline)
+	
+	// Find the latest auto-shelve
+	files, err := os.ReadDir(shelveDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// No shelves exist, which is fine
+			return nil
+		}
+		return err
+	}
+	
+	var latestShelve string
+	var latestTime time.Time
+	
+	for _, file := range files {
+		if strings.HasPrefix(file.Name(), "auto-shelve-") && strings.HasSuffix(file.Name(), ".json") {
+			shelveData, err := os.ReadFile(filepath.Join(shelveDir, file.Name()))
+			if err != nil {
+				continue
+			}
+			
+			var shelve map[string]interface{}
+			if err := json.Unmarshal(shelveData, &shelve); err != nil {
+				continue
+			}
+			
+			if timestampStr, ok := shelve["timestamp"].(string); ok {
+				if timestamp, err := time.Parse(time.RFC3339, timestampStr); err == nil {
+					if timestamp.After(latestTime) {
+						latestTime = timestamp
+						latestShelve = file.Name()
+					}
+				}
+			}
+		}
+	}
+	
+	if latestShelve == "" {
+		// No auto-shelves found
+		return nil
+	}
+	
+	// Load and restore the latest shelve
+	shelveData, err := os.ReadFile(filepath.Join(shelveDir, latestShelve))
+	if err != nil {
+		return err
+	}
+	
+	type ShelveEntry struct {
+		ID          string                        `json:"id"`
+		Timeline    string                        `json:"timeline"`
+		Timestamp   time.Time                     `json:"timestamp"`
+		Files       map[string]*workspace.FileState `json:"files"`
+		AnvilFiles  map[string]*workspace.FileState `json:"anvil_files"`
+		Description string                        `json:"description"`
+	}
+	
+	var shelve ShelveEntry
+	if err := json.Unmarshal(shelveData, &shelve); err != nil {
+		return err
+	}
+	
+	fmt.Printf("Restoring auto-shelved changes from %s\n", shelve.Timestamp.Format("2006-01-02 15:04:05"))
+	
+	// Merge shelved files back into workspace
+	if r.workspace.Files == nil {
+		r.workspace.Files = make(map[string]*workspace.FileState)
+	}
+	if r.workspace.AnvilFiles == nil {
+		r.workspace.AnvilFiles = make(map[string]*workspace.FileState)
+	}
+	
+	for path, fileState := range shelve.Files {
+		r.workspace.Files[path] = fileState
+	}
+	
+	for path, fileState := range shelve.AnvilFiles {
+		r.workspace.AnvilFiles[path] = fileState
+	}
+	
+	return nil
+}
+
+// restoreFilesFromWorkspaceState restores files based on workspace state when tree restoration fails
+func (r *Repository) restoreFilesFromWorkspaceState() error {
+	if r.workspace.Files == nil || len(r.workspace.Files) == 0 {
+		return nil // No files to restore
+	}
+	
+	for path, fileState := range r.workspace.Files {
+		if fileState.Status == workspace.StatusUnmodified {
+			// This file should exist on this timeline
+			fullPath := filepath.Join(r.root, path)
+			
+			// Check if file already exists
+			if _, err := os.Stat(fullPath); err == nil {
+				continue // File already exists
+			}
+			
+			// Try to restore from CA store using BlobHash
+			if !fileState.BlobHash.IsZero() {
+				if err := r.restoreFileFromStore(path, fileState.BlobHash); err != nil {
+					fmt.Printf("Warning: failed to restore %s from store: %v\n", path, err)
+					continue
+				}
+				fmt.Printf("Restored %s from content store\n", path)
+			}
+		}
+	}
+	
+	return nil
+}
+
+// restoreFileFromStore restores a single file from the content store
+func (r *Repository) restoreFileFromStore(path string, hash objects.CAHash) error {
+	// Get file data from store
+	data, _, err := r.workspace.Store.Get(hash)
+	if err != nil {
+		return err
+	}
+	
+	fullPath := filepath.Join(r.root, path)
+	
+	// Create directory if needed
+	dir := filepath.Dir(fullPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	
+	// Write file
+	return os.WriteFile(fullPath, data, 0644)
 }

@@ -123,6 +123,12 @@ func (w *Workspace) Scan() error {
 			w.AnvilFiles[relPath] = anvilFile
 		}
 		
+		// Preserve BlobHash from existing file state if it exists
+		var blobHash objects.CAHash
+		if existing, exists := w.Files[relPath]; exists {
+			blobHash = existing.BlobHash
+		}
+		
 		fileState := &FileState{
 			Path:        relPath,
 			Status:      status,
@@ -131,6 +137,7 @@ func (w *Workspace) Scan() error {
 			ModTime:     info.ModTime(),
 			WorkingHash: hash,
 			OnAnvil:     onAnvil,
+			BlobHash:    blobHash, // Preserve existing BlobHash
 		}
 
 		w.Files[relPath] = fileState
