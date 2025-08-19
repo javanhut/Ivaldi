@@ -331,7 +331,7 @@ func (cm *ConfigManager) LoadGitCredentials() (string, error) {
 
 // GetGitHubTokenWithFallback gets token with multiple fallback options
 func (cm *ConfigManager) GetGitHubTokenWithFallback() (string, error) {
-	// 1. Try stored token first
+	// 1. Try stored token first (only if no error)
 	if token, err := cm.GetGitHubToken(); err == nil && token != "" {
 		return token, nil
 	}
@@ -345,6 +345,11 @@ func (cm *ConfigManager) GetGitHubTokenWithFallback() (string, error) {
 	globalConfig := NewGlobalConfigManager()
 	if token, err := globalConfig.GetGitHubToken(); err == nil && token != "" {
 		return token, nil
+	}
+	
+	// 4. Check environment variable as final fallback
+	if envToken := os.Getenv("GITHUB_TOKEN"); envToken != "" {
+		return envToken, nil
 	}
 	
 	return "", fmt.Errorf("no GitHub token found in config or git credentials")
