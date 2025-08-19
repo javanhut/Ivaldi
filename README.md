@@ -1,4 +1,4 @@
-# Ivaldi - Human-Centered Version Control
+# Ivaldi - New  Version Control System
 
 > **Version control that makes sense to humans, not just computers.**
 
