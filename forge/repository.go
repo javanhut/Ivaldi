@@ -1,6 +1,7 @@
 package forge
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -255,48 +256,143 @@ func (r *Repository) Seal(message string) (*objects.Seal, error) {
 		return nil, fmt.Errorf("nothing gathered on the anvil to seal")
 	}
 
-	name := r.generateMemorableName()
+	// Step 1: Build tree from staged items
+	candidateTree := r.workspace.GetCandidateTree()
+	if candidateTree == nil {
+		// Build tree if not already built
+		if err := r.workspace.BuildCandidateTree(); err != nil {
+			return nil, fmt.Errorf("failed to build candidate tree: %v", err)
+		}
+		candidateTree = r.workspace.GetCandidateTree()
+		if candidateTree == nil {
+			return nil, fmt.Errorf("failed to create tree from staged files")
+		}
+	}
+
+	// Step 2: Store the tree in content-addressed storage
+	treeData, err := candidateTree.Encode()
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode tree: %v", err)
+	}
+
+	treeHash, err := r.workspace.Store.Put(treeData, local.KindTree)
+	if err != nil {
+		return nil, fmt.Errorf("failed to store tree: %v", err)
+	}
+
+	// Step 3: Determine parents (current head or empty for first seal)
+	var parents []objects.CAHash
+	currentHead, err := r.timeline.GetHead(r.timeline.Current())
 	
+	// Check if currentHead is zero (empty hash)
+	var zeroHash objects.Hash
+	isFirstSeal := err != nil || currentHead == zeroHash
+	
+	if !isFirstSeal {
+		// Get the previous seal's content-addressed hash
+		previousSealHash, err := r.getPreviousSealCAHash(currentHead)
+		if err == nil {
+			parents = []objects.CAHash{previousSealHash}
+		} else {
+			// If we can't find the previous CA seal, start a fresh chain
+			parents = []objects.CAHash{}
+		}
+	} else {
+		// First seal - no parents
+		parents = []objects.CAHash{}
+	}
+
+	// Step 4: Get author information (from config or defaults)
+	author, committer := r.getAuthorInfo()
+
+	// Step 5: Create content-addressed seal
+	caSeal := objects.NewCASeal(treeHash, parents, author, committer, message)
+
+	// Step 6: Store the seal
+	sealData, err := caSeal.Encode()
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode seal: %v", err)
+	}
+
+	sealHash, err := r.workspace.Store.Put(sealData, local.KindSeal)
+	if err != nil {
+		return nil, fmt.Errorf("failed to store seal: %v", err)
+	}
+
+	// Step 7: Create legacy seal for compatibility with existing systems
+	name := r.generateMemorableName()
+	iteration := r.getNextIteration()
+	
+	legacySeal := &objects.Seal{
+		Name:      name,
+		Iteration: iteration,
+		Message:   message,
+		Author:    author,
+		Timestamp: caSeal.Timestamp,
+		Parents:   []objects.Hash{}, // Start fresh
+	}
+
+	// Store legacy seal for compatibility
+	if err := r.storage.StoreSeal(legacySeal); err != nil {
+		return nil, fmt.Errorf("failed to store legacy seal: %v", err)
+	}
+
+	if err := r.index.IndexSeal(legacySeal); err != nil {
+		return nil, fmt.Errorf("failed to index seal: %v", err)
+	}
+
+	// Step 8: Update position and timeline head atomically
+	if err := r.position.SetPosition(legacySeal.Hash, r.timeline.Current()); err != nil {
+		return nil, fmt.Errorf("failed to set position: %v", err)
+	}
+
+	if err := r.position.SetMemorableName(legacySeal.Hash, name); err != nil {
+		return nil, fmt.Errorf("failed to set memorable name: %v", err)
+	}
+	
+	// Register the memorable name with the reference manager
+	if err := r.refMgr.RegisterMemorableName(name, legacySeal.Hash, legacySeal.Author.Name); err != nil {
+		return nil, fmt.Errorf("failed to register memorable name: %v", err)
+	}
+
+	// Update timeline head atomically
+	if err := r.timeline.UpdateHead(r.timeline.Current(), legacySeal.Hash); err != nil {
+		return nil, fmt.Errorf("failed to update timeline head: %v", err)
+	}
+
+	// Store the mapping between legacy and content-addressed seals for chaining
+	if err := r.storeSealMapping(legacySeal.Hash, sealHash); err != nil {
+		// Log but don't fail - this is for optimization, not critical
+		fmt.Printf("Warning: failed to store seal mapping: %v\n", err)
+	}
+
+	// Step 9: Update workspace state - clear anvil and mark files as committed
+	r.updateWorkspaceAfterSeal()
+
+	// Save the updated workspace state
+	if err := r.workspace.SaveState(r.timeline.Current()); err != nil {
+		return legacySeal, fmt.Errorf("failed to save workspace state: %v", err)
+	}
+
+	return legacySeal, nil
+}
+
+// getAuthorInfo retrieves author and committer information from config or defaults
+func (r *Repository) getAuthorInfo() (objects.Identity, objects.Identity) {
+	// Try to get from config first
+	// For now, use defaults - in a real implementation, read from .ivaldi/config
 	author := objects.Identity{
 		Name:  "Developer",
 		Email: "dev@example.com",
 	}
-
-	seal := &objects.Seal{
-		Name:      name,
-		Iteration: r.getNextIteration(),
-		Message:   message,
-		Author:    author,
-		Timestamp: time.Now(),
-		Parents:   []objects.Hash{r.position.Current().Hash},
-	}
-
-	if err := r.storage.StoreSeal(seal); err != nil {
-		return nil, err
-	}
-
-	if err := r.index.IndexSeal(seal); err != nil {
-		return nil, err
-	}
-
-	if err := r.position.SetPosition(seal.Hash, r.timeline.Current()); err != nil {
-		return nil, err
-	}
-
-	if err := r.position.SetMemorableName(seal.Hash, name); err != nil {
-		return nil, err
-	}
 	
-	// Register the memorable name with the reference manager
-	if err := r.refMgr.RegisterMemorableName(name, seal.Hash, seal.Author.Name); err != nil {
-		return nil, err
-	}
+	committer := author // Same as author for now
+	
+	return author, committer
+}
 
-	if err := r.timeline.UpdateHead(r.timeline.Current(), seal.Hash); err != nil {
-		return nil, err
-	}
-
-	// Clear the anvil and update file statuses
+// updateWorkspaceAfterSeal clears the anvil and updates file statuses after sealing
+func (r *Repository) updateWorkspaceAfterSeal() {
 	// After sealing, all sealed files should be marked as unchanged
 	for path, anvilFile := range r.workspace.AnvilFiles {
 		if fileState, exists := r.workspace.Files[path]; exists {
@@ -315,19 +411,76 @@ func (r *Repository) Seal(message string) (*objects.Seal, error) {
 				Size:        anvilFile.Size,
 				ModTime:     anvilFile.ModTime,
 				OnAnvil:     false,
+				BlobHash:    anvilFile.BlobHash,
 			}
 		}
 	}
 	
-	// Now clear the anvil
+	// Clear the anvil
 	r.workspace.AnvilFiles = make(map[string]*workspace.FileState)
-	
-	// Save the updated workspace state
-	if err := r.workspace.SaveState(r.timeline.Current()); err != nil {
-		return seal, err
-	}
+	r.workspace.CandidateTree = nil // Clear the candidate tree
+}
 
-	return seal, nil
+// getPreviousSealCAHash attempts to get the content-addressed hash of the previous seal
+func (r *Repository) getPreviousSealCAHash(legacyHash objects.Hash) (objects.CAHash, error) {
+	// Try to load the relationship from a mapping file
+	// For now, we'll implement a simple approach where we store the mapping
+	mappingPath := filepath.Join(r.root, ".ivaldi", "seal_mapping.json")
+	
+	type SealMapping struct {
+		LegacyToCA map[string]string `json:"legacy_to_ca"`
+		CAToLegacy map[string]string `json:"ca_to_legacy"`
+	}
+	
+	var mapping SealMapping
+	if data, err := os.ReadFile(mappingPath); err == nil {
+		json.Unmarshal(data, &mapping)
+	} else {
+		mapping = SealMapping{
+			LegacyToCA: make(map[string]string),
+			CAToLegacy: make(map[string]string),
+		}
+	}
+	
+	legacyHashStr := hex.EncodeToString(legacyHash[:])
+	if caHashStr, exists := mapping.LegacyToCA[legacyHashStr]; exists {
+		return objects.ParseCAHash(caHashStr)
+	}
+	
+	return objects.CAHash{}, fmt.Errorf("no content-addressed hash found for legacy hash %s", legacyHashStr)
+}
+
+// storeSealMapping stores the relationship between legacy and content-addressed seals
+func (r *Repository) storeSealMapping(legacyHash objects.Hash, caHash objects.CAHash) error {
+	mappingPath := filepath.Join(r.root, ".ivaldi", "seal_mapping.json")
+	
+	type SealMapping struct {
+		LegacyToCA map[string]string `json:"legacy_to_ca"`
+		CAToLegacy map[string]string `json:"ca_to_legacy"`
+	}
+	
+	var mapping SealMapping
+	if data, err := os.ReadFile(mappingPath); err == nil {
+		json.Unmarshal(data, &mapping)
+	} else {
+		mapping = SealMapping{
+			LegacyToCA: make(map[string]string),
+			CAToLegacy: make(map[string]string),
+		}
+	}
+	
+	legacyHashStr := hex.EncodeToString(legacyHash[:])
+	caHashStr := caHash.FullString()
+	
+	mapping.LegacyToCA[legacyHashStr] = caHashStr
+	mapping.CAToLegacy[caHashStr] = legacyHashStr
+	
+	data, err := json.MarshalIndent(mapping, "", "  ")
+	if err != nil {
+		return err
+	}
+	
+	return os.WriteFile(mappingPath, data, 0644)
 }
 
 func (r *Repository) CreateTimeline(name, description string) error {
