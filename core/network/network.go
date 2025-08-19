@@ -3,6 +3,7 @@ package network
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -80,22 +81,17 @@ type FetchResult struct {
 	Objects []objects.Hash `json:"objects"`
 }
 
-// FetchFromPortal fetches changes from a remote portal using Ivaldi's native protocol
+// FetchFromPortal fetches changes from a remote portal using GitHub API
 func (nm *NetworkManager) FetchFromPortal(portalURL, timeline string) (*FetchResult, error) {
-	// For now, we'll create a placeholder implementation that simulates
-	// fetching remote changes. In a real implementation, this would:
-	// 1. Connect to the remote Ivaldi repository
-	// 2. Request the timeline heads and recent seals
-	// 3. Download any missing objects
-	// 4. Return the fetched data
-	
-	// This is a temporary implementation that will be replaced with
-	// actual Ivaldi protocol communication
-	return &FetchResult{
-		Refs:    []RemoteRef{},
-		Seals:   []*objects.Seal{},
-		Objects: []objects.Hash{},
-	}, nil
+	// Handle GitHub repositories
+	if strings.Contains(portalURL, "github.com") {
+		return nm.fetchFromGitHub(portalURL, timeline)
+	} else if strings.Contains(portalURL, "gitlab.com") {
+		return nm.fetchFromGitLab(portalURL, timeline)
+	} else {
+		// Native Ivaldi repository
+		return nm.fetchFromIvaldiRepo(portalURL, timeline)
+	}
 }
 
 // UploadToPortal uploads changes to a remote portal using Ivaldi's native approach
@@ -1529,4 +1525,167 @@ func (nm *NetworkManager) createReference(owner, repo, ref, sha string) error {
 	}
 	
 	return nil
+}
+
+// GitHubCommitInfo represents commit information from GitHub API
+type GitHubCommitInfo struct {
+	Message string `json:"message"`
+	Author  struct {
+		Name  string    `json:"name"`
+		Email string    `json:"email"`
+		Date  time.Time `json:"date"`
+	} `json:"author"`
+	Committer struct {
+		Name  string    `json:"name"`
+		Email string    `json:"email"`
+		Date  time.Time `json:"date"`
+	} `json:"committer"`
+	Tree struct {
+		SHA string `json:"sha"`
+	} `json:"tree"`
+	Parents []struct {
+		SHA string `json:"sha"`
+	} `json:"parents"`
+}
+
+// fetchFromGitHub fetches changes from a GitHub repository
+func (nm *NetworkManager) fetchFromGitHub(portalURL, timeline string) (*FetchResult, error) {
+	// Extract owner and repo from URL
+	urlParts := strings.Split(strings.TrimSuffix(portalURL, ".git"), "/")
+	if len(urlParts) < 2 {
+		return nil, fmt.Errorf("invalid GitHub URL format: %s", portalURL)
+	}
+	
+	owner := urlParts[len(urlParts)-2]
+	repo := urlParts[len(urlParts)-1]
+	
+	// Get the latest commit SHA for the timeline/branch
+	commitSHA, err := nm.getCurrentCommitSHA(owner, repo, timeline)
+	if err != nil {
+		// Branch doesn't exist on remote
+		return &FetchResult{
+			Refs:    []RemoteRef{},
+			Seals:   []*objects.Seal{},
+			Objects: []objects.Hash{},
+		}, nil
+	}
+	
+	// Get commit information
+	commit, err := nm.getGitHubCommit(owner, repo, commitSHA)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get commit info: %v", err)
+	}
+	
+	// Convert GitHub commit to Ivaldi seal
+	seal := &objects.Seal{
+		Name:      nm.generateMemorableNameFromCommit(commit),
+		Iteration: 1, // TODO: Calculate proper iteration
+		Message:   commit.Message,
+		Author: objects.Identity{
+			Name:  commit.Author.Name,
+			Email: commit.Author.Email,
+		},
+		Timestamp: commit.Author.Date,
+		Parents:   []objects.Hash{}, // TODO: Convert parent SHAs
+	}
+	
+	// Let the storage layer calculate the hash when it stores the seal
+	// For now, compute a temporary hash for the ref
+	data, err := json.Marshal(seal)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal seal: %v", err)
+	}
+	tempHash := objects.NewHash(data)
+	
+	// Create remote ref
+	remoteRef := RemoteRef{
+		Name: timeline,
+		Hash: tempHash,
+		Type: "timeline",
+	}
+	
+	return &FetchResult{
+		Refs:    []RemoteRef{remoteRef},
+		Seals:   []*objects.Seal{seal},
+		Objects: []objects.Hash{tempHash},
+	}, nil
+}
+
+// getGitHubCommit gets commit information from GitHub API
+func (nm *NetworkManager) getGitHubCommit(owner, repo, commitSHA string) (*GitHubCommitInfo, error) {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/git/commits/%s", owner, repo, commitSHA)
+	
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Add authentication
+	if token, err := nm.getGitHubToken(); err == nil && token != "" {
+		req.Header.Set("Authorization", "token "+token)
+	}
+	req.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
+	
+	resp, err := nm.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GitHub API error (%d): %s", resp.StatusCode, string(body))
+	}
+	
+	var commit GitHubCommitInfo
+	if err := json.NewDecoder(resp.Body).Decode(&commit); err != nil {
+		return nil, err
+	}
+	
+	return &commit, nil
+}
+
+// generateMemorableNameFromCommit generates a memorable name from a commit
+func (nm *NetworkManager) generateMemorableNameFromCommit(commit *GitHubCommitInfo) string {
+	// Use a simple hash-based approach for now
+	adjectives := []string{"bright", "swift", "bold", "calm", "wise", "strong", "gentle", "fierce"}
+	nouns := []string{"river", "mountain", "forest", "ocean", "star", "moon", "sun", "wind"}
+	
+	// Use first few characters of commit SHA to ensure consistency
+	hash := strings.ToLower(commit.Tree.SHA)
+	if len(hash) < 8 {
+		hash = "00000000"
+	}
+	
+	// Parse hex characters properly
+	val1, _ := hex.DecodeString(hash[0:2])
+	val2, _ := hex.DecodeString(hash[2:4])
+	val3, _ := hex.DecodeString(hash[4:6])
+	val4, _ := hex.DecodeString(hash[6:8])
+	
+	adjIndex := int(val1[0]) % len(adjectives)
+	nounIndex := int(val2[0]) % len(nouns)
+	number := (int(val3[0])*256 + int(val4[0])) % 1000
+	
+	return fmt.Sprintf("%s-%s-%d", adjectives[adjIndex], nouns[nounIndex], number)
+}
+
+// fetchFromGitLab fetches changes from a GitLab repository
+func (nm *NetworkManager) fetchFromGitLab(portalURL, timeline string) (*FetchResult, error) {
+	// Placeholder for GitLab implementation
+	return &FetchResult{
+		Refs:    []RemoteRef{},
+		Seals:   []*objects.Seal{},
+		Objects: []objects.Hash{},
+	}, nil
+}
+
+// fetchFromIvaldiRepo fetches changes from a native Ivaldi repository
+func (nm *NetworkManager) fetchFromIvaldiRepo(portalURL, timeline string) (*FetchResult, error) {
+	// Placeholder for native Ivaldi protocol
+	return &FetchResult{
+		Refs:    []RemoteRef{},
+		Seals:   []*objects.Seal{},
+		Objects: []objects.Hash{},
+	}, nil
 }
