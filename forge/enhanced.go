@@ -474,6 +474,10 @@ func (er *EnhancedRepository) DeleteTimeline(name string) error {
 	return er.timeline.Delete(name)
 }
 
+func (er *EnhancedRepository) RenameTimeline(oldName, newName string) error {
+	return er.Repository.RenameTimeline(oldName, newName)
+}
+
 // GetStatus returns the current workspace status
 func (er *EnhancedRepository) GetStatus() *WorkspaceStatus {
 	// Extract modified and staged files from workspace

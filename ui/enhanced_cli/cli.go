@@ -72,6 +72,7 @@ Workshop Commands:
   remove <files...>        Remove files from repository
   seal [message]           Commit changes with memorable name
   timeline                 Manage development timelines (branches)
+  rename <old> --to <new>  Rename timeline
   jump <reference>         Jump to any point using natural language
   shelf                    Save work for later
   portal                   Manage remote connections
@@ -157,6 +158,7 @@ func (ec *EnhancedCLI) addEnhancedCommands(rootCmd *cobra.Command) {
 	rootCmd.AddCommand(ec.createRemoveCommand())
 	rootCmd.AddCommand(ec.createSealCommand())
 	rootCmd.AddCommand(ec.createTimelineCommand())
+	rootCmd.AddCommand(ec.createRenameCommand())
 	rootCmd.AddCommand(ec.createJumpCommand())
 	rootCmd.AddCommand(ec.createShelfCommand())
 	rootCmd.AddCommand(ec.createPortalCommand())
@@ -459,13 +461,15 @@ Subcommands:
   switch <name>           Switch to timeline (with auto-preservation) 
   list                    List all timelines
   delete <name>           Delete timeline
+  rename <old> --to <new> Rename timeline
   merge <from> <to>       Merge timelines
 
 Examples:
   timeline create feature
   timeline switch main --preserve
   timeline list
-  timeline delete old-feature`,
+  timeline delete old-feature
+  timeline rename master --to main`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Show timeline status by default
 			if ec.currentRepo == nil {
@@ -494,6 +498,7 @@ Examples:
 	cmd.AddCommand(ec.createTimelineSwitchCommand())
 	cmd.AddCommand(ec.createTimelineListCommand())
 	cmd.AddCommand(ec.createTimelineDeleteCommand())
+	cmd.AddCommand(ec.createTimelineRenameCommand())
 	
 	return cmd
 }
@@ -695,6 +700,202 @@ func (ec *EnhancedCLI) createTimelineDeleteCommand() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func (ec *EnhancedCLI) createTimelineRenameCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "rename <old-name> --to <new-name>",
+		Short: "Rename timeline with remote overwrite support",
+		Long: `Rename a timeline locally and handle remote uploads properly
+
+This command:
+- Renames the timeline locally with all its history
+- Updates the current timeline reference if renaming the active timeline
+- When uploading, creates the new timeline name remotely and overwrites it
+- Preserves all timeline metadata and state files
+
+Examples:
+  timeline rename master --to main
+  timeline rename old-feature --to new-feature
+  timeline rename bugfix-123 --to hotfix-user-auth`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if ec.currentRepo == nil {
+				return fmt.Errorf("not in repository")
+			}
+
+			oldName := args[0]
+			newName, _ := cmd.Flags().GetString("to")
+			
+			if newName == "" {
+				ec.output.Error("Missing required --to flag", []string{
+					"Specify the new timeline name",
+					"Example: timeline rename master --to main",
+				})
+				return fmt.Errorf("new timeline name required")
+			}
+
+			// Check if old timeline exists
+			timelines := ec.currentRepo.ListTimelines()
+			oldExists := false
+			for _, t := range timelines {
+				if t == oldName {
+					oldExists = true
+					break
+				}
+			}
+			
+			if !oldExists {
+				ec.output.Error(fmt.Sprintf("Timeline '%s' does not exist", oldName), []string{
+					"Use: timeline list (to see available timelines)",
+				})
+				return fmt.Errorf("timeline does not exist")
+			}
+
+			// Check if new name already exists
+			for _, t := range timelines {
+				if t == newName {
+					ec.output.Error(fmt.Sprintf("Timeline '%s' already exists", newName), []string{
+						"Choose a different name",
+						"Use: timeline list (to see existing timelines)",
+					})
+					return fmt.Errorf("timeline name already exists")
+				}
+			}
+
+			// Get current timeline to show appropriate message
+			currentTimeline := ec.currentRepo.GetCurrentTimeline()
+			isCurrentTimeline := currentTimeline == oldName
+
+			// Perform the rename
+			ec.output.Info(fmt.Sprintf("Renaming timeline '%s' to '%s'...", oldName, newName))
+			
+			err := ec.currentRepo.RenameTimeline(oldName, newName)
+			if err != nil {
+				ec.output.Error("Failed to rename timeline", []string{
+					"Timeline might not exist",
+					"New name might already be in use",
+					"Check for file permission issues",
+				})
+				return err
+			}
+
+			// Success messages
+			ec.output.Success(fmt.Sprintf("Timeline renamed: %s → %s", oldName, newName))
+			
+			if isCurrentTimeline {
+				ec.output.Info("You are now on the renamed timeline")
+			}
+			
+			ec.output.Info("Timeline history and metadata preserved")
+			ec.output.Info("")
+			ec.output.Info("When uploading to remote:")
+			ec.output.Info(fmt.Sprintf("  - New branch '%s' will be created", newName))
+			ec.output.Info(fmt.Sprintf("  - Old branch '%s' will remain untouched", oldName))
+			ec.output.Info("  - You may want to delete the old remote branch manually")
+
+			return nil
+		},
+	}
+
+	cmd.Flags().String("to", "", "New timeline name (required)")
+	cmd.MarkFlagRequired("to")
+	
+	return cmd
+}
+
+// Create top-level rename command (alias for timeline rename)
+func (ec *EnhancedCLI) createRenameCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "rename <old-name> --to <new-name>",
+		Short: "Rename current or specified timeline",
+		Long: `Rename a timeline (shortcut for timeline rename)
+
+This is a convenient alias for 'timeline rename' that makes it easier to rename timelines.
+When no old name is provided, renames the current timeline.
+
+Examples:
+  rename master --to main
+  rename old-feature --to new-feature
+  rename --to better-name  # renames current timeline`,
+		Args: cobra.RangeArgs(0, 1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if ec.currentRepo == nil {
+				return fmt.Errorf("not in repository")
+			}
+
+			var oldName string
+			newName, _ := cmd.Flags().GetString("to")
+			
+			if newName == "" {
+				ec.output.Error("Missing required --to flag", []string{
+					"Specify the new timeline name",
+					"Example: rename master --to main",
+					"Or: rename --to new-name (renames current timeline)",
+				})
+				return fmt.Errorf("new timeline name required")
+			}
+
+			// If no old name provided, use current timeline
+			if len(args) == 0 {
+				oldName = ec.currentRepo.GetCurrentTimeline()
+				ec.output.Info(fmt.Sprintf("Renaming current timeline '%s' to '%s'", oldName, newName))
+			} else {
+				oldName = args[0]
+				ec.output.Info(fmt.Sprintf("Renaming timeline '%s' to '%s'", oldName, newName))
+			}
+
+			// Check if old timeline exists
+			timelines := ec.currentRepo.ListTimelines()
+			oldExists := false
+			for _, t := range timelines {
+				if t == oldName {
+					oldExists = true
+					break
+				}
+			}
+			
+			if !oldExists {
+				ec.output.Error(fmt.Sprintf("Timeline '%s' does not exist", oldName), []string{
+					"Use: timeline list (to see available timelines)",
+				})
+				return fmt.Errorf("timeline does not exist")
+			}
+
+			// Check if new name already exists
+			for _, t := range timelines {
+				if t == newName {
+					ec.output.Error(fmt.Sprintf("Timeline '%s' already exists", newName), []string{
+						"Choose a different name",
+						"Use: timeline list (to see existing timelines)",
+					})
+					return fmt.Errorf("timeline name already exists")
+				}
+			}
+
+			// Perform the rename
+			err := ec.currentRepo.RenameTimeline(oldName, newName)
+			if err != nil {
+				ec.output.Error("Failed to rename timeline", []string{
+					"Timeline might not exist",
+					"New name might already be in use", 
+					"Check for file permission issues",
+				})
+				return err
+			}
+
+			// Success messages
+			ec.output.Success(fmt.Sprintf("Timeline renamed: %s → %s", oldName, newName))
+			ec.output.Info("Timeline history and metadata preserved")
+			
+			return nil
+		},
+	}
+	
+	cmd.Flags().String("to", "", "New timeline name (required)")
+	cmd.MarkFlagRequired("to")
+	
+	return cmd
 }
 
 // Create remaining essential commands

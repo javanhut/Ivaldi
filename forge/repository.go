@@ -1844,6 +1844,35 @@ func (r *Repository) DeleteTimeline(name string) error {
 	return r.timeline.Delete(name)
 }
 
+func (r *Repository) RenameTimeline(oldName, newName string) error {
+	// First rename in the timeline manager
+	if err := r.timeline.Rename(oldName, newName); err != nil {
+		return err
+	}
+	
+	// Rename timeline state files if they exist
+	oldStatePath := filepath.Join(r.root, ".ivaldi", "timeline_states", oldName+".json")
+	newStatePath := filepath.Join(r.root, ".ivaldi", "timeline_states", newName+".json")
+	
+	if _, err := os.Stat(oldStatePath); err == nil {
+		if err := os.Rename(oldStatePath, newStatePath); err != nil {
+			return fmt.Errorf("failed to rename timeline state file: %v", err)
+		}
+	}
+	
+	// Rename workspace state files if they exist
+	oldWorkspacePath := filepath.Join(r.root, ".ivaldi", "workspace", oldName+".json")
+	newWorkspacePath := filepath.Join(r.root, ".ivaldi", "workspace", newName+".json")
+	
+	if _, err := os.Stat(oldWorkspacePath); err == nil {
+		if err := os.Rename(oldWorkspacePath, newWorkspacePath); err != nil {
+			return fmt.Errorf("failed to rename workspace state file: %v", err)
+		}
+	}
+	
+	return nil
+}
+
 // WorkspaceManager interface implementation for FuseManager
 func (r *Repository) HasUncommittedChanges() bool {
 	return r.workspace.HasUncommittedChanges()

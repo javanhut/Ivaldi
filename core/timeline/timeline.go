@@ -166,6 +166,54 @@ func (m *Manager) Delete(name string) error {
 	return m.save()
 }
 
+func (m *Manager) Rename(oldName, newName string) error {
+	// Check if old timeline exists
+	timeline, exists := m.timelines[oldName]
+	if !exists {
+		return fmt.Errorf("timeline '%s' does not exist", oldName)
+	}
+	
+	// Check if new name already exists
+	if _, exists := m.timelines[newName]; exists {
+		return fmt.Errorf("timeline '%s' already exists", newName)
+	}
+	
+	// Validate new name
+	if newName == "" {
+		return fmt.Errorf("new timeline name cannot be empty")
+	}
+	
+	// Create new timeline entry with same data but new name
+	newTimeline := &Timeline{
+		Name:        newName,
+		Head:        timeline.Head,
+		CreatedAt:   timeline.CreatedAt,
+		UpdatedAt:   time.Now(), // Update the modification time
+		Description: timeline.Description,
+		Parent:      timeline.Parent,
+	}
+	
+	// Add new timeline
+	m.timelines[newName] = newTimeline
+	
+	// Update current timeline reference if we're renaming the current one
+	if m.current == oldName {
+		m.current = newName
+	}
+	
+	// Update any timelines that have this as their parent
+	for _, t := range m.timelines {
+		if t.Parent == oldName {
+			t.Parent = newName
+		}
+	}
+	
+	// Remove old timeline
+	delete(m.timelines, oldName)
+	
+	return m.save()
+}
+
 // DeleteTimeline is an alias for Delete to match the fuse interface
 func (m *Manager) DeleteTimeline(name string) error {
 	return m.Delete(name)
