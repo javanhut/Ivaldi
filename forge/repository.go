@@ -96,13 +96,53 @@ func Initialize(root string) (*Repository, error) {
 	return repo, nil
 }
 
+// Mirror clones a Git repository and imports its history into Ivaldi format
 func Mirror(url, dest string) (*Repository, error) {
-	// Use git-independent download via network manager
+	// Use git clone to get full history
 	networkMgr := network.NewNetworkManager(dest)
 	
-	// Download repository contents using API
-	if err := networkMgr.DownloadIvaldiRepo(url, dest); err != nil {
-		return nil, fmt.Errorf("failed to download repository: %v", err)
+	// Clone the Git repository with full history
+	if err := networkMgr.CloneGitRepo(url, dest); err != nil {
+		return nil, fmt.Errorf("failed to clone Git repository: %v", err)
+	}
+
+	// Initialize Ivaldi repository
+	repo, err := Initialize(dest)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize Ivaldi: %v", err)
+	}
+
+	// Import Git history into Ivaldi format
+	if err := repo.importGitHistory(); err != nil {
+		return nil, fmt.Errorf("failed to import Git history: %v", err)
+	}
+
+	// Add origin portal
+	if err := repo.AddPortal("origin", url); err != nil {
+		return nil, fmt.Errorf("failed to add origin portal: %v", err)
+	}
+
+	// Scan workspace to register current files
+	if err := repo.workspace.Scan(); err != nil {
+		return nil, fmt.Errorf("failed to scan workspace: %v", err)
+	}
+
+	// Save initial workspace state
+	if err := repo.workspace.SaveState(repo.timeline.Current()); err != nil {
+		return nil, fmt.Errorf("failed to save workspace state: %v", err)
+	}
+
+	return repo, nil
+}
+
+// Download gets current repository files without Git history
+func Download(url, dest string) (*Repository, error) {
+	// Use HTTP-based download for current files only
+	networkMgr := network.NewNetworkManager(dest)
+	
+	// Download repository contents using API (no Git history)
+	if err := networkMgr.DownloadRepoFiles(url, dest); err != nil {
+		return nil, fmt.Errorf("failed to download repository files: %v", err)
 	}
 
 	// Initialize Ivaldi repository
@@ -127,6 +167,194 @@ func Mirror(url, dest string) (*Repository, error) {
 	}
 
 	return repo, nil
+}
+
+// importGitHistory converts Git commits to Ivaldi seals with memorable names
+func (r *Repository) importGitHistory() error {
+	gitDir := filepath.Join(r.root, ".git")
+	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
+		return fmt.Errorf("no Git repository found")
+	}
+	
+	// Get Git log in reverse chronological order (oldest first)
+	cmd := exec.Command("git", "-C", r.root, "log", "--reverse", "--pretty=format:%H|%P|%an|%ae|%at|%s")
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to get Git log: %v", err)
+	}
+	
+	lines := strings.Split(string(output), "\n")
+	commitMap := make(map[string]objects.Hash) // Git SHA -> Ivaldi Hash
+	
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		
+		parts := strings.Split(line, "|")
+		if len(parts) < 6 {
+			continue
+		}
+		
+		gitSHA := parts[0]
+		parentSHAs := strings.Fields(parts[1])
+		authorName := parts[2]
+		authorEmail := parts[3]
+		timestamp := parts[4]
+		message := strings.Join(parts[5:], "|")
+		
+		// Convert timestamp
+		ts, _ := strconv.ParseInt(timestamp, 10, 64)
+		
+		// Get tree for this commit (info only - not used in current implementation)
+		treeCmd := exec.Command("git", "-C", r.root, "show", "--format=", "--name-only", gitSHA)
+		_, err = treeCmd.Output()
+		if err != nil {
+			fmt.Printf("Warning: failed to get tree for commit %s: %v\n", gitSHA[:8], err)
+			continue
+		}
+		
+		// Checkout this specific commit temporarily
+		checkoutCmd := exec.Command("git", "-C", r.root, "checkout", gitSHA, "--quiet")
+		if err := checkoutCmd.Run(); err != nil {
+			fmt.Printf("Warning: failed to checkout commit %s: %v\n", gitSHA[:8], err)
+			continue
+		}
+		
+		// Create tree snapshot of current state
+		treeHash, err := r.createTreeFromWorkspace()
+		if err != nil {
+			fmt.Printf("Warning: failed to create tree for commit %s: %v\n", gitSHA[:8], err)
+			continue
+		}
+		
+		// Convert parent Git SHAs to Ivaldi hashes
+		var parentHashes []objects.Hash
+		for _, parentSHA := range parentSHAs {
+			if parentHash, exists := commitMap[parentSHA]; exists {
+				parentHashes = append(parentHashes, parentHash)
+			}
+		}
+		
+		// Create Ivaldi seal
+		author := objects.Identity{
+			Name:  authorName,
+			Email: authorEmail,
+		}
+		
+		seal := &objects.Seal{
+			Name:      r.generateMemorableName(),
+			Iteration: i + 1,
+			Position:  treeHash,
+			Message:   message,
+			Author:    author,
+			Timestamp: time.Unix(ts, 0),
+			Parents:   parentHashes,
+		}
+		
+		// Store the seal
+		if err := r.storage.StoreSeal(seal); err != nil {
+			return fmt.Errorf("failed to store seal for commit %s: %v", gitSHA[:8], err)
+		}
+		
+		// Index the seal
+		if err := r.index.IndexSeal(seal); err != nil {
+			return fmt.Errorf("failed to index seal for commit %s: %v", gitSHA[:8], err)
+		}
+		
+		// Register memorable name
+		if err := r.refMgr.RegisterMemorableName(seal.Name, seal.Hash, authorName); err != nil {
+			return fmt.Errorf("failed to register memorable name for commit %s: %v", gitSHA[:8], err)
+		}
+		
+		// Map Git SHA to Ivaldi hash
+		commitMap[gitSHA] = seal.Hash
+		
+		fmt.Printf("Imported commit %s -> %s (%s)\n", gitSHA[:8], seal.Name, message)
+	}
+	
+	// Return to HEAD
+	headCmd := exec.Command("git", "-C", r.root, "checkout", "HEAD", "--quiet")
+	if err := headCmd.Run(); err != nil {
+		fmt.Printf("Warning: failed to return to HEAD: %v\n", err)
+	}
+	
+	// Update timeline head to latest imported commit if we have any
+	if len(commitMap) > 0 {
+		// Get the latest commit hash (last one processed)
+		var latestHash objects.Hash
+		for _, hash := range commitMap {
+			latestHash = hash
+		}
+		if err := r.timeline.UpdateHead(r.timeline.Current(), latestHash); err != nil {
+			return fmt.Errorf("failed to update timeline head: %v", err)
+		}
+	}
+	
+	fmt.Printf("Successfully imported %d Git commits to Ivaldi\n", len(commitMap))
+	return nil
+}
+
+// createTreeFromWorkspace creates a tree from current workspace state
+func (r *Repository) createTreeFromWorkspace() (objects.Hash, error) {
+	// Get all files in workspace (excluding .git and .ivaldi)
+	var entries []objects.TreeEntry
+	
+	err := filepath.Walk(r.root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		
+		relPath, err := filepath.Rel(r.root, path)
+		if err != nil {
+			return err
+		}
+		
+		// Skip .git and .ivaldi directories
+		if strings.HasPrefix(relPath, ".git/") || strings.HasPrefix(relPath, ".ivaldi/") ||
+		   relPath == ".git" || relPath == ".ivaldi" || relPath == "." {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		
+		// Skip directories
+		if info.IsDir() {
+			return nil
+		}
+		
+		// Read file content
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		
+		// Create a simple hash of the content for tracking
+		blobHash := objects.NewHash(content)
+		
+		// Create tree entry
+		entry := objects.TreeEntry{
+			Name: filepath.Base(relPath),
+			Type: objects.ObjectTypeBlob,
+			Hash: blobHash,
+			Mode: uint32(info.Mode()),
+		}
+		
+		entries = append(entries, entry)
+		return nil
+	})
+	
+	if err != nil {
+		return objects.Hash{}, err
+	}
+	
+	// Create tree hash from entries
+	treeData, err := json.Marshal(entries)
+	if err != nil {
+		return objects.Hash{}, err
+	}
+	return objects.NewHash(treeData), nil
 }
 
 func Open(root string) (*Repository, error) {

@@ -65,7 +65,8 @@ Key Features:
 
 Workshop Commands:
   forge                    Create a new repository
-  download <url>           Download repository from URL
+  download <url>           Download current files (no Git history)
+  mirror <url>             Mirror repository with full Git history
   gather [files...]        Stage files for sealing
   exclude <files...>       Exclude files from tracking
   remove <files...>        Remove files from repository
@@ -246,13 +247,16 @@ Example:
 func (ec *EnhancedCLI) createMirrorCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "mirror <url> [destination]",
-		Short: "Mirror a repository from remote location",
-		Long: `Mirror (clone) a repository with enhanced Ivaldi features
+		Short: "Mirror a Git repository with full history import",
+		Long: `Mirror a Git repository and import its complete commit history into Ivaldi format
 
-This clones a Git repository and upgrades it to Ivaldi with:
-- Memorable names assigned to all commits
-- Revolutionary features enabled
-- Git compatibility maintained
+This command:
+- Clones the Git repository with full commit history
+- Converts all Git commits to Ivaldi seals with memorable names
+- Preserves the complete development history and branching structure
+- Maintains Git compatibility while adding Ivaldi's revolutionary features
+
+Use this when you want to preserve and enhance the existing Git history.
 
 Example:
   mirror https://github.com/user/repo
@@ -2858,21 +2862,23 @@ This replaces complex 'git rm' workflows with intuitive file removal.`,
 func (ec *EnhancedCLI) createDownloadCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "download <url> [destination]",
-		Short: "Download repository from URL",
-		Long: `Download a repository from a remote URL (GitHub, GitLab, etc.)
+		Short: "Download current repository files without Git history",
+		Long: `Download current repository files from a remote URL without importing Git history
 
 This command:
-1. Downloads the repository from the specified URL
-2. Initializes it as an Ivaldi repository with all revolutionary features
-3. Imports the Git history with memorable names
-4. Sets up the origin portal automatically
+1. Downloads only the current files from the repository (like a snapshot)
+2. Initializes it as a fresh Ivaldi repository 
+3. Creates a clean slate without preserving Git commit history
+4. Sets up the origin portal for future synchronization
+
+Use this when you want a clean start without the historical baggage.
 
 Examples:
   ivaldi download https://github.com/user/repo.git          # Download to ./repo
   ivaldi download https://github.com/user/repo.git my-repo  # Download to ./my-repo
   
-This replaces the traditional 'git clone' with a more intuitive command that
-automatically sets up Ivaldi's revolutionary features.`,
+This gives you a fresh Ivaldi repository with just the current files,
+perfect for starting development without historical complexity.`,
 		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			url := args[0]
@@ -2900,8 +2906,8 @@ automatically sets up Ivaldi's revolutionary features.`,
 			ec.output.Info(fmt.Sprintf("Downloading repository from: %s", url))
 			ec.output.Info(fmt.Sprintf("Destination: %s", dest))
 
-			// Use the enhanced mirror functionality
-			repo, err := forge.EnhancedMirror(url, dest)
+			// Use the download functionality (files only, no Git history)
+			repo, err := forge.Download(url, dest)
 			if err != nil {
 				ec.output.Error("Failed to download repository", []string{
 					"Check the URL is correct and accessible",
@@ -2912,7 +2918,8 @@ automatically sets up Ivaldi's revolutionary features.`,
 				return err
 			}
 
-			ec.output.Success(fmt.Sprintf("Successfully downloaded repository to %s!", dest))
+			ec.output.Success(fmt.Sprintf("Successfully downloaded repository files to %s!", dest))
+			ec.output.Info("Fresh Ivaldi repository created with current files (no Git history)")
 			ec.output.Info("Repository is now ready with all Ivaldi revolutionary features:")
 			ec.output.Info("  • Natural language references")
 			ec.output.Info("  • Automatic work preservation")

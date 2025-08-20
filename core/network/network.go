@@ -1706,3 +1706,29 @@ func (nm *NetworkManager) fetchFromIvaldiRepo(portalURL, timeline string) (*Fetc
 		Objects: []objects.Hash{},
 	}, nil
 }
+
+// CloneGitRepo clones a Git repository with full history for mirror operation
+func (nm *NetworkManager) CloneGitRepo(url, dest string) error {
+	if err := os.MkdirAll(dest, 0755); err != nil {
+		return fmt.Errorf("failed to create directory: %v", err)
+	}
+
+	// Use git clone to get full repository with history
+	fmt.Printf("Cloning Git repository with full history: %s\n", url)
+	cmd := exec.Command("git", "clone", url, dest)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("git clone failed: %v", err)
+	}
+	
+	fmt.Printf("Successfully cloned repository with Git history\n")
+	return nil
+}
+
+// DownloadRepoFiles downloads current repository files without Git history
+func (nm *NetworkManager) DownloadRepoFiles(url, dest string) error {
+	// Use existing API-based download logic
+	return nm.DownloadIvaldiRepo(url, dest)
+}
