@@ -426,8 +426,24 @@ func (er *EnhancedRepository) CreateTimeline(name string) error {
 		return err
 	}
 	
-	// Copy current workspace state to the new timeline
+	// Save the current timeline state (if any) before creating new one
 	currentTimeline := er.timeline.Current()
+	if currentTimeline != name {
+		fmt.Printf("[DEBUG] Saving current timeline state for: %s\n", currentTimeline)
+		if err := er.Repository.saveTimelineState(currentTimeline); err != nil {
+			fmt.Printf("[DEBUG] Failed to save current timeline state: %v\n", err)
+			return fmt.Errorf("failed to save current timeline state: %v", err)
+		}
+	}
+	
+	// Copy the current timeline's state as the divergence point for the new timeline
+	fmt.Printf("[DEBUG] Creating initial state for timeline: %s from current working directory\n", name)
+	if err := er.Repository.saveTimelineState(name); err != nil {
+		fmt.Printf("[DEBUG] Failed to create initial state for timeline: %v\n", err)
+		return fmt.Errorf("failed to create initial state for timeline: %v", err)
+	}
+	
+	// Copy current workspace state to the new timeline
 	fmt.Printf("[DEBUG] Current timeline: %s, copying workspace state to new timeline: %s\n", currentTimeline, name)
 	
 	// Save current workspace state first

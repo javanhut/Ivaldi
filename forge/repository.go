@@ -4,7 +4,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -510,8 +509,22 @@ func (r *Repository) CreateTimeline(name, description string) error {
 		return err
 	}
 	
-	// Copy current workspace state to the new timeline
+	// Save the current timeline state (if any) before creating new one
 	currentTimeline := r.timeline.Current()
+	if currentTimeline != name {
+		fmt.Printf("Saving current state for timeline: %s\n", currentTimeline)
+		if err := r.saveTimelineState(currentTimeline); err != nil {
+			return fmt.Errorf("failed to save current timeline state: %v", err)
+		}
+	}
+	
+	// Copy the current timeline's state as the divergence point for the new timeline
+	fmt.Printf("Creating initial state for timeline: %s from current working directory\n", name)
+	if err := r.saveTimelineState(name); err != nil {
+		return fmt.Errorf("failed to create initial state for timeline: %v", err)
+	}
+	
+	// Copy current workspace state to the new timeline
 	fmt.Printf("Saving current workspace state for timeline: %s\n", currentTimeline)
 	if err := r.workspace.SaveState(currentTimeline); err != nil {
 		return fmt.Errorf("failed to save current workspace state: %v", err)
@@ -530,12 +543,20 @@ func (r *Repository) CreateTimeline(name, description string) error {
 func (r *Repository) SwitchTimeline(name string) error {
 	currentTimeline := r.timeline.Current()
 	
-	// Check for uncommitted changes and auto-shelve them
-	if r.workspace.HasUncommittedChanges() {
-		fmt.Printf("Auto-shelving uncommitted changes from timeline '%s'\n", currentTimeline)
-		if err := r.shelveUncommittedChanges(currentTimeline); err != nil {
-			return fmt.Errorf("failed to shelve uncommitted changes: %v", err)
-		}
+	// If switching to the same timeline, do nothing
+	if currentTimeline == name {
+		return nil
+	}
+	
+	// Calculate the diff between current state and target timeline
+	diff, err := r.calculateTimelineDiff(currentTimeline, name)
+	if err != nil {
+		return fmt.Errorf("failed to calculate timeline diff: %v", err)
+	}
+	
+	// Save current timeline state before switching
+	if err := r.saveTimelineState(currentTimeline); err != nil {
+		return fmt.Errorf("failed to save timeline state for %s: %v", currentTimeline, err)
 	}
 	
 	// Save current workspace state before switching
@@ -557,16 +578,15 @@ func (r *Repository) SwitchTimeline(name string) error {
 		return err
 	}
 
+	// Apply the diff to transform working directory
+	if err := r.applyTimelineDiff(diff); err != nil {
+		return fmt.Errorf("failed to apply timeline diff: %v", err)
+	}
+
 	// Clear workspace state to prepare for new timeline
 	r.workspace.Files = make(map[string]*workspace.FileState)
 	r.workspace.AnvilFiles = make(map[string]*workspace.FileState)
 	r.workspace.Timeline = name
-
-	// Restore working directory to match target timeline's HEAD
-	if err := r.RestoreWorkingDirectory(targetHead); err != nil {
-		// Log error but don't fail the switch - timeline still switched
-		fmt.Printf("Warning: failed to restore working directory: %v\n", err)
-	}
 
 	// Load target timeline's workspace state
 	if err := r.workspace.LoadState(name); err != nil {
@@ -576,21 +596,278 @@ func (r *Repository) SwitchTimeline(name string) error {
 		}
 	}
 
-	// If normal restoration failed (Position was 0), try to restore files from workspace state
-	if err := r.restoreFilesFromWorkspaceState(); err != nil {
-		fmt.Printf("Warning: failed to restore files from workspace state: %v\n", err)
-	}
-
-	// Restore any auto-shelved changes for this timeline
-	if err := r.restoreFromShelve(name); err != nil {
-		fmt.Printf("Warning: failed to restore shelved changes: %v\n", err)
-	}
-
 	// Force rescan to update file tracking after restoration
 	if err := r.workspace.Scan(); err != nil {
 		return fmt.Errorf("failed to scan workspace after switch: %v", err)
 	}
 
+	return nil
+}
+
+// FileOperation represents a file change operation
+type FileOperation struct {
+	Type     string // "add", "modify", "delete", "unchanged"
+	Path     string
+	Content  []byte
+	Mode     os.FileMode
+	Hash     string // For content deduplication
+}
+
+// TimelineDiff represents the differences between two timeline states
+type TimelineDiff struct {
+	Operations []FileOperation
+}
+
+// calculateTimelineDiff calculates what changes need to be made to transform from current timeline to target
+func (r *Repository) calculateTimelineDiff(currentTimeline, targetTimeline string) (*TimelineDiff, error) {
+	// Get current working directory state
+	currentFiles := make(map[string]FileOperation)
+	err := filepath.Walk(r.root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		
+		// Skip .ivaldi directory
+		if strings.Contains(path, ".ivaldi") {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		
+		// Skip directories
+		if info.IsDir() {
+			return nil
+		}
+		
+		relPath, _ := filepath.Rel(r.root, path)
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		
+		currentFiles[relPath] = FileOperation{
+			Type:    "current",
+			Path:    relPath,
+			Content: content,
+			Mode:    info.Mode(),
+			Hash:    r.hashContent(content),
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	
+	// Get target timeline state
+	targetFiles, err := r.loadTimelineState(targetTimeline)
+	if err != nil {
+		return nil, err
+	}
+	
+	var operations []FileOperation
+	
+	// Find files to add or modify
+	for path, targetFile := range targetFiles {
+		if currentFile, exists := currentFiles[path]; exists {
+			// File exists in both - check if content differs
+			if currentFile.Hash != targetFile.Hash {
+				operations = append(operations, FileOperation{
+					Type:    "modify",
+					Path:    path,
+					Content: targetFile.Content,
+					Mode:    targetFile.Mode,
+					Hash:    targetFile.Hash,
+				})
+			}
+			// Mark as processed
+			delete(currentFiles, path)
+		} else {
+			// File only exists in target - add it
+			operations = append(operations, FileOperation{
+				Type:    "add",
+				Path:    path,
+				Content: targetFile.Content,
+				Mode:    targetFile.Mode,
+				Hash:    targetFile.Hash,
+			})
+		}
+	}
+	
+	// Remaining files in currentFiles need to be deleted
+	for path := range currentFiles {
+		operations = append(operations, FileOperation{
+			Type: "delete",
+			Path: path,
+		})
+	}
+	
+	return &TimelineDiff{Operations: operations}, nil
+}
+
+// saveTimelineState saves the current working directory state using content-addressed storage
+func (r *Repository) saveTimelineState(timelineName string) error {
+	stateFile := filepath.Join(r.root, ".ivaldi", "timeline_states", timelineName+".json")
+	
+	// Create state directory
+	if err := os.MkdirAll(filepath.Dir(stateFile), 0755); err != nil {
+		return err
+	}
+	
+	state := make(map[string]FileOperation)
+	
+	// Walk through working directory and record file states
+	err := filepath.Walk(r.root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		
+		// Skip .ivaldi directory
+		if strings.Contains(path, ".ivaldi") {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		
+		// Skip directories
+		if info.IsDir() {
+			return nil
+		}
+		
+		relPath, _ := filepath.Rel(r.root, path)
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		
+		hash := r.hashContent(content)
+		
+		// Store content in content-addressed storage
+		contentPath := filepath.Join(r.root, ".ivaldi", "content", hash)
+		if _, err := os.Stat(contentPath); os.IsNotExist(err) {
+			if err := os.MkdirAll(filepath.Dir(contentPath), 0755); err != nil {
+				return err
+			}
+			if err := os.WriteFile(contentPath, content, 0644); err != nil {
+				return err
+			}
+		}
+		
+		state[relPath] = FileOperation{
+			Type: "stored",
+			Path: relPath,
+			Mode: info.Mode(),
+			Hash: hash,
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	
+	// Save state metadata
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return err
+	}
+	
+	return os.WriteFile(stateFile, data, 0644)
+}
+
+// loadTimelineState loads a timeline state from storage
+func (r *Repository) loadTimelineState(timelineName string) (map[string]FileOperation, error) {
+	stateFile := filepath.Join(r.root, ".ivaldi", "timeline_states", timelineName+".json")
+	
+	// Check if state exists
+	if _, err := os.Stat(stateFile); os.IsNotExist(err) {
+		// No state yet - return empty state
+		return make(map[string]FileOperation), nil
+	}
+	
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		return nil, err
+	}
+	
+	var state map[string]FileOperation
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, err
+	}
+	
+	// Load content for each file
+	for path, file := range state {
+		contentPath := filepath.Join(r.root, ".ivaldi", "content", file.Hash)
+		content, err := os.ReadFile(contentPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load content for %s: %v", path, err)
+		}
+		file.Content = content
+		state[path] = file
+	}
+	
+	return state, nil
+}
+
+// applyTimelineDiff applies the calculated diff to transform the working directory
+func (r *Repository) applyTimelineDiff(diff *TimelineDiff) error {
+	for _, op := range diff.Operations {
+		fullPath := filepath.Join(r.root, op.Path)
+		
+		switch op.Type {
+		case "add", "modify":
+			// Ensure directory exists
+			if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+				return err
+			}
+			// Write content
+			if err := os.WriteFile(fullPath, op.Content, op.Mode); err != nil {
+				return err
+			}
+			
+		case "delete":
+			// Remove file
+			if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+	}
+	
+	return nil
+}
+
+// hashContent creates a content hash for deduplication
+func (r *Repository) hashContent(content []byte) string {
+	// Simple hash for now - could use SHA256 or similar
+	return fmt.Sprintf("%x", len(content)) + fmt.Sprintf("%x", content[:min(len(content), 32)])
+}
+
+// Helper function for min
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// clearWorkingDirectory removes all files from working directory except .ivaldi (for legacy compatibility)
+func (r *Repository) clearWorkingDirectory() error {
+	entries, err := os.ReadDir(r.root)
+	if err != nil {
+		return err
+	}
+	
+	for _, entry := range entries {
+		if entry.Name() == ".ivaldi" {
+			continue // Skip .ivaldi directory
+		}
+		
+		fullPath := filepath.Join(r.root, entry.Name())
+		if err := os.RemoveAll(fullPath); err != nil {
+			return err
+		}
+	}
+	
 	return nil
 }
 
@@ -1407,36 +1684,6 @@ func (r *Repository) RestoreWorkingDirectory(targetHash objects.Hash) error {
 
 	// Restore files from tree
 	return r.restoreFromTree(tree, "")
-}
-
-// clearWorkingDirectory removes all tracked files from working directory
-func (r *Repository) clearWorkingDirectory() error {
-	// Get all files currently in the working directory (except ignored ones)
-	return filepath.WalkDir(r.root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if d.IsDir() {
-			// Skip special directories
-			if d.Name() == ".ivaldi" || d.Name() == ".git" || d.Name() == "build" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		// Remove file if it's tracked (not ignored)
-		relPath, err := filepath.Rel(r.root, path)
-		if err != nil {
-			return err
-		}
-
-		if !r.isIgnored(relPath) {
-			return os.Remove(path)
-		}
-
-		return nil
-	})
 }
 
 // restoreFromTree recursively restores files from a tree object

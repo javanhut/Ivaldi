@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"ivaldi/core/objects"
+	"ivaldi/pkg/storage/objectstore"
+	"ivaldi/pkg/storage/worktree"
 )
 
 type Timeline struct {
@@ -33,6 +35,12 @@ func NewManager(root string) *Manager {
 }
 
 func (m *Manager) Initialize() error {
+	// Check for and recover from any incomplete timeline switches
+	store := objectstore.New(m.root)
+	if err := worktree.RecoverWAL(m.root, store); err != nil {
+		return fmt.Errorf("failed to recover from incomplete switch: %v", err)
+	}
+	
 	timelineDir := filepath.Join(m.root, ".ivaldi", "timelines")
 	if err := os.MkdirAll(timelineDir, 0755); err != nil {
 		return err
@@ -75,6 +83,8 @@ func (m *Manager) Switch(name string) error {
 		return fmt.Errorf("timeline '%s' does not exist", name)
 	}
 
+	// Simple switch - just update the current timeline
+	// The actual file handling is done by forge/repository.go
 	m.current = name
 	return m.save()
 }
