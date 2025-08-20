@@ -1,5 +1,6 @@
 BINARY_NAME = ivaldi
 INSTALL_DIR = /usr/local/bin
+SHARE_DIR = /usr/local/share/ivaldi
 GO_CMD = go
 GO_BUILD = $(GO_CMD) build
 GO_CLEAN = $(GO_CMD) clean
@@ -26,8 +27,20 @@ install: build
 	@sudo mkdir -p $(INSTALL_DIR)
 	@sudo cp $(BUILD_DIR)/$(BINARY_NAME) $(INSTALL_DIR)/$(BINARY_NAME)
 	@sudo chmod 755 $(INSTALL_DIR)/$(BINARY_NAME)
+	@echo "Installing prompt scripts to $(SHARE_DIR)..."
+	@sudo mkdir -p $(SHARE_DIR)/scripts
+	@sudo cp scripts/ivaldi-prompt.sh $(SHARE_DIR)/scripts/
+	@sudo cp scripts/INSTALL_PROMPT.md $(SHARE_DIR)/scripts/
+	@sudo cp scripts/example-bashrc.sh $(SHARE_DIR)/scripts/
+	@sudo cp scripts/example-zshrc.sh $(SHARE_DIR)/scripts/
+	@sudo chmod 755 $(SHARE_DIR)/scripts/ivaldi-prompt.sh
+	@sudo chmod 644 $(SHARE_DIR)/scripts/*.md $(SHARE_DIR)/scripts/example-*.sh
 	@echo "$(BINARY_NAME) installed successfully to $(INSTALL_DIR)"
+	@echo "Prompt scripts installed to $(SHARE_DIR)/scripts"
 	@echo "You can now run '$(BINARY_NAME)' from anywhere"
+	@echo ""
+	@echo "To add timeline info to your shell prompt, see:"
+	@echo "  $(SHARE_DIR)/scripts/INSTALL_PROMPT.md"
 
 uninstall:
 	@echo "Uninstalling $(BINARY_NAME) from $(INSTALL_DIR)..."
@@ -36,6 +49,13 @@ uninstall:
 		echo "$(BINARY_NAME) uninstalled successfully"; \
 	else \
 		echo "$(BINARY_NAME) not found in $(INSTALL_DIR)"; \
+	fi
+	@echo "Removing prompt scripts from $(SHARE_DIR)..."
+	@if [ -d $(SHARE_DIR) ]; then \
+		sudo rm -rf $(SHARE_DIR); \
+		echo "Prompt scripts removed successfully"; \
+	else \
+		echo "Prompt scripts not found in $(SHARE_DIR)"; \
 	fi
 
 clean:
@@ -69,8 +89,20 @@ dev-install: build
 	@mkdir -p ~/.local/bin
 	@cp $(BUILD_DIR)/$(BINARY_NAME) ~/.local/bin/$(BINARY_NAME)
 	@chmod 755 ~/.local/bin/$(BINARY_NAME)
+	@echo "Installing prompt scripts to ~/.local/share/ivaldi..."
+	@mkdir -p ~/.local/share/ivaldi/scripts
+	@cp scripts/ivaldi-prompt.sh ~/.local/share/ivaldi/scripts/
+	@cp scripts/INSTALL_PROMPT.md ~/.local/share/ivaldi/scripts/
+	@cp scripts/example-bashrc.sh ~/.local/share/ivaldi/scripts/
+	@cp scripts/example-zshrc.sh ~/.local/share/ivaldi/scripts/
+	@chmod 755 ~/.local/share/ivaldi/scripts/ivaldi-prompt.sh
+	@chmod 644 ~/.local/share/ivaldi/scripts/*.md ~/.local/share/ivaldi/scripts/example-*.sh
 	@echo "$(BINARY_NAME) installed to ~/.local/bin"
+	@echo "Prompt scripts installed to ~/.local/share/ivaldi/scripts"
 	@echo "Make sure ~/.local/bin is in your PATH"
+	@echo ""
+	@echo "To add timeline info to your shell prompt, see:"
+	@echo "  ~/.local/share/ivaldi/scripts/INSTALL_PROMPT.md"
 
 dev-uninstall:
 	@echo "Uninstalling $(BINARY_NAME) from user local bin..."
@@ -79,6 +111,13 @@ dev-uninstall:
 		echo "$(BINARY_NAME) uninstalled from ~/.local/bin"; \
 	else \
 		echo "$(BINARY_NAME) not found in ~/.local/bin"; \
+	fi
+	@echo "Removing prompt scripts from ~/.local/share/ivaldi..."
+	@if [ -d ~/.local/share/ivaldi ]; then \
+		rm -rf ~/.local/share/ivaldi; \
+		echo "Prompt scripts removed successfully"; \
+	else \
+		echo "Prompt scripts not found in ~/.local/share/ivaldi"; \
 	fi
 
 help:
