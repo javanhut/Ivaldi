@@ -32,7 +32,7 @@ ivaldi forge my-project        # Create repository in new directory
 - Creates memorable name generator
 
 ### `ivaldi download <url> [destination]`
-**Download repository from URL**
+**Download current repository files without Git history**
 
 ```bash
 ivaldi download https://github.com/user/repo.git
@@ -40,9 +40,24 @@ ivaldi download https://github.com/user/repo.git my-project
 ```
 
 **Features:**
+- Downloads only current files (like a snapshot)
+- Creates fresh Ivaldi repository
 - Auto-detects destination from URL
+- Perfect for starting clean without historical baggage
+
+### `ivaldi mirror <url> [destination]`
+**Mirror repository with full Git history**
+
+```bash
+ivaldi mirror https://github.com/user/repo.git
+ivaldi mirror https://github.com/user/repo.git my-project
+```
+
+**Features:**
+- Clones full Git repository with all history
+- Converts all Git commits to Ivaldi seals with memorable names
+- Preserves complete development history
 - Sets up all Ivaldi features automatically
-- Imports Git history with memorable names
 - Configures origin portal
 
 ### `ivaldi status`
@@ -167,6 +182,40 @@ ivaldi timeline switch feature
 ```bash
 ivaldi timeline list
 ```
+
+#### `ivaldi timeline delete <name>`
+```bash
+ivaldi timeline delete old-feature
+```
+
+#### `ivaldi timeline rename <old-name> --to <new-name>`
+**Rename timeline with remote overwrite support**
+```bash
+ivaldi timeline rename master --to main
+ivaldi timeline rename old-feature --to new-feature
+ivaldi timeline rename bugfix-123 --to hotfix-user-auth
+```
+
+**Features:**
+- Renames timeline locally with all history preserved
+- Updates current timeline reference if renaming the active timeline
+- Renames associated state files (timeline_states, workspace states)  
+- When uploading, creates new remote branch with new name
+- Old remote branch remains untouched (can be deleted manually)
+- Perfect for GitHub's master→main migration
+
+### `ivaldi rename <old-name> --to <new-name>`
+**Top-level rename command (shortcut for timeline rename)**
+```bash
+ivaldi rename master --to main
+ivaldi rename old-feature --to new-feature  
+ivaldi rename --to better-name              # renames current timeline
+```
+
+**Features:**
+- Convenient shortcut for `ivaldi timeline rename`
+- Can rename current timeline by omitting old name
+- Same functionality as timeline rename command
 
 ### `ivaldi fuse <timeline> [flags]`
 **Merge timelines with multiple strategies**

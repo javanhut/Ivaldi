@@ -92,13 +92,6 @@ PROMPT="${PROMPT%% }%{\$(ivaldi_timeline_prompt_zsh)%} "
 RPROMPT="${RPROMPT}%{\$(ivaldi_timeline_prompt_zsh)%}"
 ```
 
-### Oh My Zsh- Quick Setup
-
-```zsh
-chmod +x ../scripts/quick-setup.sh
-
-```
-
 ## Customization
 
 ### Changing the Format

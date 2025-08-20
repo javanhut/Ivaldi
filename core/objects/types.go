@@ -192,6 +192,10 @@ func HashData(data []byte) Hash {
 	return NewHash(data)
 }
 
+func (h Hash) IsZero() bool {
+	return h == Hash{}
+}
+
 // Identity represents an author or committer
 type Identity struct {
 	Name  string `json:"name"`

@@ -13,6 +13,7 @@ Ivaldi is a modern version control system designed around how developers actuall
 | `git checkout a7b8c9d` | `ivaldi jump to bright-river-42` |
 | `git add . && git commit -m "..."` | `ivaldi gather . && ivaldi seal "..."` |
 | `git branch feature && git checkout feature` | `ivaldi timeline create feature` |
+| `git branch -m master main` | `ivaldi rename master --to main` |
 | `git merge --squash feature` | `ivaldi fuse feature --squash` |
 | `git push origin feature` | `ivaldi upload` |
 
@@ -21,6 +22,8 @@ Ivaldi is a modern version control system designed around how developers actuall
 - **Memorable Names**: Every commit gets a human-friendly name like `bright-river-42`
 - **Never Lose Work**: Automatic preservation prevents data loss
 - **Natural Language**: `ivaldi jump to "yesterday"` or `ivaldi jump to "Sarah's last commit"`
+- **Shell Integration**: Timeline info in your prompt just like Git branches
+- **Easy Renaming**: Rename timelines with automatic remote handling
 - **Seamless GitHub**: Direct API integration without git dependency
 - **Intuitive Commands**: Workshop metaphors that make sense
 
@@ -34,8 +37,32 @@ git clone https://github.com/javanhut/Ivaldi.git
 cd Ivaldi
 make build
 
-# Install system-wide (optional)
+# Install system-wide (includes shell prompt integration)
 make install
+
+# OR install to user directory (no sudo required)
+make dev-install
+```
+
+### Shell Integration
+
+Get timeline info in your prompt like Git branches:
+
+**For Oh My Zsh users:**
+```bash
+# Quick setup (recommended)
+./scripts/quick-setup.sh
+
+# Your prompt will show: ➜ myproject git:(main) ivaldi:(feature-timeline)
+```
+
+**For other shells:**
+```bash
+# General installation
+./scripts/oh-my-zsh-plugin/install.sh
+
+# See full documentation
+./scripts/INSTALL_PROMPT.md
 ```
 
 ### First Repository
@@ -70,6 +97,9 @@ ivaldi upload
 ivaldi timeline create auth
 ivaldi timeline switch auth
 
+# Rename timeline if needed
+ivaldi rename auth --to user-authentication
+
 # Make changes
 echo "auth code" > auth.go
 ivaldi gather .
@@ -78,8 +108,8 @@ ivaldi seal "Add authentication"
 
 # Switch back to main and merge
 ivaldi timeline switch main
-ivaldi fuse auth --squash
-# → Fused auth timeline into main
+ivaldi fuse user-authentication --squash
+# → Fused user-authentication timeline into main
 ```
 
 ## Essential Commands
@@ -95,10 +125,11 @@ ivaldi upload                 # Push to remote (like git push)
 
 ### Timeline Management
 ```bash
-ivaldi timeline create <name>  # Create new timeline/branch
-ivaldi timeline switch <name>  # Switch timeline
-ivaldi timeline list           # List all timelines
-ivaldi fuse <timeline>         # Merge timeline into current
+ivaldi timeline create <name>    # Create new timeline/branch
+ivaldi timeline switch <name>    # Switch timeline
+ivaldi timeline list             # List all timelines
+ivaldi rename <old> --to <new>   # Rename timeline
+ivaldi fuse <timeline>           # Merge timeline into current
 ```
 
 ### Navigation
@@ -128,7 +159,9 @@ ivaldi jump to #15
 
 ### Remote Operations
 ```bash
-ivaldi portal add origin <url>  # Add GitHub remote
+ivaldi mirror <url>            # Clone repo with full Git history  
+ivaldi download <url>          # Download current files only
+ivaldi portal add origin <url> # Add GitHub remote
 ivaldi portal list             # List remotes
 ivaldi upload                  # Upload current timeline
 ivaldi sync origin             # Sync with remote
@@ -140,6 +173,8 @@ ivaldi sync origin             # Sync with remote
 - Memorable commit names instead of SHA hashes
 - Natural language navigation and references
 - Workshop metaphor commands (forge, gather, seal, fuse)
+- Timeline info in shell prompt like Git branches
+- Easy timeline renaming with `--to` syntax
 
 ###  **Data Protection**
 - Automatic work preservation during timeline switches
@@ -149,6 +184,8 @@ ivaldi sync origin             # Sync with remote
 ###  **GitHub Integration**
 - Direct REST API integration (no git dependency)
 - Automatic branch creation for new timelines
+- Timeline rename creates new remote branches
+- Distinguish between `mirror` (with Git history) and `download` (files only)
 - Batch uploads for performance
 - Support for .ivaldiignore files
 
@@ -210,7 +247,11 @@ ivaldi upload  # Push to GitHub
 
 ### Collaborating
 ```bash
-# Download existing repository
+# Mirror repository with full Git history
+ivaldi mirror https://github.com/team/project.git
+cd project
+
+# OR just download current files without history
 ivaldi download https://github.com/team/project.git
 cd project
 
@@ -218,9 +259,25 @@ cd project
 ivaldi timeline create my-feature
 # Make changes...
 ivaldi gather . && ivaldi seal "My contribution"
+
+# Rename timeline if needed
+ivaldi rename my-feature --to better-feature-name
+
 ivaldi upload  # Creates branch on GitHub
 
 # Then create pull request on GitHub
+```
+
+### Shell Prompt Integration
+```bash
+# With Oh My Zsh plugin installed:
+➜  myproject git:(main) ivaldi:(feature-timeline) 
+
+# Available aliases:
+irename master --to main    # Rename timeline
+igather .                   # Stage files  
+iseal "message"            # Commit changes
+iswitch main               # Switch timeline
 ```
 
 ## FAQ
@@ -229,13 +286,19 @@ ivaldi upload  # Creates branch on GitHub
 A: No! Ivaldi works completely independently and integrates directly with GitHub's API.
 
 **Q: Can I use existing Git repositories?**
-A: Yes! Use `ivaldi download <git-url>` to import any Git repository with full history preservation.
+A: Yes! Use `ivaldi mirror <git-url>` to import any Git repository with full history preservation, or `ivaldi download <git-url>` for just the current files.
 
 **Q: What happens to my work when I switch timelines?**
 A: Ivaldi automatically preserves all uncommitted work - you can never lose changes.
 
 **Q: How do memorable names work?**
 A: Every commit gets a unique name like `bright-river-42`. You can reference commits by these names instead of SHA hashes.
+
+**Q: How do I rename timelines like master to main?**
+A: Use `ivaldi rename master --to main`. When you upload, it creates the new branch name on GitHub.
+
+**Q: Can I get timeline info in my shell prompt?**
+A: Yes! Run `./scripts/quick-setup.sh` for Oh My Zsh integration, or see `./scripts/INSTALL_PROMPT.md` for other shells.
 
 **Q: Is this compatible with my team's Git workflow?**
 A: Yes! Ivaldi creates standard Git repositories on GitHub that your team can interact with normally.

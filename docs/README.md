@@ -8,6 +8,8 @@ Welcome to the complete documentation for Ivaldi - the revolutionary human-cente
 Start here if you're new to Ivaldi:
 
 - **[Quick Usage Guide](IVALDI_USAGE.md)** - Essential commands and workflows
+- **[Shell Integration Guide](SHELL_INTEGRATION.md)** - Get timeline info in your prompt
+- **[Command Reference](REFERENCE.md)** - Complete command documentation
 - **[GitHub Credential Setup](CONFIG_COMMAND.md)** - Configure GitHub integration
 - **[Complete Revolutionary Demo](REVOLUTIONARY_DEMO_COMPLETE.md)** - See all features in action
 
@@ -18,6 +20,8 @@ Start here if you're new to Ivaldi:
 
 ### Core Commands
 
+- **[Complete Command Reference](REFERENCE.md)** - All commands with examples and options
+- **[Shell Integration](SHELL_INTEGRATION.md)** - Timeline prompts and Oh My Zsh plugin
 - **[Sync Command](SYNC_COMMAND.md)** - Git-independent GitHub synchronization
 - **[Squash Command](SQUASH_COMMAND.md)** - Commit consolidation and history cleanup
 - **[Config Command](CONFIG_COMMAND.md)** - Credential management and setup

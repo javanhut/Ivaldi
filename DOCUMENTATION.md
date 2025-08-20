@@ -7,6 +7,7 @@ All documentation has been organized in the **[docs/](docs/)** directory for bet
 ### **Getting Started**
 - **[Complete Documentation Index](docs/README.md)** - Full documentation overview
 - **[Quick Usage Guide](docs/IVALDI_USAGE.md)** - Essential commands and workflows
+- **[Shell Integration Guide](docs/SHELL_INTEGRATION.md)** - Timeline info in your prompt
 - **[Revolutionary Demo](docs/REVOLUTIONARY_DEMO_COMPLETE.md)** - See all features in action
 
 ### **Understanding Ivaldi**
@@ -20,6 +21,8 @@ All documentation has been organized in the **[docs/](docs/)** directory for bet
 docs/
 ├── README.md                        # Complete documentation index
 ├── IVALDI_USAGE.md                 # Quick start and essential commands
+├── SHELL_INTEGRATION.md            # Timeline info in shell prompts
+├── REFERENCE.md                    # Complete command reference
 ├── CONFIG_COMMAND.md               # GitHub credential setup
 ├── SYNC_COMMAND.md                 # Git-independent sync documentation
 ├── SQUASH_COMMAND.md               # Commit squashing and history cleanup

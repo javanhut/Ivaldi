@@ -61,6 +61,11 @@ func NewNetworkManager(root string) *NetworkManager {
 	}
 }
 
+// GetRoot returns the repository root path
+func (nm *NetworkManager) GetRoot() string {
+	return nm.root
+}
+
 // getGitHubToken gets GitHub token with multiple fallback options
 func (nm *NetworkManager) getGitHubToken() (string, error) {
 	// Try local config first
@@ -1593,6 +1598,12 @@ func (nm *NetworkManager) fetchFromGitHub(portalURL, timeline string) (*FetchRes
 		return nil, fmt.Errorf("failed to get commit info: %v", err)
 	}
 	
+	// Download the actual files from this commit's tree
+	fmt.Printf("Fetching files from commit %s...\n", commitSHA[:8])
+	if err := nm.downloadGitHubTree(owner, repo, commit.Tree.SHA); err != nil {
+		return nil, fmt.Errorf("failed to download tree: %v", err)
+	}
+	
 	// Convert GitHub commit to Ivaldi seal
 	seal := &objects.Seal{
 		Name:      nm.generateMemorableNameFromCommit(commit),
@@ -1705,6 +1716,132 @@ func (nm *NetworkManager) fetchFromIvaldiRepo(portalURL, timeline string) (*Fetc
 		Seals:   []*objects.Seal{},
 		Objects: []objects.Hash{},
 	}, nil
+}
+
+// downloadGitHubTree downloads all files from a GitHub tree SHA
+func (nm *NetworkManager) downloadGitHubTree(owner, repo, treeSHA string) error {
+	// Get tree contents from GitHub API
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/git/trees/%s?recursive=true", owner, repo, treeSHA)
+	
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+	
+	// Add authentication
+	if token, err := nm.getGitHubToken(); err == nil && token != "" {
+		req.Header.Set("Authorization", "token "+token)
+	}
+	req.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
+	
+	resp, err := nm.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("GitHub API error (%d): %s", resp.StatusCode, string(body))
+	}
+	
+	var treeData struct {
+		Tree []struct {
+			Path string `json:"path"`
+			Mode string `json:"mode"`
+			Type string `json:"type"`
+			SHA  string `json:"sha"`
+			Size int    `json:"size"`
+		} `json:"tree"`
+	}
+	
+	if err := json.NewDecoder(resp.Body).Decode(&treeData); err != nil {
+		return err
+	}
+	
+	// Download each file (blobs only, not trees)
+	fileCount := 0
+	for _, item := range treeData.Tree {
+		if item.Type == "blob" {
+			fileCount++
+		}
+	}
+	
+	fmt.Printf("Downloading %d files from remote...\n", fileCount)
+	downloaded := 0
+	
+	for _, item := range treeData.Tree {
+		if item.Type != "blob" {
+			continue // Skip directories
+		}
+		
+		// Download blob content
+		blobURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/git/blobs/%s", owner, repo, item.SHA)
+		
+		blobReq, err := http.NewRequest("GET", blobURL, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create request for %s: %v", item.Path, err)
+		}
+		
+		// Add authentication
+		if token, err := nm.getGitHubToken(); err == nil && token != "" {
+			blobReq.Header.Set("Authorization", "token "+token)
+		}
+		blobReq.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
+		
+		blobResp, err := nm.client.Do(blobReq)
+		if err != nil {
+			return fmt.Errorf("failed to download %s: %v", item.Path, err)
+		}
+		defer blobResp.Body.Close()
+		
+		if blobResp.StatusCode != 200 {
+			body, _ := io.ReadAll(blobResp.Body)
+			return fmt.Errorf("failed to download %s: %s", item.Path, string(body))
+		}
+		
+		var blobData struct {
+			Content  string `json:"content"`
+			Encoding string `json:"encoding"`
+		}
+		
+		if err := json.NewDecoder(blobResp.Body).Decode(&blobData); err != nil {
+			return fmt.Errorf("failed to decode %s: %v", item.Path, err)
+		}
+		
+		// Decode base64 content
+		var content []byte
+		if blobData.Encoding == "base64" {
+			content, err = base64.StdEncoding.DecodeString(strings.ReplaceAll(blobData.Content, "\\n", ""))
+			if err != nil {
+				return fmt.Errorf("failed to decode base64 for %s: %v", item.Path, err)
+			}
+		} else {
+			content = []byte(blobData.Content)
+		}
+		
+		// Write file to disk
+		fullPath := filepath.Join(nm.root, item.Path)
+		
+		// Create directory if needed
+		dir := filepath.Dir(fullPath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("failed to create directory for %s: %v", item.Path, err)
+		}
+		
+		// Write the file
+		if err := os.WriteFile(fullPath, content, 0644); err != nil {
+			return fmt.Errorf("failed to write %s: %v", item.Path, err)
+		}
+		
+		downloaded++
+		if downloaded%10 == 0 || downloaded == fileCount {
+			fmt.Printf("Progress: %d/%d files\r", downloaded, fileCount)
+		}
+	}
+	
+	fmt.Printf("\nSuccessfully downloaded %d files\n", fileCount)
+	return nil
 }
 
 // CloneGitRepo clones a Git repository with full history for mirror operation

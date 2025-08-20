@@ -62,6 +62,7 @@ type FuseResult struct {
 	FilesChanged   []string
 	DeletedSource  bool
 	Strategy       FuseStrategy
+	Success        bool
 }
 
 func NewFuseManager(storage Storage, timeline TimelineManager, workspace WorkspaceManager) *FuseManager {
@@ -167,6 +168,7 @@ func (fm *FuseManager) analyzeFuse(sourceHead, targetHead objects.Hash, strategy
 		FilesChanged:  []string{"(analysis not implemented)"},
 		DeletedSource: opts.DeleteSource,
 		Strategy:      strategy,
+		Success:       true,
 	}
 
 	switch strategy {
@@ -210,6 +212,7 @@ func (fm *FuseManager) performFastForward(sourceHead, targetHead objects.Hash, o
 		FilesChanged:  []string{"Fast-forward completed"},
 		DeletedSource: false,
 		Strategy:      FuseStrategyFastForward,
+		Success:       true,
 	}
 
 	// Delete source timeline if requested
@@ -267,6 +270,7 @@ func (fm *FuseManager) performSquash(sourceHead, targetHead objects.Hash, opts F
 		FilesChanged:  []string{fmt.Sprintf("Squashed %s", sourceSeal.Name)},
 		DeletedSource: false,
 		Strategy:      FuseStrategySquash,
+		Success:       true,
 	}
 
 	// Delete source timeline if requested
@@ -330,6 +334,7 @@ func (fm *FuseManager) performMerge(sourceHead, targetHead objects.Hash, opts Fu
 		FilesChanged:  []string{fmt.Sprintf("Merged %s into %s", sourceSeal.Name, targetSeal.Name)},
 		DeletedSource: false,
 		Strategy:      FuseStrategyAutomatic,
+		Success:       true,
 	}
 
 	// Delete source timeline if requested
