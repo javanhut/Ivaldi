@@ -564,15 +564,6 @@ func (r *Repository) SwitchTimeline(name string) error {
 		return fmt.Errorf("failed to save workspace state: %v", err)
 	}
 
-	// Get target timeline's HEAD commit before switching
-	targetHead, err := r.timeline.GetHead(name)
-	if err != nil {
-		return fmt.Errorf("failed to get timeline head: %v", err)
-	}
-	
-	// Debug: check what hash we're getting
-	fmt.Printf("Debug: switching to timeline %s with HEAD: %s\n", name, targetHead.String())
-
 	// Switch timeline
 	if err := r.timeline.Switch(name); err != nil {
 		return err

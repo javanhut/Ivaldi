@@ -111,13 +111,10 @@ func (eo *EnhancedOutput) Warning(message string) {
 
 // Info prints an informational message
 func (eo *EnhancedOutput) Info(message string) {
-	if eo.style.UseEmoji {
-		fmt.Printf("%s ", SymbolInfo)
-	}
 	if eo.style.UseColors {
 		fmt.Printf("%s%s%s\n", ColorBlue, message, ColorReset)
 	} else {
-		fmt.Printf("Info: %s\n", message)
+		fmt.Printf("%s\n", message)
 	}
 }
 

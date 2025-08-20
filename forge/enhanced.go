@@ -418,67 +418,46 @@ func (er *EnhancedRepository) ListTimelines() []string {
 
 // CreateTimeline creates a new timeline
 func (er *EnhancedRepository) CreateTimeline(name string) error {
-	fmt.Printf("[DEBUG] EnhancedRepository.CreateTimeline called with name: %s\n", name)
-	
 	// Create the timeline first
 	if err := er.timeline.Create(name, "Feature timeline"); err != nil {
-		fmt.Printf("[DEBUG] Failed to create timeline: %v\n", err)
 		return err
 	}
 	
 	// Save the current timeline state (if any) before creating new one
 	currentTimeline := er.timeline.Current()
 	if currentTimeline != name {
-		fmt.Printf("[DEBUG] Saving current timeline state for: %s\n", currentTimeline)
 		if err := er.Repository.saveTimelineState(currentTimeline); err != nil {
-			fmt.Printf("[DEBUG] Failed to save current timeline state: %v\n", err)
 			return fmt.Errorf("failed to save current timeline state: %v", err)
 		}
 	}
 	
 	// Copy the current timeline's state as the divergence point for the new timeline
-	fmt.Printf("[DEBUG] Creating initial state for timeline: %s from current working directory\n", name)
 	if err := er.Repository.saveTimelineState(name); err != nil {
-		fmt.Printf("[DEBUG] Failed to create initial state for timeline: %v\n", err)
 		return fmt.Errorf("failed to create initial state for timeline: %v", err)
 	}
 	
-	// Copy current workspace state to the new timeline
-	fmt.Printf("[DEBUG] Current timeline: %s, copying workspace state to new timeline: %s\n", currentTimeline, name)
-	
 	// Save current workspace state first
 	if err := er.workspace.SaveState(currentTimeline); err != nil {
-		fmt.Printf("[DEBUG] Failed to save current workspace state: %v\n", err)
 		return fmt.Errorf("failed to save current workspace state: %v", err)
 	}
 	
 	// Copy workspace state from current timeline to new timeline
 	if err := er.copyWorkspaceState(currentTimeline, name); err != nil {
-		fmt.Printf("[DEBUG] Failed to copy workspace state: %v\n", err)
 		return fmt.Errorf("failed to copy workspace state: %v", err)
 	}
 	
-	fmt.Printf("[DEBUG] Successfully created timeline %s with workspace state copied from %s\n", name, currentTimeline)
 	return nil
 }
 
 // copyWorkspaceState copies workspace state from source to target timeline
 func (er *EnhancedRepository) copyWorkspaceState(sourceTimeline, targetTimeline string) error {
-	fmt.Printf("[DEBUG] Copying workspace state from %s to %s\n", sourceTimeline, targetTimeline)
-	
 	// Load the source workspace state
 	sourceWorkspace := workspace.New(er.root, er.workspace.Store)
 	if err := sourceWorkspace.LoadState(sourceTimeline); err != nil {
 		if os.IsNotExist(err) {
-			fmt.Printf("[DEBUG] Source workspace state doesn't exist for %s, creating empty state\n", sourceTimeline)
 			return nil
 		}
 		return err
-	}
-	
-	fmt.Printf("[DEBUG] Loaded source workspace with %d files\n", len(sourceWorkspace.Files))
-	for path, file := range sourceWorkspace.Files {
-		fmt.Printf("[DEBUG] Source file: %s (BlobHash: %s)\n", path, file.BlobHash)
 	}
 	
 	// Set the target timeline and save
@@ -487,7 +466,6 @@ func (er *EnhancedRepository) copyWorkspaceState(sourceTimeline, targetTimeline 
 		return err
 	}
 	
-	fmt.Printf("[DEBUG] Successfully saved workspace state for %s\n", targetTimeline)
 	return nil
 }
 
