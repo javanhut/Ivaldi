@@ -33,14 +33,19 @@ install: build
 	@sudo cp scripts/INSTALL_PROMPT.md $(SHARE_DIR)/scripts/
 	@sudo cp scripts/example-bashrc.sh $(SHARE_DIR)/scripts/
 	@sudo cp scripts/example-zshrc.sh $(SHARE_DIR)/scripts/
+	@sudo cp -r scripts/oh-my-zsh-plugin $(SHARE_DIR)/scripts/
 	@sudo chmod 755 $(SHARE_DIR)/scripts/ivaldi-prompt.sh
+	@sudo chmod 755 $(SHARE_DIR)/scripts/oh-my-zsh-plugin/install.sh
 	@sudo chmod 644 $(SHARE_DIR)/scripts/*.md $(SHARE_DIR)/scripts/example-*.sh
+	@sudo chmod 644 $(SHARE_DIR)/scripts/oh-my-zsh-plugin/*.md $(SHARE_DIR)/scripts/oh-my-zsh-plugin/*.zsh*
 	@echo "$(BINARY_NAME) installed successfully to $(INSTALL_DIR)"
 	@echo "Prompt scripts installed to $(SHARE_DIR)/scripts"
 	@echo "You can now run '$(BINARY_NAME)' from anywhere"
 	@echo ""
-	@echo "To add timeline info to your shell prompt, see:"
-	@echo "  $(SHARE_DIR)/scripts/INSTALL_PROMPT.md"
+	@echo "To add timeline info to your shell prompt:"
+	@echo "  General instructions: $(SHARE_DIR)/scripts/INSTALL_PROMPT.md"
+	@echo "  Oh My Zsh users: $(SHARE_DIR)/scripts/oh-my-zsh-plugin/README.md"
+	@echo "  Quick Oh My Zsh install: $(SHARE_DIR)/scripts/oh-my-zsh-plugin/install.sh"
 
 uninstall:
 	@echo "Uninstalling $(BINARY_NAME) from $(INSTALL_DIR)..."
@@ -95,14 +100,19 @@ dev-install: build
 	@cp scripts/INSTALL_PROMPT.md ~/.local/share/ivaldi/scripts/
 	@cp scripts/example-bashrc.sh ~/.local/share/ivaldi/scripts/
 	@cp scripts/example-zshrc.sh ~/.local/share/ivaldi/scripts/
+	@cp -r scripts/oh-my-zsh-plugin ~/.local/share/ivaldi/scripts/
 	@chmod 755 ~/.local/share/ivaldi/scripts/ivaldi-prompt.sh
+	@chmod 755 ~/.local/share/ivaldi/scripts/oh-my-zsh-plugin/install.sh
 	@chmod 644 ~/.local/share/ivaldi/scripts/*.md ~/.local/share/ivaldi/scripts/example-*.sh
+	@chmod 644 ~/.local/share/ivaldi/scripts/oh-my-zsh-plugin/*.md ~/.local/share/ivaldi/scripts/oh-my-zsh-plugin/*.zsh*
 	@echo "$(BINARY_NAME) installed to ~/.local/bin"
 	@echo "Prompt scripts installed to ~/.local/share/ivaldi/scripts"
 	@echo "Make sure ~/.local/bin is in your PATH"
 	@echo ""
-	@echo "To add timeline info to your shell prompt, see:"
-	@echo "  ~/.local/share/ivaldi/scripts/INSTALL_PROMPT.md"
+	@echo "To add timeline info to your shell prompt:"
+	@echo "  General instructions: ~/.local/share/ivaldi/scripts/INSTALL_PROMPT.md"
+	@echo "  Oh My Zsh users: ~/.local/share/ivaldi/scripts/oh-my-zsh-plugin/README.md"
+	@echo "  Quick Oh My Zsh install: ~/.local/share/ivaldi/scripts/oh-my-zsh-plugin/install.sh"
 
 dev-uninstall:
 	@echo "Uninstalling $(BINARY_NAME) from user local bin..."
