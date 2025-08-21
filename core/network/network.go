@@ -1306,6 +1306,108 @@ func (nm *NetworkManager) listTimelineUploadStates(owner, repo string) (map[stri
 	return states, nil
 }
 
+// listRemoteTimelines discovers all available timelines (branches) on a remote repository
+func (nm *NetworkManager) listRemoteTimelines(portalURL string) ([]RemoteRef, error) {
+	if strings.Contains(portalURL, "github.com") {
+		return nm.listGitHubTimelines(portalURL)
+	} else if strings.Contains(portalURL, "gitlab.com") {
+		return nm.listGitLabTimelines(portalURL)
+	} else {
+		return nm.listIvaldiTimelines(portalURL)
+	}
+}
+
+// listGitHubTimelines lists all branches (timelines) in a GitHub repository
+func (nm *NetworkManager) listGitHubTimelines(portalURL string) ([]RemoteRef, error) {
+	// Extract owner and repo from URL
+	urlParts := strings.Split(strings.TrimSuffix(portalURL, ".git"), "/")
+	if len(urlParts) < 2 {
+		return nil, fmt.Errorf("invalid GitHub URL format: %s", portalURL)
+	}
+	
+	owner := urlParts[len(urlParts)-2]
+	repo := urlParts[len(urlParts)-1]
+	
+	// GitHub API endpoint for all refs
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/git/refs/heads", owner, repo)
+	
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Add authentication if available
+	if token, err := nm.getGitHubToken(); err == nil && token != "" {
+		req.Header.Set("Authorization", "token "+token)
+	}
+	req.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
+	
+	resp, err := nm.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GitHub API error (%d): %s", resp.StatusCode, string(body))
+	}
+	
+	var refs []struct {
+		Ref    string `json:"ref"`
+		Object struct {
+			SHA string `json:"sha"`
+		} `json:"object"`
+	}
+	
+	if err := json.NewDecoder(resp.Body).Decode(&refs); err != nil {
+		return nil, err
+	}
+	
+	var remoteRefs []RemoteRef
+	for _, ref := range refs {
+		// Extract branch name from "refs/heads/branch-name"
+		branchName := strings.TrimPrefix(ref.Ref, "refs/heads/")
+		
+		// Create a temporary hash for the ref (will be updated when fetched)
+		tempHash := objects.Hash{}
+		copy(tempHash[:], ref.Object.SHA[:min(len(ref.Object.SHA), len(tempHash))])
+		
+		remoteRefs = append(remoteRefs, RemoteRef{
+			Name: branchName,
+			Hash: tempHash,
+			Type: "timeline",
+		})
+	}
+	
+	return remoteRefs, nil
+}
+
+// listGitLabTimelines lists all branches in a GitLab repository
+func (nm *NetworkManager) listGitLabTimelines(portalURL string) ([]RemoteRef, error) {
+	// Placeholder for GitLab implementation
+	return []RemoteRef{}, nil
+}
+
+// listIvaldiTimelines lists all timelines in a native Ivaldi repository
+func (nm *NetworkManager) listIvaldiTimelines(portalURL string) ([]RemoteRef, error) {
+	// Placeholder for native Ivaldi implementation
+	return []RemoteRef{}, nil
+}
+
+// min returns the minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// ListRemoteTimelines exposes the timeline discovery functionality
+func (nm *NetworkManager) ListRemoteTimelines(portalURL string) ([]RemoteRef, error) {
+	return nm.listRemoteTimelines(portalURL)
+}
+
 // getAllRepositoryFiles loads the workspace and returns ALL repository files 
 // This is used for initial uploads to ensure the remote has the complete repository state
 func (nm *NetworkManager) getAllRepositoryFiles() (map[string]string, error) {

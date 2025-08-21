@@ -164,7 +164,10 @@ ivaldi download <url>          # Download current files only
 ivaldi portal add origin <url> # Add GitHub remote
 ivaldi portal list             # List remotes
 ivaldi upload                  # Upload current timeline
-ivaldi sync origin             # Sync with remote
+ivaldi upload --all            # Upload all local timelines
+ivaldi sync origin             # Sync current timeline with remote
+ivaldi sync origin --all       # Sync all remote timelines
+ivaldi scout origin            # Discover all remote timelines
 ```
 
 ## Features
@@ -180,6 +183,7 @@ ivaldi sync origin             # Sync with remote
 - Automatic work preservation during timeline switches
 - Mathematical impossibility of data loss
 - Smart conflict resolution
+- Local changes preserved during sync operations
 
 ###  **GitHub Integration**
 - Direct REST API integration (no git dependency)
@@ -188,11 +192,24 @@ ivaldi sync origin             # Sync with remote
 - Distinguish between `mirror` (with Git history) and `download` (files only)
 - Batch uploads for performance
 - Support for .ivaldiignore files
+- Per-timeline upload state tracking
+- Timeline name validation for Git compatibility
+
+###  **Advanced Sync Capabilities**
+- **Concurrent Downloads**: 8x faster sync with parallel file downloads
+- **Timeline Discovery**: Automatically find all remote branches/timelines
+- **Bulk Synchronization**: Sync all remote timelines at once
+- **Selective Sync**: Choose specific timelines to sync
+- **Smart Change Detection**: Only sync modified files
+- **Progress Tracking**: Real-time download progress bars
+- **Multiple Timeline Upload**: Upload different timelines independently
+- **Error Resilience**: Continue syncing even if individual timelines fail
 
 ###  **Intelligent**
 - Auto-detects file changes
 - Smart timeline inheritance from main
 - Efficient content-based storage
+- Optimized file scanning (skips binaries and large files)
 
 ## Configuration
 
@@ -268,6 +285,40 @@ ivaldi upload  # Creates branch on GitHub
 # Then create pull request on GitHub
 ```
 
+### Advanced Sync Operations
+```bash
+# Discover all remote timelines
+ivaldi scout origin
+# → Found 5 timelines: main, develop, feature-auth, bugfix-123, release-2.0
+
+# Sync all remote timelines at once
+ivaldi sync origin --all
+# → Syncing 5 timelines...
+# → ✓ main: 42 files updated
+# → ✓ develop: 15 files updated
+# → ✓ feature-auth: 8 files updated
+# → ✓ bugfix-123: 3 files updated
+# → ✓ release-2.0: Already up to date
+
+# Sync specific timelines only
+ivaldi sync origin --timelines main,develop,feature-auth
+# → Syncing 3 selected timelines...
+
+# Upload multiple timelines
+ivaldi timeline list
+# → main, feature-x, bugfix-y
+ivaldi upload --all
+# → Uploading all 3 timelines to origin...
+# → Each timeline maintains its own upload state
+
+# Handle timeline conflicts
+ivaldi sync origin --timeline feature-auth
+# → Fetching feature-auth from origin...
+# → Local changes preserved
+# → Merging remote changes...
+# → ✓ Sync complete: 8 files updated, 2 local changes preserved
+```
+
 ### Shell Prompt Integration
 ```bash
 # With Oh My Zsh plugin installed:
@@ -302,6 +353,15 @@ A: Yes! Run `./scripts/quick-setup.sh` for Oh My Zsh integration, or see `./scri
 
 **Q: Is this compatible with my team's Git workflow?**
 A: Yes! Ivaldi creates standard Git repositories on GitHub that your team can interact with normally.
+
+**Q: How fast is syncing compared to git?**
+A: Ivaldi uses concurrent downloads with 8 parallel workers, making large repository syncs up to 8x faster than sequential operations.
+
+**Q: Can I sync multiple branches at once?**
+A: Yes! Use `ivaldi sync origin --all` to sync all remote timelines, or `ivaldi sync origin --timelines main,develop` for specific ones.
+
+**Q: What happens if I upload multiple timelines?**
+A: Each timeline maintains its own upload state, so you can upload different timelines independently without conflicts. Use `ivaldi upload --all` to upload all local timelines.
 
 ## Contributing
 

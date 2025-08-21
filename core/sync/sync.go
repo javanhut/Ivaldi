@@ -518,3 +518,192 @@ func (sm *SyncManager) extractTreeToWorkingDirectory(tree *objects.Tree, targetP
 	
 	return nil
 }
+
+// SyncAllTimelines synchronizes all available timelines from a remote portal
+func (sm *SyncManager) SyncAllTimelines(portalURL string) (*SyncAllResult, error) {
+	// Step 1: Discover all remote timelines
+	remoteTimelines, err := sm.network.ListRemoteTimelines(portalURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to discover remote timelines: %v", err)
+	}
+	
+	if len(remoteTimelines) == 0 {
+		return &SyncAllResult{
+			SyncedTimelines: []string{},
+			FailedTimelines: map[string]string{},
+			TotalTimelines:  0,
+			Success:         true,
+			Message:         "No remote timelines found",
+		}, nil
+	}
+	
+	fmt.Printf("Discovered %d remote timelines: ", len(remoteTimelines))
+	for i, ref := range remoteTimelines {
+		if i > 0 {
+			fmt.Print(", ")
+		}
+		fmt.Print(ref.Name)
+	}
+	fmt.Println()
+	
+	// Step 2: Sync each timeline
+	result := &SyncAllResult{
+		SyncedTimelines: []string{},
+		FailedTimelines: make(map[string]string),
+		TotalTimelines:  len(remoteTimelines),
+	}
+	
+	for _, ref := range remoteTimelines {
+		fmt.Printf("\nSyncing timeline: %s\n", ref.Name)
+		
+		// Create sync options for this timeline
+		opts := SyncOptions{
+			RemoteTimeline: ref.Name,
+			LocalTimeline:  ref.Name, // Create/update local timeline with same name
+			Strategy:       fuse.FuseStrategyAutomatic,
+		}
+		
+		// Perform sync for this timeline
+		syncResult, err := sm.Sync(portalURL, opts)
+		if err != nil {
+			fmt.Printf("Failed to sync timeline '%s': %v\n", ref.Name, err)
+			result.FailedTimelines[ref.Name] = err.Error()
+			continue
+		}
+		
+		if syncResult.Success {
+			result.SyncedTimelines = append(result.SyncedTimelines, ref.Name)
+			fmt.Printf("Successfully synced timeline: %s\n", ref.Name)
+		} else {
+			result.FailedTimelines[ref.Name] = syncResult.Message
+		}
+	}
+	
+	// Step 3: Generate summary
+	successCount := len(result.SyncedTimelines)
+	failCount := len(result.FailedTimelines)
+	
+	result.Success = successCount > 0 // Success if at least one timeline synced
+	
+	if failCount == 0 {
+		result.Message = fmt.Sprintf("Successfully synced all %d timelines", successCount)
+	} else if successCount == 0 {
+		result.Message = fmt.Sprintf("Failed to sync all %d timelines", failCount)
+	} else {
+		result.Message = fmt.Sprintf("Synced %d timelines, failed %d timelines", successCount, failCount)
+	}
+	
+	return result, nil
+}
+
+// SyncAllResult contains the outcome of syncing all timelines
+type SyncAllResult struct {
+	SyncedTimelines []string          `json:"synced_timelines"`
+	FailedTimelines map[string]string `json:"failed_timelines"` // timeline -> error message
+	TotalTimelines  int               `json:"total_timelines"`
+	Success         bool              `json:"success"`
+	Message         string            `json:"message"`
+}
+
+// SyncSelectedTimelines synchronizes only the specified timelines from a remote portal
+func (sm *SyncManager) SyncSelectedTimelines(portalURL string, timelineNames []string) (*SyncAllResult, error) {
+	if len(timelineNames) == 0 {
+		return nil, fmt.Errorf("no timelines specified for sync")
+	}
+	
+	fmt.Printf("Syncing %d selected timelines: %v\n", len(timelineNames), timelineNames)
+	
+	// Step 1: Verify all timelines exist on remote
+	remoteTimelines, err := sm.network.ListRemoteTimelines(portalURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to discover remote timelines: %v", err)
+	}
+	
+	remoteTimelineMap := make(map[string]bool)
+	for _, ref := range remoteTimelines {
+		remoteTimelineMap[ref.Name] = true
+	}
+	
+	// Step 2: Validate requested timelines exist
+	var validTimelines []string
+	var missingTimelines []string
+	
+	for _, name := range timelineNames {
+		if remoteTimelineMap[name] {
+			validTimelines = append(validTimelines, name)
+		} else {
+			missingTimelines = append(missingTimelines, name)
+		}
+	}
+	
+	if len(missingTimelines) > 0 {
+		fmt.Printf("Warning: The following timelines do not exist on remote: %v\n", missingTimelines)
+	}
+	
+	if len(validTimelines) == 0 {
+		return &SyncAllResult{
+			SyncedTimelines: []string{},
+			FailedTimelines: map[string]string{},
+			TotalTimelines:  len(timelineNames),
+			Success:         false,
+			Message:         "None of the specified timelines exist on remote",
+		}, nil
+	}
+	
+	// Step 3: Sync valid timelines
+	result := &SyncAllResult{
+		SyncedTimelines: []string{},
+		FailedTimelines: make(map[string]string),
+		TotalTimelines:  len(validTimelines),
+	}
+	
+	// Add missing timelines to failed list
+	for _, missing := range missingTimelines {
+		result.FailedTimelines[missing] = "timeline does not exist on remote"
+	}
+	
+	for _, timelineName := range validTimelines {
+		fmt.Printf("\nSyncing timeline: %s\n", timelineName)
+		
+		// Create sync options for this timeline
+		opts := SyncOptions{
+			RemoteTimeline: timelineName,
+			LocalTimeline:  timelineName, // Create/update local timeline with same name
+			Strategy:       fuse.FuseStrategyAutomatic,
+		}
+		
+		// Perform sync for this timeline
+		syncResult, err := sm.Sync(portalURL, opts)
+		if err != nil {
+			fmt.Printf("Failed to sync timeline '%s': %v\n", timelineName, err)
+			result.FailedTimelines[timelineName] = err.Error()
+			continue
+		}
+		
+		if syncResult.Success {
+			result.SyncedTimelines = append(result.SyncedTimelines, timelineName)
+			fmt.Printf("Successfully synced timeline: %s\n", timelineName)
+		} else {
+			result.FailedTimelines[timelineName] = syncResult.Message
+		}
+	}
+	
+	// Step 4: Generate summary
+	successCount := len(result.SyncedTimelines)
+	failCount := len(result.FailedTimelines)
+	
+	result.Success = successCount > 0 // Success if at least one timeline synced
+	
+	if len(missingTimelines) > 0 && successCount > 0 {
+		result.Message = fmt.Sprintf("Synced %d timelines, %d missing from remote, %d failed", 
+			successCount, len(missingTimelines), failCount-len(missingTimelines))
+	} else if failCount == 0 {
+		result.Message = fmt.Sprintf("Successfully synced all %d timelines", successCount)
+	} else if successCount == 0 {
+		result.Message = fmt.Sprintf("Failed to sync all %d timelines", failCount)
+	} else {
+		result.Message = fmt.Sprintf("Synced %d timelines, failed %d timelines", successCount, failCount)
+	}
+	
+	return result, nil
+}
