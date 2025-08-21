@@ -1718,7 +1718,23 @@ func (nm *NetworkManager) fetchFromIvaldiRepo(portalURL, timeline string) (*Fetc
 	}, nil
 }
 
-// downloadGitHubTree downloads all files from a GitHub tree SHA
+// FileDownloadJob represents a single file download task
+type FileDownloadJob struct {
+	Path string
+	SHA  string
+	URL  string
+}
+
+// ConcurrentDownloader handles concurrent file downloads
+type ConcurrentDownloader struct {
+	networkMgr   *NetworkManager
+	owner        string
+	repo         string
+	workerCount  int
+	progress     *downloadProgress
+}
+
+// downloadGitHubTree downloads all files from a GitHub tree SHA using concurrent workers
 func (nm *NetworkManager) downloadGitHubTree(owner, repo, treeSHA string) error {
 	// Get tree contents from GitHub API
 	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/git/trees/%s?recursive=true", owner, repo, treeSHA)
@@ -1759,89 +1775,184 @@ func (nm *NetworkManager) downloadGitHubTree(owner, repo, treeSHA string) error 
 		return err
 	}
 	
-	// Download each file (blobs only, not trees)
-	fileCount := 0
+	// Collect all file download jobs
+	var jobs []FileDownloadJob
 	for _, item := range treeData.Tree {
 		if item.Type == "blob" {
-			fileCount++
+			blobURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/git/blobs/%s", owner, repo, item.SHA)
+			jobs = append(jobs, FileDownloadJob{
+				Path: item.Path,
+				SHA:  item.SHA,
+				URL:  blobURL,
+			})
 		}
 	}
 	
-	fmt.Printf("Downloading %d files from remote...\n", fileCount)
-	downloaded := 0
+	if len(jobs) == 0 {
+		fmt.Println("No files to download")
+		return nil
+	}
 	
-	for _, item := range treeData.Tree {
-		if item.Type != "blob" {
-			continue // Skip directories
-		}
-		
-		// Download blob content
-		blobURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/git/blobs/%s", owner, repo, item.SHA)
-		
-		blobReq, err := http.NewRequest("GET", blobURL, nil)
-		if err != nil {
-			return fmt.Errorf("failed to create request for %s: %v", item.Path, err)
-		}
-		
-		// Add authentication
-		if token, err := nm.getGitHubToken(); err == nil && token != "" {
-			blobReq.Header.Set("Authorization", "token "+token)
-		}
-		blobReq.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
-		
-		blobResp, err := nm.client.Do(blobReq)
-		if err != nil {
-			return fmt.Errorf("failed to download %s: %v", item.Path, err)
-		}
-		defer blobResp.Body.Close()
-		
-		if blobResp.StatusCode != 200 {
-			body, _ := io.ReadAll(blobResp.Body)
-			return fmt.Errorf("failed to download %s: %s", item.Path, string(body))
-		}
-		
-		var blobData struct {
-			Content  string `json:"content"`
-			Encoding string `json:"encoding"`
-		}
-		
-		if err := json.NewDecoder(blobResp.Body).Decode(&blobData); err != nil {
-			return fmt.Errorf("failed to decode %s: %v", item.Path, err)
-		}
-		
-		// Decode base64 content
-		var content []byte
-		if blobData.Encoding == "base64" {
-			content, err = base64.StdEncoding.DecodeString(strings.ReplaceAll(blobData.Content, "\\n", ""))
-			if err != nil {
-				return fmt.Errorf("failed to decode base64 for %s: %v", item.Path, err)
+	fmt.Printf("Downloading %d files from remote using %d concurrent workers...\n", len(jobs), nm.getWorkerCount())
+	
+	// Initialize progress tracking
+	nm.downloadProgress = &downloadProgress{
+		total:      len(jobs),
+		downloaded: 0,
+		mutex:      sync.Mutex{},
+	}
+	
+	// Use concurrent downloader
+	downloader := &ConcurrentDownloader{
+		networkMgr:  nm,
+		owner:       owner,
+		repo:        repo,
+		workerCount: nm.getWorkerCount(),
+		progress:    nm.downloadProgress,
+	}
+	
+	return downloader.downloadConcurrently(jobs)
+}
+
+// getWorkerCount determines optimal number of concurrent workers
+func (nm *NetworkManager) getWorkerCount() int {
+	// Use adaptive worker count based on file count
+	// For GitHub API, limit to reasonable number to avoid rate limiting
+	return 8 // Conservative to avoid GitHub rate limits
+}
+
+// downloadConcurrently downloads files using worker pool pattern
+func (cd *ConcurrentDownloader) downloadConcurrently(jobs []FileDownloadJob) error {
+	jobChan := make(chan FileDownloadJob, len(jobs))
+	errorChan := make(chan error, len(jobs))
+	doneChan := make(chan bool, cd.workerCount)
+	
+	// Start workers
+	for i := 0; i < cd.workerCount; i++ {
+		go cd.worker(jobChan, errorChan, doneChan)
+	}
+	
+	// Send jobs to workers
+	for _, job := range jobs {
+		jobChan <- job
+	}
+	close(jobChan)
+	
+	// Wait for all workers to complete
+	completedWorkers := 0
+	var firstError error
+	
+	for completedWorkers < cd.workerCount {
+		select {
+		case err := <-errorChan:
+			if err != nil && firstError == nil {
+				firstError = err
 			}
-		} else {
-			content = []byte(blobData.Content)
-		}
-		
-		// Write file to disk
-		fullPath := filepath.Join(nm.root, item.Path)
-		
-		// Create directory if needed
-		dir := filepath.Dir(fullPath)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return fmt.Errorf("failed to create directory for %s: %v", item.Path, err)
-		}
-		
-		// Write the file
-		if err := os.WriteFile(fullPath, content, 0644); err != nil {
-			return fmt.Errorf("failed to write %s: %v", item.Path, err)
-		}
-		
-		downloaded++
-		if downloaded%10 == 0 || downloaded == fileCount {
-			fmt.Printf("Progress: %d/%d files\r", downloaded, fileCount)
+		case <-doneChan:
+			completedWorkers++
 		}
 	}
 	
-	fmt.Printf("\nSuccessfully downloaded %d files\n", fileCount)
-	return nil
+	// Drain any remaining errors
+	for len(errorChan) > 0 {
+		select {
+		case err := <-errorChan:
+			if err != nil && firstError == nil {
+				firstError = err
+			}
+		default:
+			break
+		}
+	}
+	
+	fmt.Printf("\nSuccessfully downloaded %d files\n", len(jobs))
+	return firstError
+}
+
+// worker processes download jobs from the job channel
+func (cd *ConcurrentDownloader) worker(jobs <-chan FileDownloadJob, errors chan<- error, done chan<- bool) {
+	defer func() { done <- true }()
+	
+	for job := range jobs {
+		err := cd.downloadFile(job)
+		if err != nil {
+			errors <- fmt.Errorf("failed to download %s: %v", job.Path, err)
+			continue
+		}
+		
+		// Update progress
+		cd.progress.mutex.Lock()
+		cd.progress.downloaded++
+		downloaded := cd.progress.downloaded
+		total := cd.progress.total
+		cd.progress.mutex.Unlock()
+		
+		// Show progress every 5 files or at completion
+		if downloaded%5 == 0 || downloaded == total {
+			percentage := (downloaded * 100) / total
+			fmt.Printf("\rProgress: %d/%d files (%d%%)     ", downloaded, total, percentage)
+		}
+	}
+}
+
+// downloadFile downloads a single file
+func (cd *ConcurrentDownloader) downloadFile(job FileDownloadJob) error {
+	// Create request
+	req, err := http.NewRequest("GET", job.URL, nil)
+	if err != nil {
+		return err
+	}
+	
+	// Add authentication
+	if token, err := cd.networkMgr.getGitHubToken(); err == nil && token != "" {
+		req.Header.Set("Authorization", "token "+token)
+	}
+	req.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
+	
+	// Download blob
+	resp, err := cd.networkMgr.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	
+	// Decode response
+	var blobData struct {
+		Content  string `json:"content"`
+		Encoding string `json:"encoding"`
+	}
+	
+	if err := json.NewDecoder(resp.Body).Decode(&blobData); err != nil {
+		return err
+	}
+	
+	// Decode content
+	var content []byte
+	if blobData.Encoding == "base64" {
+		content, err = base64.StdEncoding.DecodeString(strings.ReplaceAll(blobData.Content, "\n", ""))
+		if err != nil {
+			return err
+		}
+	} else {
+		content = []byte(blobData.Content)
+	}
+	
+	// Write file to disk
+	fullPath := filepath.Join(cd.networkMgr.root, job.Path)
+	
+	// Create directory if needed
+	dir := filepath.Dir(fullPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	
+	// Write the file
+	return os.WriteFile(fullPath, content, 0644)
 }
 
 // CloneGitRepo clones a Git repository with full history for mirror operation

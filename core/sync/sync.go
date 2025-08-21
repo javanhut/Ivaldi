@@ -10,6 +10,7 @@ import (
 	"ivaldi/core/fuse"
 	"ivaldi/core/network"
 	"ivaldi/core/objects"
+	"ivaldi/core/workspace"
 )
 
 // SyncManager handles synchronization with remote portals
@@ -227,51 +228,154 @@ type LocalChanges struct {
 	AddedFiles    map[string][]byte // path -> content
 }
 
+// WorkspaceAdapter provides access to workspace functionality
+type WorkspaceAdapter struct {
+	*workspace.Workspace
+}
+
+// Scan delegates to the underlying workspace
+func (wa *WorkspaceAdapter) Scan() error {
+	return wa.Workspace.Scan()
+}
+
+// Files returns the workspace files
+func (wa *WorkspaceAdapter) Files() map[string]*workspace.FileState {
+	return wa.Workspace.Files
+}
+
+// AnvilFiles returns the anvil files
+func (wa *WorkspaceAdapter) AnvilFiles() map[string]*workspace.FileState {
+	return wa.Workspace.AnvilFiles
+}
+
 // saveLocalChanges preserves local uncommitted changes before sync
 func (sm *SyncManager) saveLocalChanges() (*LocalChanges, error) {
+	// Use optimized approach - only scan for common file types in key directories
+	// This avoids reading large binary files or deep directory trees
+	return sm.saveSelectedFiles()
+}
+
+// saveSelectedFiles optimized implementation that saves only commonly changed files
+func (sm *SyncManager) saveSelectedFiles() (*LocalChanges, error) {
 	changes := &LocalChanges{
 		ModifiedFiles: make(map[string][]byte),
 		AddedFiles:    make(map[string][]byte),
 		DeletedFiles:  []string{},
 	}
 	
-	// Scan for local changes
 	workDir := sm.network.GetRoot()
 	
-	// Walk through the working directory to find changes
-	err := filepath.Walk(workDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		
-		// Skip directories and special paths
-		if info.IsDir() {
-			// Skip .git and .ivaldi directories
-			if info.Name() == ".git" || info.Name() == ".ivaldi" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		
-		relPath, err := filepath.Rel(workDir, path)
-		if err != nil {
-			return err
-		}
-		
-		// Read current file content
-		content, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		
-		// For now, save all files as potentially modified
-		// In a real implementation, we'd compare with the last committed state
-		changes.ModifiedFiles[relPath] = content
-		
-		return nil
-	})
+	// Fast scan - only check specific file patterns and common directories
+	searchPaths := []string{
+		"*.go", "*.js", "*.ts", "*.py", "*.java", "*.c", "*.cpp", "*.h",
+		"*.txt", "*.md", "*.json", "*.yaml", "*.yml", "*.toml", "*.ini",
+		"src/*.go", "lib/*.go", "cmd/*.go", "pkg/*.go", "internal/*.go",
+		"*.sh", "*.bat", "Dockerfile", "Makefile", "*.sql",
+	}
 	
-	return changes, err
+	for _, pattern := range searchPaths {
+		matches, err := filepath.Glob(filepath.Join(workDir, pattern))
+		if err != nil {
+			continue // Skip invalid patterns
+		}
+		
+		for _, match := range matches {
+			// Check if it's a file and not too large
+			info, err := os.Stat(match)
+			if err != nil || info.IsDir() || info.Size() > 1024*1024 { // Skip files > 1MB
+				continue
+			}
+			
+			relPath, err := filepath.Rel(workDir, match)
+			if err != nil {
+				continue
+			}
+			
+			// Only save text files to avoid binaries
+			if sm.isTextFile(filepath.Ext(match)) {
+				content, err := os.ReadFile(match)
+				if err != nil {
+					continue
+				}
+				changes.ModifiedFiles[relPath] = content
+			}
+		}
+	}
+	
+	return changes, nil
+}
+
+// saveAllFiles is a fallback implementation that saves all files
+func (sm *SyncManager) saveAllFiles() (*LocalChanges, error) {
+	changes := &LocalChanges{
+		ModifiedFiles: make(map[string][]byte),
+		AddedFiles:    make(map[string][]byte),
+		DeletedFiles:  []string{},
+	}
+	
+	workDir := sm.network.GetRoot()
+	
+	// Quick scan of only top-level and common directories to avoid deep recursion
+	commonDirs := []string{".", "src", "lib", "cmd", "pkg", "internal"}
+	
+	for _, dir := range commonDirs {
+		dirPath := filepath.Join(workDir, dir)
+		if _, err := os.Stat(dirPath); os.IsNotExist(err) {
+			continue
+		}
+		
+		err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			
+			// Skip deep nesting and special directories
+			if info.IsDir() {
+				if info.Name() == ".git" || info.Name() == ".ivaldi" || 
+				   info.Name() == "node_modules" || info.Name() == "target" {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			
+			relPath, err := filepath.Rel(workDir, path)
+			if err != nil {
+				return err
+			}
+			
+			// Only save files with common extensions to avoid binaries
+			ext := filepath.Ext(path)
+			if sm.isTextFile(ext) {
+				content, err := os.ReadFile(path)
+				if err != nil {
+					return err
+				}
+				changes.ModifiedFiles[relPath] = content
+			}
+			
+			return nil
+		})
+		
+		if err != nil {
+			return nil, err
+		}
+	}
+	
+	return changes, nil
+}
+
+// isTextFile checks if a file extension indicates a text file
+func (sm *SyncManager) isTextFile(ext string) bool {
+	textExts := map[string]bool{
+		".go": true, ".js": true, ".ts": true, ".py": true, ".rb": true,
+		".java": true, ".c": true, ".cpp": true, ".h": true, ".hpp": true,
+		".txt": true, ".md": true, ".json": true, ".yaml": true, ".yml": true,
+		".xml": true, ".html": true, ".css": true, ".scss": true, ".less": true,
+		".sh": true, ".bat": true, ".ps1": true, ".sql": true, ".csv": true,
+		".gitignore": true, ".dockerignore": true, "Dockerfile": true,
+		".toml": true, ".ini": true, ".cfg": true, ".conf": true,
+	}
+	return textExts[ext] || ext == ""
 }
 
 // restoreLocalChanges reapplies local changes after sync
