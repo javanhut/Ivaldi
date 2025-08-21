@@ -501,8 +501,24 @@ func (er *EnhancedRepository) GetStatus() *WorkspaceStatus {
 
 // GetHistory returns recent seals
 func (er *EnhancedRepository) GetHistory(limit int) []*objects.Seal {
-	// Basic history implementation - would load from storage
-	return []*objects.Seal{} // Placeholder
+	// Get seal hashes from index
+	hashes, err := er.index.GetSealHistory(limit)
+	if err != nil {
+		return []*objects.Seal{} // Return empty on error
+	}
+	
+	var seals []*objects.Seal
+	
+	// Load each seal from storage
+	for _, hash := range hashes {
+		seal, err := er.storage.LoadSeal(hash)
+		if err != nil {
+			continue // Skip seals that can't be loaded
+		}
+		seals = append(seals, seal)
+	}
+	
+	return seals
 }
 
 // ListPortals returns configured portals

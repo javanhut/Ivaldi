@@ -81,6 +81,9 @@ func (s *Storage) LoadSeal(hash objects.Hash) (*objects.Seal, error) {
 		return nil, err
 	}
 
+	// Ensure the seal has the correct hash set
+	seal.Hash = hash
+
 	return &seal, nil
 }
 

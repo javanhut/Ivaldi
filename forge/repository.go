@@ -368,9 +368,14 @@ func (r *Repository) importCommitsForBranch(branchName string) (map[string]objec
 			Parents:   parentHashes,
 		}
 		
-		// Store the seal
+		// Store the seal (this will set seal.Hash)
 		if err := r.storage.StoreSeal(seal); err != nil {
 			return nil, fmt.Errorf("failed to store seal for commit %s: %v", gitSHA[:8], err)
+		}
+		
+		// Verify the seal hash was set properly
+		if seal.Hash.IsZero() {
+			return nil, fmt.Errorf("seal hash was not set during storage for commit %s", gitSHA[:8])
 		}
 		
 		// Index the seal
@@ -378,7 +383,7 @@ func (r *Repository) importCommitsForBranch(branchName string) (map[string]objec
 			return nil, fmt.Errorf("failed to index seal for commit %s: %v", gitSHA[:8], err)
 		}
 		
-		// Register memorable name
+		// Register memorable name with the properly set hash
 		if err := r.refMgr.RegisterMemorableName(seal.Name, seal.Hash, authorName); err != nil {
 			return nil, fmt.Errorf("failed to register memorable name for commit %s: %v", gitSHA[:8], err)
 		}
@@ -431,12 +436,17 @@ func (r *Repository) createTreeFromWorkspace() (objects.Hash, error) {
 			return err
 		}
 		
-		// Skip .git and .ivaldi directories
+		// Skip .git and .ivaldi directories  
 		if strings.HasPrefix(relPath, ".git/") || strings.HasPrefix(relPath, ".ivaldi/") ||
-		   relPath == ".git" || relPath == ".ivaldi" || relPath == "." {
+		   relPath == ".git" || relPath == ".ivaldi" {
 			if info.IsDir() {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		
+		// Skip the root directory itself but continue walking
+		if relPath == "." {
 			return nil
 		}
 		
@@ -2071,8 +2081,6 @@ func (r *Repository) RestoreWorkingDirectory(targetHash objects.Hash) error {
 		return fmt.Errorf("failed to load seal: %v", err)
 	}
 
-	// Debug: check the seal's position
-	fmt.Printf("Debug: seal position: %s\n", seal.Position.String())
 
 	// Check if seal has a valid position set
 	emptyPos := objects.Hash{}
