@@ -708,16 +708,21 @@ func (nm *NetworkManager) uploadToGitHub(portalURL, timeline string, seals []*ob
 		return fmt.Errorf("no seals to upload")
 	}
 	
-	fmt.Printf("Uploading to GitHub repo: %s/%s\n", owner, repo)
+	// Validate timeline name for GitHub branch compatibility
+	if err := nm.validateTimelineName(timeline); err != nil {
+		return fmt.Errorf("invalid timeline name '%s': %v", timeline, err)
+	}
+	
+	fmt.Printf("Uploading to GitHub repo: %s/%s (timeline: %s)\n", owner, repo, timeline)
 	
 	// Get files that have changed and need to be uploaded
-	changedFiles, allFiles, isFirstUpload, err := nm.getFilesForUpload(owner, repo, seals)
+	changedFiles, allFiles, isFirstUpload, err := nm.getFilesForUpload(owner, repo, timeline, seals)
 	if err != nil {
 		return fmt.Errorf("failed to get files for upload: %v", err)
 	}
 	
 	if len(changedFiles) == 0 {
-		fmt.Println("Repository is already up-to-date with remote")
+		fmt.Printf("Timeline '%s' is already up-to-date with remote\n", timeline)
 		return nil
 	}
 	
@@ -728,7 +733,7 @@ func (nm *NetworkManager) uploadToGitHub(portalURL, timeline string, seals []*ob
 	} else {
 		fmt.Printf("Changed: %d files (of %d total)\n", len(changedFiles), len(allFiles))
 	}
-	fmt.Printf("%s %d files to GitHub repo: %s/%s\n", action, len(allFiles), owner, repo)
+	fmt.Printf("%s %d files to GitHub repo: %s/%s (timeline: %s)\n", action, len(allFiles), owner, repo, timeline)
 	
 	latestSeal := seals[len(seals)-1]
 	err = nm.uploadCompleteRepositoryState(owner, repo, timeline, latestSeal, allFiles, changedFiles)
@@ -737,7 +742,7 @@ func (nm *NetworkManager) uploadToGitHub(portalURL, timeline string, seals []*ob
 	}
 	
 	// Save upload state after successful upload
-	return nm.saveUploadStateAfterUpload(owner, repo, latestSeal, allFiles)
+	return nm.saveUploadStateAfterUpload(owner, repo, timeline, latestSeal, allFiles)
 }
 
 // uploadToGitLab uploads changes to GitLab using their API
@@ -1082,7 +1087,7 @@ func (nm *NetworkManager) uploadFilesBatchWithProgress(owner, repo, timeline str
 	err = nm.createOrUpdateReference(owner, repo, "heads/"+timeline, commitSHA)
 	if err != nil {
 		fmt.Println("Failed")
-		return fmt.Errorf("failed to set branch: %v", err)
+		return fmt.Errorf("failed to set branch '%s': %v", timeline, err)
 	}
 	fmt.Println("Done")
 	
@@ -1100,13 +1105,14 @@ func (nm *NetworkManager) uploadFilesBatch(owner, repo string, files []FileToUpl
 
 // UploadState tracks what was last uploaded to avoid redundant uploads
 type UploadState struct {
+	Timeline         string            `json:"timeline"`
 	LastUploadedSeal string            `json:"last_uploaded_seal"`
 	LastUploadTime   time.Time         `json:"last_upload_time"`
 	FileHashes       map[string]string `json:"file_hashes"` // path -> hash
 }
 
 // getFilesForUpload returns changed files and all files for smart incremental upload
-func (nm *NetworkManager) getFilesForUpload(owner, repo string, seals []*objects.Seal) (map[string]string, map[string]string, bool, error) {
+func (nm *NetworkManager) getFilesForUpload(owner, repo, timeline string, seals []*objects.Seal) (map[string]string, map[string]string, bool, error) {
 	store, err := local.NewStore(nm.root, objects.BLAKE3)
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("failed to create store: %v", err)
@@ -1125,7 +1131,7 @@ func (nm *NetworkManager) getFilesForUpload(owner, repo string, seals []*objects
 	}
 
 	// Load previous upload state
-	uploadState, err := nm.loadUploadState(owner, repo)
+	uploadState, err := nm.loadUploadState(owner, repo, timeline)
 	if err != nil {
 		// First upload - all files are "changed"
 		return allFiles, allFiles, true, nil
@@ -1169,9 +1175,9 @@ func (nm *NetworkManager) getFilesForUpload(owner, repo string, seals []*objects
 	return changedFiles, allFiles, false, nil
 }
 
-// loadUploadState loads the last upload state for a repository
-func (nm *NetworkManager) loadUploadState(owner, repo string) (*UploadState, error) {
-	statePath := filepath.Join(nm.root, ".ivaldi", "upload_state", fmt.Sprintf("%s_%s.json", owner, repo))
+// loadUploadState loads the last upload state for a repository timeline
+func (nm *NetworkManager) loadUploadState(owner, repo, timeline string) (*UploadState, error) {
+	statePath := filepath.Join(nm.root, ".ivaldi", "upload_state", fmt.Sprintf("%s_%s_%s.json", owner, repo, timeline))
 	
 	data, err := os.ReadFile(statePath)
 	if err != nil {
@@ -1187,13 +1193,13 @@ func (nm *NetworkManager) loadUploadState(owner, repo string) (*UploadState, err
 }
 
 // saveUploadState saves the upload state after successful upload
-func (nm *NetworkManager) saveUploadState(owner, repo string, state *UploadState) error {
+func (nm *NetworkManager) saveUploadState(owner, repo, timeline string, state *UploadState) error {
 	stateDir := filepath.Join(nm.root, ".ivaldi", "upload_state")
 	if err := os.MkdirAll(stateDir, 0755); err != nil {
 		return err
 	}
 	
-	statePath := filepath.Join(stateDir, fmt.Sprintf("%s_%s.json", owner, repo))
+	statePath := filepath.Join(stateDir, fmt.Sprintf("%s_%s_%s.json", owner, repo, timeline))
 	
 	data, err := json.Marshal(state)
 	if err != nil {
@@ -1204,7 +1210,7 @@ func (nm *NetworkManager) saveUploadState(owner, repo string, state *UploadState
 }
 
 // saveUploadStateAfterUpload creates and saves upload state after successful upload
-func (nm *NetworkManager) saveUploadStateAfterUpload(owner, repo string, seal *objects.Seal, allFiles map[string]string) error {
+func (nm *NetworkManager) saveUploadStateAfterUpload(owner, repo, timeline string, seal *objects.Seal, allFiles map[string]string) error {
 	store, err := local.NewStore(nm.root, objects.BLAKE3)
 	if err != nil {
 		return fmt.Errorf("failed to create store: %v", err)
@@ -1223,12 +1229,81 @@ func (nm *NetworkManager) saveUploadStateAfterUpload(owner, repo string, seal *o
 	}
 	
 	state := &UploadState{
+		Timeline:         timeline,
 		LastUploadedSeal: seal.Name,
 		LastUploadTime:   time.Now(),
 		FileHashes:       fileHashes,
 	}
 	
-	return nm.saveUploadState(owner, repo, state)
+	return nm.saveUploadState(owner, repo, timeline, state)
+}
+
+// validateTimelineName validates that a timeline name is compatible with Git branch naming
+func (nm *NetworkManager) validateTimelineName(timeline string) error {
+	if timeline == "" {
+		return fmt.Errorf("timeline name cannot be empty")
+	}
+	
+	// Git branch name restrictions
+	invalidChars := []string{" ", "~", "^", ":", "?", "*", "[", "\\", "..", "@{", "//"}
+	for _, char := range invalidChars {
+		if strings.Contains(timeline, char) {
+			return fmt.Errorf("timeline name contains invalid character '%s'", char)
+		}
+	}
+	
+	// Cannot start or end with certain characters
+	if strings.HasPrefix(timeline, ".") || strings.HasSuffix(timeline, ".") {
+		return fmt.Errorf("timeline name cannot start or end with '.'")
+	}
+	
+	if strings.HasPrefix(timeline, "/") || strings.HasSuffix(timeline, "/") {
+		return fmt.Errorf("timeline name cannot start or end with '/'")
+	}
+	
+	if strings.HasSuffix(timeline, ".lock") {
+		return fmt.Errorf("timeline name cannot end with '.lock'")
+	}
+	
+	// Length restrictions
+	if len(timeline) > 255 {
+		return fmt.Errorf("timeline name too long (max 255 characters)")
+	}
+	
+	return nil
+}
+
+// listTimelineUploadStates lists all timeline upload states for a repository
+func (nm *NetworkManager) listTimelineUploadStates(owner, repo string) (map[string]*UploadState, error) {
+	stateDir := filepath.Join(nm.root, ".ivaldi", "upload_state")
+	pattern := fmt.Sprintf("%s_%s_*.json", owner, repo)
+	
+	matches, err := filepath.Glob(filepath.Join(stateDir, pattern))
+	if err != nil {
+		return nil, err
+	}
+	
+	states := make(map[string]*UploadState)
+	
+	for _, match := range matches {
+		// Extract timeline from filename: owner_repo_timeline.json
+		basename := filepath.Base(match)
+		parts := strings.Split(strings.TrimSuffix(basename, ".json"), "_")
+		if len(parts) < 3 {
+			continue // Invalid filename format
+		}
+		timeline := strings.Join(parts[2:], "_") // Handle timeline names with underscores
+		
+		state, err := nm.loadUploadState(owner, repo, timeline)
+		if err != nil {
+			fmt.Printf("Warning: failed to load upload state for timeline '%s': %v\n", timeline, err)
+			continue
+		}
+		
+		states[timeline] = state
+	}
+	
+	return states, nil
 }
 
 // getAllRepositoryFiles loads the workspace and returns ALL repository files 
@@ -1498,10 +1573,12 @@ func (nm *NetworkManager) createOrUpdateReference(owner, repo, ref, sha string) 
 	err := nm.updateReference(owner, repo, ref, sha)
 	if err != nil {
 		// If update failed because reference doesn't exist, create it
-		if strings.Contains(err.Error(), "Reference does not exist") {
+		if strings.Contains(err.Error(), "Reference does not exist") || 
+		   strings.Contains(err.Error(), "Not Found") {
+			fmt.Printf(" (creating new branch)")
 			return nm.createReference(owner, repo, ref, sha)
 		}
-		return err
+		return fmt.Errorf("failed to update reference: %v", err)
 	}
 	return nil
 }
