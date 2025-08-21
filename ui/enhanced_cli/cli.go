@@ -78,6 +78,7 @@ Workshop Commands:
   portal                   Manage remote connections
   upload [branch]          Upload current branch to portal
   sync <timeline> --with <remote>  Sync local timeline with remote timeline
+  scout [portal]           Discover remote timelines
   
 Natural Language Examples:
   jump to "yesterday before lunch"
@@ -164,6 +165,7 @@ func (ec *EnhancedCLI) addEnhancedCommands(rootCmd *cobra.Command) {
 	rootCmd.AddCommand(ec.createPortalCommand())
 	rootCmd.AddCommand(ec.createUploadCommand())
 	rootCmd.AddCommand(ec.createSyncCommand())
+	rootCmd.AddCommand(ec.createScoutCommand())
 	
 	// Information commands
 	rootCmd.AddCommand(ec.createStatusCommand())
@@ -1192,6 +1194,108 @@ Examples:
 
 	cmd.Flags().StringP("with", "w", "", "Remote timeline to sync with (required)")
 	cmd.MarkFlagRequired("with")
+
+	return cmd
+}
+
+// Create scout command (discover remote timelines)
+func (ec *EnhancedCLI) createScoutCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "scout [portal-name]",
+		Short: "Discover remote timelines (branches)",
+		Long: `Scout discovers all available timelines on a remote repository.
+
+This command lists all branches/timelines that exist on the remote portal,
+helping you understand what timelines are available for syncing.
+
+Examples:
+  ivaldi scout                    # Scout default portal (origin)
+  ivaldi scout origin             # Scout origin portal
+  ivaldi scout upstream           # Scout upstream portal
+  
+The output shows:
+- Timeline names
+- Latest commit information
+- Whether each timeline exists locally`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if ec.currentRepo == nil {
+				return fmt.Errorf("not in repository")
+			}
+
+			// Get portal name (default to "origin")
+			portalName := "origin"
+			if len(args) > 0 {
+				portalName = args[0]
+			}
+
+			// Get portal URL
+			portals := ec.currentRepo.ListPortals()
+			portalURL, exists := portals[portalName]
+			if !exists {
+				ec.output.Error(fmt.Sprintf("Portal '%s' not configured", portalName), []string{
+					fmt.Sprintf("Add it with: ivaldi portal add %s <url>", portalName),
+					"List portals with: ivaldi portal list",
+				})
+				return fmt.Errorf("portal not found: %s", portalName)
+			}
+
+			ec.output.Info(fmt.Sprintf("Scouting remote timelines from %s...", portalName))
+			ec.output.Info(fmt.Sprintf("Portal URL: %s", portalURL))
+			ec.output.Info("")
+
+			// Use the network manager to discover remote timelines
+			remoteTimelines, err := ec.currentRepo.DiscoverRemoteTimelines(portalURL)
+			if err != nil {
+				ec.output.Error("Failed to discover remote timelines", []string{
+					"Check network connection",
+					"Verify portal URL and credentials",
+					"Ensure the repository is accessible",
+					fmt.Sprintf("Portal: %s (%s)", portalName, portalURL),
+				})
+				return err
+			}
+
+			if len(remoteTimelines) == 0 {
+				ec.output.Warning("No timelines found on remote portal")
+				return nil
+			}
+
+			// Get local timelines for comparison
+			localTimelines := ec.currentRepo.ListTimelines()
+			localMap := make(map[string]bool)
+			for _, timeline := range localTimelines {
+				localMap[timeline] = true
+			}
+
+			// Display discovered timelines
+			ec.output.Success(fmt.Sprintf("Found %d remote timeline(s):", len(remoteTimelines)))
+			ec.output.Info("")
+			
+			for _, ref := range remoteTimelines {
+				status := "remote only"
+				statusSymbol := "↓"
+				if localMap[ref.Name] {
+					status = "exists locally"
+					statusSymbol = "✓"
+				}
+				
+				// Format the output
+				ec.output.Info(fmt.Sprintf("  %s %s (%s)", statusSymbol, ref.Name, status))
+			}
+
+			ec.output.Info("")
+			ec.output.Info("Legend:")
+			ec.output.Info("  ✓ = Timeline exists locally")
+			ec.output.Info("  ↓ = Remote timeline not synced locally")
+			ec.output.Info("")
+			ec.output.Info("Next steps:")
+			ec.output.Info(fmt.Sprintf("  Sync a timeline: ivaldi sync <timeline> --with <remote-timeline>"))
+			ec.output.Info(fmt.Sprintf("  Sync all: ivaldi sync --all %s", portalName))
+			ec.output.Info(fmt.Sprintf("  Create local timeline: ivaldi timeline create <name>"))
+
+			return nil
+		},
+	}
 
 	return cmd
 }

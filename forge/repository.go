@@ -1401,6 +1401,13 @@ func (r *Repository) Sync(portalName, localTimeline, remoteTimeline string) erro
 	return nil
 }
 
+// DiscoverRemoteTimelines discovers all available timelines on a remote repository
+func (r *Repository) DiscoverRemoteTimelines(portalURL string) ([]network.RemoteRef, error) {
+	// Use the network manager to discover remote timelines
+	networkMgr := network.NewNetworkManager(r.root)
+	return networkMgr.ListRemoteTimelines(portalURL)
+}
+
 func (r *Repository) exportToGit() error {
 	// Add all files to git
 	cmd := exec.Command("git", "add", ".")
