@@ -286,3 +286,23 @@ func (m *Manager) save() error {
 
 	return os.WriteFile(configPath, data, 0644)
 }
+
+// AddMemorableName adds a memorable name mapping for a hash
+func (m *Manager) AddMemorableName(hash objects.Hash, name string) {
+	m.nameMap[hash] = name
+}
+
+// SyncMemorableNamesFromReference syncs memorable names from reference manager
+func (m *Manager) SyncMemorableNamesFromReference(getNameFunc func(objects.Hash) (string, bool)) {
+	// Sync names for all hashes in our history
+	for _, pos := range m.history {
+		if name, exists := getNameFunc(pos.Hash); exists {
+			m.nameMap[pos.Hash] = name
+		}
+	}
+	
+	// Sync current position name
+	if name, exists := getNameFunc(m.current.Hash); exists {
+		m.nameMap[m.current.Hash] = name
+	}
+}

@@ -106,6 +106,11 @@ func (m *Manager) Get(name string) (*Timeline, bool) {
 	return timeline, exists
 }
 
+func (m *Manager) Exists(name string) bool {
+	_, exists := m.timelines[name]
+	return exists
+}
+
 func (m *Manager) UpdateHead(name string, hash objects.Hash) error {
 	timeline, exists := m.timelines[name]
 	if !exists {

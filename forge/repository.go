@@ -176,11 +176,135 @@ func (r *Repository) importGitHistory() error {
 		return fmt.Errorf("no Git repository found")
 	}
 	
-	// Get Git log in reverse chronological order (oldest first)
-	cmd := exec.Command("git", "-C", r.root, "log", "--reverse", "--pretty=format:%H|%P|%an|%ae|%at|%s")
+	// First, get all Git branches and import them as timelines
+	if err := r.importGitBranches(); err != nil {
+		return fmt.Errorf("failed to import Git branches: %v", err)
+	}
+	
+	// Get current Git branch to know which timeline to activate
+	currentBranchCmd := exec.Command("git", "-C", r.root, "branch", "--show-current")
+	currentBranchOutput, err := currentBranchCmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to get current Git branch: %v", err)
+	}
+	currentBranch := strings.TrimSpace(string(currentBranchOutput))
+	if currentBranch == "" {
+		currentBranch = "main" // fallback
+	}
+	
+	// Import commits for all branches
+	branchesCmd := exec.Command("git", "-C", r.root, "branch", "-r")
+	branchOutput, err := branchesCmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to list Git branches: %v", err)
+	}
+	
+	branchLines := strings.Split(string(branchOutput), "\n")
+	allCommitMaps := make(map[string]map[string]objects.Hash) // branch -> (Git SHA -> Ivaldi Hash)
+	
+	for _, branchLine := range branchLines {
+		branchName := strings.TrimSpace(branchLine)
+		if branchName == "" || strings.Contains(branchName, "HEAD") {
+			continue
+		}
+		
+		// Remove origin/ prefix if present
+		if strings.HasPrefix(branchName, "origin/") {
+			branchName = strings.TrimPrefix(branchName, "origin/")
+		}
+		
+		// Import commits for this branch
+		commitMap, err := r.importCommitsForBranch(branchName)
+		if err != nil {
+			fmt.Printf("Warning: failed to import commits for branch %s: %v\n", branchName, err)
+			continue
+		}
+		
+		allCommitMaps[branchName] = commitMap
+		fmt.Printf("Imported %d commits for branch %s\n", len(commitMap), branchName)
+	}
+	
+	// Switch to the current Git branch timeline
+	if err := r.timeline.Switch(currentBranch); err != nil {
+		fmt.Printf("Warning: failed to switch to timeline %s: %v\n", currentBranch, err)
+	} else {
+		// Set position to the HEAD of current branch
+		if commitMap, exists := allCommitMaps[currentBranch]; exists && len(commitMap) > 0 {
+			// Get HEAD commit of current branch
+			headCmd := exec.Command("git", "-C", r.root, "rev-parse", "HEAD")
+			headOutput, err := headCmd.Output()
+			if err == nil {
+				headSHA := strings.TrimSpace(string(headOutput))
+				if ivaldiHash, exists := commitMap[headSHA]; exists {
+					if err := r.position.SetPosition(ivaldiHash, currentBranch); err != nil {
+						fmt.Printf("Warning: failed to set position to HEAD: %v\n", err)
+					}
+				}
+			}
+		}
+	}
+	
+	totalCommits := 0
+	for _, commitMap := range allCommitMaps {
+		totalCommits += len(commitMap)
+	}
+	
+	// Sync memorable names between reference manager and position manager
+	r.position.SyncMemorableNamesFromReference(r.refMgr.GetMemorableName)
+	
+	fmt.Printf("Successfully imported %d Git commits across %d branches to Ivaldi\n", totalCommits, len(allCommitMaps))
+	return nil
+}
+
+// importGitBranches creates Ivaldi timelines for all Git branches
+func (r *Repository) importGitBranches() error {
+	// Get all Git branches (local and remote)
+	branchesCmd := exec.Command("git", "-C", r.root, "branch", "-a")
+	output, err := branchesCmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to list Git branches: %v", err)
+	}
+	
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		branchName := strings.TrimSpace(line)
+		if branchName == "" {
+			continue
+		}
+		
+		// Remove markers and prefixes
+		branchName = strings.TrimPrefix(branchName, "* ")
+		branchName = strings.TrimPrefix(branchName, "  ")
+		branchName = strings.TrimPrefix(branchName, "remotes/origin/")
+		
+		// Skip HEAD references
+		if strings.Contains(branchName, "HEAD") || branchName == "" {
+			continue
+		}
+		
+		// Create timeline if it doesn't exist
+		if !r.timeline.Exists(branchName) {
+			if err := r.timeline.Create(branchName, fmt.Sprintf("Imported from Git branch %s", branchName)); err != nil {
+				fmt.Printf("Warning: failed to create timeline %s: %v\n", branchName, err)
+			}
+		}
+	}
+	
+	return nil
+}
+
+// importCommitsForBranch imports all commits for a specific Git branch
+func (r *Repository) importCommitsForBranch(branchName string) (map[string]objects.Hash, error) {
+	// Get Git log for this specific branch in reverse chronological order (oldest first)
+	cmd := exec.Command("git", "-C", r.root, "log", "--reverse", "--pretty=format:%H|%P|%an|%ae|%at|%s", "origin/"+branchName)
 	output, err := cmd.Output()
 	if err != nil {
-		return fmt.Errorf("failed to get Git log: %v", err)
+		// Try without origin/ prefix
+		cmd = exec.Command("git", "-C", r.root, "log", "--reverse", "--pretty=format:%H|%P|%an|%ae|%at|%s", branchName)
+		output, err = cmd.Output()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get Git log for branch %s: %v", branchName, err)
+		}
 	}
 	
 	lines := strings.Split(string(output), "\n")
@@ -205,14 +329,6 @@ func (r *Repository) importGitHistory() error {
 		
 		// Convert timestamp
 		ts, _ := strconv.ParseInt(timestamp, 10, 64)
-		
-		// Get tree for this commit (info only - not used in current implementation)
-		treeCmd := exec.Command("git", "-C", r.root, "show", "--format=", "--name-only", gitSHA)
-		_, err = treeCmd.Output()
-		if err != nil {
-			fmt.Printf("Warning: failed to get tree for commit %s: %v\n", gitSHA[:8], err)
-			continue
-		}
 		
 		// Checkout this specific commit temporarily
 		checkoutCmd := exec.Command("git", "-C", r.root, "checkout", gitSHA, "--quiet")
@@ -254,29 +370,29 @@ func (r *Repository) importGitHistory() error {
 		
 		// Store the seal
 		if err := r.storage.StoreSeal(seal); err != nil {
-			return fmt.Errorf("failed to store seal for commit %s: %v", gitSHA[:8], err)
+			return nil, fmt.Errorf("failed to store seal for commit %s: %v", gitSHA[:8], err)
 		}
 		
 		// Index the seal
 		if err := r.index.IndexSeal(seal); err != nil {
-			return fmt.Errorf("failed to index seal for commit %s: %v", gitSHA[:8], err)
+			return nil, fmt.Errorf("failed to index seal for commit %s: %v", gitSHA[:8], err)
 		}
 		
 		// Register memorable name
 		if err := r.refMgr.RegisterMemorableName(seal.Name, seal.Hash, authorName); err != nil {
-			return fmt.Errorf("failed to register memorable name for commit %s: %v", gitSHA[:8], err)
+			return nil, fmt.Errorf("failed to register memorable name for commit %s: %v", gitSHA[:8], err)
+		}
+		
+		// Add memorable name to position manager as well
+		r.position.AddMemorableName(seal.Hash, seal.Name)
+		
+		// Add this commit to position history for this timeline
+		if err := r.position.SetPosition(seal.Hash, branchName); err != nil {
+			fmt.Printf("Warning: failed to set position for commit %s: %v\n", gitSHA[:8], err)
 		}
 		
 		// Map Git SHA to Ivaldi hash
 		commitMap[gitSHA] = seal.Hash
-		
-		fmt.Printf("Imported commit %s -> %s (%s)\n", gitSHA[:8], seal.Name, message)
-	}
-	
-	// Return to HEAD
-	headCmd := exec.Command("git", "-C", r.root, "checkout", "HEAD", "--quiet")
-	if err := headCmd.Run(); err != nil {
-		fmt.Printf("Warning: failed to return to HEAD: %v\n", err)
 	}
 	
 	// Update timeline head to latest imported commit if we have any
@@ -286,16 +402,21 @@ func (r *Repository) importGitHistory() error {
 		for _, hash := range commitMap {
 			latestHash = hash
 		}
-		if err := r.timeline.UpdateHead(r.timeline.Current(), latestHash); err != nil {
-			return fmt.Errorf("failed to update timeline head: %v", err)
+		if err := r.timeline.UpdateHead(branchName, latestHash); err != nil {
+			return nil, fmt.Errorf("failed to update timeline head for %s: %v", branchName, err)
 		}
 	}
 	
-	fmt.Printf("Successfully imported %d Git commits to Ivaldi\n", len(commitMap))
-	return nil
+	// Return to HEAD
+	headCmd := exec.Command("git", "-C", r.root, "checkout", "HEAD", "--quiet")
+	if err := headCmd.Run(); err != nil {
+		fmt.Printf("Warning: failed to return to HEAD: %v\n", err)
+	}
+	
+	return commitMap, nil
 }
 
-// createTreeFromWorkspace creates a tree from current workspace state
+// createTreeFromWorkspace creates a tree from current workspace state and stores it
 func (r *Repository) createTreeFromWorkspace() (objects.Hash, error) {
 	// Get all files in workspace (excluding .git and .ivaldi)
 	var entries []objects.TreeEntry
@@ -330,12 +451,20 @@ func (r *Repository) createTreeFromWorkspace() (objects.Hash, error) {
 			return err
 		}
 		
-		// Create a simple hash of the content for tracking
-		blobHash := objects.NewHash(content)
+		// Create blob object
+		blob := &objects.Blob{
+			Data: content,
+		}
+		
+		// Store the blob using StoreObject
+		blobHash, err := r.storage.StoreObject(blob)
+		if err != nil {
+			return fmt.Errorf("failed to store blob for %s: %v", relPath, err)
+		}
 		
 		// Create tree entry
 		entry := objects.TreeEntry{
-			Name: filepath.Base(relPath),
+			Name: relPath,
 			Type: objects.ObjectTypeBlob,
 			Hash: blobHash,
 			Mode: uint32(info.Mode()),
@@ -349,12 +478,21 @@ func (r *Repository) createTreeFromWorkspace() (objects.Hash, error) {
 		return objects.Hash{}, err
 	}
 	
-	// Create tree hash from entries
-	treeData, err := json.Marshal(entries)
-	if err != nil {
-		return objects.Hash{}, err
+	// Create tree object
+	tree := &objects.Tree{
+		Entries: entries,
 	}
-	return objects.NewHash(treeData), nil
+	
+	// Store the tree using StoreObject
+	treeHash, err := r.storage.StoreObject(tree)
+	if err != nil {
+		return objects.Hash{}, fmt.Errorf("failed to store tree: %v", err)
+	}
+	
+	// Set the hash on the tree for consistency
+	tree.Hash = treeHash
+	
+	return treeHash, nil
 }
 
 func Open(root string) (*Repository, error) {
@@ -429,6 +567,9 @@ func Open(root string) (*Repository, error) {
 		fuseMgr:   fuseMgr,
 		network:   networkMgr,
 	}
+
+	// Sync memorable names between reference manager and position manager on open
+	pm.SyncMemorableNamesFromReference(rm.GetMemorableName)
 
 	return repo, nil
 }
@@ -820,6 +961,14 @@ func (r *Repository) SwitchTimeline(name string) error {
 		return fmt.Errorf("failed to scan workspace after switch: %v", err)
 	}
 
+	// Update position to the head of the target timeline
+	targetHead, err := r.timeline.GetHead(name)
+	if err == nil && !targetHead.IsZero() {
+		if err := r.position.SetPosition(targetHead, name); err != nil {
+			fmt.Printf("Warning: failed to set position to timeline head: %v\n", err)
+		}
+	}
+
 	return nil
 }
 
@@ -1104,7 +1253,13 @@ func (r *Repository) Jump(reference string) error {
 		return err
 	}
 
-	return r.position.SetPosition(hash, r.timeline.Current())
+	// Update position tracking
+	if err := r.position.SetPosition(hash, r.timeline.Current()); err != nil {
+		return err
+	}
+
+	// Restore working directory to match the target commit
+	return r.RestoreWorkingDirectory(hash)
 }
 
 func (r *Repository) Status() Status {
