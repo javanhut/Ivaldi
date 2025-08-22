@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"ivaldi/core/objects"
@@ -52,7 +51,6 @@ type ReferenceManager struct {
 	aliases    map[string]objects.Hash
 	iterations map[string]int // timeline -> iteration count
 	index      Index
-	mu         sync.RWMutex   // Protects references, aliases, and iterations
 }
 
 func NewReferenceManager(root string) *ReferenceManager {
@@ -90,8 +88,6 @@ func (rm *ReferenceManager) GenerateMemorableName() string {
 
 	name := fmt.Sprintf("%s-%s-%d", adjective, noun, number)
 	
-	rm.mu.RLock()
-	defer rm.mu.RUnlock()
 	// Ensure uniqueness
 	for rm.references[name] != nil {
 		number = rand.Intn(999) + 1
@@ -104,9 +100,6 @@ func (rm *ReferenceManager) GenerateMemorableName() string {
 // Resolve natural language references to commit hashes
 func (rm *ReferenceManager) Resolve(ref string, currentTimeline string) (objects.Hash, error) {
 	ref = strings.TrimSpace(ref)
-	
-	rm.mu.RLock()
-	defer rm.mu.RUnlock()
 	
 	// Direct memorable name
 	if rm.references[ref] != nil {
@@ -404,24 +397,18 @@ func (rm *ReferenceManager) RegisterMemorableName(name string, hash objects.Hash
 		Time:   time.Now(),
 	}
 	
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
 	rm.references[name] = ref
-	return rm.saveUnsafe()
+	return rm.save()
 }
 
 // Register a custom alias
 func (rm *ReferenceManager) RegisterAlias(alias string, hash objects.Hash) error {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
 	rm.aliases[alias] = hash
-	return rm.saveUnsafe()
+	return rm.save()
 }
 
 // Get the next iteration number for a timeline
 func (rm *ReferenceManager) GetNextIteration(timeline string) int {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
 	current := rm.iterations[timeline]
 	next := current + 1
 	rm.iterations[timeline] = next
@@ -429,7 +416,7 @@ func (rm *ReferenceManager) GetNextIteration(timeline string) int {
 }
 
 // Save references to disk
-func (rm *ReferenceManager) saveUnsafe() error {
+func (rm *ReferenceManager) save() error {
 	refPath := filepath.Join(rm.root, ".ivaldi", "references.json")
 	
 	data := struct {
@@ -448,12 +435,6 @@ func (rm *ReferenceManager) saveUnsafe() error {
 	}
 	
 	return os.WriteFile(refPath, jsonData, 0644)
-}
-
-func (rm *ReferenceManager) save() error {
-	rm.mu.RLock()
-	defer rm.mu.RUnlock()
-	return rm.saveUnsafe()
 }
 
 // Load references from disk
@@ -478,8 +459,6 @@ func (rm *ReferenceManager) Load() error {
 		return err
 	}
 	
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
 	rm.references = loaded.References
 	if rm.references == nil {
 		rm.references = make(map[string]*Reference)

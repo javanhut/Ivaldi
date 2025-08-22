@@ -1,0 +1,224 @@
+package index
+
+import (
+	"database/sql"
+	"fmt"
+	"ivaldi/core/objects"
+	"sync"
+)
+
+// BatchIndexer provides efficient batch indexing operations
+type BatchIndexer struct {
+	index    *SQLiteIndex
+	buffer   []*objects.Seal
+	bufferMu sync.Mutex
+	maxSize  int
+}
+
+// NewBatchIndexer creates a new batch indexer
+func NewBatchIndexer(index *SQLiteIndex, maxSize int) *BatchIndexer {
+	if maxSize <= 0 {
+		maxSize = 100
+	}
+	return &BatchIndexer{
+		index:   index,
+		buffer:  make([]*objects.Seal, 0, maxSize),
+		maxSize: maxSize,
+	}
+}
+
+// AddSeal adds a seal to the batch buffer
+func (bi *BatchIndexer) AddSeal(seal *objects.Seal) error {
+	bi.bufferMu.Lock()
+	defer bi.bufferMu.Unlock()
+	
+	bi.buffer = append(bi.buffer, seal)
+	
+	// Flush if buffer is full
+	if len(bi.buffer) >= bi.maxSize {
+		return bi.flushLocked()
+	}
+	
+	return nil
+}
+
+// Flush writes all buffered seals to the database
+func (bi *BatchIndexer) Flush() error {
+	bi.bufferMu.Lock()
+	defer bi.bufferMu.Unlock()
+	
+	return bi.flushLocked()
+}
+
+// flushLocked performs the actual batch insert (must be called with lock held)
+func (bi *BatchIndexer) flushLocked() error {
+	if len(bi.buffer) == 0 {
+		return nil
+	}
+	
+	// Begin transaction for batch insert
+	tx, err := bi.index.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %v", err)
+	}
+	defer tx.Rollback()
+	
+	// Prepare statement for batch insert
+	stmt, err := tx.Prepare(`
+		INSERT INTO seals (hash, name, iteration, position, message, author_name, author_email, timestamp)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare statement: %v", err)
+	}
+	defer stmt.Close()
+	
+	// Insert all seals
+	for _, seal := range bi.buffer {
+		_, err = stmt.Exec(
+			seal.Hash[:],
+			seal.Name,
+			seal.Iteration,
+			seal.Position[:],
+			seal.Message,
+			seal.Author.Name,
+			seal.Author.Email,
+			seal.Timestamp.Unix(),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to insert seal %s: %v", seal.Name, err)
+		}
+	}
+	
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %v", err)
+	}
+	
+	// Clear buffer
+	bi.buffer = bi.buffer[:0]
+	
+	return nil
+}
+
+// BatchIndexSeals indexes multiple seals in a single transaction
+func (idx *SQLiteIndex) BatchIndexSeals(seals []*objects.Seal) error {
+	if len(seals) == 0 {
+		return nil
+	}
+	
+	// Begin transaction
+	tx, err := idx.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %v", err)
+	}
+	defer tx.Rollback()
+	
+	// Prepare statement
+	stmt, err := tx.Prepare(`
+		INSERT INTO seals (hash, name, iteration, position, message, author_name, author_email, timestamp)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare statement: %v", err)
+	}
+	defer stmt.Close()
+	
+	// Insert all seals
+	for _, seal := range seals {
+		_, err = stmt.Exec(
+			seal.Hash[:],
+			seal.Name,
+			seal.Iteration,
+			seal.Position[:],
+			seal.Message,
+			seal.Author.Name,
+			seal.Author.Email,
+			seal.Timestamp.Unix(),
+		)
+		if err != nil {
+			// Skip duplicates
+			if isUniqueConstraintError(err) {
+				continue
+			}
+			return fmt.Errorf("failed to insert seal %s: %v", seal.Name, err)
+		}
+	}
+	
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %v", err)
+	}
+	
+	return nil
+}
+
+// isUniqueConstraintError checks if error is due to unique constraint violation
+func isUniqueConstraintError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// SQLite unique constraint error contains "UNIQUE constraint failed"
+	return err.Error() == "UNIQUE constraint failed: seals.hash" ||
+		err.Error() == "UNIQUE constraint failed: seals.name"
+}
+
+// BatchTransaction provides a way to run multiple operations in a single transaction
+type BatchTransaction struct {
+	tx   *sql.Tx
+	done bool
+}
+
+// NewBatchTransaction starts a new batch transaction
+func (idx *SQLiteIndex) NewBatchTransaction() (*BatchTransaction, error) {
+	tx, err := idx.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	return &BatchTransaction{tx: tx}, nil
+}
+
+// Commit commits the batch transaction
+func (bt *BatchTransaction) Commit() error {
+	if bt.done {
+		return fmt.Errorf("transaction already completed")
+	}
+	bt.done = true
+	return bt.tx.Commit()
+}
+
+// Rollback rolls back the batch transaction
+func (bt *BatchTransaction) Rollback() error {
+	if bt.done {
+		return nil
+	}
+	bt.done = true
+	return bt.tx.Rollback()
+}
+
+// IndexSealInTransaction indexes a seal within an existing transaction
+func (bt *BatchTransaction) IndexSeal(seal *objects.Seal) error {
+	if bt.done {
+		return fmt.Errorf("transaction already completed")
+	}
+	
+	_, err := bt.tx.Exec(`
+		INSERT INTO seals (hash, name, iteration, position, message, author_name, author_email, timestamp)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		seal.Hash[:],
+		seal.Name,
+		seal.Iteration,
+		seal.Position[:],
+		seal.Message,
+		seal.Author.Name,
+		seal.Author.Email,
+		seal.Timestamp.Unix(),
+	)
+	
+	if err != nil && !isUniqueConstraintError(err) {
+		return err
+	}
+	
+	return nil
+}

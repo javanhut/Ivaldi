@@ -3,7 +3,6 @@ package index
 import (
 	"database/sql"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"ivaldi/core/objects"
@@ -13,22 +12,15 @@ import (
 type SQLiteIndex struct {
 	db   *sql.DB
 	path string
-	mu   sync.RWMutex // Protects database operations
 }
 
 func NewSQLiteIndex(root string) (*SQLiteIndex, error) {
 	indexPath := filepath.Join(root, ".ivaldi", "index.db")
 	
-	// Configure SQLite for concurrent access
-	db, err := sql.Open("sqlite", indexPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=synchronous(NORMAL)&_pragma=cache_size(10000)")
+	db, err := sql.Open("sqlite", indexPath)
 	if err != nil {
 		return nil, err
 	}
-
-	// Configure connection pool for better concurrency
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(time.Hour)
 
 	index := &SQLiteIndex{
 		db:   db,
@@ -133,9 +125,6 @@ func (idx *SQLiteIndex) initialize() error {
 }
 
 func (idx *SQLiteIndex) IndexSeal(seal *objects.Seal) error {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	
 	tx, err := idx.db.Begin()
 	if err != nil {
 		return err
@@ -183,9 +172,6 @@ func (idx *SQLiteIndex) IndexSeal(seal *objects.Seal) error {
 }
 
 func (idx *SQLiteIndex) IndexChunk(chunk *objects.Chunk) error {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	
 	tx, err := idx.db.Begin()
 	if err != nil {
 		return err
@@ -208,9 +194,6 @@ func (idx *SQLiteIndex) IndexChunk(chunk *objects.Chunk) error {
 }
 
 func (idx *SQLiteIndex) IndexTree(tree *objects.Tree) error {
-	idx.mu.Lock()
-	defer idx.mu.Unlock()
-	
 	tx, err := idx.db.Begin()
 	if err != nil {
 		return err

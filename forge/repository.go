@@ -112,9 +112,24 @@ func Mirror(url, dest string) (*Repository, error) {
 		return nil, fmt.Errorf("failed to initialize Ivaldi: %v", err)
 	}
 
-	// Import Git history into Ivaldi format
-	if err := repo.importGitHistory(); err != nil {
-		return nil, fmt.Errorf("failed to import Git history: %v", err)
+	// Check for optimized import flag (can be set via environment variable)
+	useOptimized := os.Getenv("IVALDI_OPTIMIZED_IMPORT") != "false"
+	
+	if useOptimized {
+		// Use optimized import for better performance
+		fmt.Println("Using optimized Git import (set IVALDI_OPTIMIZED_IMPORT=false to use legacy)")
+		if err := repo.ImportGitHistoryOptimized(); err != nil {
+			// Fallback to legacy on error
+			fmt.Printf("Optimized import failed, falling back to legacy: %v\n", err)
+			if err := repo.importGitHistory(); err != nil {
+				return nil, fmt.Errorf("failed to import Git history: %v", err)
+			}
+		}
+	} else {
+		// Use legacy import
+		if err := repo.importGitHistory(); err != nil {
+			return nil, fmt.Errorf("failed to import Git history: %v", err)
+		}
 	}
 
 	// Add origin portal
