@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"ivaldi/core/fuse"
+	"ivaldi/core/mesh"
 	"ivaldi/core/network"
 	"ivaldi/core/objects"
+	"ivaldi/core/p2p"
 	"ivaldi/core/position"
 	"ivaldi/core/references"
 	"ivaldi/core/sync"
@@ -35,6 +37,8 @@ type Repository struct {
 	syncMgr   *sync.SyncManager
 	fuseMgr   *fuse.FuseManager
 	network   *network.NetworkManager
+	p2pMgr    *p2p.P2PManager
+	meshMgr   *mesh.MeshManager
 }
 
 type Status struct {
@@ -580,6 +584,17 @@ func Open(root string) (*Repository, error) {
 	// Create network manager
 	networkMgr := network.NewNetworkManager(root)
 
+	// Create P2P manager with adapters
+	storageAdapter := p2p.NewStorageAdapter(storage)
+	timelineAdapter := p2p.NewTimelineAdapter(tm)
+	p2pMgr, err := p2p.NewP2PManager(root, storageAdapter, timelineAdapter)
+	if err != nil {
+		// For now, just log the error and continue without P2P
+		// This allows the repository to be created even if P2P fails
+		fmt.Printf("Warning: Failed to create P2P manager: %v\n", err)
+		p2pMgr = nil
+	}
+
 	repo := &Repository{
 		root:      root,
 		storage:   storage,
@@ -591,6 +606,7 @@ func Open(root string) (*Repository, error) {
 		syncMgr:   syncMgr,
 		fuseMgr:   fuseMgr,
 		network:   networkMgr,
+		p2pMgr:    p2pMgr,
 	}
 
 	// Sync memorable names between reference manager and position manager on open
@@ -2010,6 +2026,11 @@ func (r *Repository) GetStorage() *local.Storage {
 	return r.storage
 }
 
+// GetTimelineManager returns the repository's timeline manager
+func (r *Repository) GetTimelineManager() *timeline.Manager {
+	return r.timeline
+}
+
 // TimelineManager interface implementation for FuseManager
 func (r *Repository) Current() string {
 	return r.timeline.Current()
@@ -2537,4 +2558,308 @@ func (r *Repository) restoreFileFromStore(path string, hash objects.CAHash) erro
 	
 	// Write file
 	return os.WriteFile(fullPath, data, 0644)
+}
+
+// P2P Methods
+
+// StartP2P starts the P2P network for this repository
+func (r *Repository) StartP2P() error {
+	if r.p2pMgr == nil {
+		// Initialize P2P manager if not already done
+		storageAdapter := p2p.NewStorageAdapter(r.storage)
+		timelineAdapter := p2p.NewTimelineAdapter(r.timeline)
+		p2pMgr, err := p2p.NewP2PManager(r.root, storageAdapter, timelineAdapter)
+		if err != nil {
+			return fmt.Errorf("failed to initialize P2P manager: %v", err)
+		}
+		r.p2pMgr = p2pMgr
+	}
+	return r.p2pMgr.Start()
+}
+
+// StopP2P stops the P2P network for this repository
+func (r *Repository) StopP2P() error {
+	if r.p2pMgr == nil {
+		return nil
+	}
+	err := r.p2pMgr.Stop()
+	r.p2pMgr = nil // Clear the manager after stopping
+	return err
+}
+
+// IsP2PRunning returns whether P2P is currently running
+func (r *Repository) IsP2PRunning() bool {
+	if r.p2pMgr == nil {
+		return false
+	}
+	return r.p2pMgr.IsRunning()
+}
+
+// ConnectToPeer connects to a P2P peer
+func (r *Repository) ConnectToPeer(address string, port int) error {
+	if r.p2pMgr == nil {
+		return fmt.Errorf("P2P manager not initialized")
+	}
+	return r.p2pMgr.ConnectToPeer(address, port)
+}
+
+// GetP2PPeers returns all connected P2P peers
+func (r *Repository) GetP2PPeers() []*p2p.Peer {
+	if r.p2pMgr == nil {
+		return []*p2p.Peer{}
+	}
+	return r.p2pMgr.GetPeers()
+}
+
+// GetDiscoveredPeers returns all discovered P2P peers
+func (r *Repository) GetDiscoveredPeers() []*p2p.DiscoveredPeer {
+	if r.p2pMgr == nil {
+		return []*p2p.DiscoveredPeer{}
+	}
+	return r.p2pMgr.GetDiscoveredPeers()
+}
+
+// SyncWithP2PPeer performs manual synchronization with a specific peer
+func (r *Repository) SyncWithP2PPeer(peerID string) error {
+	if r.p2pMgr == nil {
+		return fmt.Errorf("P2P manager not initialized")
+	}
+	return r.p2pMgr.SyncWithPeer(peerID)
+}
+
+// SyncWithAllP2PPeers performs synchronization with all connected peers
+func (r *Repository) SyncWithAllP2PPeers() error {
+	if r.p2pMgr == nil {
+		return fmt.Errorf("P2P manager not initialized")
+	}
+	return r.p2pMgr.SyncWithAllPeers()
+}
+
+// GetP2PSyncState returns synchronization state for all peers
+func (r *Repository) GetP2PSyncState() map[string]*p2p.PeerSyncState {
+	if r.p2pMgr == nil {
+		return make(map[string]*p2p.PeerSyncState)
+	}
+	return r.p2pMgr.GetSyncState()
+}
+
+// EnableP2PAutoSync enables or disables automatic P2P synchronization
+func (r *Repository) EnableP2PAutoSync(enabled bool) error {
+	if r.p2pMgr == nil {
+		// Initialize P2P manager if not already done
+		storageAdapter := p2p.NewStorageAdapter(r.storage)
+		timelineAdapter := p2p.NewTimelineAdapter(r.timeline)
+		p2pMgr, err := p2p.NewP2PManager(r.root, storageAdapter, timelineAdapter)
+		if err != nil {
+			return fmt.Errorf("failed to initialize P2P manager: %v", err)
+		}
+		r.p2pMgr = p2pMgr
+	}
+	return r.p2pMgr.EnableAutoSync(enabled)
+}
+
+// SetP2PSyncInterval sets the P2P synchronization interval
+func (r *Repository) SetP2PSyncInterval(interval string) error {
+	if r.p2pMgr == nil {
+		// Initialize P2P manager if not already done
+		storageAdapter := p2p.NewStorageAdapter(r.storage)
+		timelineAdapter := p2p.NewTimelineAdapter(r.timeline)
+		p2pMgr, err := p2p.NewP2PManager(r.root, storageAdapter, timelineAdapter)
+		if err != nil {
+			return fmt.Errorf("failed to initialize P2P manager: %v", err)
+		}
+		r.p2pMgr = p2pMgr
+	}
+	return r.p2pMgr.SetSyncInterval(interval)
+}
+
+// GetP2PConfig returns the current P2P configuration
+func (r *Repository) GetP2PConfig() *p2p.P2PConfig {
+	if r.p2pMgr == nil {
+		// Return default config if P2P manager not initialized
+		return p2p.DefaultP2PConfig()
+	}
+	return r.p2pMgr.GetConfig()
+}
+
+// UpdateP2PConfig updates the P2P configuration
+func (r *Repository) UpdateP2PConfig(config *p2p.P2PConfig) error {
+	// Always recreate the P2P manager with the new config to avoid port conflicts
+	// First, stop existing manager if running
+	if r.p2pMgr != nil && r.p2pMgr.IsRunning() {
+		r.p2pMgr.Stop()
+	}
+	
+	// Save the config first
+	configManager := p2p.NewP2PConfigManager(r.root)
+	err := configManager.Save(config)
+	if err != nil {
+		return fmt.Errorf("failed to save P2P config: %v", err)
+	}
+	
+	// Create P2P manager with updated config
+	storageAdapter := p2p.NewStorageAdapter(r.storage)
+	timelineAdapter := p2p.NewTimelineAdapter(r.timeline)
+	p2pMgr, err := p2p.NewP2PManager(r.root, storageAdapter, timelineAdapter)
+	if err != nil {
+		return fmt.Errorf("failed to initialize P2P manager: %v", err)
+	}
+	r.p2pMgr = p2pMgr
+	
+	return nil
+}
+
+// GetP2PStatus returns current P2P status information
+func (r *Repository) GetP2PStatus() *p2p.P2PStatus {
+	if r.p2pMgr == nil {
+		return &p2p.P2PStatus{Running: false}
+	}
+	return r.p2pMgr.GetStatus()
+}
+
+// FindPeersWithRepository finds P2P peers that have a specific repository
+func (r *Repository) FindPeersWithRepository(repoName string) []*p2p.DiscoveredPeer {
+	if r.p2pMgr == nil {
+		return []*p2p.DiscoveredPeer{}
+	}
+	return r.p2pMgr.FindPeersWithRepository(repoName)
+}
+
+// Mesh Network Methods
+
+// StartMesh starts the mesh networking layer
+func (r *Repository) StartMesh() error {
+	if r.meshMgr == nil {
+		// Initialize mesh manager if not already done
+		if r.p2pMgr == nil {
+			// Initialize P2P manager first
+			if err := r.initializeP2PManager(); err != nil {
+				return fmt.Errorf("failed to initialize P2P manager for mesh: %v", err)
+			}
+		}
+		r.meshMgr = mesh.NewMeshManager(r.p2pMgr)
+	}
+	return r.meshMgr.Start()
+}
+
+// StopMesh stops the mesh networking layer
+func (r *Repository) StopMesh() error {
+	if r.meshMgr == nil {
+		return nil
+	}
+	err := r.meshMgr.Stop()
+	r.meshMgr = nil
+	return err
+}
+
+// IsMeshRunning returns whether mesh networking is active
+func (r *Repository) IsMeshRunning() bool {
+	if r.meshMgr == nil {
+		return false
+	}
+	return r.meshMgr.IsRunning()
+}
+
+// JoinMesh joins a mesh network via a bootstrap peer
+func (r *Repository) JoinMesh(bootstrapAddress string, bootstrapPort int) error {
+	if r.meshMgr == nil {
+		return fmt.Errorf("mesh manager not initialized")
+	}
+	return r.meshMgr.Join(bootstrapAddress, bootstrapPort)
+}
+
+// GetMeshStatus returns current mesh network status
+func (r *Repository) GetMeshStatus() *mesh.MeshStatus {
+	if r.meshMgr == nil {
+		return &mesh.MeshStatus{Running: false}
+	}
+	return r.meshMgr.GetStatus()
+}
+
+// GetMeshTopology returns the current mesh topology
+func (r *Repository) GetMeshTopology() map[string]*mesh.MeshPeer {
+	if r.meshMgr == nil {
+		return make(map[string]*mesh.MeshPeer)
+	}
+	return r.meshMgr.GetTopology()
+}
+
+// GetMeshRoute returns the route to a specific peer
+func (r *Repository) GetMeshRoute(targetPeerID string) []string {
+	if r.meshMgr == nil {
+		return nil
+	}
+	return r.meshMgr.GetRoute(targetPeerID)
+}
+
+// SendMeshMessage sends a message through the mesh network
+func (r *Repository) SendMeshMessage(targetPeerID string, messageType string, payload interface{}) error {
+	if r.meshMgr == nil {
+		return fmt.Errorf("mesh manager not initialized")
+	}
+	return r.meshMgr.SendMessage(targetPeerID, messageType, payload)
+}
+
+// PingMeshPeer sends a ping to a peer via mesh routing
+func (r *Repository) PingMeshPeer(targetPeerID string) error {
+	if r.meshMgr == nil {
+		return fmt.Errorf("mesh manager not initialized")
+	}
+	return r.meshMgr.Ping(targetPeerID)
+}
+
+// GetMeshPeers returns all peers in the mesh network
+func (r *Repository) GetMeshPeers() []*mesh.MeshPeer {
+	if r.meshMgr == nil {
+		return []*mesh.MeshPeer{}
+	}
+	return r.meshMgr.GetPeers()
+}
+
+// GetDirectMeshPeers returns only directly connected mesh peers
+func (r *Repository) GetDirectMeshPeers() []*mesh.MeshPeer {
+	if r.meshMgr == nil {
+		return []*mesh.MeshPeer{}
+	}
+	return r.meshMgr.GetDirectPeers()
+}
+
+// GetIndirectMeshPeers returns only indirectly connected mesh peers
+func (r *Repository) GetIndirectMeshPeers() []*mesh.MeshPeer {
+	if r.meshMgr == nil {
+		return []*mesh.MeshPeer{}
+	}
+	return r.meshMgr.GetIndirectPeers()
+}
+
+// HealMeshNetwork manually triggers mesh network healing
+func (r *Repository) HealMeshNetwork() error {
+	if r.meshMgr == nil {
+		return fmt.Errorf("mesh manager not initialized")
+	}
+	return r.meshMgr.HealNetwork()
+}
+
+// RefreshMeshTopology manually triggers mesh topology refresh
+func (r *Repository) RefreshMeshTopology() error {
+	if r.meshMgr == nil {
+		return fmt.Errorf("mesh manager not initialized")
+	}
+	return r.meshMgr.RefreshTopology()
+}
+
+// initializeP2PManager initializes the P2P manager if needed
+func (r *Repository) initializeP2PManager() error {
+	if r.p2pMgr != nil {
+		return nil
+	}
+	
+	storageAdapter := p2p.NewStorageAdapter(r.storage)
+	timelineAdapter := p2p.NewTimelineAdapter(r.timeline)
+	p2pMgr, err := p2p.NewP2PManager(r.root, storageAdapter, timelineAdapter)
+	if err != nil {
+		return fmt.Errorf("failed to initialize P2P manager: %v", err)
+	}
+	r.p2pMgr = p2pMgr
+	return nil
 }

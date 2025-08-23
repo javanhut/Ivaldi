@@ -19,6 +19,7 @@ import (
 	"ivaldi/core/commands"
 	"ivaldi/core/config"
 	"ivaldi/core/fuse"
+	"ivaldi/core/p2p"
 	"ivaldi/core/reshape"
 	"ivaldi/core/search"
 	"ivaldi/core/semantic"
@@ -79,6 +80,7 @@ Workshop Commands:
   upload [branch]          Upload current branch to portal
   sync <timeline> --with <remote>  Sync local timeline with remote timeline
   scout [portal]           Discover remote timelines
+  p2p                      Peer-to-peer collaboration and sync
   
 Natural Language Examples:
   jump to "yesterday before lunch"
@@ -166,6 +168,7 @@ func (ec *EnhancedCLI) addEnhancedCommands(rootCmd *cobra.Command) {
 	rootCmd.AddCommand(ec.createUploadCommand())
 	rootCmd.AddCommand(ec.createSyncCommand())
 	rootCmd.AddCommand(ec.createScoutCommand())
+	rootCmd.AddCommand(ec.createP2PCommand())
 	
 	// Information commands
 	rootCmd.AddCommand(ec.createStatusCommand())
@@ -1704,27 +1707,92 @@ Subcommands:
 }
 
 func (ec *EnhancedCLI) createMeshCommand() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "mesh",
-		Short: "Local peer-to-peer networking",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			ec.output.Info("P2P networking")
-			ec.output.Info("(Implementation coming soon)")
-			return nil
-		},
+		Short: "Mesh networking for automatic peer discovery and multi-hop routing",
+		Long: `Mesh networking provides true mesh connectivity on top of P2P.
+
+Unlike simple P2P that requires manual connections, mesh networking automatically:
+- Discovers all peers in the network through gossip protocols
+- Establishes full connectivity where every node can reach every other node
+- Routes messages through intermediate peers when direct connections aren't possible
+- Self-heals when nodes join or leave the network
+- Maintains topology awareness for efficient routing
+
+Commands:
+  start                    Start mesh networking
+  stop                     Stop mesh networking  
+  status                   Show mesh status and topology
+  join <address:port>      Join mesh via bootstrap peer
+  topology                 Show network topology
+  route <peer-id>          Show route to specific peer
+  ping <peer-id>           Ping peer via mesh routing
+  peers                    List all mesh peers
+  heal                     Manually trigger network healing
+  refresh                  Refresh topology information
+
+Examples:
+  ivaldi mesh start                        # Start mesh networking
+  ivaldi mesh join 192.168.1.100:9090     # Join mesh via bootstrap
+  ivaldi mesh topology                     # View network topology
+  ivaldi mesh ping abc123def               # Ping peer through mesh`,
 	}
+
+	cmd.AddCommand(ec.createMeshStartCommand())
+	cmd.AddCommand(ec.createMeshStopCommand())
+	cmd.AddCommand(ec.createMeshStatusCommand())
+	cmd.AddCommand(ec.createMeshJoinCommand())
+	cmd.AddCommand(ec.createMeshTopologyCommand())
+	cmd.AddCommand(ec.createMeshRouteCommand())
+	cmd.AddCommand(ec.createMeshPingCommand())
+	cmd.AddCommand(ec.createMeshPeersCommand())
+	cmd.AddCommand(ec.createMeshHealCommand())
+	cmd.AddCommand(ec.createMeshRefreshCommand())
+
+	return cmd
 }
 
 func (ec *EnhancedCLI) createCollaborateCommand() *cobra.Command {
-	return &cobra.Command{
+	// Create the same command structure as P2P but with collaborate-friendly naming
+	cmd := &cobra.Command{
 		Use:   "collaborate",
 		Short: "Real-time collaboration session",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			ec.output.Info("Real-time collaboration")
-			ec.output.Info("(Implementation coming soon)")
-			return nil
-		},
+		Long: `Start real-time collaboration with other Ivaldi repositories.
+
+This is an alias for the P2P system that enables direct synchronization 
+between repositories without needing a central server, perfect for:
+- Real-time collaboration on local networks
+- Offline sync when internet is unavailable  
+- Faster transfers between nearby peers
+- Private networks for sensitive projects
+
+Commands:
+  start                    Start collaboration network
+  stop                     Stop collaboration network
+  status                   Show collaboration status and connections
+  connect <address:port>   Connect to a collaborator
+  peers                    List all connected collaborators
+  discover                 Show discovered collaborators on network
+  sync [peer-id]           Sync with specific collaborator or all
+  config                   View or update collaboration configuration
+
+Examples:
+  ivaldi collaborate start                    # Start collaboration
+  ivaldi collaborate connect 192.168.1.100:9090  # Connect to collaborator
+  ivaldi collaborate sync                     # Sync with all collaborators`,
 	}
+
+	// Add all the same subcommands as P2P
+	cmd.AddCommand(ec.createP2PStartCommand())
+	cmd.AddCommand(ec.createP2PStopCommand())
+	cmd.AddCommand(ec.createP2PStatusCommand())
+	cmd.AddCommand(ec.createP2PConnectCommand())
+	cmd.AddCommand(ec.createP2PPeersCommand())
+	cmd.AddCommand(ec.createP2PDiscoverCommand())
+	cmd.AddCommand(ec.createP2PSyncCommand())
+	cmd.AddCommand(ec.createP2PConfigCommand())
+
+	return cmd
 }
 
 func (ec *EnhancedCLI) createVersionCommand() *cobra.Command {
@@ -3243,6 +3311,410 @@ perfect for starting development without historical complexity.`,
 	}
 
 	return cmd
+}
+
+// Create P2P command for peer-to-peer collaboration
+func (ec *EnhancedCLI) createP2PCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "p2p",
+		Short: "Peer-to-peer collaboration and sync",
+		Long: `Manage peer-to-peer (P2P) connections for direct collaboration.
+
+P2P allows direct synchronization between Ivaldi repositories without
+needing a central server, enabling:
+- Real-time collaboration on local networks
+- Offline sync when internet is unavailable  
+- Faster transfers between nearby peers
+- Private networks for sensitive projects
+
+Commands:
+  start                    Start P2P network
+  stop                     Stop P2P network
+  status                   Show P2P status and connections
+  connect <address:port>   Connect to a specific peer
+  peers                    List all connected peers
+  discover                 Show discovered peers on network
+  sync [peer-id]           Sync with specific peer or all peers
+  config                   View or update P2P configuration
+
+Examples:
+  ivaldi p2p start                    # Start P2P networking
+  ivaldi p2p connect 192.168.1.100:9090  # Connect to peer
+  ivaldi p2p sync                     # Sync with all peers
+  ivaldi p2p sync abc123def            # Sync with specific peer
+  ivaldi p2p config --auto-sync=true  # Enable automatic sync`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				status := ec.currentRepo.GetP2PStatus()
+				ec.showP2PStatus(status)
+				return nil
+			}
+			return fmt.Errorf("unknown P2P subcommand: %s", args[0])
+		},
+	}
+
+	// Add subcommands
+	cmd.AddCommand(ec.createP2PStartCommand())
+	cmd.AddCommand(ec.createP2PStopCommand())
+	cmd.AddCommand(ec.createP2PStatusCommand())
+	cmd.AddCommand(ec.createP2PConnectCommand())
+	cmd.AddCommand(ec.createP2PPeersCommand())
+	cmd.AddCommand(ec.createP2PDiscoverCommand())
+	cmd.AddCommand(ec.createP2PSyncCommand())
+	cmd.AddCommand(ec.createP2PConfigCommand())
+
+	return cmd
+}
+
+// Create P2P start command
+func (ec *EnhancedCLI) createP2PStartCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "start",
+		Short: "Start P2P network",
+		Long:  "Start the peer-to-peer network for this repository, enabling discovery and sync with other peers.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if ec.currentRepo.IsP2PRunning() {
+				ec.output.Info("P2P network is already running")
+				return nil
+			}
+
+			ec.output.Info("Starting P2P network...")
+			if err := ec.currentRepo.StartP2P(); err != nil {
+				ec.output.Error("Failed to start P2P network", []string{
+					"Check if port is already in use",
+					"Verify network configuration",
+					"Try: p2p config to check settings",
+				})
+				return err
+			}
+
+			config := ec.currentRepo.GetP2PConfig()
+			ec.output.Success("P2P network started successfully!")
+			ec.output.Info(fmt.Sprintf("Listening on port: %d", config.Port))
+			ec.output.Info(fmt.Sprintf("Discovery port: %d", config.DiscoveryPort))
+			if config.AutoSyncEnabled {
+				ec.output.Info(fmt.Sprintf("Auto-sync enabled (every %v)", config.SyncInterval))
+			}
+			ec.output.Info("Other Ivaldi repositories on the network can now discover and connect to this peer")
+
+			return nil
+		},
+	}
+}
+
+// Create P2P stop command
+func (ec *EnhancedCLI) createP2PStopCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "stop",
+		Short: "Stop P2P network",
+		Long:  "Stop the peer-to-peer network, disconnecting from all peers.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !ec.currentRepo.IsP2PRunning() {
+				ec.output.Info("P2P network is not running")
+				return nil
+			}
+
+			ec.output.Info("Stopping P2P network...")
+			if err := ec.currentRepo.StopP2P(); err != nil {
+				ec.output.Error("Failed to stop P2P network", []string{
+					"Check system logs for errors",
+				})
+				return err
+			}
+
+			ec.output.Success("P2P network stopped")
+			return nil
+		},
+	}
+}
+
+// Create P2P status command
+func (ec *EnhancedCLI) createP2PStatusCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "status",
+		Short: "Show P2P status and connections",
+		Long:  "Display current P2P network status, connected peers, and sync information.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			status := ec.currentRepo.GetP2PStatus()
+			ec.showP2PStatus(status)
+			return nil
+		},
+	}
+}
+
+// Create P2P connect command
+func (ec *EnhancedCLI) createP2PConnectCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "connect <address:port>",
+		Short: "Connect to a specific peer",
+		Long:  "Connect to a peer at the specified address and port (e.g., 192.168.1.100:9090).",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !ec.currentRepo.IsP2PRunning() {
+				return fmt.Errorf("P2P network is not running. Start it with: p2p start")
+			}
+
+			peerAddr := args[0]
+			parts := strings.Split(peerAddr, ":")
+			if len(parts) != 2 {
+				return fmt.Errorf("invalid address format. Use: address:port (e.g., 192.168.1.100:9090)")
+			}
+
+			address := parts[0]
+			port, err := strconv.Atoi(parts[1])
+			if err != nil {
+				return fmt.Errorf("invalid port number: %s", parts[1])
+			}
+
+			ec.output.Info(fmt.Sprintf("Connecting to peer: %s", peerAddr))
+			if err := ec.currentRepo.ConnectToPeer(address, port); err != nil {
+				ec.output.Error("Failed to connect to peer", []string{
+					"Check the address and port are correct",
+					"Verify the peer is running and accepting connections",
+					"Ensure network connectivity",
+					"Try: p2p discover to find peers automatically",
+				})
+				return err
+			}
+
+			ec.output.Success(fmt.Sprintf("Successfully connected to peer: %s", peerAddr))
+			return nil
+		},
+	}
+}
+
+// Create P2P peers command
+func (ec *EnhancedCLI) createP2PPeersCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "peers",
+		Short: "List all connected peers",
+		Long:  "Show all currently connected P2P peers and their sync status.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			peers := ec.currentRepo.GetP2PPeers()
+			syncStates := ec.currentRepo.GetP2PSyncState()
+
+			if len(peers) == 0 {
+				ec.output.Info("No connected peers")
+				if !ec.currentRepo.IsP2PRunning() {
+					ec.output.Info("P2P network is not running. Start with: p2p start")
+				} else {
+					ec.output.Info("Try: p2p discover to find peers on the network")
+				}
+				return nil
+			}
+
+			ec.output.Info(fmt.Sprintf("Connected peers (%d):", len(peers)))
+			for _, peer := range peers {
+				syncState := syncStates[peer.ID]
+				lastSync := "never"
+				if syncState != nil && !syncState.LastSync.IsZero() {
+					lastSync = formatTimeSince(syncState.LastSync)
+				}
+
+				ec.output.Info(fmt.Sprintf("  %s", peer.ID))
+				ec.output.Info(fmt.Sprintf("    Address: %s:%d", peer.Address, peer.Port))
+				ec.output.Info(fmt.Sprintf("    Status: %s", peer.Status))
+				ec.output.Info(fmt.Sprintf("    Last sync: %s", lastSync))
+				if syncState != nil {
+					ec.output.Info(fmt.Sprintf("    Conflicts: %d", syncState.ConflictCount))
+				}
+			}
+
+			return nil
+		},
+	}
+}
+
+// Create P2P discover command
+func (ec *EnhancedCLI) createP2PDiscoverCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "discover",
+		Short: "Show discovered peers on network",
+		Long:  "Show all Ivaldi repositories discovered on the local network that can be connected to.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !ec.currentRepo.IsP2PRunning() {
+				return fmt.Errorf("P2P network is not running. Start it with: p2p start")
+			}
+
+			discovered := ec.currentRepo.GetDiscoveredPeers()
+
+			if len(discovered) == 0 {
+				ec.output.Info("No peers discovered on network")
+				ec.output.Info("Make sure other Ivaldi repositories are running P2P")
+				return nil
+			}
+
+			ec.output.Info(fmt.Sprintf("Discovered peers (%d):", len(discovered)))
+			for _, peer := range discovered {
+				ec.output.Info(fmt.Sprintf("  %s", peer.NodeID))
+				ec.output.Info(fmt.Sprintf("    Address: %s:%d", peer.Address, peer.Port))
+				ec.output.Info(fmt.Sprintf("    Last seen: %s", formatTimeSince(peer.LastSeen)))
+				if len(peer.Repositories) > 0 {
+					ec.output.Info(fmt.Sprintf("    Repositories: %v", peer.Repositories))
+				}
+				ec.output.Info(fmt.Sprintf("    Connect with: p2p connect %s:%d", peer.Address, peer.Port))
+			}
+
+			return nil
+		},
+	}
+}
+
+// Create P2P sync command
+func (ec *EnhancedCLI) createP2PSyncCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "sync [peer-id]",
+		Short: "Sync with specific peer or all peers",
+		Long: `Synchronize timelines with P2P peers.
+
+Without arguments, syncs with all connected peers.
+With peer-id, syncs only with that specific peer.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !ec.currentRepo.IsP2PRunning() {
+				return fmt.Errorf("P2P network is not running. Start it with: p2p start")
+			}
+
+			if len(args) == 0 {
+				// Sync with all peers
+				ec.output.Info("Syncing with all connected peers...")
+				if err := ec.currentRepo.SyncWithAllP2PPeers(); err != nil {
+					ec.output.Error("Failed to sync with peers", []string{
+						"Check network connectivity",
+						"Verify peers are still connected: p2p peers",
+					})
+					return err
+				}
+				ec.output.Success("Sync completed with all peers")
+			} else {
+				// Sync with specific peer
+				peerID := args[0]
+				ec.output.Info(fmt.Sprintf("Syncing with peer: %s", peerID))
+				if err := ec.currentRepo.SyncWithP2PPeer(peerID); err != nil {
+					ec.output.Error("Failed to sync with peer", []string{
+						"Check the peer ID is correct: p2p peers",
+						"Verify peer is still connected",
+						"Check network connectivity",
+					})
+					return err
+				}
+				ec.output.Success(fmt.Sprintf("Sync completed with peer: %s", peerID))
+			}
+
+			return nil
+		},
+	}
+}
+
+// Create P2P config command
+func (ec *EnhancedCLI) createP2PConfigCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "config",
+		Short: "View or update P2P configuration",
+		Long: `View or update P2P network configuration.
+
+Examples:
+  ivaldi p2p config                     # Show current config
+  ivaldi p2p config --auto-sync=true    # Enable auto sync
+  ivaldi p2p config --sync-interval=1m  # Set sync interval`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			config := ec.currentRepo.GetP2PConfig()
+			if config == nil {
+				return fmt.Errorf("P2P configuration not available")
+			}
+
+			// Handle flag updates
+			autoSync, _ := cmd.Flags().GetBool("auto-sync")
+			syncInterval, _ := cmd.Flags().GetString("sync-interval")
+
+			updated := false
+
+			if cmd.Flags().Changed("auto-sync") {
+				if err := ec.currentRepo.EnableP2PAutoSync(autoSync); err != nil {
+					return fmt.Errorf("failed to update auto-sync setting: %v", err)
+				}
+				ec.output.Success(fmt.Sprintf("Auto-sync %s", map[bool]string{true: "enabled", false: "disabled"}[autoSync]))
+				updated = true
+			}
+
+			if cmd.Flags().Changed("sync-interval") {
+				if err := ec.currentRepo.SetP2PSyncInterval(syncInterval); err != nil {
+					return fmt.Errorf("failed to update sync interval: %v", err)
+				}
+				ec.output.Success(fmt.Sprintf("Sync interval set to %s", syncInterval))
+				updated = true
+			}
+
+			if updated {
+				// Reload config after updates
+				config = ec.currentRepo.GetP2PConfig()
+			}
+
+			// Show current configuration
+			ec.output.Info("P2P Configuration:")
+			ec.output.Info(fmt.Sprintf("  Port: %d", config.Port))
+			ec.output.Info(fmt.Sprintf("  Discovery Port: %d", config.DiscoveryPort))
+			ec.output.Info(fmt.Sprintf("  Max Peers: %d", config.MaxPeers))
+			ec.output.Info(fmt.Sprintf("  Auto-connect: %t", config.EnableAutoConnect))
+			ec.output.Info(fmt.Sprintf("  Auto-sync: %t", config.AutoSyncEnabled))
+			if config.AutoSyncEnabled {
+				ec.output.Info(fmt.Sprintf("  Sync Interval: %v", config.SyncInterval))
+			}
+			ec.output.Info(fmt.Sprintf("  Conflict Strategy: %s", config.ConflictStrategy))
+			ec.output.Info(fmt.Sprintf("  Known Peers: %d", len(config.KnownPeers)))
+
+			return nil
+		},
+	}
+
+	cmd.Flags().Bool("auto-sync", false, "Enable or disable automatic sync")
+	cmd.Flags().String("sync-interval", "", "Set sync interval (e.g., 30s, 1m, 5m)")
+
+	return cmd
+}
+
+// Helper function to show P2P status
+func (ec *EnhancedCLI) showP2PStatus(status *p2p.P2PStatus) {
+	if status.Running {
+		ec.output.Success("P2P Network: RUNNING")
+		ec.output.Info(fmt.Sprintf("Node ID: %s", status.NodeID))
+		ec.output.Info(fmt.Sprintf("Port: %d", status.Port))
+		ec.output.Info(fmt.Sprintf("Connected Peers: %d", status.ConnectedPeers))
+		ec.output.Info(fmt.Sprintf("Discovered Peers: %d", status.DiscoveredPeers))
+		
+		autoSyncStatus := "disabled"
+		if status.AutoSyncEnabled {
+			autoSyncStatus = fmt.Sprintf("enabled (every %v)", status.SyncInterval)
+		}
+		ec.output.Info(fmt.Sprintf("Auto-sync: %s", autoSyncStatus))
+		
+		if status.TotalSyncs > 0 {
+			ec.output.Info(fmt.Sprintf("Total Syncs: %d", status.TotalSyncs))
+		}
+		if status.ConflictCount > 0 {
+			ec.output.Info(fmt.Sprintf("Conflicts: %d", status.ConflictCount))
+		}
+	} else {
+		ec.output.Info("P2P Network: STOPPED")
+		ec.output.Info("Start with: p2p start")
+	}
+}
+
+// Helper function to format time since
+func formatTimeSince(t time.Time) string {
+	if t.IsZero() {
+		return "never"
+	}
+	
+	duration := time.Since(t)
+	if duration < time.Minute {
+		return fmt.Sprintf("%d seconds ago", int(duration.Seconds()))
+	} else if duration < time.Hour {
+		return fmt.Sprintf("%d minutes ago", int(duration.Minutes()))
+	} else if duration < 24*time.Hour {
+		return fmt.Sprintf("%d hours ago", int(duration.Hours()))
+	} else {
+		return fmt.Sprintf("%d days ago", int(duration.Hours()/24))
+	}
 }
 
 // Execute runs the enhanced CLI
