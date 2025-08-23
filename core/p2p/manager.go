@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -15,6 +16,7 @@ type P2PManager struct {
 	syncManager     *P2PSyncManager
 	discovery       *DiscoveryService
 	configManager   *P2PConfigManager
+	stateManager    *P2PStateManager
 	eventBus        *EventBus
 	storage         Storage
 	timelineManager TimelineManager
@@ -90,17 +92,31 @@ func NewP2PManager(rootDir string, storage Storage, timelineManager TimelineMana
 		return nil
 	})
 
-	return &P2PManager{
+	// Create state manager and check if P2P is already running
+	stateManager := NewP2PStateManager(rootDir)
+	
+	pm := &P2PManager{
 		network:         network,
 		syncManager:     syncManager,
 		discovery:       discovery,
 		configManager:   configManager,
+		stateManager:    stateManager,
 		eventBus:        eventBus,
 		storage:         storage,
 		timelineManager: timelineManager,
 		rootDir:         rootDir,
 		running:         false,
-	}, nil
+	}
+	
+	// Check if P2P is already running from a previous session
+	if state, ok := stateManager.GetRunningState(); ok {
+		pm.running = true
+		// Note: The actual network connections would need to be re-established
+		// This just indicates that P2P was started in a previous command
+		fmt.Printf("P2P network already running (NodeID: %s, Port: %d)\n", state.NodeID, state.Port)
+	}
+	
+	return pm, nil
 }
 
 // Start begins all P2P services
@@ -141,6 +157,20 @@ func (pm *P2PManager) Start() error {
 	}
 
 	pm.running = true
+	
+	// Save state to disk
+	state := &P2PState{
+		Running:       true,
+		NodeID:        pm.network.GetNodeID(),
+		Port:          pm.network.port,
+		DiscoveryPort: pm.discovery.broadcastPort,
+		StartedAt:     time.Now(),
+		PID:           os.Getpid(),
+	}
+	if err := pm.stateManager.Save(state); err != nil {
+		fmt.Printf("Warning: Failed to save P2P state: %v\n", err)
+	}
+	
 	fmt.Println("P2P manager started successfully")
 	return nil
 }
@@ -168,6 +198,12 @@ func (pm *P2PManager) Stop() error {
 	}
 
 	pm.running = false
+	
+	// Clear state from disk
+	if err := pm.stateManager.Clear(); err != nil {
+		fmt.Printf("Warning: Failed to clear P2P state: %v\n", err)
+	}
+	
 	fmt.Println("P2P manager stopped")
 	return nil
 }
@@ -176,7 +212,14 @@ func (pm *P2PManager) Stop() error {
 func (pm *P2PManager) IsRunning() bool {
 	pm.mutex.RLock()
 	defer pm.mutex.RUnlock()
-	return pm.running
+	
+	// First check in-memory state
+	if pm.running {
+		return true
+	}
+	
+	// Then check persistent state
+	return pm.stateManager.IsRunning()
 }
 
 // GetPeers returns all connected peers

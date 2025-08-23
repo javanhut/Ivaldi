@@ -2589,23 +2589,29 @@ func (r *Repository) StopP2P() error {
 
 // IsP2PRunning returns whether P2P is currently running
 func (r *Repository) IsP2PRunning() bool {
-	if r.p2pMgr == nil {
-		return false
+	// First check if we have a P2P manager instance
+	if r.p2pMgr != nil {
+		return r.p2pMgr.IsRunning()
 	}
-	return r.p2pMgr.IsRunning()
+	
+	// If no manager instance, check if P2P state file indicates it's running
+	stateManager := p2p.NewP2PStateManager(r.root)
+	return stateManager.IsRunning()
 }
 
 // ConnectToPeer connects to a P2P peer
 func (r *Repository) ConnectToPeer(address string, port int) error {
-	if r.p2pMgr == nil {
-		return fmt.Errorf("P2P manager not initialized")
+	// Initialize P2P manager if needed
+	if err := r.ensureP2PManager(); err != nil {
+		return err
 	}
 	return r.p2pMgr.ConnectToPeer(address, port)
 }
 
 // GetP2PPeers returns all connected P2P peers
 func (r *Repository) GetP2PPeers() []*p2p.Peer {
-	if r.p2pMgr == nil {
+	// Try to ensure P2P manager is initialized
+	if err := r.ensureP2PManager(); err != nil {
 		return []*p2p.Peer{}
 	}
 	return r.p2pMgr.GetPeers()
@@ -2613,7 +2619,8 @@ func (r *Repository) GetP2PPeers() []*p2p.Peer {
 
 // GetDiscoveredPeers returns all discovered P2P peers
 func (r *Repository) GetDiscoveredPeers() []*p2p.DiscoveredPeer {
-	if r.p2pMgr == nil {
+	// Try to ensure P2P manager is initialized
+	if err := r.ensureP2PManager(); err != nil {
 		return []*p2p.DiscoveredPeer{}
 	}
 	return r.p2pMgr.GetDiscoveredPeers()
@@ -2621,16 +2628,18 @@ func (r *Repository) GetDiscoveredPeers() []*p2p.DiscoveredPeer {
 
 // SyncWithP2PPeer performs manual synchronization with a specific peer
 func (r *Repository) SyncWithP2PPeer(peerID string) error {
-	if r.p2pMgr == nil {
-		return fmt.Errorf("P2P manager not initialized")
+	// Initialize P2P manager if needed
+	if err := r.ensureP2PManager(); err != nil {
+		return err
 	}
 	return r.p2pMgr.SyncWithPeer(peerID)
 }
 
 // SyncWithAllP2PPeers performs synchronization with all connected peers
 func (r *Repository) SyncWithAllP2PPeers() error {
-	if r.p2pMgr == nil {
-		return fmt.Errorf("P2P manager not initialized")
+	// Initialize P2P manager if needed
+	if err := r.ensureP2PManager(); err != nil {
+		return err
 	}
 	return r.p2pMgr.SyncWithAllPeers()
 }
@@ -2711,10 +2720,26 @@ func (r *Repository) UpdateP2PConfig(config *p2p.P2PConfig) error {
 
 // GetP2PStatus returns current P2P status information
 func (r *Repository) GetP2PStatus() *p2p.P2PStatus {
-	if r.p2pMgr == nil {
-		return &p2p.P2PStatus{Running: false}
+	// Check if we have a P2P manager instance
+	if r.p2pMgr != nil {
+		return r.p2pMgr.GetStatus()
 	}
-	return r.p2pMgr.GetStatus()
+	
+	// Check persistent state
+	stateManager := p2p.NewP2PStateManager(r.root)
+	if state, ok := stateManager.GetRunningState(); ok {
+		// P2P is running but we don't have a manager instance
+		// Return basic status from state file
+		return &p2p.P2PStatus{
+			Running:         true,
+			NodeID:          state.NodeID,
+			Port:            state.Port,
+			ConnectedPeers:  0, // We don't know actual peer count
+			DiscoveredPeers: 0, // We don't know actual discovered count
+		}
+	}
+	
+	return &p2p.P2PStatus{Running: false}
 }
 
 // FindPeersWithRepository finds P2P peers that have a specific repository
@@ -2862,4 +2887,20 @@ func (r *Repository) initializeP2PManager() error {
 	}
 	r.p2pMgr = p2pMgr
 	return nil
+}
+
+// ensureP2PManager ensures P2P manager is initialized if P2P is running
+func (r *Repository) ensureP2PManager() error {
+	if r.p2pMgr != nil {
+		return nil
+	}
+	
+	// Check if P2P is running from state
+	stateManager := p2p.NewP2PStateManager(r.root)
+	if !stateManager.IsRunning() {
+		return fmt.Errorf("P2P network is not running. Start it with: p2p start")
+	}
+	
+	// Initialize P2P manager to reconnect to running P2P
+	return r.initializeP2PManager()
 }

@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -3368,11 +3370,13 @@ Examples:
 
 // Create P2P start command
 func (ec *EnhancedCLI) createP2PStartCommand() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Start P2P network",
 		Long:  "Start the peer-to-peer network for this repository, enabling discovery and sync with other peers.",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			daemon, _ := cmd.Flags().GetBool("daemon")
+			
 			if ec.currentRepo.IsP2PRunning() {
 				ec.output.Info("P2P network is already running")
 				return nil
@@ -3397,9 +3401,30 @@ func (ec *EnhancedCLI) createP2PStartCommand() *cobra.Command {
 			}
 			ec.output.Info("Other Ivaldi repositories on the network can now discover and connect to this peer")
 
+			// If daemon mode, keep running
+			if daemon {
+				ec.output.Info("Running in daemon mode. Press Ctrl+C to stop.")
+				
+				// Set up signal handling for graceful shutdown
+				sigChan := make(chan os.Signal, 1)
+				signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+				
+				// Wait for signal
+				<-sigChan
+				
+				ec.output.Info("\nStopping P2P network...")
+				if err := ec.currentRepo.StopP2P(); err != nil {
+					ec.output.Error("Failed to stop P2P network", []string{err.Error()})
+				}
+				ec.output.Info("P2P network stopped")
+			}
+
 			return nil
 		},
 	}
+	
+	cmd.Flags().BoolP("daemon", "d", false, "Run as daemon (keep process running)")
+	return cmd
 }
 
 // Create P2P stop command
