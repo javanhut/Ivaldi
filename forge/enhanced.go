@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"ivaldi/core/network"
 	"ivaldi/core/objects"
 	"ivaldi/core/overwrite"
 	"ivaldi/storage/local"
@@ -723,4 +724,17 @@ func (er *EnhancedRepository) StoreSeal(seal *objects.Seal) error {
 // GetStorage returns the storage for FuseManager
 func (er *EnhancedRepository) GetStorage() *local.Storage {
 	return er.storage
+}
+
+// Accessor methods for CLI integration
+func (er *EnhancedRepository) Network() *network.NetworkManager {
+	return er.network
+}
+
+func (er *EnhancedRepository) Storage() *local.Storage {
+	return er.storage
+}
+
+func (er *EnhancedRepository) Timeline() *timeline.Manager {
+	return er.timeline
 }

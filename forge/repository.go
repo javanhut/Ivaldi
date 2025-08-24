@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"ivaldi/core/fuse"
@@ -37,7 +38,7 @@ type Repository struct {
 	syncMgr   *sync.SyncManager
 	fuseMgr   *fuse.FuseManager
 	network   *network.NetworkManager
-	p2pMgr    *p2p.P2PManager
+	p2pMgr    p2p.P2PManagerInterface
 	meshMgr   *mesh.MeshManager
 }
 
@@ -2762,27 +2763,60 @@ func (r *Repository) StartMesh() error {
 				return fmt.Errorf("failed to initialize P2P manager for mesh: %v", err)
 			}
 		}
-		r.meshMgr = mesh.NewMeshManager(r.p2pMgr)
+		// Mesh manager currently only supports traditional P2P manager
+		if concreteMgr, ok := r.p2pMgr.(*p2p.P2PManager); ok {
+			r.meshMgr = mesh.NewMeshManager(concreteMgr, r.root)
+		} else {
+			return fmt.Errorf("mesh networking only supports traditional P2P manager, not WebSocket P2P")
+		}
 	}
 	return r.meshMgr.Start()
 }
 
 // StopMesh stops the mesh networking layer
 func (r *Repository) StopMesh() error {
-	if r.meshMgr == nil {
+	if r.meshMgr != nil {
+		err := r.meshMgr.Stop()
+		r.meshMgr = nil
+		return err
+	}
+	
+	// No local mesh manager, but check if mesh is running in another process
+	stateManager := mesh.NewMeshStateManager(r.root)
+	if state, ok := stateManager.GetRunningState(); ok {
+		// Mesh is running in another process, send termination signal
+		process, err := os.FindProcess(state.PID)
+		if err != nil {
+			// Process doesn't exist, just clear state
+			stateManager.Clear()
+			return nil
+		}
+		
+		// Send SIGTERM to gracefully stop the process
+		err = process.Signal(syscall.SIGTERM)
+		if err != nil {
+			return fmt.Errorf("failed to stop mesh process (PID %d): %v", state.PID, err)
+		}
+		
+		// Clear state file
+		stateManager.Clear()
+		
+		fmt.Printf("Sent termination signal to mesh process (PID %d)\n", state.PID)
 		return nil
 	}
-	err := r.meshMgr.Stop()
-	r.meshMgr = nil
-	return err
+	
+	return nil
 }
 
 // IsMeshRunning returns whether mesh networking is active
 func (r *Repository) IsMeshRunning() bool {
-	if r.meshMgr == nil {
-		return false
+	if r.meshMgr != nil {
+		return r.meshMgr.IsRunning()
 	}
-	return r.meshMgr.IsRunning()
+	
+	// Check persistent state as fallback
+	stateManager := mesh.NewMeshStateManager(r.root)
+	return stateManager.IsRunning()
 }
 
 // JoinMesh joins a mesh network via a bootstrap peer
@@ -2795,18 +2829,47 @@ func (r *Repository) JoinMesh(bootstrapAddress string, bootstrapPort int) error 
 
 // GetMeshStatus returns current mesh network status
 func (r *Repository) GetMeshStatus() *mesh.MeshStatus {
-	if r.meshMgr == nil {
-		return &mesh.MeshStatus{Running: false}
+	// Check if we have a mesh manager instance
+	if r.meshMgr != nil {
+		return r.meshMgr.GetStatus()
 	}
-	return r.meshMgr.GetStatus()
+	
+	// Check persistent state
+	stateManager := mesh.NewMeshStateManager(r.root)
+	if state, ok := stateManager.GetRunningState(); ok {
+		// Mesh is running but we don't have a manager instance
+		// Return basic status from state file
+		return &mesh.MeshStatus{
+			Running:       true,
+			NodeID:        state.NodeID,
+			PeerCount:     0, // We don't know actual peer count without manager
+			DirectPeers:   0,
+			IndirectPeers: 0,
+			MaxHops:       0,
+			AvgHops:       0,
+			Topology:      make(map[string]*mesh.MeshPeer),
+			Routes:        make(map[string][]string),
+		}
+	}
+	
+	// Not running
+	return &mesh.MeshStatus{Running: false}
 }
 
 // GetMeshTopology returns the current mesh topology
 func (r *Repository) GetMeshTopology() map[string]*mesh.MeshPeer {
-	if r.meshMgr == nil {
+	if r.meshMgr != nil {
+		return r.meshMgr.GetTopology()
+	}
+	
+	// If mesh manager is not available but mesh is running, return empty topology
+	// Commands that need full topology should initialize the manager first
+	stateManager := mesh.NewMeshStateManager(r.root)
+	if stateManager.IsRunning() {
 		return make(map[string]*mesh.MeshPeer)
 	}
-	return r.meshMgr.GetTopology()
+	
+	return make(map[string]*mesh.MeshPeer)
 }
 
 // GetMeshRoute returns the route to a specific peer
@@ -2879,13 +2942,32 @@ func (r *Repository) initializeP2PManager() error {
 		return nil
 	}
 	
-	storageAdapter := p2p.NewStorageAdapter(r.storage)
-	timelineAdapter := p2p.NewTimelineAdapter(r.timeline)
-	p2pMgr, err := p2p.NewP2PManager(r.root, storageAdapter, timelineAdapter)
-	if err != nil {
-		return fmt.Errorf("failed to initialize P2P manager: %v", err)
+	// Check if WebSocket P2P mode is enabled via environment variable
+	useWebSocket := os.Getenv("IVALDI_WEBSOCKET_P2P") == "true"
+	fmt.Printf("Debug: IVALDI_WEBSOCKET_P2P=%q, useWebSocket=%v\n", os.Getenv("IVALDI_WEBSOCKET_P2P"), useWebSocket)
+	
+	if useWebSocket {
+		// Use Carrion WebSocket-based P2P
+		fmt.Println("Using WebSocket-based P2P networking (Carrion)")
+		websocketMgr, err := p2p.NewWebSocketP2PManager(r.root, 9092)
+		if err != nil {
+			return fmt.Errorf("failed to initialize WebSocket P2P manager: %v", err)
+		}
+		
+		// WebSocketP2PManager implements P2PManagerInterface
+		r.p2pMgr = websocketMgr
+	} else {
+		// Use traditional Go-based P2P (fallback)
+		fmt.Println("Using traditional P2P networking (Go)")
+		storageAdapter := p2p.NewStorageAdapter(r.storage)
+		timelineAdapter := p2p.NewTimelineAdapter(r.timeline)
+		p2pMgr, err := p2p.NewP2PManager(r.root, storageAdapter, timelineAdapter)
+		if err != nil {
+			return fmt.Errorf("failed to initialize P2P manager: %v", err)
+		}
+		r.p2pMgr = p2pMgr
 	}
-	r.p2pMgr = p2pMgr
+	
 	return nil
 }
 

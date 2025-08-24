@@ -100,6 +100,19 @@ func (nm *NetworkManager) FetchFromPortal(portalURL, timeline string) (*FetchRes
 	}
 }
 
+// FetchFromPortalWithHistory fetches complete commit history from a remote portal
+func (nm *NetworkManager) FetchFromPortalWithHistory(portalURL, timeline string) (*FetchResult, error) {
+	// Handle GitHub repositories
+	if strings.Contains(portalURL, "github.com") {
+		return nm.fetchFromGitHubWithHistory(portalURL, timeline)
+	} else if strings.Contains(portalURL, "gitlab.com") {
+		return nm.fetchFromGitLab(portalURL, timeline) // TODO: Implement GitLab history
+	} else {
+		// Native Ivaldi repository
+		return nm.fetchFromIvaldiRepo(portalURL, timeline) // TODO: Implement Ivaldi history
+	}
+}
+
 // UploadToPortal uploads changes to a remote portal using Ivaldi's native approach
 func (nm *NetworkManager) UploadToPortal(portalURL, timeline string, seals []*objects.Seal) error {
 	// Determine the portal type and handle accordingly
@@ -1780,6 +1793,7 @@ func (nm *NetworkManager) createReference(owner, repo, ref, sha string) error {
 
 // GitHubCommitInfo represents commit information from GitHub API
 type GitHubCommitInfo struct {
+	SHA     string `json:"sha"`
 	Message string `json:"message"`
 	Author  struct {
 		Name  string    `json:"name"`
@@ -1797,6 +1811,109 @@ type GitHubCommitInfo struct {
 	Parents []struct {
 		SHA string `json:"sha"`
 	} `json:"parents"`
+}
+
+// fetchFromGitHubWithHistory fetches complete commit history from a GitHub repository
+func (nm *NetworkManager) fetchFromGitHubWithHistory(portalURL, timeline string) (*FetchResult, error) {
+	// Extract owner and repo from URL
+	urlParts := strings.Split(strings.TrimSuffix(portalURL, ".git"), "/")
+	if len(urlParts) < 2 {
+		return nil, fmt.Errorf("invalid GitHub URL format: %s", portalURL)
+	}
+	
+	owner := urlParts[len(urlParts)-2]
+	repo := urlParts[len(urlParts)-1]
+	
+	fmt.Printf("Fetching complete history for %s/%s branch %s...\n", owner, repo, timeline)
+	
+	// Get the complete commit history
+	commits, err := nm.fetchGitHubCommitHistory(owner, repo, timeline)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch commit history: %v", err)
+	}
+	
+	if len(commits) == 0 {
+		return &FetchResult{
+			Refs:    []RemoteRef{},
+			Seals:   []*objects.Seal{},
+			Objects: []objects.Hash{},
+		}, nil
+	}
+	
+	// Convert all commits to seals (in reverse order for proper chronological ordering)
+	var seals []*objects.Seal
+	var refHashes []objects.Hash
+	
+	// Process commits in reverse order (oldest first) to build proper parent relationships
+	commitToSealHash := make(map[string]objects.Hash)
+	
+	for i := len(commits) - 1; i >= 0; i-- {
+		commit := commits[i]
+		
+		commitMsg := strings.Split(commit.Message, "\n")[0]
+		if len(commitMsg) > 50 {
+			commitMsg = commitMsg[:50] + "..."
+		}
+		fmt.Printf("Converting commit %s (%s)\n", commit.SHA[:8], commitMsg)
+		
+		// Download files for this commit (only for the latest commit to save time)
+		if i == 0 { // Latest commit
+			if err := nm.downloadGitHubTree(owner, repo, commit.Tree.SHA); err != nil {
+				fmt.Printf("Warning: failed to download tree for commit %s: %v\n", commit.SHA[:8], err)
+			}
+		}
+		
+		// Convert parent SHAs to Ivaldi hashes
+		var parentHashes []objects.Hash
+		for _, parent := range commit.Parents {
+			if parentHash, exists := commitToSealHash[parent.SHA]; exists {
+				parentHashes = append(parentHashes, parentHash)
+			}
+		}
+		
+		// Create seal from commit
+		seal := &objects.Seal{
+			Name:      nm.generateMemorableNameFromCommit(commit),
+			Iteration: 1,
+			Message:   commit.Message,
+			Author: objects.Identity{
+				Name:  commit.Author.Name,
+				Email: commit.Author.Email,
+			},
+			Timestamp: commit.Author.Date,
+			Parents:   parentHashes,
+		}
+		
+		// Calculate seal hash
+		data, err := json.Marshal(seal)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal seal: %v", err)
+		}
+		sealHash := objects.NewHash(data)
+		seal.Hash = sealHash
+		
+		// Store mapping from git commit SHA to Ivaldi seal hash
+		commitToSealHash[commit.SHA] = sealHash
+		
+		seals = append(seals, seal)
+		refHashes = append(refHashes, sealHash)
+	}
+	
+	// Create remote ref pointing to the latest commit (head)
+	headSealHash := commitToSealHash[commits[0].SHA]
+	remoteRef := RemoteRef{
+		Name: timeline,
+		Hash: headSealHash,
+		Type: "timeline",
+	}
+	
+	fmt.Printf("Converted %d commits to Ivaldi seals\n", len(seals))
+	
+	return &FetchResult{
+		Refs:    []RemoteRef{remoteRef},
+		Seals:   seals,
+		Objects: refHashes,
+	}, nil
 }
 
 // fetchFromGitHub fetches changes from a GitHub repository
@@ -1900,6 +2017,108 @@ func (nm *NetworkManager) getGitHubCommit(owner, repo, commitSHA string) (*GitHu
 	}
 	
 	return &commit, nil
+}
+
+// fetchGitHubCommitHistory fetches the complete commit history for a branch
+func (nm *NetworkManager) fetchGitHubCommitHistory(owner, repo, branch string) ([]*GitHubCommitInfo, error) {
+	var allCommits []*GitHubCommitInfo
+	page := 1
+	perPage := 100
+
+	for {
+		url := fmt.Sprintf("https://api.github.com/repos/%s/%s/commits?sha=%s&page=%d&per_page=%d", 
+			owner, repo, branch, page, perPage)
+		
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+		
+		// Add authentication
+		if token, err := nm.getGitHubToken(); err == nil && token != "" {
+			req.Header.Set("Authorization", "token "+token)
+		}
+		req.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
+		
+		resp, err := nm.client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		
+		if resp.StatusCode != 200 {
+			body, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("GitHub API error (%d): %s", resp.StatusCode, string(body))
+		}
+		
+		var commits []struct {
+			SHA    string `json:"sha"`
+			Commit struct {
+				Message string `json:"message"`
+				Author  struct {
+					Name  string    `json:"name"`
+					Email string    `json:"email"`
+					Date  time.Time `json:"date"`
+				} `json:"author"`
+				Tree struct {
+					SHA string `json:"sha"`
+				} `json:"tree"`
+			} `json:"commit"`
+			Parents []struct {
+				SHA string `json:"sha"`
+			} `json:"parents"`
+		}
+		
+		if err := json.NewDecoder(resp.Body).Decode(&commits); err != nil {
+			return nil, err
+		}
+		
+		// If no commits returned, we're done
+		if len(commits) == 0 {
+			break
+		}
+		
+		// Convert to GitHubCommitInfo format
+		for _, c := range commits {
+			commitInfo := &GitHubCommitInfo{
+				SHA:     c.SHA,
+				Message: c.Commit.Message,
+			}
+			
+			// Set author info
+			commitInfo.Author.Name = c.Commit.Author.Name
+			commitInfo.Author.Email = c.Commit.Author.Email
+			commitInfo.Author.Date = c.Commit.Author.Date
+			
+			// Set tree info
+			commitInfo.Tree.SHA = c.Commit.Tree.SHA
+			
+			// Add parent SHAs
+			for _, parent := range c.Parents {
+				commitInfo.Parents = append(commitInfo.Parents, struct {
+					SHA string `json:"sha"`
+				}{SHA: parent.SHA})
+			}
+			
+			allCommits = append(allCommits, commitInfo)
+		}
+		
+		// If we got fewer than perPage commits, we're done
+		if len(commits) < perPage {
+			break
+		}
+		
+		page++
+		
+		// Safety limit to prevent infinite loops
+		if page > 100 {
+			fmt.Printf("Warning: stopped after fetching %d pages of history\n", page-1)
+			break
+		}
+	}
+	
+	fmt.Printf("Fetched %d commits from history\n", len(allCommits))
+	return allCommits, nil
 }
 
 // generateMemorableNameFromCommit generates a memorable name from a commit

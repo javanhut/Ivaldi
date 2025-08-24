@@ -1,0 +1,202 @@
+#!/usr/bin/env carrion
+# Carrion WebSocket P2P Server
+# A robust peer-to-peer networking server using HTTP/TCP sockets
+
+print("=== Carrion WebSocket P2P Server ===")
+
+# Initialize time grimoire
+time = Time()
+
+# Use hardcoded port for now - can be modified later
+port = 9092
+node_id = "node_" + str(port) + "_" + str(time.now())
+bootstrap_host = ""
+bootstrap_port = 0
+
+print("Port:", port)
+print("Node ID:", node_id)
+
+# P2P server state
+peers = {}
+topology = {}
+running = 1
+
+# Create TCP server for HTTP
+print("Creating TCP server on localhost:" + str(port))
+server_id = server("tcp", "localhost:" + str(port), 60)
+print("✓ TCP server created")
+
+# Listen for connections
+listener_id = socket_listen(server_id)
+print("✓ Server listening for connections")
+print("🌐 P2P Server is running at: http://localhost:" + str(port))
+print("📱 Ready to accept peer connections")
+print("")
+
+# Helper function to create HTTP response
+spell create_http_response(status_code, content):
+    content_length = len(content)
+    headers = "HTTP/1.1 " + str(status_code) + " OK\r\nContent-Type: application/json\r\nContent-Length: " + str(content_length) + "\r\nConnection: close\r\n\r\n"
+    return headers + content
+
+# Helper function to extract JSON from HTTP POST
+spell extract_json_from_http(http_data):
+    lines = http_data.split("\n")
+    json_start = 0
+    json_body = ""
+    
+    for line in lines:
+        if json_start == 1:
+            json_body = json_body + line
+        if line.strip() == "":
+            json_start = 1
+    
+    return json_body.strip()
+
+# Handler for peer discovery
+spell handle_peer_discovery(data):
+    peer_id = "unknown"
+    peer_port = 0
+    
+    # Simple JSON parsing for peer_id and port
+    if "peer_id" in data:
+        peer_id = data["peer_id"]
+    if "port" in data:
+        peer_port = data["port"]
+    
+    print("📥 Peer discovery from " + peer_id + " on port " + str(peer_port))
+    
+    # Add peer to our topology
+    peers[peer_id] = {
+        "id": peer_id,
+        "port": peer_port,
+        "last_seen": time.now(),
+        "status": "connected"
+    }
+    
+    # Create response JSON
+    response = '{"status":"success","peer_id":"' + node_id + '","port":' + str(port) + ',"peer_count":' + str(len(peers)) + '}'
+    return response
+
+# Handler for ping requests
+spell handle_ping(data):
+    from_peer = "unknown"
+    if "peer_id" in data:
+        from_peer = data["peer_id"]
+    
+    print("🏓 Ping from " + from_peer)
+    
+    # Update last seen time if peer exists
+    if from_peer in peers:
+        peers[from_peer]["last_seen"] = time.now()
+    
+    response = '{"status":"pong","peer_id":"' + node_id + '","timestamp":' + str(time.now()) + '}'
+    return response
+
+# Handler for sync requests
+spell handle_sync_request(data):
+    sync_type = "unknown"
+    target = ""
+    
+    if "sync_type" in data:
+        sync_type = data["sync_type"]
+    if "target" in data:
+        target = data["target"]
+    
+    print("🔄 Sync request: " + sync_type + " for " + target)
+    
+    response = '{"status":"success","sync_data":{"type":"' + sync_type + '","target":"' + target + '","timestamp":' + str(time.now()) + '}}'
+    return response
+
+# Handler for connect peer requests
+spell handle_connect_peer(data):
+    peer_address = "localhost"
+    peer_port = 0
+    
+    if "address" in data:
+        peer_address = data["address"]
+    if "port" in data:
+        peer_port = data["port"]
+    
+    print("🤝 Connecting to peer at " + peer_address + ":" + str(peer_port))
+    
+    # Simple connection success simulation
+    response = '{"status":"success","message":"Connection to ' + peer_address + ':' + str(peer_port) + '"}'
+    return response
+
+# Process incoming P2P message
+spell process_p2p_message(json_data):
+    attempt:
+        # Basic JSON parsing - look for type field
+        message_type = "unknown"
+        
+        if "peer_discovery" in json_data:
+            return handle_peer_discovery({})
+        otherwise "ping" in json_data:
+            return handle_ping({})
+        otherwise "sync_request" in json_data:
+            return handle_sync_request({})
+        otherwise "connect_peer" in json_data:
+            return handle_connect_peer({})
+        else:
+            return '{"status":"error","message":"Unknown message type"}'
+            
+    ensnare(error):
+        return '{"status":"error","message":"JSON parsing error: ' + str(error) + '"}'
+
+# Main server loop
+connection_count = 0
+print("🚀 Starting main server loop...")
+print("")
+
+while running == 1:
+    attempt:
+        # Accept new connection
+        client_id = socket_accept(listener_id)
+        connection_count = connection_count + 1
+        print("📥 Connection " + str(connection_count) + " - Client connected")
+        
+        # Receive HTTP request
+        request = socket_receive(client_id, 4096)
+        print("📨 Received request (" + str(len(request)) + " bytes)")
+        
+        # Process only POST requests
+        if len(request) > 0 and "POST" in request:
+            print("🔍 Processing POST request")
+            
+            # Extract JSON data
+            json_data = extract_json_from_http(request)
+            
+            if len(json_data) > 0:
+                # Process P2P message
+                response_json = process_p2p_message(json_data)
+                http_response = create_http_response(200, response_json)
+                
+                # Send response
+                bytes_sent = socket_send(client_id, http_response)
+                print("📤 Sent response (" + str(bytes_sent) + " bytes)")
+            else:
+                # Send error response
+                error_json = '{"status":"error","message":"Invalid JSON"}'
+                http_response = create_http_response(400, error_json)
+                socket_send(client_id, http_response)
+                print("❌ Sent error response - Invalid JSON")
+        else:
+            # Send basic status response for GET requests
+            status_json = '{"status":"running","node_id":"' + node_id + '","port":' + str(port) + ',"peer_count":' + str(len(peers)) + '}'
+            http_response = create_http_response(200, status_json)
+            socket_send(client_id, http_response)
+            print("📊 Sent status response")
+        
+        # Close connection
+        socket_close(client_id)
+        print("✅ Connection " + str(connection_count) + " closed")
+        print("")
+        
+    ensnare(error):
+        print("❌ Error handling connection: " + str(error))
+        print("")
+
+print("WebSocket P2P server stopped")
+socket_close(listener_id)
+socket_close(server_id)

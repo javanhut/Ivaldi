@@ -2,6 +2,7 @@ package mesh
 
 import (
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -10,10 +11,12 @@ import (
 
 // MeshManager manages mesh networking for a repository
 type MeshManager struct {
-	meshNetwork *MeshNetwork
-	p2pManager  *p2p.P2PManager
-	running     bool
-	mutex       sync.RWMutex
+	meshNetwork  *MeshNetwork
+	p2pManager   *p2p.P2PManager
+	running      bool
+	mutex        sync.RWMutex
+	stateManager *MeshStateManager
+	rootDir      string
 }
 
 // MeshStatus contains mesh network status information
@@ -30,14 +33,22 @@ type MeshStatus struct {
 }
 
 // NewMeshManager creates a new mesh manager
-func NewMeshManager(p2pManager *p2p.P2PManager) *MeshManager {
+func NewMeshManager(p2pManager *p2p.P2PManager, rootDir string) *MeshManager {
 	meshNetwork := NewMeshNetwork(p2pManager)
+	stateManager := NewMeshStateManager(rootDir)
 	
-	return &MeshManager{
-		meshNetwork: meshNetwork,
-		p2pManager:  p2pManager,
-		running:     false,
+	mm := &MeshManager{
+		meshNetwork:  meshNetwork,
+		p2pManager:   p2pManager,
+		running:      false,
+		stateManager: stateManager,
+		rootDir:      rootDir,
 	}
+	
+	// Check if mesh was already running from a previous session
+	mm.loadState()
+	
+	return mm
 }
 
 // Start begins mesh networking
@@ -54,6 +65,18 @@ func (mm *MeshManager) Start() error {
 	}
 	
 	mm.running = true
+	
+	// Release lock before calling saveState to avoid deadlock
+	mm.mutex.Unlock()
+	
+	// Save state to disk
+	if err := mm.saveState(); err != nil {
+		fmt.Printf("Warning: failed to save mesh state: %v\n", err)
+	}
+	
+	// Re-acquire lock for the deferred unlock
+	mm.mutex.Lock()
+	
 	return nil
 }
 
@@ -71,6 +94,12 @@ func (mm *MeshManager) Stop() error {
 	}
 	
 	mm.running = false
+	
+	// Clear state from disk
+	if err := mm.stateManager.Clear(); err != nil {
+		fmt.Printf("Warning: failed to clear mesh state: %v\n", err)
+	}
+	
 	return nil
 }
 
@@ -78,7 +107,14 @@ func (mm *MeshManager) Stop() error {
 func (mm *MeshManager) IsRunning() bool {
 	mm.mutex.RLock()
 	defer mm.mutex.RUnlock()
-	return mm.running
+	
+	// Check in-memory state first
+	if mm.running {
+		return true
+	}
+	
+	// Check persistent state as fallback
+	return mm.stateManager.IsRunning()
 }
 
 // Join connects to a mesh network via a bootstrap peer
@@ -285,4 +321,42 @@ func (mm *MeshManager) SetEventHandlers(
 		mm.meshNetwork.onPeerLeave = onPeerLeave
 		mm.meshNetwork.onTopologyChange = onTopologyChange
 	}
+}
+
+// loadState loads the mesh state from disk and restores running state
+func (mm *MeshManager) loadState() {
+	if state, exists := mm.stateManager.GetRunningState(); exists {
+		// Mesh was running in a previous session, try to restore
+		fmt.Printf("Detected mesh network was previously running (PID: %d), checking status...\n", state.PID)
+		
+		// The state manager already verified the process is still running
+		// Try to reconnect to the existing mesh network
+		mm.running = true
+		fmt.Printf("Mesh network state restored (Node ID: %s)\n", state.NodeID)
+	}
+}
+
+// saveState saves the current mesh state to disk
+func (mm *MeshManager) saveState() error {
+	if !mm.running {
+		return nil
+	}
+	
+	status := mm.GetStatus()
+	state := &MeshState{
+		Running:       true,
+		NodeID:        status.NodeID,
+		Port:          0, // We don't have direct port access from mesh manager
+		StartedAt:     time.Now(),
+		PID:           os.Getpid(),
+		TopologyCount: status.PeerCount,
+	}
+	
+	// Try to get port from P2P manager if available
+	if mm.p2pManager != nil {
+		p2pStatus := mm.p2pManager.GetStatus()
+		state.Port = p2pStatus.Port
+	}
+	
+	return mm.stateManager.Save(state)
 }
