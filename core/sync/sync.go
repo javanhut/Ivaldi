@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -429,6 +430,11 @@ func (sm *SyncManager) restoreLocalChanges(changes *LocalChanges) error {
 	// In a real implementation, we'd check if the file was added by sync
 	// and only delete it if it wasn't
 	
+	// Handle git submodules after restoring files
+	if err := sm.handleSubmodules(workDir); err != nil {
+		return fmt.Errorf("failed to handle submodules: %v", err)
+	}
+	
 	return nil
 }
 
@@ -465,8 +471,19 @@ func (sm *SyncManager) UpdateWorkingDirectory(timeline string) error {
 		return fmt.Errorf("failed to load tree: %v", err)
 	}
 
+	workingDir := sm.network.GetRoot()
+	
 	// Extract files from tree to working directory
-	return sm.extractTreeToWorkingDirectory(tree, sm.network.GetRoot())
+	if err := sm.extractTreeToWorkingDirectory(tree, workingDir); err != nil {
+		return err
+	}
+
+	// Handle git submodules after extracting main files
+	if err := sm.handleSubmodules(workingDir); err != nil {
+		return fmt.Errorf("failed to handle submodules: %v", err)
+	}
+
+	return nil
 }
 
 // extractTreeToWorkingDirectory recursively extracts files from a tree to the working directory
@@ -596,6 +613,118 @@ func (sm *SyncManager) SyncAllTimelines(portalURL string) (*SyncAllResult, error
 	return result, nil
 }
 
+// handleSubmodules initializes and updates git submodules after syncing
+func (sm *SyncManager) handleSubmodules(workingDir string) error {
+	// Check if .gitmodules file exists
+	gitmodulesPath := filepath.Join(workingDir, ".gitmodules")
+	if _, err := os.Stat(gitmodulesPath); os.IsNotExist(err) {
+		// No submodules to handle
+		return nil
+	}
+
+	// Parse the .gitmodules file to get submodule information
+	submodules, err := workspace.ParseGitmodules(workingDir)
+	if err != nil {
+		return fmt.Errorf("failed to parse .gitmodules: %v", err)
+	}
+
+	if len(submodules) == 0 {
+		return nil
+	}
+
+	fmt.Printf("Found %d submodules, initializing and updating...\n", len(submodules))
+
+	// Initialize and update each submodule
+	for path, submodule := range submodules {
+		if err := sm.initializeSubmodule(workingDir, path, submodule); err != nil {
+			fmt.Printf("Warning: failed to initialize submodule %s: %v\n", path, err)
+			continue
+		}
+		fmt.Printf("Initialized submodule: %s\n", path)
+	}
+
+	return nil
+}
+
+// initializeSubmodule initializes a single git submodule
+func (sm *SyncManager) initializeSubmodule(workingDir, submodulePath string, submodule *workspace.SubmoduleInfo) error {
+	fullSubmodulePath := filepath.Join(workingDir, submodulePath)
+
+	// Check if submodule directory exists and is not empty
+	if info, err := os.Stat(fullSubmodulePath); err == nil && info.IsDir() {
+		// Check if it's already a git repository
+		gitDir := filepath.Join(fullSubmodulePath, ".git")
+		if _, err := os.Stat(gitDir); err == nil {
+			// Already initialized, try to update
+			return sm.updateSubmodule(fullSubmodulePath, submodule)
+		}
+	}
+
+	// Create submodule directory if it doesn't exist
+	if err := os.MkdirAll(fullSubmodulePath, 0755); err != nil {
+		return fmt.Errorf("failed to create submodule directory: %v", err)
+	}
+
+	// Clone the submodule repository
+	if err := sm.cloneSubmodule(submodule.URL, fullSubmodulePath, submodule.Branch); err != nil {
+		return fmt.Errorf("failed to clone submodule: %v", err)
+	}
+
+	return nil
+}
+
+// cloneSubmodule clones a git repository for a submodule
+func (sm *SyncManager) cloneSubmodule(url, targetPath, branch string) error {
+	// Use git clone to clone the submodule
+	args := []string{"clone"}
+	
+	// If branch is specified, use it
+	if branch != "" && branch != "master" && branch != "main" {
+		args = append(args, "-b", branch)
+	}
+	
+	args = append(args, url, targetPath)
+
+	// Execute git clone
+	cmd := exec.Command("git", args...)
+	cmd.Dir = filepath.Dir(targetPath)
+	
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git clone failed: %v, output: %s", err, string(output))
+	}
+
+	return nil
+}
+
+// updateSubmodule updates an existing submodule
+func (sm *SyncManager) updateSubmodule(submodulePath string, submodule *workspace.SubmoduleInfo) error {
+	// Fetch latest changes
+	cmd := exec.Command("git", "fetch", "origin")
+	cmd.Dir = submodulePath
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to fetch submodule updates: %v", err)
+	}
+
+	// Check out the appropriate branch/commit
+	checkoutTarget := "origin/HEAD"
+	if submodule.Branch != "" {
+		checkoutTarget = "origin/" + submodule.Branch
+	}
+
+	cmd = exec.Command("git", "checkout", checkoutTarget)
+	cmd.Dir = submodulePath
+	if err := cmd.Run(); err != nil {
+		// Try without origin prefix
+		cmd = exec.Command("git", "checkout", submodule.Branch)
+		cmd.Dir = submodulePath
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to checkout submodule branch: %v", err)
+		}
+	}
+
+	return nil
+}
+
 // SyncAllResult contains the outcome of syncing all timelines
 type SyncAllResult struct {
 	SyncedTimelines []string          `json:"synced_timelines"`
@@ -603,107 +732,4 @@ type SyncAllResult struct {
 	TotalTimelines  int               `json:"total_timelines"`
 	Success         bool              `json:"success"`
 	Message         string            `json:"message"`
-}
-
-// SyncSelectedTimelines synchronizes only the specified timelines from a remote portal
-func (sm *SyncManager) SyncSelectedTimelines(portalURL string, timelineNames []string) (*SyncAllResult, error) {
-	if len(timelineNames) == 0 {
-		return nil, fmt.Errorf("no timelines specified for sync")
-	}
-	
-	fmt.Printf("Syncing %d selected timelines: %v\n", len(timelineNames), timelineNames)
-	
-	// Step 1: Verify all timelines exist on remote
-	remoteTimelines, err := sm.network.ListRemoteTimelines(portalURL)
-	if err != nil {
-		return nil, fmt.Errorf("failed to discover remote timelines: %v", err)
-	}
-	
-	remoteTimelineMap := make(map[string]bool)
-	for _, ref := range remoteTimelines {
-		remoteTimelineMap[ref.Name] = true
-	}
-	
-	// Step 2: Validate requested timelines exist
-	var validTimelines []string
-	var missingTimelines []string
-	
-	for _, name := range timelineNames {
-		if remoteTimelineMap[name] {
-			validTimelines = append(validTimelines, name)
-		} else {
-			missingTimelines = append(missingTimelines, name)
-		}
-	}
-	
-	if len(missingTimelines) > 0 {
-		fmt.Printf("Warning: The following timelines do not exist on remote: %v\n", missingTimelines)
-	}
-	
-	if len(validTimelines) == 0 {
-		return &SyncAllResult{
-			SyncedTimelines: []string{},
-			FailedTimelines: map[string]string{},
-			TotalTimelines:  len(timelineNames),
-			Success:         false,
-			Message:         "None of the specified timelines exist on remote",
-		}, nil
-	}
-	
-	// Step 3: Sync valid timelines
-	result := &SyncAllResult{
-		SyncedTimelines: []string{},
-		FailedTimelines: make(map[string]string),
-		TotalTimelines:  len(validTimelines),
-	}
-	
-	// Add missing timelines to failed list
-	for _, missing := range missingTimelines {
-		result.FailedTimelines[missing] = "timeline does not exist on remote"
-	}
-	
-	for _, timelineName := range validTimelines {
-		fmt.Printf("\nSyncing timeline: %s\n", timelineName)
-		
-		// Create sync options for this timeline
-		opts := SyncOptions{
-			RemoteTimeline: timelineName,
-			LocalTimeline:  timelineName, // Create/update local timeline with same name
-			Strategy:       fuse.FuseStrategyAutomatic,
-		}
-		
-		// Perform sync for this timeline
-		syncResult, err := sm.Sync(portalURL, opts)
-		if err != nil {
-			fmt.Printf("Failed to sync timeline '%s': %v\n", timelineName, err)
-			result.FailedTimelines[timelineName] = err.Error()
-			continue
-		}
-		
-		if syncResult.Success {
-			result.SyncedTimelines = append(result.SyncedTimelines, timelineName)
-			fmt.Printf("Successfully synced timeline: %s\n", timelineName)
-		} else {
-			result.FailedTimelines[timelineName] = syncResult.Message
-		}
-	}
-	
-	// Step 4: Generate summary
-	successCount := len(result.SyncedTimelines)
-	failCount := len(result.FailedTimelines)
-	
-	result.Success = successCount > 0 // Success if at least one timeline synced
-	
-	if len(missingTimelines) > 0 && successCount > 0 {
-		result.Message = fmt.Sprintf("Synced %d timelines, %d missing from remote, %d failed", 
-			successCount, len(missingTimelines), failCount-len(missingTimelines))
-	} else if failCount == 0 {
-		result.Message = fmt.Sprintf("Successfully synced all %d timelines", successCount)
-	} else if successCount == 0 {
-		result.Message = fmt.Sprintf("Failed to sync all %d timelines", failCount)
-	} else {
-		result.Message = fmt.Sprintf("Synced %d timelines, failed %d timelines", successCount, failCount)
-	}
-	
-	return result, nil
 }
