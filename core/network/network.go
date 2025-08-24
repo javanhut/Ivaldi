@@ -880,12 +880,38 @@ func (nm *NetworkManager) uploadCompleteRepositoryState(owner, repo, timeline st
 		ignorePatterns = []string{} // Continue without ignore patterns
 	}
 	
+	// Get list of submodule paths to skip
+	submodulePaths, _ := workspace.GetSubmodulePaths(nm.root)
+	submoduleMap := make(map[string]bool)
+	for _, path := range submodulePaths {
+		submoduleMap[filepath.ToSlash(path)] = true
+	}
+	
 	// Prepare ALL repository files for upload (complete state)
 	var filesToUpload []FileToUpload
 	
 	for relPath := range allFiles {
 		// Convert to forward slashes for consistent matching
 		cleanPath := strings.ReplaceAll(relPath, "\\", "/")
+		
+		// Check if file is in a submodule directory
+		if submoduleMap[cleanPath] {
+			fmt.Printf("Skipping submodule: %s\n", cleanPath)
+			continue
+		}
+		
+		// Check if file is inside a submodule
+		isInSubmodule := false
+		for submodulePath := range submoduleMap {
+			if strings.HasPrefix(cleanPath, submodulePath+"/") {
+				fmt.Printf("Skipping file in submodule: %s\n", cleanPath)
+				isInSubmodule = true
+				break
+			}
+		}
+		if isInSubmodule {
+			continue
+		}
 		
 		// Check if file should be ignored
 		if nm.shouldIgnoreFile(cleanPath, ignorePatterns) {
@@ -1122,9 +1148,33 @@ func (nm *NetworkManager) getFilesForUpload(owner, repo, timeline string, seals 
 		return nil, nil, false, fmt.Errorf("failed to scan workspace: %v", err)
 	}
 
-	// Get all current files
+	// Get list of submodule paths to exclude
+	submodulePaths, _ := workspace.GetSubmodulePaths(nm.root)
+	submoduleMap := make(map[string]bool)
+	for _, path := range submodulePaths {
+		submoduleMap[filepath.ToSlash(path)] = true
+	}
+
+	// Get all current files (excluding submodules)
 	allFiles := make(map[string]string)
 	for path, fileState := range ws.Files {
+		cleanPath := filepath.ToSlash(path)
+		
+		// Skip if it's a submodule or inside a submodule
+		if submoduleMap[cleanPath] {
+			continue
+		}
+		isInSubmodule := false
+		for submodulePath := range submoduleMap {
+			if strings.HasPrefix(cleanPath, submodulePath+"/") {
+				isInSubmodule = true
+				break
+			}
+		}
+		if isInSubmodule {
+			continue
+		}
+		
 		if fileState.Status != workspace.StatusDeleted {
 			allFiles[path] = "tracked"
 		}
@@ -2140,14 +2190,30 @@ func (nm *NetworkManager) CloneGitRepo(url, dest string) error {
 		return fmt.Errorf("failed to create directory: %v", err)
 	}
 
-	// Use git clone to get full repository with history
+	// Use git clone to get full repository with history including submodules
 	fmt.Printf("Cloning Git repository with full history: %s\n", url)
-	cmd := exec.Command("git", "clone", url, dest)
+	cmd := exec.Command("git", "clone", "--recurse-submodules", url, dest)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("git clone failed: %v", err)
+	}
+	
+	// Check if there are submodules and ensure they're initialized
+	gitmodulesPath := filepath.Join(dest, ".gitmodules")
+	if _, err := os.Stat(gitmodulesPath); err == nil {
+		fmt.Printf("Initializing submodules...\n")
+		// Run git submodule update to ensure all submodules are properly initialized
+		submodCmd := exec.Command("git", "submodule", "update", "--init", "--recursive")
+		submodCmd.Dir = dest
+		submodCmd.Stdout = os.Stdout
+		submodCmd.Stderr = os.Stderr
+		
+		if err := submodCmd.Run(); err != nil {
+			// Non-fatal: submodules might already be initialized
+			fmt.Printf("Warning: submodule initialization had issues (may already be initialized): %v\n", err)
+		}
 	}
 	
 	fmt.Printf("Successfully cloned repository with Git history\n")

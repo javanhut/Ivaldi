@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"ivaldi/core/objects"
+	"ivaldi/core/workspace"
 )
 
 // OptimizedImporter handles efficient Git history import
@@ -480,6 +481,13 @@ func (oi *OptimizedImporter) createTreeFromGitTree(gitTreeSHA string) (objects.H
 	}
 	oi.cacheMutex.RUnlock()
 	
+	// Get list of submodule paths to skip
+	submodulePaths, _ := workspace.GetSubmodulePaths(oi.repo.root)
+	submoduleMap := make(map[string]bool)
+	for _, path := range submodulePaths {
+		submoduleMap[filepath.ToSlash(path)] = true
+	}
+	
 	// Get tree contents using git ls-tree
 	cmd := exec.Command("git", "-C", oi.repo.root, "ls-tree", "-r", gitTreeSHA)
 	output, err := cmd.Output()
@@ -511,6 +519,24 @@ func (oi *OptimizedImporter) createTreeFromGitTree(gitTreeSHA string) (objects.H
 			continue
 		}
 		path := line[tabIdx+1:]
+		
+		// Skip submodules (mode 160000) and files inside submodules
+		if mode == "160000" {
+			continue // This is a submodule entry itself
+		}
+		
+		// Check if file is inside a submodule directory
+		cleanPath := filepath.ToSlash(path)
+		isInSubmodule := false
+		for submodulePath := range submoduleMap {
+			if cleanPath == submodulePath || strings.HasPrefix(cleanPath, submodulePath+"/") {
+				isInSubmodule = true
+				break
+			}
+		}
+		if isInSubmodule {
+			continue
+		}
 		
 		// Get Ivaldi hash from cache
 		var ivaldiHash objects.Hash

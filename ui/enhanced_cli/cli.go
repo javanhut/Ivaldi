@@ -1432,6 +1432,13 @@ func (ec *EnhancedCLI) getUntrackedFiles() []string {
 	ws := ec.currentRepo.GetWorkspace()
 	var untracked []string
 	
+	// Get list of submodule paths to skip
+	submodulePaths, _ := workspace.GetSubmodulePaths(ec.currentRepo.Root())
+	submoduleMap := make(map[string]bool)
+	for _, path := range submodulePaths {
+		submoduleMap[filepath.FromSlash(path)] = true
+	}
+	
 	// Walk through directory and find files not in workspace
 	err := filepath.Walk(ec.currentRepo.Root(), func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -1446,15 +1453,25 @@ func (ec *EnhancedCLI) getUntrackedFiles() []string {
 			return nil
 		}
 		
-		// Skip directories
-		if info.IsDir() {
-			return nil
-		}
-		
-		// Get relative path
+		// Get relative path first to check for submodules
 		relPath, err := filepath.Rel(ec.currentRepo.Root(), path)
 		if err != nil {
 			return nil
+		}
+		
+		// Skip submodule directories
+		if info.IsDir() {
+			if submoduleMap[relPath] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		
+		// Skip files inside submodules
+		for submodulePath := range submoduleMap {
+			if strings.HasPrefix(relPath, submodulePath+string(filepath.Separator)) {
+				return nil
+			}
 		}
 		
 		// Skip if already tracked or ignored

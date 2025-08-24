@@ -68,6 +68,13 @@ func (w *Workspace) Scan() error {
 	// Track which files we've seen during scan
 	seenFiles := make(map[string]bool)
 	
+	// Get list of submodule paths to skip
+	submodulePaths, _ := GetSubmodulePaths(w.Root)
+	submoduleMap := make(map[string]bool)
+	for _, path := range submodulePaths {
+		submoduleMap[filepath.FromSlash(path)] = true
+	}
+	
 	err := filepath.WalkDir(w.Root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -77,6 +84,14 @@ func (w *Workspace) Scan() error {
 			if d.Name() == ".ivaldi" || d.Name() == ".git" || d.Name() == "build" {
 				return filepath.SkipDir
 			}
+			
+			// Check if this directory is a submodule
+			relPath, err := filepath.Rel(w.Root, path)
+			if err == nil && submoduleMap[relPath] {
+				// Skip submodule directories
+				return filepath.SkipDir
+			}
+			
 			return nil
 		}
 
