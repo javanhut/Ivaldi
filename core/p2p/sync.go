@@ -18,6 +18,7 @@ type P2PSyncManager struct {
 	syncMutex       sync.RWMutex
 	autoSync        bool
 	syncInterval    time.Duration
+	configMutex     sync.RWMutex // Protects autoSync and syncInterval
 }
 
 // Storage interface for P2P sync operations
@@ -127,25 +128,37 @@ func (psm *P2PSyncManager) Start() error {
 
 // EnableAutoSync enables or disables automatic synchronization
 func (psm *P2PSyncManager) EnableAutoSync(enabled bool) {
+	psm.configMutex.Lock()
+	defer psm.configMutex.Unlock()
 	psm.autoSync = enabled
 	fmt.Printf("Auto-sync %s\n", map[bool]string{true: "enabled", false: "disabled"}[enabled])
 }
 
 // SetSyncInterval sets the interval for automatic synchronization
 func (psm *P2PSyncManager) SetSyncInterval(interval time.Duration) {
+	psm.configMutex.Lock()
+	defer psm.configMutex.Unlock()
 	psm.syncInterval = interval
 	fmt.Printf("Sync interval set to %v\n", interval)
 }
 
 // autoSyncService continuously syncs with peers to keep them updated
 func (psm *P2PSyncManager) autoSyncService() {
-	ticker := time.NewTicker(psm.syncInterval)
+	psm.configMutex.RLock()
+	interval := psm.syncInterval
+	psm.configMutex.RUnlock()
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			if psm.autoSync {
+			psm.configMutex.RLock()
+			autoSync := psm.autoSync
+			psm.configMutex.RUnlock()
+
+			if autoSync {
 				psm.syncWithAllPeers()
 			}
 		}
