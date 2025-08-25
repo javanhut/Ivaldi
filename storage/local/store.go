@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"ivaldi/core/objects"
@@ -352,7 +353,7 @@ func (s *Store) Stats() (StoreStats, error) {
 		// Try to determine object kind and algorithm
 		for algo := range map[objects.HashAlgorithm]bool{objects.BLAKE3: true, objects.SHA256: true} {
 			algoDir := filepath.Join(s.objectDir, algo.String())
-			if filepath.HasPrefix(path, algoDir) {
+			if strings.HasPrefix(path, algoDir) {
 				stats.AlgorithmCounts[algo]++
 
 				// Try to read object kind
