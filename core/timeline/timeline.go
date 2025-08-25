@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"ivaldi/core/objects"
@@ -25,6 +26,7 @@ type Manager struct {
 	root      string
 	current   string
 	timelines map[string]*Timeline
+	mu        sync.RWMutex
 }
 
 func NewManager(root string) *Manager {
@@ -53,13 +55,18 @@ func (m *Manager) Initialize() error {
 		Description: "Main development timeline",
 	}
 
+	m.mu.Lock()
 	m.timelines["main"] = mainTimeline
 	m.current = "main"
+	m.mu.Unlock()
 
 	return m.save()
 }
 
 func (m *Manager) Create(name, description string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
 	if _, exists := m.timelines[name]; exists {
 		return fmt.Errorf("timeline '%s' already exists", name)
 	}
@@ -79,6 +86,9 @@ func (m *Manager) Create(name, description string) error {
 }
 
 func (m *Manager) Switch(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
 	if _, exists := m.timelines[name]; !exists {
 		return fmt.Errorf("timeline '%s' does not exist", name)
 	}
@@ -90,10 +100,15 @@ func (m *Manager) Switch(name string) error {
 }
 
 func (m *Manager) Current() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.current
 }
 
 func (m *Manager) List() []*Timeline {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	
 	var result []*Timeline
 	for _, timeline := range m.timelines {
 		result = append(result, timeline)
@@ -102,16 +117,25 @@ func (m *Manager) List() []*Timeline {
 }
 
 func (m *Manager) Get(name string) (*Timeline, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	
 	timeline, exists := m.timelines[name]
 	return timeline, exists
 }
 
 func (m *Manager) Exists(name string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	
 	_, exists := m.timelines[name]
 	return exists
 }
 
 func (m *Manager) UpdateHead(name string, hash objects.Hash) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
 	timeline, exists := m.timelines[name]
 	if !exists {
 		return fmt.Errorf("timeline '%s' does not exist", name)
@@ -141,12 +165,18 @@ func (m *Manager) Load() error {
 		return err
 	}
 
+	m.mu.Lock()
 	m.current = config.Current
 	m.timelines = config.Timelines
+	m.mu.Unlock()
+	
 	return nil
 }
 
 func (m *Manager) GetHead(name string) (objects.Hash, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	
 	timeline, exists := m.timelines[name]
 	if !exists {
 		return objects.Hash{}, fmt.Errorf("timeline '%s' does not exist", name)
@@ -155,6 +185,9 @@ func (m *Manager) GetHead(name string) (objects.Hash, error) {
 }
 
 func (m *Manager) Delete(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
 	if name == "main" {
 		return fmt.Errorf("cannot delete main timeline")
 	}
@@ -172,6 +205,9 @@ func (m *Manager) Delete(name string) error {
 }
 
 func (m *Manager) Rename(oldName, newName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
 	// Check if old timeline exists
 	timeline, exists := m.timelines[oldName]
 	if !exists {
