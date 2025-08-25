@@ -284,6 +284,10 @@ func (w *Workspace) gatherPath(path string) error {
 			fileState.OnAnvil = true
 			// Keep the original status (Modified/Added/Deleted) instead of changing to Gathered
 			w.AnvilFiles[relPath] = fileState
+		} else if fileState.Status == StatusUnmodified {
+			// For unmodified files, we still want to gather them if explicitly requested
+			fileState.OnAnvil = true
+			w.AnvilFiles[relPath] = fileState
 		}
 		// If file is unmodified, don't gather it
 	} else {

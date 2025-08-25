@@ -1,4 +1,4 @@
-package errors
+package apperrors
 
 import (
 	"fmt"
@@ -14,14 +14,14 @@ func (e HashAlgorithmError) Error() string {
 	return fmt.Sprintf("hash algorithm error: %s (algorithm: %v)", e.Message, e.Algorithm)
 }
 
-// ValidationError represents a validation error
-type ValidationError struct {
+// FieldValidationError represents a field-specific validation error
+type FieldValidationError struct {
 	Field   string
 	Value   interface{}
 	Message string
 }
 
-func (e ValidationError) Error() string {
+func (e FieldValidationError) Error() string {
 	return fmt.Sprintf("validation error for %s (%v): %s", e.Field, e.Value, e.Message)
 }
 
@@ -106,14 +106,6 @@ func NewHashAlgorithmError(algorithm interface{}, message string) error {
 	return HashAlgorithmError{
 		Algorithm: algorithm,
 		Message:   message,
-	}
-}
-
-func NewValidationError(field string, value interface{}, message string) error {
-	return ValidationError{
-		Field:   field,
-		Value:   value,
-		Message: message,
 	}
 }
 

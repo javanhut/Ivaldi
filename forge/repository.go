@@ -997,6 +997,12 @@ func (r *Repository) SwitchTimeline(name string) error {
 			return fmt.Errorf("failed to load workspace state: %v", err)
 		}
 	}
+	
+	// Also restore any files that were committed on the target timeline
+	// This ensures files committed on other timelines are properly restored
+	if err := r.restoreTimelineFiles(name); err != nil {
+		return fmt.Errorf("failed to restore timeline files: %v", err)
+	}
 
 	// Force rescan to update file tracking after restoration
 	if err := r.workspace.Scan(); err != nil {
@@ -1012,6 +1018,26 @@ func (r *Repository) SwitchTimeline(name string) error {
 	}
 
 	return nil
+}
+
+// restoreTimelineFiles restores files that were committed on the specified timeline
+func (r *Repository) restoreTimelineFiles(timelineName string) error {
+	// Get the head of the target timeline
+	head, err := r.timeline.GetHead(timelineName)
+	if err != nil || head.IsZero() {
+		// No commits on this timeline yet, nothing to restore
+		return nil
+	}
+	
+	// Load the seal at the head
+	_, err = r.storage.LoadSeal(head)
+	if err != nil {
+		// Seal not found, nothing to restore
+		return nil
+	}
+	
+	// Restore the working directory to match the seal
+	return r.RestoreWorkingDirectory(head)
 }
 
 // FileOperation represents a file change operation
@@ -2669,7 +2695,7 @@ func (r *Repository) EnableP2PAutoSync(enabled bool) error {
 }
 
 // SetP2PSyncInterval sets the P2P synchronization interval
-func (r *Repository) SetP2PSyncInterval(interval string) error {
+func (r *Repository) SetP2PSyncInterval(interval time.Duration) error {
 	if r.p2pMgr == nil {
 		// Initialize P2P manager if not already done
 		storageAdapter := p2p.NewStorageAdapter(r.storage)

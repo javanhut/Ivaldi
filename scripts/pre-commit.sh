@@ -17,7 +17,54 @@ fi
 GO_VERSION=$(go version | awk '{print $3}' | sed 's/go//')
 REQUIRED_VERSION="1.24"
 
-if [ "$(printf '%s\n' "$REQUIRED_VERSION" "$GO_VERSION" | sort -V | head -n1)" != "$REQUIRED_VERSION" ]; then
+# POSIX-safe semantic version comparison
+compare_versions() {
+    local required="$1"
+    local current="$2"
+    
+    # Parse required version (major.minor.patch)
+    local req_major="${required%%.*}"
+    local req_rest="${required#*.}"
+    local req_minor="${req_rest%%.*}"
+    local req_patch="${req_rest#*.}"
+    
+    # Default missing components to 0
+    [ "$req_minor" = "$required" ] && req_minor=0
+    [ "$req_patch" = "$req_rest" ] && req_patch=0
+    
+    # Parse current version (major.minor.patch)
+    local cur_major="${current%%.*}"
+    local cur_rest="${current#*.}"
+    local cur_minor="${cur_rest%%.*}"
+    local cur_patch="${cur_rest#*.}"
+    
+    # Default missing components to 0
+    [ "$cur_minor" = "$current" ] && cur_minor=0
+    [ "$cur_patch" = "$cur_rest" ] && cur_patch=0
+    
+    # Compare major version
+    if [ "$cur_major" -lt "$req_major" ]; then
+        return 1  # current < required
+    elif [ "$cur_major" -gt "$req_major" ]; then
+        return 0  # current > required
+    fi
+    
+    # Major versions equal, compare minor
+    if [ "$cur_minor" -lt "$req_minor" ]; then
+        return 1  # current < required
+    elif [ "$cur_minor" -gt "$req_minor" ]; then
+        return 0  # current > required
+    fi
+    
+    # Major and minor equal, compare patch
+    if [ "$cur_patch" -lt "$req_patch" ]; then
+        return 1  # current < required
+    fi
+    
+    return 0  # current >= required
+}
+
+if ! compare_versions "$REQUIRED_VERSION" "$GO_VERSION"; then
     echo "❌ Go version $GO_VERSION is too old. Required: $REQUIRED_VERSION or later."
     exit 1
 fi

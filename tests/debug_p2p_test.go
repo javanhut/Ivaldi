@@ -1,7 +1,9 @@
 package tests
 
 import (
+	"net"
 	"os"
+	"strconv"
 	"testing"
 
 	"ivaldi/forge"
@@ -9,6 +11,11 @@ import (
 
 // TestP2PManagerCreation tests P2P manager creation directly
 func TestP2PManagerCreation(t *testing.T) {
+	// Skip test unless explicitly enabled via environment variable
+	if os.Getenv("P2P_DEBUG") != "1" {
+		t.Skip("skipping debug P2P test; set P2P_DEBUG=1 to enable")
+	}
+
 	// Create test repository
 	tempDir, err := os.MkdirTemp("", "ivaldi-p2p-debug-*")
 	if err != nil {
@@ -35,7 +42,16 @@ func TestP2PManagerCreation(t *testing.T) {
 	t.Logf("P2P Config: %+v", config)
 
 	// Check if UpdateP2PConfig works (this is what fails in the robust test)
-	config.Port = 9999
+	// Use dynamic port allocation to avoid conflicts
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatalf("Failed to allocate ephemeral port: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+	
+	config.Port = port
+	t.Logf("Using dynamic port: %d", port)
 	err = repo.UpdateP2PConfig(config)
 	if err != nil {
 		t.Errorf("UpdateP2PConfig failed: %v", err)

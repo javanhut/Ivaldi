@@ -3,9 +3,9 @@ package mesh
 import (
 	"encoding/json"
 	"fmt"
+	"ivaldi/core/logging"
 	"os"
 	"path/filepath"
-	"syscall"
 	"time"
 )
 
@@ -48,7 +48,7 @@ func (sm *MeshStateManager) Save(state *MeshState) error {
 		return fmt.Errorf("failed to create state directory: %v", err)
 	}
 
-	if err := os.WriteFile(statePath, data, 0644); err != nil {
+	if err := os.WriteFile(statePath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write mesh state: %v", err)
 	}
 
@@ -75,25 +75,20 @@ func (sm *MeshStateManager) Load() (*MeshState, error) {
 	// Check if the process is still running - ignore the "running" field in the state
 	// and check if the PID is actually running
 	if state.PID > 0 {
-		// Check if process exists by trying to send signal 0 (no-op signal)
-		process, err := os.FindProcess(state.PID)
-		if err != nil {
-			// Process doesn't exist, mesh is not running
-			state.Running = false
-		} else {
-			// Try to send signal 0 to check if process is alive
-			// On Unix systems, signal 0 can be used to check if a process exists
-			err := process.Signal(syscall.Signal(0))
-			if err != nil {
-				// Process is not running or not accessible
-				state.Running = false
-			} else {
-				// Process is running
-				state.Running = true
+		oldRunning := state.Running
+		state.Running = isProcessAlive(state.PID)
+		
+		// Only save state if the running status changed
+		if state.Running != oldRunning {
+			if err := sm.Save(&state); err != nil {
+				logging.Error("Failed to save mesh state after process liveness check",
+					"node_id", state.NodeID,
+					"pid", state.PID,
+					"running", state.Running,
+					"error", err)
+				return nil, fmt.Errorf("failed to update mesh state: %v", err)
 			}
 		}
-		// Update state file with corrected running status
-		sm.Save(&state)
 	}
 
 	return &state, nil

@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,6 +9,17 @@ import (
 	
 	"ivaldi/forge"
 )
+
+// freePort returns an available ephemeral port
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
+}
 
 // TestP2PBasicConflict tests basic P2P conflict detection
 func TestP2PBasicConflict(t *testing.T) {
@@ -44,18 +56,25 @@ func TestP2PBasicConflict(t *testing.T) {
 	seal2, _ := repo2.Seal("Initial from repo2")
 	t.Logf("Repo2 created seal: %s", seal2.Name)
 	
-	// Configure P2P
+	// Configure P2P with dynamic ports
 	config1 := repo1.GetP2PConfig()
-	config1.Port = 9430
-	config1.DiscoveryPort = 9431
+	config1.Port = freePort(t)
+	config1.DiscoveryPort = freePort(t)
 	config1.AutoSyncEnabled = false
-	repo1.UpdateP2PConfig(config1)
+	if err := repo1.UpdateP2PConfig(config1); err != nil {
+		t.Fatalf("repo1 UpdateP2PConfig: %v", err)
+	}
 	
 	config2 := repo2.GetP2PConfig()
-	config2.Port = 9432
-	config2.DiscoveryPort = 9433
+	config2.Port = freePort(t)
+	config2.DiscoveryPort = freePort(t)
 	config2.AutoSyncEnabled = false
-	repo2.UpdateP2PConfig(config2)
+	if err := repo2.UpdateP2PConfig(config2); err != nil {
+		t.Fatalf("repo2 UpdateP2PConfig: %v", err)
+	}
+	
+	t.Logf("Repo1 P2P ports: %d (main), %d (discovery)", config1.Port, config1.DiscoveryPort)
+	t.Logf("Repo2 P2P ports: %d (main), %d (discovery)", config2.Port, config2.DiscoveryPort)
 	
 	// Start P2P
 	err = repo1.StartP2P()
@@ -71,7 +90,7 @@ func TestP2PBasicConflict(t *testing.T) {
 	defer repo2.StopP2P()
 	
 	// Connect repos
-	err = repo2.ConnectToPeer("localhost", 9430)
+	err = repo2.ConnectToPeer("localhost", config1.Port)
 	if err != nil {
 		t.Fatalf("Failed to connect repos: %v", err)
 	}

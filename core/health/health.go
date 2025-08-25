@@ -1,6 +1,7 @@
 package health
 
 import (
+	"context"
 	"fmt"
 	"ivaldi/core/logging"
 	"sync"
@@ -43,6 +44,10 @@ type HealthChecker struct {
 	components map[string]*ComponentHealth
 	mu         sync.RWMutex
 	logger     *logging.Logger
+	// Periodic health check control
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	mutex      sync.Mutex // protects cancel and wg operations
 }
 
 // NewHealthChecker creates a new health checker
@@ -97,7 +102,25 @@ func (hc *HealthChecker) GetComponentHealth(name string) (*ComponentHealth, bool
 	defer hc.mu.RUnlock()
 
 	component, exists := hc.components[name]
-	return component, exists
+	if !exists {
+		return nil, false
+	}
+
+	// Create a deep copy of the component
+	copy := &ComponentHealth{
+		Name:      component.Name,
+		Status:    component.Status,
+		Message:   component.Message,
+		LastCheck: component.LastCheck,
+		Details:   make(map[string]interface{}),
+	}
+
+	// Deep copy the Details map
+	for k, v := range component.Details {
+		copy.Details[k] = v
+	}
+
+	return copy, true
 }
 
 // GetOverallHealth returns the overall health status
@@ -139,7 +162,21 @@ func (hc *HealthChecker) GetAllComponents() map[string]*ComponentHealth {
 
 	result := make(map[string]*ComponentHealth)
 	for name, component := range hc.components {
-		result[name] = component
+		// Create a deep copy of each component
+		copy := &ComponentHealth{
+			Name:      component.Name,
+			Status:    component.Status,
+			Message:   component.Message,
+			LastCheck: component.LastCheck,
+			Details:   make(map[string]interface{}),
+		}
+
+		// Deep copy the Details map
+		for k, v := range component.Details {
+			copy.Details[k] = v
+		}
+
+		result[name] = copy
 	}
 
 	return result
@@ -150,7 +187,21 @@ func (hc *HealthChecker) CheckHealth() map[string]*ComponentHealth {
 	hc.mu.RLock()
 	components := make(map[string]*ComponentHealth)
 	for name, component := range hc.components {
-		components[name] = component
+		// Create a deep copy of each component
+		copy := &ComponentHealth{
+			Name:      component.Name,
+			Status:    component.Status,
+			Message:   component.Message,
+			LastCheck: component.LastCheck,
+			Details:   make(map[string]interface{}),
+		}
+
+		// Deep copy the Details map
+		for k, v := range component.Details {
+			copy.Details[k] = v
+		}
+
+		components[name] = copy
 	}
 	hc.mu.RUnlock()
 
@@ -228,12 +279,33 @@ func (hc *HealthChecker) getAllComponentsCopy() map[string]*ComponentHealth {
 
 // StartPeriodicHealthCheck starts periodic health checking
 func (hc *HealthChecker) StartPeriodicHealthCheck(interval time.Duration) {
+	hc.mutex.Lock()
+	defer hc.mutex.Unlock()
+
+	// If already running, stop the existing one first
+	if hc.cancel != nil {
+		hc.cancel()
+		hc.wg.Wait()
+	}
+
+	// Create new context for this health check session
+	ctx, cancel := context.WithCancel(context.Background())
+	hc.cancel = cancel
+
+	hc.wg.Add(1)
 	go func() {
+		defer hc.wg.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			hc.CheckHealth()
+		for {
+			select {
+			case <-ticker.C:
+				hc.CheckHealth()
+			case <-ctx.Done():
+				hc.logger.Info("Periodic health checking stopped")
+				return
+			}
 		}
 	}()
 
@@ -242,5 +314,13 @@ func (hc *HealthChecker) StartPeriodicHealthCheck(interval time.Duration) {
 
 // StopPeriodicHealthCheck stops periodic health checking
 func (hc *HealthChecker) StopPeriodicHealthCheck() {
-	hc.logger.Info("Stopping periodic health checking")
+	hc.mutex.Lock()
+	defer hc.mutex.Unlock()
+
+	if hc.cancel != nil {
+		hc.logger.Info("Stopping periodic health checking")
+		hc.cancel()
+		hc.wg.Wait() // Wait for the goroutine to finish
+		hc.cancel = nil
+	}
 }

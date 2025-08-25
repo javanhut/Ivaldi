@@ -29,6 +29,11 @@ type NetworkManager struct {
 	downloadProgress *downloadProgress
 }
 
+// GetRoot returns the repository root directory
+func (nm *NetworkManager) GetRoot() string {
+	return nm.root
+}
+
 // downloadProgress tracks download progress
 type downloadProgress struct {
 	total      int
@@ -61,10 +66,6 @@ func NewNetworkManager(root string) *NetworkManager {
 	}
 }
 
-// GetRoot returns the repository root path
-func (nm *NetworkManager) GetRoot() string {
-	return nm.root
-}
 
 // getGitHubToken gets GitHub token with multiple fallback options
 func (nm *NetworkManager) getGitHubToken() (string, error) {
@@ -106,10 +107,10 @@ func (nm *NetworkManager) FetchFromPortalWithHistory(portalURL, timeline string)
 	if strings.Contains(portalURL, "github.com") {
 		return nm.fetchFromGitHubWithHistory(portalURL, timeline)
 	} else if strings.Contains(portalURL, "gitlab.com") {
-		return nm.fetchFromGitLab(portalURL, timeline) // TODO: Implement GitLab history
+		return nil, fmt.Errorf("history fetch not implemented for GitLab repositories (portal: %s, timeline: %s)", portalURL, timeline)
 	} else {
 		// Native Ivaldi repository
-		return nm.fetchFromIvaldiRepo(portalURL, timeline) // TODO: Implement Ivaldi history
+		return nil, fmt.Errorf("history fetch not implemented for Ivaldi repositories (portal: %s, timeline: %s)", portalURL, timeline)
 	}
 }
 

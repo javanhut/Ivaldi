@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -85,14 +86,16 @@ type Message struct {
 type MessageType string
 
 const (
-	MessageTypeHandshake        MessageType = "handshake"
-	MessageTypePeerDiscovery    MessageType = "peer_discovery"
-	MessageTypeSyncRequest      MessageType = "sync_request"
-	MessageTypeSyncResponse     MessageType = "sync_response"
-	MessageTypeTimelineUpdate   MessageType = "timeline_update"
-	MessageTypeSealBroadcast    MessageType = "seal_broadcast"
-	MessageTypeHeartbeat        MessageType = "heartbeat"
-	MessageTypeConflictResolve  MessageType = "conflict_resolve"
+	MessageTypeHandshake         MessageType = "handshake"
+	MessageTypePeerDiscovery     MessageType = "peer_discovery"
+	MessageTypeSyncRequest       MessageType = "sync_request"
+	MessageTypeSyncResponse      MessageType = "sync_response"
+	MessageTypeTimelineUpdate    MessageType = "timeline_update"
+	MessageTypeSealBroadcast     MessageType = "seal_broadcast"
+	MessageTypeHeartbeat         MessageType = "heartbeat"
+	MessageTypeConflictResolve   MessageType = "conflict_resolve"
+	MessageTypeMeshTopology      MessageType = "mesh_topology"
+	MessageTypeMeshTopologyReq   MessageType = "mesh_topology_request"
 )
 
 // NewP2PNetwork creates a new P2P network instance
@@ -344,7 +347,14 @@ func (p2p *P2PNetwork) handlePeerConnection(peer *Peer) {
 			}
 
 			peer.LastSeen = time.Now()
-			peer.metrics.BytesReceived++
+			
+			// Calculate message size by marshaling back to JSON
+			if messageBytes, err := json.Marshal(message); err == nil {
+				atomic.AddInt64(&peer.metrics.BytesReceived, int64(len(messageBytes)))
+			} else {
+				// Fallback: estimate message size if marshaling fails
+				atomic.AddInt64(&peer.metrics.BytesReceived, 100) // Conservative estimate
+			}
 
 			if err := p2p.handleMessage(peer, &message); err != nil {
 				fmt.Printf("Error handling message from peer %s: %v\n", peer.ID, err)
@@ -396,7 +406,13 @@ func (p2p *P2PNetwork) SendMessage(peerID string, msgType MessageType, data inte
 		return fmt.Errorf("failed to send message to peer %s: %v", peerID, err)
 	}
 
-	peer.metrics.BytesSent++
+	// Calculate actual message size by marshaling to JSON
+	if messageBytes, err := json.Marshal(message); err == nil {
+		atomic.AddInt64(&peer.metrics.BytesSent, int64(len(messageBytes)))
+	} else {
+		// Fallback: estimate message size if marshaling fails
+		atomic.AddInt64(&peer.metrics.BytesSent, 100) // Conservative estimate
+	}
 	return nil
 }
 
@@ -477,6 +493,34 @@ func (p2p *P2PNetwork) handleHeartbeat(peer *Peer, message *Message) error {
 	}
 
 	return p2p.SendMessage(peer.ID, MessageTypeHeartbeat, responseData)
+}
+
+// handleSyncRequest processes sync requests from peers
+func (p2p *P2PNetwork) handleSyncRequest(peer *Peer, message *Message) error {
+	// Basic implementation - could be enhanced to delegate to sync manager
+	fmt.Printf("Received sync request from peer %s\n", peer.ID)
+	return nil
+}
+
+// handleSyncResponse processes sync responses from peers
+func (p2p *P2PNetwork) handleSyncResponse(peer *Peer, message *Message) error {
+	// Basic implementation - could be enhanced to delegate to sync manager
+	fmt.Printf("Received sync response from peer %s\n", peer.ID)
+	return nil
+}
+
+// handleTimelineUpdate processes timeline updates from peers
+func (p2p *P2PNetwork) handleTimelineUpdate(peer *Peer, message *Message) error {
+	// Basic implementation - could be enhanced to delegate to sync manager
+	fmt.Printf("Received timeline update from peer %s\n", peer.ID)
+	return nil
+}
+
+// handleSealBroadcast processes seal broadcasts from peers
+func (p2p *P2PNetwork) handleSealBroadcast(peer *Peer, message *Message) error {
+	// Basic implementation - could be enhanced to delegate to sync manager
+	fmt.Printf("Received seal broadcast from peer %s\n", peer.ID)
+	return nil
 }
 
 // generateNodeID creates a unique identifier for this node

@@ -389,6 +389,11 @@ func DecodeCATree(data []byte) (*CATree, error) {
 		hashAlgo := HashAlgorithm(data[offset])
 		offset++
 
+		// Validate hash algorithm
+		if hashAlgo < 0 || hashAlgo >= HashAlgorithm(len(algorithmNames)) {
+			return nil, fmt.Errorf("unknown hash algorithm %d at offset %d", hashAlgo, offset-33)
+		}
+
 		var hashValue [32]byte
 		copy(hashValue[:], data[offset:offset+32])
 		offset += 32
@@ -510,6 +515,11 @@ func DecodeCASeal(data []byte) (*CASeal, error) {
 	treeHashAlgo := HashAlgorithm(data[offset])
 	offset++
 
+	// Validate hash algorithm
+	if treeHashAlgo < 0 || treeHashAlgo >= HashAlgorithm(len(algorithmNames)) {
+		return nil, fmt.Errorf("unknown hash algorithm %d at offset %d", treeHashAlgo, offset-1)
+	}
+
 	var treeHashValue [32]byte
 	copy(treeHashValue[:], data[offset:offset+32])
 	offset += 32
@@ -533,6 +543,11 @@ func DecodeCASeal(data []byte) (*CASeal, error) {
 
 		parentHashAlgo := HashAlgorithm(data[offset])
 		offset++
+
+		// Validate hash algorithm
+		if parentHashAlgo < 0 || parentHashAlgo >= HashAlgorithm(len(algorithmNames)) {
+			return nil, fmt.Errorf("unknown hash algorithm %d at offset %d", parentHashAlgo, offset-34)
+		}
 
 		var parentHashValue [32]byte
 		copy(parentHashValue[:], data[offset:offset+32])

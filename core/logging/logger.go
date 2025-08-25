@@ -3,6 +3,7 @@ package logging
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -47,15 +48,44 @@ func (l *Logger) shouldLog(level LogLevel) bool {
 	return level >= l.level
 }
 
-// format formats a log message with timestamp, level, and prefix
+// format formats a log message with timestamp, level, prefix, and structured key/value pairs
 func (l *Logger) format(level LogLevel, message string, args ...interface{}) string {
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 	levelStr := levelNames[level]
-
+	
+	// Build the base message
+	var baseMessage string
 	if l.prefix != "" {
-		return fmt.Sprintf("[%s] %s [%s] %s", timestamp, levelStr, l.prefix, fmt.Sprintf(message, args...))
+		baseMessage = fmt.Sprintf("[%s] %s [%s] %s", timestamp, levelStr, l.prefix, message)
+	} else {
+		baseMessage = fmt.Sprintf("[%s] %s %s", timestamp, levelStr, message)
 	}
-	return fmt.Sprintf("[%s] %s %s", timestamp, levelStr, fmt.Sprintf(message, args...))
+	
+	// Process structured key/value pairs from args
+	if len(args) > 0 {
+		var kvPairs []string
+		
+		// Process args in pairs (key, value)
+		for i := 0; i < len(args); i += 2 {
+			if i+1 < len(args) {
+				// We have a key-value pair
+				key := fmt.Sprintf("%v", args[i])
+				value := fmt.Sprintf("%v", args[i+1])
+				kvPairs = append(kvPairs, fmt.Sprintf("%s=%s", key, value))
+			} else {
+				// Odd number of args - handle the remaining single value
+				key := fmt.Sprintf("%v", args[i])
+				kvPairs = append(kvPairs, fmt.Sprintf("%s=<missing_value>", key))
+			}
+		}
+		
+		// Join key/value pairs and append to base message
+		if len(kvPairs) > 0 {
+			baseMessage += " " + strings.Join(kvPairs, " ")
+		}
+	}
+	
+	return baseMessage
 }
 
 // Debug logs a debug message

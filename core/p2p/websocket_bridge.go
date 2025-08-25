@@ -56,8 +56,8 @@ func (wsb *WebSocketBridge) Start() error {
 		return fmt.Errorf("Carrion language not found in PATH. Please install Carrion: %v", err)
 	}
 
-	// Launch the Carrion WebSocket server
-	carrionScript := "/home/javanstorm/Ivaldi/core/p2p/websocket_server.crl"
+	// Launch the Carrion HTTP P2P server
+	carrionScript := "/home/javanstorm/Ivaldi/core/p2p/http_p2p_server.crl"
 	wsb.carrionCmd = exec.Command("carrion", carrionScript, strconv.Itoa(wsb.port))
 	
 	// Set up process group for clean shutdown

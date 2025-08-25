@@ -1,8 +1,8 @@
 #!/usr/bin/env carrion
-# Carrion WebSocket P2P Server
+# Carrion HTTP P2P Server
 # A robust peer-to-peer networking server using HTTP/TCP sockets
 
-print("=== Carrion WebSocket P2P Server ===")
+print("=== Carrion HTTP P2P Server ===")
 
 # Initialize time grimoire
 time = Time()
@@ -197,6 +197,6 @@ while running == 1:
         print("❌ Error handling connection: " + str(error))
         print("")
 
-print("WebSocket P2P server stopped")
+print("HTTP P2P server stopped")
 socket_close(listener_id)
 socket_close(server_id)

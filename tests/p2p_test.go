@@ -70,7 +70,9 @@ func TestP2PBasicNetworking(t *testing.T) {
 	config2 := repo2.GetP2PConfig()
 	config2.Port = 9092
 	config2.DiscoveryPort = 9093
-	repo2.UpdateP2PConfig(config2)
+	if err := repo2.UpdateP2PConfig(config2); err != nil {
+		t.Fatalf("repo2 UpdateP2PConfig: %v", err)
+	}
 
 	err = repo2.StartP2P()
 	if err != nil {
@@ -156,14 +158,18 @@ func TestP2PSync(t *testing.T) {
 	config1.DiscoveryPort = 9095
 	config1.AutoSyncEnabled = true
 	config1.SyncInterval = 1 * time.Second
-	repo1.UpdateP2PConfig(config1)
+	if err := repo1.UpdateP2PConfig(config1); err != nil {
+		t.Fatalf("repo1 UpdateP2PConfig: %v", err)
+	}
 
 	config2 := repo2.GetP2PConfig()
 	config2.Port = 9096
 	config2.DiscoveryPort = 9097
 	config2.AutoSyncEnabled = true
 	config2.SyncInterval = 1 * time.Second
-	repo2.UpdateP2PConfig(config2)
+	if err := repo2.UpdateP2PConfig(config2); err != nil {
+		t.Fatalf("repo2 UpdateP2PConfig: %v", err)
+	}
 
 	err = repo1.StartP2P()
 	if err != nil {
@@ -243,13 +249,17 @@ func TestP2PDiscovery(t *testing.T) {
 	config1.Port = 9098
 	config1.DiscoveryPort = 9099
 	config1.EnableAutoConnect = true
-	repo1.UpdateP2PConfig(config1)
+	if err := repo1.UpdateP2PConfig(config1); err != nil {
+		t.Fatalf("repo1 UpdateP2PConfig: %v", err)
+	}
 
 	config2 := repo2.GetP2PConfig()
 	config2.Port = 9100
 	config2.DiscoveryPort = 9099 // Same discovery port for local discovery
 	config2.EnableAutoConnect = true
-	repo2.UpdateP2PConfig(config2)
+	if err := repo2.UpdateP2PConfig(config2); err != nil {
+		t.Fatalf("repo2 UpdateP2PConfig: %v", err)
+	}
 
 	err = repo1.StartP2P()
 	if err != nil {
@@ -322,7 +332,7 @@ func TestP2PConfig(t *testing.T) {
 	}
 
 	// Test sync interval update
-	err = repo.SetP2PSyncInterval("5m")
+	err = repo.SetP2PSyncInterval(5 * time.Minute)
 	if err != nil {
 		t.Fatalf("Failed to set sync interval: %v", err)
 	}
@@ -483,10 +493,10 @@ func TestP2PErrorHandling(t *testing.T) {
 		t.Error("Expected error when connecting to unreachable port")
 	}
 
-	// Test invalid sync interval
-	err = repo.SetP2PSyncInterval("invalid")
+	// Test invalid sync interval (negative duration)
+	err = repo.SetP2PSyncInterval(-1 * time.Second)
 	if err == nil {
-		t.Error("Expected error when setting invalid sync interval")
+		t.Error("Expected error when setting negative sync interval")
 	}
 
 	t.Log("P2P error handling test passed!")
@@ -540,7 +550,7 @@ func TestP2PAutoSync(t *testing.T) {
 	}
 
 	// Test sync interval
-	err = repo.SetP2PSyncInterval("30s")
+	err = repo.SetP2PSyncInterval(30 * time.Second)
 	if err != nil {
 		t.Fatalf("Failed to set sync interval: %v", err)
 	}

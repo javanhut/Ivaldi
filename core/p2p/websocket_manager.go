@@ -192,15 +192,33 @@ func (wpm *WebSocketP2PManager) SyncWithPeer(peerID string) error {
 	return wpm.bridge.SyncWithPeer(peerID, "repository", "all")
 }
 
-// BroadcastMessage sends a message to all connected peers
-func (wpm *WebSocketP2PManager) BroadcastMessage(messageType string, data interface{}) error {
+// SendMessage sends a message to a specific peer
+func (wpm *WebSocketP2PManager) SendMessage(peerID string, msgType MessageType, data interface{}) error {
 	if !wpm.IsRunning() {
 		return fmt.Errorf("WebSocket P2P manager is not running")
 	}
 
 	// Convert data to map[string]interface{} for JSON marshaling
 	dataMap := make(map[string]interface{})
-	dataMap["message_type"] = messageType
+	dataMap["message_type"] = msgType
+	dataMap["data"] = data
+	dataMap["from_peer"] = wpm.nodeID
+	dataMap["to_peer"] = peerID
+
+	// Use the bridge to send message to specific peer
+	_, err := wpm.bridge.SendMessage(peerID, dataMap)
+	return err
+}
+
+// BroadcastMessage sends a message to all connected peers
+func (wpm *WebSocketP2PManager) BroadcastMessage(msgType MessageType, data interface{}) error {
+	if !wpm.IsRunning() {
+		return fmt.Errorf("WebSocket P2P manager is not running")
+	}
+
+	// Convert data to map[string]interface{} for JSON marshaling
+	dataMap := make(map[string]interface{})
+	dataMap["message_type"] = msgType
 	dataMap["data"] = data
 	dataMap["from_peer"] = wpm.nodeID
 
@@ -256,7 +274,7 @@ func (wpm *WebSocketP2PManager) EnableAutoSync(enabled bool) error {
 }
 
 // SetSyncInterval sets the synchronization interval
-func (wpm *WebSocketP2PManager) SetSyncInterval(interval string) error {
+func (wpm *WebSocketP2PManager) SetSyncInterval(interval time.Duration) error {
 	// WebSocket P2P uses fixed intervals for now
 	fmt.Printf("WebSocket P2P: Sync interval set to %v (placeholder)\n", interval)
 	return nil

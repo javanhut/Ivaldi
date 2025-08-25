@@ -97,7 +97,15 @@ func TestP2PStressMultiplePeers(t *testing.T) {
 				go func(from, to int) {
 					defer wg.Done()
 					
+					// Add small delay to avoid overwhelming the system
+					time.Sleep(time.Duration(rand.Intn(100)) * time.Millisecond)
+					
 					toStatus := repos[to].GetP2PStatus()
+					if toStatus.NodeID == "" {
+						errors <- fmt.Errorf("repo %d has no node ID", to)
+						return
+					}
+					
 					err := repos[from].SyncWithP2PPeer(toStatus.NodeID)
 					if err != nil {
 						errors <- fmt.Errorf("sync %d->%d failed: %v", from, to, err)

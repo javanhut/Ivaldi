@@ -107,6 +107,11 @@ func (cm *P2PConfigManager) Load() (*P2PConfig, error) {
 
 // Save saves P2P configuration to file
 func (cm *P2PConfigManager) Save(config *P2PConfig) error {
+	// Validate configuration before persisting
+	if err := cm.ValidateConfig(config); err != nil {
+		return err
+	}
+
 	// Ensure directory exists
 	dir := filepath.Dir(cm.configPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {

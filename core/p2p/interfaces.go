@@ -1,5 +1,7 @@
 package p2p
 
+import "time"
+
 // P2PManagerInterface defines the interface that all P2P managers must implement
 type P2PManagerInterface interface {
 	// Core lifecycle methods
@@ -25,7 +27,11 @@ type P2PManagerInterface interface {
 	// Event handling
 	Subscribe(eventType string, handler EventHandler)
 	
+	// Messaging
+	SendMessage(peerID string, msgType MessageType, data interface{}) error
+	BroadcastMessage(msgType MessageType, data interface{}) error
+	
 	// Configuration methods
 	EnableAutoSync(enabled bool) error
-	SetSyncInterval(interval string) error
+	SetSyncInterval(interval time.Duration) error
 }

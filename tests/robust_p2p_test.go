@@ -408,17 +408,17 @@ func TestP2PErrorHandlingRobust(t *testing.T) {
 	// Test configuration errors
 	t.Log("Testing configuration errors...")
 	
-	err = repo.SetP2PSyncInterval("invalid-duration")
+	err = repo.SetP2PSyncInterval(-1 * time.Second)
 	if err == nil {
-		t.Error("Expected error when setting invalid sync interval")
+		t.Error("Expected error when setting negative sync interval")
 	} else {
-		t.Logf("Expected error for invalid sync interval: %v", err)
+		t.Logf("Expected error for negative sync interval: %v", err)
 	}
 
 	// Test valid configurations
 	t.Log("Testing valid configurations...")
 	
-	err = repo.SetP2PSyncInterval("30s")
+	err = repo.SetP2PSyncInterval(30 * time.Second)
 	if err != nil {
 		t.Errorf("Unexpected error setting valid sync interval: %v", err)
 	}

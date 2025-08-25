@@ -308,17 +308,12 @@ func (pm *P2PManager) EnableAutoSync(enabled bool) error {
 }
 
 // SetSyncInterval sets the synchronization interval
-func (pm *P2PManager) SetSyncInterval(interval string) error {
-	duration, err := parseDuration(interval)
-	if err != nil {
-		return fmt.Errorf("invalid interval format: %v", err)
-	}
-
+func (pm *P2PManager) SetSyncInterval(interval time.Duration) error {
 	if pm.syncManager != nil {
-		pm.syncManager.SetSyncInterval(duration)
+		pm.syncManager.SetSyncInterval(interval)
 	}
 
-	return pm.configManager.UpdateSyncInterval(duration)
+	return pm.configManager.UpdateSyncInterval(interval)
 }
 
 // GetConfig returns the current P2P configuration
@@ -399,6 +394,22 @@ func (pm *P2PManager) Subscribe(eventType string, handler EventHandler) {
 	}
 }
 
+// SendMessage sends a message to a specific peer
+func (pm *P2PManager) SendMessage(peerID string, msgType MessageType, data interface{}) error {
+	if pm.network == nil {
+		return fmt.Errorf("P2P network not started")
+	}
+	return pm.network.SendMessage(peerID, msgType, data)
+}
+
+// BroadcastMessage sends a message to all connected peers
+func (pm *P2PManager) BroadcastMessage(msgType MessageType, data interface{}) error {
+	if pm.network == nil {
+		return fmt.Errorf("P2P network not started")
+	}
+	return pm.network.BroadcastMessage(msgType, data)
+}
+
 // Helper functions
 
 // connectToKnownPeer attempts to connect to a known peer
@@ -428,26 +439,6 @@ func (pm *P2PManager) getRepositoryList() []string {
 	return []string{repoName}
 }
 
-// parseDuration parses a duration string with support for common formats
-func parseDuration(s string) (time.Duration, error) {
-	// Support common formats
-	switch s {
-	case "30s", "30sec", "30seconds":
-		return 30 * time.Second, nil
-	case "1m", "1min", "1minute":
-		return 1 * time.Minute, nil
-	case "5m", "5min", "5minutes":
-		return 5 * time.Minute, nil
-	case "10m", "10min", "10minutes":
-		return 10 * time.Minute, nil
-	case "30m", "30min", "30minutes":
-		return 30 * time.Minute, nil
-	case "1h", "1hour":
-		return 1 * time.Hour, nil
-	default:
-		return time.ParseDuration(s)
-	}
-}
 
 // Sync context types for passing to sync callback
 type SyncRequestContext struct {
@@ -462,38 +453,3 @@ type SyncResponseContext struct {
 
 // P2P message handlers (called by network layer)
 
-// handleSyncRequest processes sync requests from the network layer
-func (p2p *P2PNetwork) handleSyncRequest(peer *Peer, message *Message) error {
-	// Forward to sync manager if available
-	if p2p.syncCallback != nil {
-		return p2p.syncCallback(peer.ID, SyncEventSyncRequest, &SyncRequestContext{peer, message})
-	}
-	return nil
-}
-
-// handleSyncResponse processes sync responses from the network layer
-func (p2p *P2PNetwork) handleSyncResponse(peer *Peer, message *Message) error {
-	// Forward to sync manager if available
-	if p2p.syncCallback != nil {
-		return p2p.syncCallback(peer.ID, SyncEventSyncResponse, &SyncResponseContext{peer, message})
-	}
-	return nil
-}
-
-// handleTimelineUpdate processes timeline updates from the network layer
-func (p2p *P2PNetwork) handleTimelineUpdate(peer *Peer, message *Message) error {
-	// Forward to sync manager if available
-	if p2p.syncCallback != nil {
-		return p2p.syncCallback(peer.ID, SyncEventTimelineUpdate, message.Data)
-	}
-	return nil
-}
-
-// handleSealBroadcast processes seal broadcasts from the network layer
-func (p2p *P2PNetwork) handleSealBroadcast(peer *Peer, message *Message) error {
-	// Forward to sync manager if available
-	if p2p.syncCallback != nil {
-		return p2p.syncCallback(peer.ID, SyncEventNewSeal, message.Data)
-	}
-	return nil
-}

@@ -21,22 +21,22 @@ type MeshManager struct {
 
 // MeshStatus contains mesh network status information
 type MeshStatus struct {
-	Running       bool                   `json:"running"`
-	NodeID        string                 `json:"node_id"`
-	PeerCount     int                    `json:"peer_count"`
-	DirectPeers   int                    `json:"direct_peers"`
-	IndirectPeers int                    `json:"indirect_peers"`
-	MaxHops       int                    `json:"max_hops"`
-	AvgHops       float64               `json:"avg_hops"`
-	Topology      map[string]*MeshPeer  `json:"topology"`
-	Routes        map[string][]string   `json:"routes"`
+	Running       bool                 `json:"running"`
+	NodeID        string               `json:"node_id"`
+	PeerCount     int                  `json:"peer_count"`
+	DirectPeers   int                  `json:"direct_peers"`
+	IndirectPeers int                  `json:"indirect_peers"`
+	MaxHops       int                  `json:"max_hops"`
+	AvgHops       float64              `json:"avg_hops"`
+	Topology      map[string]*MeshPeer `json:"topology"`
+	Routes        map[string][]string  `json:"routes"`
 }
 
 // NewMeshManager creates a new mesh manager
 func NewMeshManager(p2pManager *p2p.P2PManager, rootDir string) *MeshManager {
 	meshNetwork := NewMeshNetwork(p2pManager)
 	stateManager := NewMeshStateManager(rootDir)
-	
+
 	mm := &MeshManager{
 		meshNetwork:  meshNetwork,
 		p2pManager:   p2pManager,
@@ -44,10 +44,10 @@ func NewMeshManager(p2pManager *p2p.P2PManager, rootDir string) *MeshManager {
 		stateManager: stateManager,
 		rootDir:      rootDir,
 	}
-	
+
 	// Check if mesh was already running from a previous session
 	mm.loadState()
-	
+
 	return mm
 }
 
@@ -55,28 +55,28 @@ func NewMeshManager(p2pManager *p2p.P2PManager, rootDir string) *MeshManager {
 func (mm *MeshManager) Start() error {
 	mm.mutex.Lock()
 	defer mm.mutex.Unlock()
-	
+
 	if mm.running {
 		return fmt.Errorf("mesh network is already running")
 	}
-	
+
 	if err := mm.meshNetwork.Start(); err != nil {
 		return fmt.Errorf("failed to start mesh network: %v", err)
 	}
-	
+
 	mm.running = true
-	
+
 	// Release lock before calling saveState to avoid deadlock
 	mm.mutex.Unlock()
-	
+
 	// Save state to disk
 	if err := mm.saveState(); err != nil {
 		fmt.Printf("Warning: failed to save mesh state: %v\n", err)
 	}
-	
+
 	// Re-acquire lock for the deferred unlock
 	mm.mutex.Lock()
-	
+
 	return nil
 }
 
@@ -84,22 +84,22 @@ func (mm *MeshManager) Start() error {
 func (mm *MeshManager) Stop() error {
 	mm.mutex.Lock()
 	defer mm.mutex.Unlock()
-	
+
 	if !mm.running {
 		return nil
 	}
-	
+
 	if err := mm.meshNetwork.Stop(); err != nil {
 		return fmt.Errorf("failed to stop mesh network: %v", err)
 	}
-	
+
 	mm.running = false
-	
+
 	// Clear state from disk
 	if err := mm.stateManager.Clear(); err != nil {
 		fmt.Printf("Warning: failed to clear mesh state: %v\n", err)
 	}
-	
+
 	return nil
 }
 
@@ -107,12 +107,12 @@ func (mm *MeshManager) Stop() error {
 func (mm *MeshManager) IsRunning() bool {
 	mm.mutex.RLock()
 	defer mm.mutex.RUnlock()
-	
+
 	// Check in-memory state first
 	if mm.running {
 		return true
 	}
-	
+
 	// Check persistent state as fallback
 	return mm.stateManager.IsRunning()
 }
@@ -122,7 +122,7 @@ func (mm *MeshManager) Join(bootstrapAddress string, bootstrapPort int) error {
 	if !mm.running {
 		return fmt.Errorf("mesh network is not running")
 	}
-	
+
 	return mm.meshNetwork.JoinMesh(bootstrapAddress, bootstrapPort)
 }
 
@@ -130,58 +130,58 @@ func (mm *MeshManager) Join(bootstrapAddress string, bootstrapPort int) error {
 func (mm *MeshManager) GetStatus() *MeshStatus {
 	mm.mutex.RLock()
 	defer mm.mutex.RUnlock()
-	
+
 	status := &MeshStatus{
 		Running: mm.running,
 	}
-	
+
 	if !mm.running {
 		return status
 	}
-	
+
 	// Get basic info
 	p2pStatus := mm.p2pManager.GetStatus()
 	status.NodeID = p2pStatus.NodeID
-	
+
 	// Get topology information
 	topology := mm.meshNetwork.GetTopology()
 	status.Topology = topology
 	status.PeerCount = len(topology) - 1 // Exclude ourselves
-	
+
 	// Count direct vs indirect peers
 	directCount := 0
 	indirectCount := 0
 	totalHops := 0
 	maxHops := 0
-	
+
 	for peerID, peer := range topology {
 		if peerID == status.NodeID {
 			continue
 		}
-		
+
 		if peer.DirectConnect {
 			directCount++
 		} else {
 			indirectCount++
 		}
-		
+
 		totalHops += peer.Hops
 		if peer.Hops > maxHops {
 			maxHops = peer.Hops
 		}
 	}
-	
+
 	status.DirectPeers = directCount
 	status.IndirectPeers = indirectCount
 	status.MaxHops = maxHops
-	
+
 	if status.PeerCount > 0 {
 		status.AvgHops = float64(totalHops) / float64(status.PeerCount)
 	}
-	
+
 	// Get routing information
 	status.Routes = make(map[string][]string)
-	
+
 	// Get all routes
 	for peerID := range topology {
 		if peerID != status.NodeID {
@@ -191,7 +191,7 @@ func (mm *MeshManager) GetStatus() *MeshStatus {
 			}
 		}
 	}
-	
+
 	return status
 }
 
@@ -200,8 +200,39 @@ func (mm *MeshManager) GetTopology() map[string]*MeshPeer {
 	if !mm.running {
 		return make(map[string]*MeshPeer)
 	}
-	
-	return mm.meshNetwork.GetTopology()
+
+	topo := mm.meshNetwork.GetTopology()
+	safe := make(map[string]*MeshPeer, len(topo))
+	for id, peer := range topo {
+		// Deep copy the MeshPeer to prevent external mutation
+		peerCopy := MeshPeer{
+			ID:            peer.ID,
+			Address:       peer.Address,
+			Port:          peer.Port,
+			LastSeen:      peer.LastSeen,
+			DirectConnect: peer.DirectConnect,
+			Hops:          peer.Hops,
+			NextHop:       peer.NextHop,
+			Version:       peer.Version,
+		}
+
+		// Deep copy the Peers map
+		if peer.Peers != nil {
+			peerCopy.Peers = make(map[string]time.Time, len(peer.Peers))
+			for peerID, lastSeen := range peer.Peers {
+				peerCopy.Peers[peerID] = lastSeen
+			}
+		}
+
+		// Deep copy the Capabilities slice
+		if peer.Capabilities != nil {
+			peerCopy.Capabilities = make([]string, len(peer.Capabilities))
+			copy(peerCopy.Capabilities, peer.Capabilities)
+		}
+
+		safe[id] = &peerCopy
+	}
+	return safe
 }
 
 // GetRoute returns the route to a specific peer
@@ -209,7 +240,7 @@ func (mm *MeshManager) GetRoute(targetPeerID string) []string {
 	if !mm.running {
 		return nil
 	}
-	
+
 	return mm.meshNetwork.GetRoute(targetPeerID)
 }
 
@@ -218,13 +249,13 @@ func (mm *MeshManager) SendMessage(targetPeerID string, messageType string, payl
 	if !mm.running {
 		return fmt.Errorf("mesh network is not running")
 	}
-	
+
 	return mm.meshNetwork.SendMeshMessage(targetPeerID, messageType, payload)
 }
 
 // Ping sends a ping message to a peer via mesh routing
 func (mm *MeshManager) Ping(targetPeerID string) error {
-	return mm.SendMessage(targetPeerID, "ping", fmt.Sprintf("ping from %s at %s", 
+	return mm.SendMessage(targetPeerID, "ping", fmt.Sprintf("ping from %s at %s",
 		mm.meshNetwork.nodeID, time.Now().Format(time.RFC3339)))
 }
 
@@ -232,14 +263,14 @@ func (mm *MeshManager) Ping(targetPeerID string) error {
 func (mm *MeshManager) GetPeers() []*MeshPeer {
 	topology := mm.GetTopology()
 	peers := make([]*MeshPeer, 0, len(topology))
-	
+
 	for peerID, peer := range topology {
 		if peerID != mm.meshNetwork.nodeID {
 			peerCopy := *peer
 			peers = append(peers, &peerCopy)
 		}
 	}
-	
+
 	return peers
 }
 
@@ -247,13 +278,13 @@ func (mm *MeshManager) GetPeers() []*MeshPeer {
 func (mm *MeshManager) GetDirectPeers() []*MeshPeer {
 	peers := mm.GetPeers()
 	directPeers := make([]*MeshPeer, 0)
-	
+
 	for _, peer := range peers {
 		if peer.DirectConnect {
 			directPeers = append(directPeers, peer)
 		}
 	}
-	
+
 	return directPeers
 }
 
@@ -261,13 +292,13 @@ func (mm *MeshManager) GetDirectPeers() []*MeshPeer {
 func (mm *MeshManager) GetIndirectPeers() []*MeshPeer {
 	peers := mm.GetPeers()
 	indirectPeers := make([]*MeshPeer, 0)
-	
+
 	for _, peer := range peers {
 		if !peer.DirectConnect {
 			indirectPeers = append(indirectPeers, peer)
 		}
 	}
-	
+
 	return indirectPeers
 }
 
@@ -275,7 +306,7 @@ func (mm *MeshManager) GetIndirectPeers() []*MeshPeer {
 func (mm *MeshManager) FindPeersWithCapability(capability string) []*MeshPeer {
 	peers := mm.GetPeers()
 	matchingPeers := make([]*MeshPeer, 0)
-	
+
 	for _, peer := range peers {
 		for _, cap := range peer.Capabilities {
 			if cap == capability {
@@ -284,7 +315,7 @@ func (mm *MeshManager) FindPeersWithCapability(capability string) []*MeshPeer {
 			}
 		}
 	}
-	
+
 	return matchingPeers
 }
 
@@ -293,7 +324,7 @@ func (mm *MeshManager) HealNetwork() error {
 	if !mm.running {
 		return fmt.Errorf("mesh network is not running")
 	}
-	
+
 	// Force a healing cycle
 	go mm.meshNetwork.healNetwork()
 	return nil
@@ -304,7 +335,7 @@ func (mm *MeshManager) RefreshTopology() error {
 	if !mm.running {
 		return fmt.Errorf("mesh network is not running")
 	}
-	
+
 	// Force topology gossip
 	go mm.meshNetwork.gossipTopology()
 	return nil
@@ -328,7 +359,7 @@ func (mm *MeshManager) loadState() {
 	if state, exists := mm.stateManager.GetRunningState(); exists {
 		// Mesh was running in a previous session, try to restore
 		fmt.Printf("Detected mesh network was previously running (PID: %d), checking status...\n", state.PID)
-		
+
 		// The state manager already verified the process is still running
 		// Try to reconnect to the existing mesh network
 		mm.running = true
@@ -341,7 +372,7 @@ func (mm *MeshManager) saveState() error {
 	if !mm.running {
 		return nil
 	}
-	
+
 	status := mm.GetStatus()
 	state := &MeshState{
 		Running:       true,
@@ -351,12 +382,12 @@ func (mm *MeshManager) saveState() error {
 		PID:           os.Getpid(),
 		TopologyCount: status.PeerCount,
 	}
-	
+
 	// Try to get port from P2P manager if available
 	if mm.p2pManager != nil {
 		p2pStatus := mm.p2pManager.GetStatus()
 		state.Port = p2pStatus.Port
 	}
-	
+
 	return mm.stateManager.Save(state)
 }

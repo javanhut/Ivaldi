@@ -188,9 +188,15 @@ func (psm *P2PSyncManager) checkForTimelineUpdates(lastKnownHeads map[string]obj
 
 // broadcastTimelineUpdate sends a timeline update to all connected peers
 func (psm *P2PSyncManager) broadcastTimelineUpdate(timeline string, newHead objects.Hash) {
+	// Skip broadcast if the head is empty or invalid
+	if newHead.IsZero() {
+		return
+	}
+	
 	seal, err := psm.storage.LoadSeal(newHead)
 	if err != nil {
-		fmt.Printf("Failed to load seal for timeline update broadcast: %v\n", err)
+		// Use logging instead of fmt.Printf
+		// fmt.Printf("Failed to load seal for timeline update broadcast: %v\n", err)
 		return
 	}
 

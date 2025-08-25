@@ -1,9 +1,12 @@
 package mesh
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"time"
+	
+	"ivaldi/core/p2p"
 )
 
 // topologyGossipService periodically shares topology information
@@ -92,15 +95,79 @@ func (mn *MeshNetwork) gossipTopology() {
 
 // sendTopologyUpdate sends a topology update to a specific peer
 func (mn *MeshNetwork) sendTopologyUpdate(peerID string, update *MeshTopologyUpdate) {
-	// Use P2P to send the topology update
-	// This would need to be integrated with the P2P message system
-	fmt.Printf("Sending topology update to peer %s (would implement P2P message sending)\n", peerID)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		
+		maxRetries := 3
+		backoffDelay := time.Second
+		
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			if attempt > 0 {
+				select {
+				case <-ctx.Done():
+					fmt.Printf("Timeout sending topology update to peer %s after %d attempts\n", peerID, attempt)
+					return
+				case <-time.After(backoffDelay):
+					backoffDelay *= 2 // Exponential backoff
+				}
+			}
+			
+			err := mn.p2pManager.SendMessage(peerID, p2p.MessageTypeMeshTopology, update)
+			if err == nil {
+				fmt.Printf("Successfully sent topology update to peer %s\n", peerID)
+				return
+			}
+			
+			if attempt == maxRetries-1 {
+				fmt.Printf("Failed to send topology update to peer %s after %d attempts: %v\n", peerID, maxRetries, err)
+			} else {
+				fmt.Printf("Failed to send topology update to peer %s (attempt %d/%d): %v, retrying...\n", peerID, attempt+1, maxRetries, err)
+			}
+		}
+	}()
 }
 
 // requestTopologyFromPeer requests topology information from a peer
 func (mn *MeshNetwork) requestTopologyFromPeer(peerID string) error {
-	// Send topology request via P2P
-	fmt.Printf("Requesting topology from peer %s (would implement P2P message sending)\n", peerID)
+	request := map[string]interface{}{
+		"from_peer":   mn.nodeID,
+		"timestamp":   time.Now(),
+		"request_id":  generateRequestID(),
+	}
+	
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		
+		maxRetries := 2
+		backoffDelay := 500 * time.Millisecond
+		
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			if attempt > 0 {
+				select {
+				case <-ctx.Done():
+					fmt.Printf("Timeout requesting topology from peer %s after %d attempts\n", peerID, attempt)
+					return
+				case <-time.After(backoffDelay):
+					backoffDelay *= 2
+				}
+			}
+			
+			err := mn.p2pManager.SendMessage(peerID, p2p.MessageTypeMeshTopologyReq, request)
+			if err == nil {
+				fmt.Printf("Successfully sent topology request to peer %s\n", peerID)
+				return
+			}
+			
+			if attempt == maxRetries-1 {
+				fmt.Printf("Failed to request topology from peer %s after %d attempts: %v\n", peerID, maxRetries, err)
+			} else {
+				fmt.Printf("Failed to request topology from peer %s (attempt %d/%d): %v, retrying...\n", peerID, attempt+1, maxRetries, err)
+			}
+		}
+	}()
+	
 	return nil
 }
 
@@ -121,6 +188,11 @@ func (mn *MeshNetwork) HandleTopologyUpdate(update *MeshTopologyUpdate) {
 			continue // Skip ourselves
 		}
 		
+		// Defensive guard: ensure remotePeer is non-nil
+		if remotePeer == nil {
+			continue
+		}
+		
 		localPeer, exists := mn.topology[peerID]
 		
 		if !exists {
@@ -133,14 +205,28 @@ func (mn *MeshNetwork) HandleTopologyUpdate(update *MeshTopologyUpdate) {
 			updated = true
 			fmt.Printf("Discovered new peer via mesh: %s (via %s, %d hops)\n", 
 				peerID, update.FromPeer, newPeer.Hops)
-		} else if remotePeer.LastSeen.After(localPeer.LastSeen) && 
+		} else if localPeer != nil && 
+			!remotePeer.LastSeen.IsZero() && !localPeer.LastSeen.IsZero() &&
+			remotePeer.LastSeen.After(localPeer.LastSeen) && 
 			remotePeer.Hops+1 < localPeer.Hops {
-			// Better route found
+			// Better route found - only compare when both timestamps are valid
 			localPeer.Hops = remotePeer.Hops + 1
 			localPeer.NextHop = update.FromPeer
 			localPeer.LastSeen = remotePeer.LastSeen
 			updated = true
 			fmt.Printf("Found better route to %s: %d hops via %s\n", 
+				peerID, localPeer.Hops, update.FromPeer)
+		} else if localPeer != nil &&
+			(remotePeer.LastSeen.IsZero() || localPeer.LastSeen.IsZero()) &&
+			remotePeer.Hops+1 < localPeer.Hops {
+			// Handle case where one timestamp is missing - prefer shorter route
+			localPeer.Hops = remotePeer.Hops + 1
+			localPeer.NextHop = update.FromPeer
+			if !remotePeer.LastSeen.IsZero() {
+				localPeer.LastSeen = remotePeer.LastSeen
+			}
+			updated = true
+			fmt.Printf("Found better route to %s: %d hops via %s (timestamp missing)\n", 
 				peerID, localPeer.Hops, update.FromPeer)
 		}
 	}
@@ -176,16 +262,13 @@ func (mn *MeshNetwork) propagateTopologyUpdate(originalUpdate *MeshTopologyUpdat
 	}
 }
 
-// recalculateRoutes recalculates routing tables using shortest path
-func (mn *MeshNetwork) recalculateRoutes() {
-	mn.topologyMutex.RLock()
-	defer mn.topologyMutex.RUnlock()
+// calculateShortestPaths computes shortest paths using Dijkstra's algorithm
+func calculateShortestPaths(nodeID string, topology map[string]*MeshPeer, directPeers []*p2p.Peer) map[string][]string {
+	routes := make(map[string][]string)
 	
-	mn.routesMutex.Lock()
-	defer mn.routesMutex.Unlock()
-	
-	// Clear existing routes
-	mn.routes = make(map[string][]string)
+	if len(topology) == 0 {
+		return routes
+	}
 	
 	// Use Dijkstra-like algorithm to find shortest paths
 	distances := make(map[string]int)
@@ -193,8 +276,8 @@ func (mn *MeshNetwork) recalculateRoutes() {
 	unvisited := make(map[string]bool)
 	
 	// Initialize
-	for peerID := range mn.topology {
-		if peerID == mn.nodeID {
+	for peerID := range topology {
+		if peerID == nodeID {
 			distances[peerID] = 0
 		} else {
 			distances[peerID] = math.MaxInt32
@@ -220,28 +303,29 @@ func (mn *MeshNetwork) recalculateRoutes() {
 		delete(unvisited, current)
 		
 		// Update distances to neighbors
-		currentPeer := mn.topology[current]
-		for neighborID := range currentPeer.Peers {
-			if !unvisited[neighborID] {
-				continue
-			}
-			
-			neighborPeer := mn.topology[neighborID]
-			if neighborPeer == nil {
-				continue
-			}
-			
-			distance := distances[current] + 1
-			if distance < distances[neighborID] {
-				distances[neighborID] = distance
-				previous[neighborID] = current
+		currentPeer := topology[current]
+		if currentPeer != nil {
+			for neighborID := range currentPeer.Peers {
+				if !unvisited[neighborID] {
+					continue
+				}
+				
+				neighborPeer := topology[neighborID]
+				if neighborPeer == nil {
+					continue
+				}
+				
+				distance := distances[current] + 1
+				if distance < distances[neighborID] {
+					distances[neighborID] = distance
+					previous[neighborID] = current
+				}
 			}
 		}
 		
 		// Check direct connections for current node
-		if current == mn.nodeID {
-			connectedPeers := mn.p2pManager.GetPeers()
-			for _, peer := range connectedPeers {
+		if current == nodeID && directPeers != nil {
+			for _, peer := range directPeers {
 				if !unvisited[peer.ID] {
 					continue
 				}
@@ -256,8 +340,8 @@ func (mn *MeshNetwork) recalculateRoutes() {
 	}
 	
 	// Build routing table
-	for peerID := range mn.topology {
-		if peerID == mn.nodeID {
+	for peerID := range topology {
+		if peerID == nodeID {
 			continue
 		}
 		
@@ -268,15 +352,33 @@ func (mn *MeshNetwork) recalculateRoutes() {
 		// Trace back the path
 		path := []string{}
 		current := peerID
-		for current != mn.nodeID && current != "" {
+		for current != nodeID && current != "" {
 			path = append([]string{current}, path...)
 			current = previous[current]
 		}
 		
 		if len(path) > 0 {
-			mn.routes[peerID] = path
+			routes[peerID] = path
 		}
 	}
+	
+	return routes
+}
+
+// recalculateRoutes recalculates routing tables using shortest path
+func (mn *MeshNetwork) recalculateRoutes() {
+	mn.topologyMutex.RLock()
+	topology := mn.topology
+	mn.topologyMutex.RUnlock()
+	
+	directPeers := mn.p2pManager.GetPeers()
+	
+	// Use extracted function to calculate routes
+	routes := calculateShortestPaths(mn.nodeID, topology, directPeers)
+	
+	mn.routesMutex.Lock()
+	mn.routes = routes
+	mn.routesMutex.Unlock()
 }
 
 // routeMessage routes a message through the mesh network
@@ -397,4 +499,9 @@ func (mn *MeshNetwork) cleanupStaleEntries() {
 	
 	// Recalculate routes after cleanup
 	mn.recalculateRoutes()
+}
+
+// generateRequestID creates a unique identifier for requests
+func generateRequestID() string {
+	return fmt.Sprintf("req-%d", time.Now().UnixNano())
 }

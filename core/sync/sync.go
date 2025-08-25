@@ -115,11 +115,30 @@ func (sm *SyncManager) Sync(portalURL string, opts SyncOptions) (*SyncResult, er
 	}
 
 	// Step 5: Update temporary timeline with remote head
-	if len(fetchResult.Refs) > 0 {
-		remoteHead := fetchResult.Refs[0].Hash // Use first ref as head
-		if err := sm.timeline.UpdateHead(remoteTimelineName, remoteHead); err != nil {
-			return nil, fmt.Errorf("failed to update remote timeline head: %v", err)
+	if len(fetchResult.Refs) == 0 {
+		return nil, fmt.Errorf("no refs found in fetch result")
+	}
+	
+	// Look for a ref that matches the requested remote timeline
+	var targetRef *network.RemoteRef
+	if opts.RemoteTimeline != "" {
+		expectedRefName := fmt.Sprintf("refs/heads/%s", opts.RemoteTimeline)
+		for i := range fetchResult.Refs {
+			if fetchResult.Refs[i].Name == expectedRefName {
+				targetRef = &fetchResult.Refs[i]
+				break
+			}
 		}
+	}
+	
+	// Fall back to first ref if no specific timeline was requested or no match found
+	if targetRef == nil {
+		targetRef = &fetchResult.Refs[0]
+	}
+	
+	remoteHead := targetRef.Hash
+	if err := sm.timeline.UpdateHead(remoteTimelineName, remoteHead); err != nil {
+		return nil, fmt.Errorf("failed to update remote timeline head: %v", err)
 	}
 
 	// Step 6: Determine target timeline
@@ -134,7 +153,18 @@ func (sm *SyncManager) Sync(portalURL string, opts SyncOptions) (*SyncResult, er
 		return nil, fmt.Errorf("failed to get local head: %v", err)
 	}
 
-	remoteHead := fetchResult.Refs[0].Hash
+	// Verify that we have refs from the remote
+	if len(fetchResult.Refs) == 0 {
+		return nil, fmt.Errorf("remote head missing from fetch result")
+	}
+	
+	// Use the same targetRef that was found earlier
+	remoteHead = targetRef.Hash
+	
+	// Optionally verify the hash is not zero
+	if remoteHead.IsZero() {
+		return nil, fmt.Errorf("remote head hash is zero - invalid remote state")
+	}
 	
 	// Check if local timeline is empty (zero hash)
 	if localHead.IsZero() {
@@ -656,27 +686,39 @@ func (sm *SyncManager) SyncAllTimelines(portalURL string) (*SyncAllResult, error
 
 // handleSubmodules initializes and updates git submodules after syncing
 func (sm *SyncManager) handleSubmodules(workingDir string) error {
-	// Check if .gitmodules file exists
+	// Check if .gitmodules or .ivaldimodules file exists
 	gitmodulesPath := filepath.Join(workingDir, ".gitmodules")
+	ivaldimodulesPath := filepath.Join(workingDir, ".ivaldimodules")
+	
 	if _, err := os.Stat(gitmodulesPath); os.IsNotExist(err) {
-		// No submodules to handle
-		return nil
+		if _, err := os.Stat(ivaldimodulesPath); os.IsNotExist(err) {
+			// No submodules to handle
+			return nil
+		}
 	}
 
-	// Parse the .gitmodules file to get submodule information
-	submodules, err := workspace.ParseGitmodules(workingDir)
+	// Parse both .gitmodules and .ivaldimodules files to get submodule information
+	allSubmodules, err := workspace.ParseSubmodules(workingDir)
 	if err != nil {
-		return fmt.Errorf("failed to parse .gitmodules: %v", err)
+		return fmt.Errorf("failed to parse submodules: %v", err)
 	}
 
-	if len(submodules) == 0 {
+	// Filter for git-only submodules
+	gitSubmodules := make(map[string]*workspace.SubmoduleInfo)
+	for path, submodule := range allSubmodules {
+		if submodule.Type == "git" {
+			gitSubmodules[path] = submodule
+		}
+	}
+
+	if len(gitSubmodules) == 0 {
 		return nil
 	}
 
-	fmt.Printf("Found %d submodules, initializing and updating...\n", len(submodules))
+	fmt.Printf("Found %d git submodules, initializing and updating...\n", len(gitSubmodules))
 
-	// Initialize and update each submodule
-	for path, submodule := range submodules {
+	// Initialize and update each git submodule
+	for path, submodule := range gitSubmodules {
 		if err := sm.initializeSubmodule(workingDir, path, submodule); err != nil {
 			fmt.Printf("Warning: failed to initialize submodule %s: %v\n", path, err)
 			continue
@@ -875,9 +917,9 @@ type SyncAllResult struct {
 
 // createObjectsFromWorkingDir scans the working directory and creates corresponding Ivaldi objects
 func (sm *SyncManager) createObjectsFromWorkingDir(fetchResult *network.FetchResult) error {
-	workDir, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("failed to get working directory: %v", err)
+	workDir := sm.network.GetRoot()
+	if workDir == "" {
+		return fmt.Errorf("sync manager has no repository root configured")
 	}
 	
 	fmt.Println("Creating Ivaldi objects from downloaded files...")
@@ -891,6 +933,7 @@ func (sm *SyncManager) createObjectsFromWorkingDir(fetchResult *network.FetchRes
 	objectHashes := make(map[string]objects.Hash)
 	
 	// Walk through all files and create blob objects
+	var err error
 	err = filepath.Walk(workDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -975,7 +1018,7 @@ func (sm *SyncManager) createTreeFromFiles(fileHashes map[string]objects.Hash, w
 	for relPath, hash := range fileHashes {
 		// Create tree entry for each file
 		entry := objects.TreeEntry{
-			Name: filepath.Base(relPath),
+			Name: relPath, // Preserve directory structure instead of flattening
 			Hash: hash,
 			Mode: 0644, // Regular file permissions
 			Type: objects.ObjectTypeBlob,

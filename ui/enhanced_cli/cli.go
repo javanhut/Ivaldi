@@ -21,6 +21,7 @@ import (
 	"ivaldi/core/commands"
 	"ivaldi/core/config"
 	"ivaldi/core/fuse"
+	"ivaldi/core/network"
 	"ivaldi/core/p2p"
 	"ivaldi/core/reshape"
 	"ivaldi/core/search"
@@ -3800,7 +3801,11 @@ Examples:
 			}
 
 			if cmd.Flags().Changed("sync-interval") {
-				if err := ec.currentRepo.SetP2PSyncInterval(syncInterval); err != nil {
+				duration, err := time.ParseDuration(syncInterval)
+				if err != nil {
+					return fmt.Errorf("invalid sync interval format: %v", err)
+				}
+				if err := ec.currentRepo.SetP2PSyncInterval(duration); err != nil {
 					return fmt.Errorf("failed to update sync interval: %v", err)
 				}
 				ec.output.Success(fmt.Sprintf("Sync interval set to %s", syncInterval))
@@ -3975,17 +3980,46 @@ func (ec *EnhancedCLI) performEnhancedMirror(url, dest string) (*forge.EnhancedR
 	// Step 7: Create timeline for the main branch
 	ec.output.Info("Step 7: Creating timeline for main branch...")
 	timelineMgr := repo.Timeline()
+	
+	// First ensure the timeline exists or create it
 	if err := timelineMgr.Create(branch, "Mirrored branch"); err != nil {
-		// Timeline might already exist, that's ok
+		// Check if it already exists - that's expected, not an error
+		if _, headErr := timelineMgr.GetHead(branch); headErr != nil {
+			// Timeline doesn't exist and creation failed
+			return nil, fmt.Errorf("failed to create timeline '%s': %v", branch, err)
+		}
 		ec.output.Info(fmt.Sprintf("Timeline '%s' already exists", branch))
+	} else {
+		ec.output.Info(fmt.Sprintf("Created timeline '%s'", branch))
 	}
 	
-	// Update timeline head to latest commit
-	if len(fetchResult.Refs) > 0 {
-		if err := timelineMgr.UpdateHead(branch, fetchResult.Refs[0].Hash); err != nil {
-			return nil, fmt.Errorf("failed to update timeline head: %v", err)
+	// Update timeline head - find the ref that matches current branch
+	if len(fetchResult.Refs) == 0 {
+		return nil, fmt.Errorf("no refs found in fetch result")
+	}
+	
+	// Look for a ref that matches our current branch
+	var targetRef *network.RemoteRef
+	expectedRefName := fmt.Sprintf("refs/heads/%s", branch)
+	
+	for i := range fetchResult.Refs {
+		if fetchResult.Refs[i].Name == expectedRefName {
+			targetRef = &fetchResult.Refs[i]
+			break
 		}
 	}
+	
+	// Fall back to first ref if no exact match found
+	if targetRef == nil {
+		ec.output.Info(fmt.Sprintf("No ref found matching '%s', using first ref '%s'", expectedRefName, fetchResult.Refs[0].Name))
+		targetRef = &fetchResult.Refs[0]
+	}
+	
+	// Update the timeline head
+	if err := timelineMgr.UpdateHead(branch, targetRef.Hash); err != nil {
+		return nil, fmt.Errorf("failed to update timeline head for '%s' with ref '%s': %v", branch, targetRef.Name, err)
+	}
+	ec.output.Info(fmt.Sprintf("Updated timeline '%s' head to %s", branch, targetRef.Hash.String()[:8]))
 	
 	// Step 8: Download all files
 	ec.output.Info("Step 8: Downloading repository files...")

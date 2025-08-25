@@ -194,6 +194,11 @@ func (s *Storage) objectPath(hash objects.Hash) string {
 	return filepath.Join(s.objectsDir, hashStr[:2], hashStr[2:])
 }
 
+// GetObjectsDir returns the path to the objects directory for iteration purposes
+func (s *Storage) GetObjectsDir() string {
+	return s.objectsDir
+}
+
 func (s *Storage) GC() error {
 	return nil
 }

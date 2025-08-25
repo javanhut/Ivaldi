@@ -204,25 +204,44 @@ func (ds *DiscoveryService) broadcastToLocalNetwork(data []byte) {
 
 		for _, addr := range addrs {
 			var ip net.IP
+			var ipNet *net.IPNet
 			switch v := addr.(type) {
 			case *net.IPNet:
 				ip = v.IP
+				ipNet = v
 			case *net.IPAddr:
 				ip = v.IP
+				// Skip IPAddr as it doesn't have network mask information
+				continue
 			}
 
-			if ip == nil || ip.IsLoopback() {
+			if ip == nil || ip.IsLoopback() || ipNet == nil {
 				continue
 			}
 
 			ip = ip.To4()
-			if ip == nil {
+			if ip == nil || len(ip) != 4 {
 				continue
 			}
 
-			// Calculate broadcast address
+			// Get the network mask
+			mask := ipNet.Mask
+			if len(mask) != 4 {
+				continue
+			}
+
+			// Calculate broadcast address: (ip & mask) | (^mask)
+			// First compute network bytes by ANDing IP with mask
+			// Then compute broadcast bytes by ORing with bitwise NOT of mask
+			broadcastIP := net.IPv4(
+				(ip[0]&mask[0])|(^mask[0]),
+				(ip[1]&mask[1])|(^mask[1]),
+				(ip[2]&mask[2])|(^mask[2]),
+				(ip[3]&mask[3])|(^mask[3]),
+			)
+
 			broadcastAddr := &net.UDPAddr{
-				IP:   net.IPv4(ip[0]|^ip[0], ip[1]|^ip[1], ip[2]|^ip[2], ip[3]|^ip[3]),
+				IP:   broadcastIP,
 				Port: ds.broadcastPort,
 			}
 
@@ -339,7 +358,16 @@ func (ds *DiscoveryService) GetDiscoveredPeers() []*DiscoveredPeer {
 
 	peers := make([]*DiscoveredPeer, 0, len(ds.knownPeers))
 	for _, peer := range ds.knownPeers {
-		peers = append(peers, peer)
+		// Create a shallow copy to prevent callers from mutating internal state
+		peerCopy := &DiscoveredPeer{
+			NodeID:       peer.NodeID,
+			Address:      peer.Address,
+			Port:         peer.Port,
+			LastSeen:     peer.LastSeen,
+			Repositories: peer.Repositories, // Note: shallow copy of slice
+			Version:      peer.Version,
+		}
+		peers = append(peers, peerCopy)
 	}
 	return peers
 }
@@ -353,7 +381,16 @@ func (ds *DiscoveryService) FindPeersWithRepository(repoName string) []*Discover
 	for _, peer := range ds.knownPeers {
 		for _, repo := range peer.Repositories {
 			if strings.Contains(repo, repoName) {
-				matches = append(matches, peer)
+				// Create a shallow copy to prevent callers from mutating internal state
+				peerCopy := &DiscoveredPeer{
+					NodeID:       peer.NodeID,
+					Address:      peer.Address,
+					Port:         peer.Port,
+					LastSeen:     peer.LastSeen,
+					Repositories: peer.Repositories, // Note: shallow copy of slice
+					Version:      peer.Version,
+				}
+				matches = append(matches, peerCopy)
 				break
 			}
 		}

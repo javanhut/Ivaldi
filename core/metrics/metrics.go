@@ -1,8 +1,10 @@
 package metrics
 
 import (
+	"context"
 	"fmt"
 	"ivaldi/core/logging"
+	"sort"
 	"sync"
 	"time"
 )
@@ -55,6 +57,10 @@ type MetricsCollector struct {
 	histograms map[string]*HistogramMetric
 	mu         sync.RWMutex
 	logger     *logging.Logger
+	// Periodic collection control
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	mutex      sync.Mutex // protects cancel and wg operations
 }
 
 // NewMetricsCollector creates a new metrics collector
@@ -202,8 +208,17 @@ func (mc *MetricsCollector) makeKey(name string, labels map[string]string) strin
 		return name
 	}
 
+	// Collect label keys and sort them for deterministic ordering
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// Build key with sorted labels
 	key := name
-	for k, v := range labels {
+	for _, k := range keys {
+		v := labels[k]
 		key += fmt.Sprintf("_%s_%s", k, v)
 	}
 	return key
@@ -314,15 +329,36 @@ func (mc *MetricsCollector) copyHistograms() map[string]*HistogramMetric {
 
 // StartPeriodicMetricsCollection starts periodic metrics collection
 func (mc *MetricsCollector) StartPeriodicMetricsCollection(interval time.Duration) {
+	mc.mutex.Lock()
+	defer mc.mutex.Unlock()
+
+	// If already running, stop the existing one first
+	if mc.cancel != nil {
+		mc.cancel()
+		mc.wg.Wait()
+	}
+
+	// Create new context for this metrics collection session
+	ctx, cancel := context.WithCancel(context.Background())
+	mc.cancel = cancel
+
+	mc.wg.Add(1)
 	go func() {
+		defer mc.wg.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			report := mc.GenerateReport()
-			mc.logger.Info("Periodic metrics collection",
-				"timestamp", report.Timestamp,
-				"summary", report.Summary)
+		for {
+			select {
+			case <-ticker.C:
+				report := mc.GenerateReport()
+				mc.logger.Info("Periodic metrics collection",
+					"timestamp", report.Timestamp,
+					"summary", report.Summary)
+			case <-ctx.Done():
+				mc.logger.Info("Periodic metrics collection stopped")
+				return
+			}
 		}
 	}()
 
@@ -331,5 +367,13 @@ func (mc *MetricsCollector) StartPeriodicMetricsCollection(interval time.Duratio
 
 // StopPeriodicMetricsCollection stops periodic metrics collection
 func (mc *MetricsCollector) StopPeriodicMetricsCollection() {
-	mc.logger.Info("Stopping periodic metrics collection")
+	mc.mutex.Lock()
+	defer mc.mutex.Unlock()
+
+	if mc.cancel != nil {
+		mc.logger.Info("Stopping periodic metrics collection")
+		mc.cancel()
+		mc.wg.Wait() // Wait for the goroutine to finish
+		mc.cancel = nil
+	}
 }
