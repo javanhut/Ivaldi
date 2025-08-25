@@ -62,7 +62,10 @@ func (s *Store) Put(data []byte, kind ObjectKind) (objects.CAHash, error) {
 	defer s.mu.Unlock()
 
 	// Calculate hash
-	hash := objects.NewCAHash(data, s.algorithm)
+	hash, err := objects.NewCAHash(data, s.algorithm)
+	if err != nil {
+		return objects.CAHash{}, fmt.Errorf("failed to create hash: %w", err)
+	}
 	
 	// Check if object already exists
 	if s.exists(hash) {
