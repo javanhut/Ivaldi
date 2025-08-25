@@ -27,5 +27,6 @@ func isProcessAlive(pid int) bool {
 	}
 
 	// STILL_ACTIVE is 259 - if the process is still running, GetExitCodeProcess returns this value
-	return exitCode == windows.STILL_ACTIVE
+	const STILL_ACTIVE = 259
+	return exitCode == STILL_ACTIVE
 }

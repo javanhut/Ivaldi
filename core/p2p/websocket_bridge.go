@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -61,7 +60,7 @@ func (wsb *WebSocketBridge) Start() error {
 	wsb.carrionCmd = exec.Command("carrion", carrionScript, strconv.Itoa(wsb.port))
 
 	// Set up process group for clean shutdown
-	wsb.carrionCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setupProcessGroup(wsb.carrionCmd)
 
 	// Redirect output for debugging
 	wsb.carrionCmd.Stdout = os.Stdout
@@ -93,9 +92,9 @@ func (wsb *WebSocketBridge) Stop() error {
 		return nil
 	}
 
-	// Send SIGTERM to the process group
-	if err := syscall.Kill(-wsb.carrionCmd.Process.Pid, syscall.SIGTERM); err != nil {
-		// If SIGTERM fails, force kill
+	// Send termination signal to the process group
+	if err := killProcessGroup(wsb.carrionCmd); err != nil {
+		// If termination fails, force kill
 		wsb.carrionCmd.Process.Kill()
 	}
 
@@ -122,7 +121,7 @@ func (wsb *WebSocketBridge) IsRunning() bool {
 	}
 
 	// Send signal 0 to check if process exists
-	if err := wsb.carrionCmd.Process.Signal(syscall.Signal(0)); err != nil {
+	if err := checkProcessAlive(wsb.carrionCmd); err != nil {
 		wsb.running = false
 		return false
 	}
