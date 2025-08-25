@@ -41,7 +41,7 @@ func TestP2PInitialization(t *testing.T) {
 
 	t.Logf("P2P status: running=%v", status.Running)
 	t.Logf("P2P config: port=%d, auto-sync=%v", config.Port, config.AutoSyncEnabled)
-	
+
 	t.Log("P2P initialization test passed!")
 }
 

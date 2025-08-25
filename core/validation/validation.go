@@ -95,7 +95,7 @@ func ValidateFilePath(path string) error {
 	// Check for path traversal attempts
 	// Normalize path separators to handle mixed separators and check both
 	normalizedPath := strings.ReplaceAll(path, "\\", string(filepath.Separator))
-	
+
 	// Split by the OS path separator and check each segment
 	segments := strings.Split(normalizedPath, string(filepath.Separator))
 	for _, segment := range segments {
@@ -103,7 +103,7 @@ func ValidateFilePath(path string) error {
 			return ValidationError{Field: "file_path", Value: path, Message: "contains path traversal"}
 		}
 	}
-	
+
 	// Also check original path segments without normalization to catch edge cases
 	if strings.Contains(path, "\\") {
 		backslashSegments := strings.Split(path, "\\")
@@ -113,7 +113,7 @@ func ValidateFilePath(path string) error {
 			}
 		}
 	}
-	
+
 	// Check cleaned path for cases that start with ".."
 	cleanPath := filepath.Clean(path)
 	if cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {

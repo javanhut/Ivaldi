@@ -70,13 +70,16 @@ func (w *Workspace) Scan() error {
 	seenFiles := make(map[string]bool)
 
 	// Get list of submodule paths to skip
-	submodulePaths, _ := GetSubmodulePaths(w.Root)
+	submodulePaths, err := GetSubmodulePaths(w.Root)
+	if err != nil {
+		return fmt.Errorf("failed to get submodule paths for workspace at %s: %w", w.Root, err)
+	}
 	submoduleMap := make(map[string]bool)
 	for _, path := range submodulePaths {
 		submoduleMap[filepath.FromSlash(path)] = true
 	}
 
-	err := filepath.WalkDir(w.Root, func(path string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(w.Root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -133,17 +136,17 @@ func (w *Workspace) Scan() error {
 		}
 
 		// Then restore anvil state if it was previously gathered
-		if anvilFile, wasOnAnvil := anvilBackup[relPath]; wasOnAnvil {
+		if _, wasOnAnvil := anvilBackup[relPath]; wasOnAnvil {
 			onAnvil = true
-			// Preserve the actual change status, don't override with StatusGathered
-			w.AnvilFiles[relPath] = anvilFile
 		}
 
-		// Preserve BlobHash from existing file state if it exists
+		// Preserve BlobHash from existing file state only if file is unchanged
 		var blobHash objects.CAHash
-		if existing, exists := w.Files[relPath]; exists {
+		if existing, exists := w.Files[relPath]; exists && status == StatusUnmodified {
+			// File is unchanged, safe to reuse existing BlobHash
 			blobHash = existing.BlobHash
 		}
+		// If file is modified or new, leave blobHash as zero value to force re-upload
 
 		fileState := &FileState{
 			Path:        relPath,
@@ -158,6 +161,11 @@ func (w *Workspace) Scan() error {
 
 		w.Files[relPath] = fileState
 		seenFiles[relPath] = true
+
+		// Update AnvilFiles with the newly created fileState if it was on anvil
+		if onAnvil {
+			w.AnvilFiles[relPath] = fileState
+		}
 		return nil
 	})
 
@@ -289,18 +297,21 @@ func (w *Workspace) gatherPath(path string) error {
 			fileState.OnAnvil = true
 			w.AnvilFiles[relPath] = fileState
 		}
-		// If file is unmodified, don't gather it
+		// Note: unmodified files may still be gathered when explicitly requested
 	} else {
 		// File not in workspace yet - it's new, scan it first
 		info, err := os.Stat(path)
 		if err != nil {
-			return nil // File might have been deleted, skip
+			if os.IsNotExist(err) {
+				return nil // deleted between selection and stat
+			}
+			return err
 		}
 
 		if !info.IsDir() {
 			hash, err := w.computeFileHash(path)
 			if err != nil {
-				return nil
+				return err
 			}
 			fileState := &FileState{
 				Path:        relPath,
@@ -431,6 +442,15 @@ func (w *Workspace) loadIgnorePatterns() {
 	w.IgnorePattern = patterns
 }
 
+// forwardSlashMatch performs filepath.Match with consistent forward-slash semantics
+// by ensuring both pattern and name use forward slashes
+func forwardSlashMatch(pattern, name string) (matched bool, err error) {
+	// Normalize both pattern and name to forward slashes
+	normalizedPattern := filepath.ToSlash(pattern)
+	normalizedName := filepath.ToSlash(name)
+	return filepath.Match(normalizedPattern, normalizedName)
+}
+
 func (w *Workspace) shouldIgnore(path string) bool {
 	// Clean path and convert to forward slashes for consistent matching
 	cleanPath := filepath.ToSlash(path)
@@ -451,7 +471,7 @@ func (w *Workspace) shouldIgnore(path string) bool {
 
 		// Handle wildcard patterns
 		if strings.Contains(cleanPattern, "*") {
-			matched, _ := filepath.Match(cleanPattern, cleanPath)
+			matched, _ := forwardSlashMatch(cleanPattern, cleanPath)
 			if matched {
 				return true
 			}
@@ -459,7 +479,7 @@ func (w *Workspace) shouldIgnore(path string) bool {
 			pathParts := strings.Split(cleanPath, "/")
 			for i := range pathParts {
 				partialPath := strings.Join(pathParts[:i+1], "/")
-				matched, _ := filepath.Match(cleanPattern, partialPath)
+				matched, _ := forwardSlashMatch(cleanPattern, partialPath)
 				if matched {
 					return true
 				}

@@ -25,9 +25,9 @@ type Storage interface {
 }
 
 type SearchResult struct {
-	Seal     *objects.Seal
-	Matches  []string // What parts matched the query
-	Score    float64  // Relevance score
+	Seal    *objects.Seal
+	Matches []string // What parts matched the query
+	Score   float64  // Relevance score
 }
 
 type SearchManager struct {
@@ -52,22 +52,22 @@ func (sm *SearchManager) Search(query string) ([]*SearchResult, error) {
 	var results []*SearchResult
 
 	// Try different search strategies based on query patterns
-	
+
 	// 1. Author search patterns
 	if authorResults, err := sm.searchByAuthor(query); err == nil {
 		results = append(results, authorResults...)
 	}
-	
+
 	// 2. Time-based search patterns
 	if timeResults, err := sm.searchByTime(query); err == nil {
 		results = append(results, timeResults...)
 	}
-	
+
 	// 3. Content search (always try this)
 	if contentResults, err := sm.searchByContent(query); err == nil {
 		results = append(results, contentResults...)
 	}
-	
+
 	// 4. Hash prefix search
 	if hashResults, err := sm.searchByHash(query); err == nil {
 		results = append(results, hashResults...)
@@ -79,7 +79,7 @@ func (sm *SearchManager) Search(query string) ([]*SearchResult, error) {
 
 	// Remove duplicates and sort by score
 	results = sm.deduplicateAndSort(results)
-	
+
 	return results, nil
 }
 
@@ -91,7 +91,7 @@ func (sm *SearchManager) searchByAuthor(query string) ([]*SearchResult, error) {
 		`^(\w+)'s\s+(commits?|changes?)$`,
 		`^commits?\s+by\s+(\w+)$`,
 	}
-	
+
 	var author string
 	for _, pattern := range authorPatterns {
 		re := regexp.MustCompile(`(?i)` + pattern)
@@ -101,16 +101,16 @@ func (sm *SearchManager) searchByAuthor(query string) ([]*SearchResult, error) {
 			break
 		}
 	}
-	
+
 	if author == "" {
 		return nil, fmt.Errorf("not an author query")
 	}
-	
+
 	hashes, err := sm.index.FindSealsByAuthor(author)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	var results []*SearchResult
 	for _, hash := range hashes {
 		if seal, err := sm.storage.LoadSeal(hash); err == nil {
@@ -121,14 +121,14 @@ func (sm *SearchManager) searchByAuthor(query string) ([]*SearchResult, error) {
 			})
 		}
 	}
-	
+
 	return results, nil
 }
 
 func (sm *SearchManager) searchByTime(query string) ([]*SearchResult, error) {
 	var start, end time.Time
 	now := time.Now()
-	
+
 	// Time patterns
 	timePatterns := map[string]func() (time.Time, time.Time){
 		`today`: func() (time.Time, time.Time) {
@@ -160,7 +160,7 @@ func (sm *SearchManager) searchByTime(query string) ([]*SearchResult, error) {
 			return start, end
 		},
 	}
-	
+
 	// Check for time patterns
 	for pattern, timeFn := range timePatterns {
 		if matched, _ := regexp.MatchString(`(?i)`+pattern, query); matched {
@@ -168,14 +168,14 @@ func (sm *SearchManager) searchByTime(query string) ([]*SearchResult, error) {
 			break
 		}
 	}
-	
+
 	// Check for "X days/hours/minutes ago" patterns
 	agoPattern := regexp.MustCompile(`(?i)(\d+)\s+(days?|hours?|minutes?)\s+ago`)
 	matches := agoPattern.FindStringSubmatch(query)
 	if len(matches) == 3 {
 		amount, _ := strconv.Atoi(matches[1])
 		unit := strings.ToLower(matches[2])
-		
+
 		var duration time.Duration
 		switch {
 		case strings.HasPrefix(unit, "minute"):
@@ -185,20 +185,20 @@ func (sm *SearchManager) searchByTime(query string) ([]*SearchResult, error) {
 		case strings.HasPrefix(unit, "day"):
 			duration = time.Duration(amount) * 24 * time.Hour
 		}
-		
+
 		start = now.Add(-duration - time.Hour) // ±1 hour buffer
 		end = now.Add(-duration + time.Hour)
 	}
-	
+
 	if start.IsZero() {
 		return nil, fmt.Errorf("not a time query")
 	}
-	
+
 	hashes, err := sm.index.FindSealsByTimeRange(start, end)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	var results []*SearchResult
 	for _, hash := range hashes {
 		if seal, err := sm.storage.LoadSeal(hash); err == nil {
@@ -209,7 +209,7 @@ func (sm *SearchManager) searchByTime(query string) ([]*SearchResult, error) {
 			})
 		}
 	}
-	
+
 	return results, nil
 }
 
@@ -218,26 +218,26 @@ func (sm *SearchManager) searchByContent(query string) ([]*SearchResult, error) 
 	cleanQuery := query
 	cleanQuery = regexp.MustCompile(`(?i)^(where|when|find|search)\s+`).ReplaceAllString(cleanQuery, "")
 	cleanQuery = regexp.MustCompile(`(?i)\s+(was|were)\s+(added|removed|changed|modified)$`).ReplaceAllString(cleanQuery, "")
-	
+
 	// Split into keywords
 	keywords := strings.Fields(cleanQuery)
 	if len(keywords) == 0 {
 		return nil, fmt.Errorf("no keywords in query")
 	}
-	
+
 	var allResults []*SearchResult
-	
+
 	// Search for each keyword
 	for _, keyword := range keywords {
 		if len(keyword) < 3 { // Skip very short keywords
 			continue
 		}
-		
+
 		hashes, err := sm.index.FindSealsContaining(keyword)
 		if err != nil {
 			continue
 		}
-		
+
 		for _, hash := range hashes {
 			if seal, err := sm.storage.LoadSeal(hash); err == nil {
 				score := sm.calculateContentScore(seal.Message, keywords)
@@ -249,7 +249,7 @@ func (sm *SearchManager) searchByContent(query string) ([]*SearchResult, error) 
 			}
 		}
 	}
-	
+
 	return allResults, nil
 }
 
@@ -258,21 +258,21 @@ func (sm *SearchManager) searchByHash(query string) ([]*SearchResult, error) {
 	if len(query) < 6 || !regexp.MustCompile(`^[a-f0-9]+$`).MatchString(query) {
 		return nil, fmt.Errorf("not a hash query")
 	}
-	
+
 	hash, err := sm.index.FindSealByHashPrefix(query)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	if hash == nil {
 		return nil, fmt.Errorf("no hash found")
 	}
-	
+
 	seal, err := sm.storage.LoadSeal(*hash)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return []*SearchResult{
 		{
 			Seal:    seal,
@@ -286,30 +286,30 @@ func (sm *SearchManager) calculateContentScore(message string, keywords []string
 	message = strings.ToLower(message)
 	score := 0.0
 	matchCount := 0
-	
+
 	for _, keyword := range keywords {
 		keyword = strings.ToLower(keyword)
 		if strings.Contains(message, keyword) {
 			matchCount++
 			// Bonus for exact word match vs substring
-			if regexp.MustCompile(`\b`+regexp.QuoteMeta(keyword)+`\b`).MatchString(message) {
+			if regexp.MustCompile(`\b` + regexp.QuoteMeta(keyword) + `\b`).MatchString(message) {
 				score += 0.3
 			} else {
 				score += 0.1
 			}
 		}
 	}
-	
+
 	// Bonus for multiple keyword matches
 	if matchCount > 1 {
 		score += 0.2 * float64(matchCount-1)
 	}
-	
+
 	// Normalize score between 0 and 1
 	if score > 1.0 {
 		score = 1.0
 	}
-	
+
 	return score
 }
 
@@ -317,14 +317,14 @@ func (sm *SearchManager) deduplicateAndSort(results []*SearchResult) []*SearchRe
 	// Remove duplicates by hash
 	seen := make(map[objects.Hash]bool)
 	var unique []*SearchResult
-	
+
 	for _, result := range results {
 		if !seen[result.Seal.Hash] {
 			seen[result.Seal.Hash] = true
 			unique = append(unique, result)
 		}
 	}
-	
+
 	// Sort by score (highest first)
 	for i := 0; i < len(unique)-1; i++ {
 		for j := i + 1; j < len(unique); j++ {
@@ -333,7 +333,7 @@ func (sm *SearchManager) deduplicateAndSort(results []*SearchResult) []*SearchRe
 			}
 		}
 	}
-	
+
 	return unique
 }
 
@@ -341,7 +341,7 @@ func (sm *SearchManager) deduplicateAndSort(results []*SearchResult) []*SearchRe
 func (sm *SearchManager) SearchSuggestions() []string {
 	suggestions := []string{
 		"today",
-		"yesterday", 
+		"yesterday",
 		"this week",
 		"last week",
 		"authentication",
@@ -354,6 +354,6 @@ func (sm *SearchManager) SearchSuggestions() []string {
 		"where auth was added",
 		"when tests were added",
 	}
-	
+
 	return suggestions
 }

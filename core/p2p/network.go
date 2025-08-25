@@ -26,10 +26,10 @@ type P2PNetwork struct {
 
 // Peer represents a connected peer in the P2P network
 type Peer struct {
-	ID       string    `json:"id"`
-	Address  string    `json:"address"`
-	Port     int       `json:"port"`
-	LastSeen time.Time `json:"last_seen"`
+	ID       string     `json:"id"`
+	Address  string     `json:"address"`
+	Port     int        `json:"port"`
+	LastSeen time.Time  `json:"last_seen"`
 	Status   PeerStatus `json:"status"`
 	conn     net.Conn
 	encoder  *json.Encoder
@@ -86,16 +86,16 @@ type Message struct {
 type MessageType string
 
 const (
-	MessageTypeHandshake         MessageType = "handshake"
-	MessageTypePeerDiscovery     MessageType = "peer_discovery"
-	MessageTypeSyncRequest       MessageType = "sync_request"
-	MessageTypeSyncResponse      MessageType = "sync_response"
-	MessageTypeTimelineUpdate    MessageType = "timeline_update"
-	MessageTypeSealBroadcast     MessageType = "seal_broadcast"
-	MessageTypeHeartbeat         MessageType = "heartbeat"
-	MessageTypeConflictResolve   MessageType = "conflict_resolve"
-	MessageTypeMeshTopology      MessageType = "mesh_topology"
-	MessageTypeMeshTopologyReq   MessageType = "mesh_topology_request"
+	MessageTypeHandshake       MessageType = "handshake"
+	MessageTypePeerDiscovery   MessageType = "peer_discovery"
+	MessageTypeSyncRequest     MessageType = "sync_request"
+	MessageTypeSyncResponse    MessageType = "sync_response"
+	MessageTypeTimelineUpdate  MessageType = "timeline_update"
+	MessageTypeSealBroadcast   MessageType = "seal_broadcast"
+	MessageTypeHeartbeat       MessageType = "heartbeat"
+	MessageTypeConflictResolve MessageType = "conflict_resolve"
+	MessageTypeMeshTopology    MessageType = "mesh_topology"
+	MessageTypeMeshTopologyReq MessageType = "mesh_topology_request"
 )
 
 // NewP2PNetwork creates a new P2P network instance
@@ -165,7 +165,7 @@ func (p2p *P2PNetwork) Stop() error {
 // ConnectToPeer establishes a connection to a peer
 func (p2p *P2PNetwork) ConnectToPeer(address string, port int) error {
 	peerAddr := fmt.Sprintf("%s:%d", address, port)
-	
+
 	conn, err := net.DialTimeout("tcp", peerAddr, 10*time.Second)
 	if err != nil {
 		return fmt.Errorf("failed to connect to peer %s: %v", peerAddr, err)
@@ -213,7 +213,7 @@ func (p2p *P2PNetwork) ConnectToPeer(address string, port int) error {
 
 	peer.ID = response.From
 	peer.Status = PeerStatusConnected
-	
+
 	p2p.peersMutex.Lock()
 	p2p.peers[peer.ID] = peer
 	p2p.peersMutex.Unlock()
@@ -323,7 +323,7 @@ func (p2p *P2PNetwork) handleIncomingConnection(conn net.Conn) {
 func (p2p *P2PNetwork) handlePeerConnection(peer *Peer) {
 	defer func() {
 		peer.conn.Close()
-		
+
 		p2p.peersMutex.Lock()
 		delete(p2p.peers, peer.ID)
 		p2p.peersMutex.Unlock()
@@ -347,7 +347,7 @@ func (p2p *P2PNetwork) handlePeerConnection(peer *Peer) {
 			}
 
 			peer.LastSeen = time.Now()
-			
+
 			// Calculate message size by marshaling back to JSON
 			if messageBytes, err := json.Marshal(message); err == nil {
 				atomic.AddInt64(&peer.metrics.BytesReceived, int64(len(messageBytes)))
@@ -484,7 +484,7 @@ func (p2p *P2PNetwork) sendHeartbeats() {
 // handleHeartbeat processes heartbeat messages from peers
 func (p2p *P2PNetwork) handleHeartbeat(peer *Peer, message *Message) error {
 	peer.LastSeen = time.Now()
-	
+
 	// Respond to heartbeat to show we're alive
 	responseData := map[string]interface{}{
 		"timestamp": time.Now(),

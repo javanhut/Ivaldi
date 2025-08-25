@@ -16,21 +16,21 @@ func TestP2PRobustNetworking(t *testing.T) {
 	// Create two test repositories
 	tempDirs := make([]string, 2)
 	repos := make([]*forge.Repository, 2)
-	
+
 	for i := 0; i < 2; i++ {
 		tempDir, err := os.MkdirTemp("", fmt.Sprintf("ivaldi-robust-p2p-%d-*", i))
 		if err != nil {
 			t.Fatalf("Failed to create temp dir %d: %v", i, err)
 		}
 		tempDirs[i] = tempDir
-		
+
 		repo, err := forge.Initialize(tempDir)
 		if err != nil {
 			t.Fatalf("Failed to initialize repo %d: %v", i, err)
 		}
 		repos[i] = repo
 	}
-	
+
 	// Cleanup
 	defer func() {
 		for i, repo := range repos {
@@ -48,19 +48,19 @@ func TestP2PRobustNetworking(t *testing.T) {
 		if config == nil {
 			t.Fatalf("P2P config is nil for repo %d", i)
 		}
-		
+
 		config.Port = 9200 + i
 		config.DiscoveryPort = 9300 + i
 		config.AutoSyncEnabled = true
 		config.SyncInterval = 2 * time.Second // Fast sync for testing
-		
+
 		t.Logf("Setting repo %d to use ports %d and %d", i, config.Port, config.DiscoveryPort)
-		
+
 		err := repo.UpdateP2PConfig(config)
 		if err != nil {
 			t.Fatalf("Failed to update P2P config for repo %d: %v", i, err)
 		}
-		
+
 		// Verify config was updated
 		updatedConfig := repo.GetP2PConfig()
 		t.Logf("Repo %d config after update: port=%d, discovery=%d", i, updatedConfig.Port, updatedConfig.DiscoveryPort)
@@ -72,7 +72,7 @@ func TestP2PRobustNetworking(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to start P2P on repo %d: %v", i, err)
 		}
-		
+
 		// Verify it's running
 		if !repo.IsP2PRunning() {
 			t.Errorf("P2P should be running on repo %d", i)
@@ -94,10 +94,10 @@ func TestP2PRobustNetworking(t *testing.T) {
 	// Verify connection established
 	peers0 := repos[0].GetP2PPeers()
 	peers1 := repos[1].GetP2PPeers()
-	
+
 	t.Logf("Repo0 has %d peers", len(peers0))
 	t.Logf("Repo1 has %d peers", len(peers1))
-	
+
 	if len(peers0) == 0 {
 		t.Error("Repo0 should have at least 1 connected peer")
 	}
@@ -114,7 +114,7 @@ func TestP2PRobustNetworking(t *testing.T) {
 	// Check sync states
 	syncStates0 := repos[0].GetP2PSyncState()
 	syncStates1 := repos[1].GetP2PSyncState()
-	
+
 	t.Logf("Repo0 sync states: %d", len(syncStates0))
 	t.Logf("Repo1 sync states: %d", len(syncStates1))
 
@@ -126,21 +126,21 @@ func TestP2PDataSynchronization(t *testing.T) {
 	// Create two test repositories
 	tempDirs := make([]string, 2)
 	repos := make([]*forge.Repository, 2)
-	
+
 	for i := 0; i < 2; i++ {
 		tempDir, err := os.MkdirTemp("", fmt.Sprintf("ivaldi-sync-test-%d-*", i))
 		if err != nil {
 			t.Fatalf("Failed to create temp dir %d: %v", i, err)
 		}
 		tempDirs[i] = tempDir
-		
+
 		repo, err := forge.Initialize(tempDir)
 		if err != nil {
 			t.Fatalf("Failed to initialize repo %d: %v", i, err)
 		}
 		repos[i] = repo
 	}
-	
+
 	// Cleanup
 	defer func() {
 		for i, repo := range repos {
@@ -178,7 +178,7 @@ func TestP2PDataSynchronization(t *testing.T) {
 		config.DiscoveryPort = 9310 + i
 		config.AutoSyncEnabled = true
 		config.SyncInterval = 1 * time.Second
-		
+
 		err := repo.UpdateP2PConfig(config)
 		if err != nil {
 			t.Fatalf("Failed to update P2P config for repo %d: %v", i, err)
@@ -214,7 +214,7 @@ func TestP2PDataSynchronization(t *testing.T) {
 	// Check that both repos have similar timeline states
 	status0 := repos[0].Status()
 	status1 := repos[1].Status()
-	
+
 	t.Logf("Repo0 timeline: %s, position: %s", status0.Timeline, status0.Position)
 	t.Logf("Repo1 timeline: %s, position: %s", status1.Timeline, status1.Position)
 
@@ -226,7 +226,7 @@ func TestP2PMultiplePeersRobust(t *testing.T) {
 	const numRepos = 3
 	tempDirs := make([]string, numRepos)
 	repos := make([]*forge.Repository, numRepos)
-	
+
 	// Create repositories
 	for i := 0; i < numRepos; i++ {
 		tempDir, err := os.MkdirTemp("", fmt.Sprintf("ivaldi-multi-p2p-%d-*", i))
@@ -234,14 +234,14 @@ func TestP2PMultiplePeersRobust(t *testing.T) {
 			t.Fatalf("Failed to create temp dir %d: %v", i, err)
 		}
 		tempDirs[i] = tempDir
-		
+
 		repo, err := forge.Initialize(tempDir)
 		if err != nil {
 			t.Fatalf("Failed to initialize repo %d: %v", i, err)
 		}
 		repos[i] = repo
 	}
-	
+
 	// Cleanup
 	defer func() {
 		for i, repo := range repos {
@@ -261,7 +261,7 @@ func TestP2PMultiplePeersRobust(t *testing.T) {
 		config.AutoSyncEnabled = true
 		config.SyncInterval = 2 * time.Second
 		config.MaxPeers = 10 // Allow multiple connections
-		
+
 		err := repo.UpdateP2PConfig(config)
 		if err != nil {
 			t.Fatalf("Failed to update P2P config for repo %d: %v", i, err)
@@ -300,9 +300,9 @@ func TestP2PMultiplePeersRobust(t *testing.T) {
 	for i, repo := range repos {
 		peers := repo.GetP2PPeers()
 		t.Logf("Repo%d has %d connected peers", i, len(peers))
-		
+
 		for j, peer := range peers {
-			t.Logf("  Peer%d: ID=%s, Address=%s:%d, Status=%s", 
+			t.Logf("  Peer%d: ID=%s, Address=%s:%d, Status=%s",
 				j, peer.ID, peer.Address, peer.Port, peer.Status)
 		}
 	}
@@ -345,7 +345,7 @@ func TestP2PErrorHandlingRobust(t *testing.T) {
 
 	// Test operations when P2P is not running
 	t.Log("Testing operations when P2P is not running...")
-	
+
 	if repo.IsP2PRunning() {
 		t.Error("P2P should not be running initially")
 	}
@@ -383,7 +383,7 @@ func TestP2PErrorHandlingRobust(t *testing.T) {
 
 	// Test invalid peer connections
 	t.Log("Testing invalid peer connections...")
-	
+
 	err = repo.ConnectToPeer("invalid-hostname-that-does-not-exist", 9999)
 	if err == nil {
 		t.Error("Expected error when connecting to invalid hostname")
@@ -407,7 +407,7 @@ func TestP2PErrorHandlingRobust(t *testing.T) {
 
 	// Test configuration errors
 	t.Log("Testing configuration errors...")
-	
+
 	err = repo.SetP2PSyncInterval(-1 * time.Second)
 	if err == nil {
 		t.Error("Expected error when setting negative sync interval")
@@ -417,7 +417,7 @@ func TestP2PErrorHandlingRobust(t *testing.T) {
 
 	// Test valid configurations
 	t.Log("Testing valid configurations...")
-	
+
 	err = repo.SetP2PSyncInterval(30 * time.Second)
 	if err != nil {
 		t.Errorf("Unexpected error setting valid sync interval: %v", err)
@@ -435,7 +435,7 @@ func TestP2PErrorHandlingRobust(t *testing.T) {
 
 	// Test stop and restart
 	t.Log("Testing stop and restart...")
-	
+
 	err = repo.StopP2P()
 	if err != nil {
 		t.Errorf("Unexpected error stopping P2P: %v", err)
@@ -551,10 +551,10 @@ func TestP2PConcurrency(t *testing.T) {
 // TestP2PResourceCleanup tests proper resource cleanup
 func TestP2PResourceCleanup(t *testing.T) {
 	const numCycles = 5
-	
+
 	for cycle := 0; cycle < numCycles; cycle++ {
 		t.Logf("Cleanup test cycle %d/%d", cycle+1, numCycles)
-		
+
 		// Create test repository
 		tempDir, err := os.MkdirTemp("", fmt.Sprintf("ivaldi-p2p-cleanup-%d-*", cycle))
 		if err != nil {
@@ -603,7 +603,7 @@ func TestP2PResourceCleanup(t *testing.T) {
 
 		// Clean up
 		os.RemoveAll(tempDir)
-		
+
 		// Give system time to cleanup resources
 		time.Sleep(200 * time.Millisecond)
 	}

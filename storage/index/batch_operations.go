@@ -31,14 +31,14 @@ func NewBatchIndexer(index *SQLiteIndex, maxSize int) *BatchIndexer {
 func (bi *BatchIndexer) AddSeal(seal *objects.Seal) error {
 	bi.bufferMu.Lock()
 	defer bi.bufferMu.Unlock()
-	
+
 	bi.buffer = append(bi.buffer, seal)
-	
+
 	// Flush if buffer is full
 	if len(bi.buffer) >= bi.maxSize {
 		return bi.flushLocked()
 	}
-	
+
 	return nil
 }
 
@@ -46,7 +46,7 @@ func (bi *BatchIndexer) AddSeal(seal *objects.Seal) error {
 func (bi *BatchIndexer) Flush() error {
 	bi.bufferMu.Lock()
 	defer bi.bufferMu.Unlock()
-	
+
 	return bi.flushLocked()
 }
 
@@ -55,18 +55,18 @@ func (bi *BatchIndexer) flushLocked() error {
 	if len(bi.buffer) == 0 {
 		return nil
 	}
-	
+
 	// Acquire database lock
 	bi.index.mu.Lock()
 	defer bi.index.mu.Unlock()
-	
+
 	// Begin transaction for batch insert
 	tx, err := bi.index.db.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %v", err)
 	}
 	defer tx.Rollback()
-	
+
 	// Prepare statement for batch insert
 	stmt, err := tx.Prepare(`
 		INSERT INTO seals (hash, name, iteration, position, message, author_name, author_email, timestamp)
@@ -76,7 +76,7 @@ func (bi *BatchIndexer) flushLocked() error {
 		return fmt.Errorf("failed to prepare statement: %v", err)
 	}
 	defer stmt.Close()
-	
+
 	// Insert all seals
 	for _, seal := range bi.buffer {
 		_, err = stmt.Exec(
@@ -93,15 +93,15 @@ func (bi *BatchIndexer) flushLocked() error {
 			return fmt.Errorf("failed to insert seal %s: %v", seal.Name, err)
 		}
 	}
-	
+
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %v", err)
 	}
-	
+
 	// Clear buffer
 	bi.buffer = bi.buffer[:0]
-	
+
 	return nil
 }
 
@@ -110,17 +110,17 @@ func (idx *SQLiteIndex) BatchIndexSeals(seals []*objects.Seal) error {
 	if len(seals) == 0 {
 		return nil
 	}
-	
+
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	
+
 	// Begin transaction
 	tx, err := idx.db.Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %v", err)
 	}
 	defer tx.Rollback()
-	
+
 	// Prepare statement
 	stmt, err := tx.Prepare(`
 		INSERT INTO seals (hash, name, iteration, position, message, author_name, author_email, timestamp)
@@ -130,7 +130,7 @@ func (idx *SQLiteIndex) BatchIndexSeals(seals []*objects.Seal) error {
 		return fmt.Errorf("failed to prepare statement: %v", err)
 	}
 	defer stmt.Close()
-	
+
 	// Insert all seals
 	for _, seal := range seals {
 		_, err = stmt.Exec(
@@ -151,12 +151,12 @@ func (idx *SQLiteIndex) BatchIndexSeals(seals []*objects.Seal) error {
 			return fmt.Errorf("failed to insert seal %s: %v", seal.Name, err)
 		}
 	}
-	
+
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %v", err)
 	}
-	
+
 	return nil
 }
 
@@ -180,7 +180,7 @@ type BatchTransaction struct {
 func (idx *SQLiteIndex) NewBatchTransaction() (*BatchTransaction, error) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	
+
 	tx, err := idx.db.Begin()
 	if err != nil {
 		return nil, err
@@ -211,7 +211,7 @@ func (bt *BatchTransaction) IndexSeal(seal *objects.Seal) error {
 	if bt.done {
 		return fmt.Errorf("transaction already completed")
 	}
-	
+
 	_, err := bt.tx.Exec(`
 		INSERT INTO seals (hash, name, iteration, position, message, author_name, author_email, timestamp)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -225,10 +225,10 @@ func (bt *BatchTransaction) IndexSeal(seal *objects.Seal) error {
 		seal.Author.Email,
 		seal.Timestamp.Unix(),
 	)
-	
+
 	if err != nil && !isUniqueConstraintError(err) {
 		return err
 	}
-	
+
 	return nil
 }

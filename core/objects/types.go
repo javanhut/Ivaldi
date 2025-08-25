@@ -52,10 +52,13 @@ type CAHash struct {
 
 // NewCAHash creates a hash using the specified algorithm
 func NewCAHash(data []byte, algo HashAlgorithm) (CAHash, error) {
+	// Treat nil data as empty byte slice
 	if data == nil {
-		return CAHash{}, fmt.Errorf("data cannot be nil")
+		data = []byte{}
 	}
-	if algo < 0 || algo >= HashAlgorithm(len(algorithmNames)) {
+
+	// Validate algorithm using membership check in algorithmNames map
+	if _, ok := algorithmNames[algo]; !ok {
 		return CAHash{}, fmt.Errorf("invalid hash algorithm: %v", algo)
 	}
 
@@ -390,8 +393,8 @@ func DecodeCATree(data []byte) (*CATree, error) {
 		offset++
 
 		// Validate hash algorithm
-		if hashAlgo < 0 || hashAlgo >= HashAlgorithm(len(algorithmNames)) {
-			return nil, fmt.Errorf("unknown hash algorithm %d at offset %d", hashAlgo, offset-33)
+		if _, ok := algorithmNames[hashAlgo]; !ok {
+			return nil, fmt.Errorf("unknown hash algorithm %d at offset %d", hashAlgo, offset-1)
 		}
 
 		var hashValue [32]byte
@@ -516,7 +519,7 @@ func DecodeCASeal(data []byte) (*CASeal, error) {
 	offset++
 
 	// Validate hash algorithm
-	if treeHashAlgo < 0 || treeHashAlgo >= HashAlgorithm(len(algorithmNames)) {
+	if _, ok := algorithmNames[treeHashAlgo]; !ok {
 		return nil, fmt.Errorf("unknown hash algorithm %d at offset %d", treeHashAlgo, offset-1)
 	}
 
@@ -545,8 +548,8 @@ func DecodeCASeal(data []byte) (*CASeal, error) {
 		offset++
 
 		// Validate hash algorithm
-		if parentHashAlgo < 0 || parentHashAlgo >= HashAlgorithm(len(algorithmNames)) {
-			return nil, fmt.Errorf("unknown hash algorithm %d at offset %d", parentHashAlgo, offset-34)
+		if _, ok := algorithmNames[parentHashAlgo]; !ok {
+			return nil, fmt.Errorf("unknown hash algorithm %d at offset %d", parentHashAlgo, offset-1)
 		}
 
 		var parentHashValue [32]byte

@@ -27,11 +27,11 @@ func TestCalculateShortestPaths(t *testing.T) {
 		}
 
 		routes := calculateShortestPaths(nodeID, topology, directPeers)
-		
+
 		expected := map[string][]string{
 			"node2": {"node2"},
 		}
-		
+
 		if !reflect.DeepEqual(routes, expected) {
 			t.Errorf("Expected routes %v, got %v", expected, routes)
 		}
@@ -46,7 +46,7 @@ func TestCalculateShortestPaths(t *testing.T) {
 				Peers: map[string]time.Time{"node2": time.Now()},
 			},
 			"node2": {
-				ID:    "node2", 
+				ID:    "node2",
 				Peers: map[string]time.Time{"node1": time.Now(), "node3": time.Now()},
 			},
 			"node3": {
@@ -59,12 +59,12 @@ func TestCalculateShortestPaths(t *testing.T) {
 		}
 
 		routes := calculateShortestPaths(nodeID, topology, directPeers)
-		
+
 		expected := map[string][]string{
 			"node2": {"node2"},
 			"node3": {"node2", "node3"},
 		}
-		
+
 		if !reflect.DeepEqual(routes, expected) {
 			t.Errorf("Expected routes %v, got %v", expected, routes)
 		}
@@ -101,14 +101,14 @@ func TestCalculateShortestPaths(t *testing.T) {
 		}
 
 		routes := calculateShortestPaths(nodeID, topology, directPeers)
-		
+
 		expected := map[string][]string{
 			"node2": {"node2"},
 			"node3": {"node3"},
 			"node4": {"node2", "node4"},
 			"node5": {"node3", "node5"},
 		}
-		
+
 		if !reflect.DeepEqual(routes, expected) {
 			t.Errorf("Expected routes %v, got %v", expected, routes)
 		}
@@ -140,12 +140,12 @@ func TestCalculateShortestPaths(t *testing.T) {
 		}
 
 		routes := calculateShortestPaths(nodeID, topology, directPeers)
-		
+
 		expected := map[string][]string{
 			"node2": {"node2"},
 			// node3 and node4 should be unreachable and not in routes
 		}
-		
+
 		if !reflect.DeepEqual(routes, expected) {
 			t.Errorf("Expected routes %v, got %v", expected, routes)
 		}
@@ -175,12 +175,12 @@ func TestCalculateShortestPaths(t *testing.T) {
 		}
 
 		routes := calculateShortestPaths(nodeID, topology, directPeers)
-		
+
 		expected := map[string][]string{
 			"node2": {"node2"},
 			"node3": {"node3"}, // Should be direct, not via node2
 		}
-		
+
 		if !reflect.DeepEqual(routes, expected) {
 			t.Errorf("Expected routes %v, got %v", expected, routes)
 		}
@@ -193,9 +193,9 @@ func TestCalculateShortestPaths(t *testing.T) {
 		directPeers := []*p2p.Peer{}
 
 		routes := calculateShortestPaths(nodeID, topology, directPeers)
-		
+
 		expected := map[string][]string{}
-		
+
 		if !reflect.DeepEqual(routes, expected) {
 			t.Errorf("Expected empty routes %v, got %v", expected, routes)
 		}
@@ -214,9 +214,9 @@ func TestCalculateShortestPaths(t *testing.T) {
 		directPeers := []*p2p.Peer{}
 
 		routes := calculateShortestPaths(nodeID, topology, directPeers)
-		
+
 		expected := map[string][]string{}
-		
+
 		if !reflect.DeepEqual(routes, expected) {
 			t.Errorf("Expected empty routes %v, got %v", expected, routes)
 		}
@@ -238,7 +238,7 @@ func TestMeshNetworkRecalculateRoutes(t *testing.T) {
 				Peers: map[string]time.Time{"node1": time.Now(), "peer2": time.Now()},
 			},
 			"peer2": {
-				ID:    "peer2", 
+				ID:    "peer2",
 				Peers: map[string]time.Time{"peer1": time.Now()},
 			},
 		}
@@ -249,13 +249,13 @@ func TestMeshNetworkRecalculateRoutes(t *testing.T) {
 
 		// Calculate expected routes using the extracted function directly
 		expectedRoutes := calculateShortestPaths(nodeID, topology, directPeers)
-		
+
 		// Verify that the function produces expected results
 		expectedSpecific := map[string][]string{
 			"peer1": {"peer1"},
 			"peer2": {"peer2"}, // Direct connection should be preferred
 		}
-		
+
 		if !reflect.DeepEqual(expectedRoutes, expectedSpecific) {
 			t.Errorf("calculateShortestPaths produced unexpected routes. Expected %v, got %v", expectedSpecific, expectedRoutes)
 		}
@@ -266,7 +266,7 @@ func TestMeshNetworkRecalculateRoutes(t *testing.T) {
 			t.Errorf("calculateShortestPaths is not deterministic. First call: %v, Second call: %v", expectedRoutes, routes2)
 		}
 	})
-	
+
 	// Test complex routing scenario with multiple hops and choices
 	t.Run("ComplexRoutingScenario", func(t *testing.T) {
 		nodeID := "central"
@@ -280,7 +280,7 @@ func TestMeshNetworkRecalculateRoutes(t *testing.T) {
 				Peers: map[string]time.Time{"central": time.Now(), "leaf1": time.Now(), "leaf2": time.Now()},
 			},
 			"hub2": {
-				ID:    "hub2", 
+				ID:    "hub2",
 				Peers: map[string]time.Time{"central": time.Now(), "leaf3": time.Now()},
 			},
 			"leaf1": {
@@ -302,19 +302,18 @@ func TestMeshNetworkRecalculateRoutes(t *testing.T) {
 		}
 
 		routes := calculateShortestPaths(nodeID, topology, directPeers)
-		
+
 		// Verify optimal routing paths
 		expectedRoutes := map[string][]string{
-			"hub1":  {"hub1"},              // Direct
-			"hub2":  {"hub2"},              // Direct
-			"leaf1": {"hub1", "leaf1"},     // Via hub1
-			"leaf2": {"hub1", "leaf2"},     // Via hub1 (shortest)
-			"leaf3": {"hub2", "leaf3"},     // Via hub2 (shortest)
+			"hub1":  {"hub1"},          // Direct
+			"hub2":  {"hub2"},          // Direct
+			"leaf1": {"hub1", "leaf1"}, // Via hub1
+			"leaf2": {"hub1", "leaf2"}, // Via hub1 (shortest)
+			"leaf3": {"hub2", "leaf3"}, // Via hub2 (shortest)
 		}
-		
+
 		if !reflect.DeepEqual(routes, expectedRoutes) {
 			t.Errorf("Complex routing scenario failed. Expected %v, got %v", expectedRoutes, routes)
 		}
 	})
 }
-

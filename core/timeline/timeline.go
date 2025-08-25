@@ -40,7 +40,7 @@ func (m *Manager) Initialize() error {
 	if err := worktree.RecoverWAL(m.root, store); err != nil {
 		return fmt.Errorf("failed to recover from incomplete switch: %v", err)
 	}
-	
+
 	timelineDir := filepath.Join(m.root, ".ivaldi", "timelines")
 	if err := os.MkdirAll(timelineDir, 0755); err != nil {
 		return err
@@ -158,15 +158,15 @@ func (m *Manager) Delete(name string) error {
 	if name == "main" {
 		return fmt.Errorf("cannot delete main timeline")
 	}
-	
+
 	if name == m.current {
 		return fmt.Errorf("cannot delete current timeline, switch to another timeline first")
 	}
-	
+
 	if _, exists := m.timelines[name]; !exists {
 		return fmt.Errorf("timeline '%s' does not exist", name)
 	}
-	
+
 	delete(m.timelines, name)
 	return m.save()
 }
@@ -177,17 +177,17 @@ func (m *Manager) Rename(oldName, newName string) error {
 	if !exists {
 		return fmt.Errorf("timeline '%s' does not exist", oldName)
 	}
-	
+
 	// Check if new name already exists
 	if _, exists := m.timelines[newName]; exists {
 		return fmt.Errorf("timeline '%s' already exists", newName)
 	}
-	
+
 	// Validate new name
 	if newName == "" {
 		return fmt.Errorf("new timeline name cannot be empty")
 	}
-	
+
 	// Create new timeline entry with same data but new name
 	newTimeline := &Timeline{
 		Name:        newName,
@@ -197,25 +197,25 @@ func (m *Manager) Rename(oldName, newName string) error {
 		Description: timeline.Description,
 		Parent:      timeline.Parent,
 	}
-	
+
 	// Add new timeline
 	m.timelines[newName] = newTimeline
-	
+
 	// Update current timeline reference if we're renaming the current one
 	if m.current == oldName {
 		m.current = newName
 	}
-	
+
 	// Update any timelines that have this as their parent
 	for _, t := range m.timelines {
 		if t.Parent == oldName {
 			t.Parent = newName
 		}
 	}
-	
+
 	// Remove old timeline
 	delete(m.timelines, oldName)
-	
+
 	return m.save()
 }
 
@@ -226,7 +226,7 @@ func (m *Manager) DeleteTimeline(name string) error {
 
 func (m *Manager) save() error {
 	configPath := filepath.Join(m.root, ".ivaldi", "timelines", "config.json")
-	
+
 	config := struct {
 		Current   string               `json:"current"`
 		Timelines map[string]*Timeline `json:"timelines"`

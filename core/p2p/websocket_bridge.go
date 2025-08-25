@@ -15,11 +15,11 @@ import (
 
 // WebSocketBridge provides a Go interface to the Carrion WebSocket P2P server
 type WebSocketBridge struct {
-	port          int
-	nodeID        string
-	carrionCmd    *exec.Cmd
-	running       bool
-	serverURL     string
+	port       int
+	nodeID     string
+	carrionCmd *exec.Cmd
+	running    bool
+	serverURL  string
 }
 
 // WebSocketP2PMessage represents a P2P message structure
@@ -59,10 +59,10 @@ func (wsb *WebSocketBridge) Start() error {
 	// Launch the Carrion HTTP P2P server
 	carrionScript := "/home/javanstorm/Ivaldi/core/p2p/http_p2p_server.crl"
 	wsb.carrionCmd = exec.Command("carrion", carrionScript, strconv.Itoa(wsb.port))
-	
+
 	// Set up process group for clean shutdown
 	wsb.carrionCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	
+
 	// Redirect output for debugging
 	wsb.carrionCmd.Stdout = os.Stdout
 	wsb.carrionCmd.Stderr = os.Stderr

@@ -58,9 +58,9 @@ type MetricsCollector struct {
 	mu         sync.RWMutex
 	logger     *logging.Logger
 	// Periodic collection control
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	mutex      sync.Mutex // protects cancel and wg operations
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+	mutex  sync.Mutex // protects cancel and wg operations
 }
 
 // NewMetricsCollector creates a new metrics collector
@@ -71,6 +71,18 @@ func NewMetricsCollector() *MetricsCollector {
 		histograms: make(map[string]*HistogramMetric),
 		logger:     logging.WithPrefix("metrics"),
 	}
+}
+
+// makeLabelsCopy creates a defensive copy of a labels map to prevent external mutations
+func makeLabelsCopy(labels map[string]string) map[string]string {
+	if labels == nil {
+		return nil
+	}
+	copy := make(map[string]string, len(labels))
+	for k, v := range labels {
+		copy[k] = v
+	}
+	return copy
 }
 
 // IncrementCounter increments a counter metric
@@ -85,7 +97,7 @@ func (mc *MetricsCollector) IncrementCounter(name string, labels map[string]stri
 		mc.counters[key] = &CounterMetric{
 			Name:   name,
 			Value:  1,
-			Labels: labels,
+			Labels: makeLabelsCopy(labels),
 		}
 	}
 }
@@ -99,7 +111,7 @@ func (mc *MetricsCollector) SetGauge(name string, value float64, labels map[stri
 	mc.gauges[key] = &GaugeMetric{
 		Name:   name,
 		Value:  value,
-		Labels: labels,
+		Labels: makeLabelsCopy(labels),
 	}
 }
 
@@ -116,7 +128,7 @@ func (mc *MetricsCollector) ObserveHistogram(name string, value float64, labels 
 			Buckets: make(map[string]int64),
 			Sum:     0,
 			Count:   0,
-			Labels:  labels,
+			Labels:  makeLabelsCopy(labels),
 		}
 		mc.histograms[key] = histogram
 	}

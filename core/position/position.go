@@ -25,13 +25,13 @@ type ReferenceResolver interface {
 }
 
 type Manager struct {
-	root      string
-	current   Position
-	history   []Position
-	aliases   map[string]objects.Hash
-	nameMap   map[objects.Hash]string
-	refMgr    ReferenceResolver
-	mu        sync.RWMutex // Protects nameMap and aliases
+	root    string
+	current Position
+	history []Position
+	aliases map[string]objects.Hash
+	nameMap map[objects.Hash]string
+	refMgr  ReferenceResolver
+	mu      sync.RWMutex // Protects nameMap and aliases
 }
 
 func NewManager(root string) *Manager {
@@ -52,7 +52,7 @@ func (m *Manager) SetPosition(hash objects.Hash, timeline string) error {
 		Timeline:  timeline,
 		Timestamp: time.Now(),
 	}
-	
+
 	m.history = append(m.history, m.current)
 	return m.save()
 }
@@ -63,7 +63,7 @@ func (m *Manager) Current() Position {
 
 func (m *Manager) ParseReference(ref string) (objects.Hash, error) {
 	ref = strings.TrimSpace(ref)
-	
+
 	// Check local aliases first
 	m.mu.RLock()
 	hash, exists := m.aliases[ref]
@@ -71,35 +71,35 @@ func (m *Manager) ParseReference(ref string) (objects.Hash, error) {
 	if exists {
 		return hash, nil
 	}
-	
+
 	if ref == "position" || ref == "" {
 		return m.current.Hash, nil
 	}
-	
+
 	// Try the advanced reference manager first if available
 	if m.refMgr != nil {
 		if hash, err := m.refMgr.Resolve(ref, m.current.Timeline); err == nil {
 			return hash, nil
 		}
 	}
-	
+
 	// Fall back to local resolution for basic cases
 	if strings.HasPrefix(ref, "#-") {
 		return m.parseRelativeIteration(ref[2:])
 	}
-	
+
 	if strings.HasPrefix(ref, "#") {
 		return m.parseIteration(ref[1:])
 	}
-	
+
 	if name, err := m.parseMemorableName(ref); err == nil {
 		return name, nil
 	}
-	
+
 	if time, err := m.parseNaturalLanguage(ref); err == nil {
 		return time, nil
 	}
-	
+
 	return objects.Hash{}, fmt.Errorf("unknown reference: %s", ref)
 }
 
@@ -108,11 +108,11 @@ func (m *Manager) parseIteration(iter string) (objects.Hash, error) {
 	if err != nil {
 		return objects.Hash{}, fmt.Errorf("invalid iteration number: %s", iter)
 	}
-	
+
 	if num < 0 || num >= len(m.history) {
 		return objects.Hash{}, fmt.Errorf("iteration %d out of range", num)
 	}
-	
+
 	return m.history[num].Hash, nil
 }
 
@@ -121,20 +121,20 @@ func (m *Manager) parseRelativeIteration(iter string) (objects.Hash, error) {
 	if err != nil {
 		return objects.Hash{}, fmt.Errorf("invalid relative iteration: %s", iter)
 	}
-	
+
 	if num <= 0 {
 		return objects.Hash{}, fmt.Errorf("relative iteration must be positive: -%d", num)
 	}
-	
+
 	if len(m.history) == 0 {
 		return objects.Hash{}, fmt.Errorf("no history available")
 	}
-	
+
 	idx := len(m.history) - 1 - num
 	if idx < 0 {
 		return objects.Hash{}, fmt.Errorf("relative iteration -%d out of range (only %d entries available)", num, len(m.history))
 	}
-	
+
 	return m.history[idx].Hash, nil
 }
 
@@ -152,7 +152,7 @@ func (m *Manager) parseMemorableName(name string) (objects.Hash, error) {
 func (m *Manager) parseNaturalLanguage(ref string) (objects.Hash, error) {
 	ref = strings.ToLower(ref)
 	now := time.Now()
-	
+
 	switch {
 	case strings.Contains(ref, "yesterday"):
 		target := now.AddDate(0, 0, -1)
@@ -164,7 +164,7 @@ func (m *Manager) parseNaturalLanguage(ref string) (objects.Hash, error) {
 		target := now.AddDate(0, -1, 0)
 		return m.findClosestByTime(target)
 	}
-	
+
 	return objects.Hash{}, fmt.Errorf("unsupported natural language reference: %s", ref)
 }
 
@@ -172,13 +172,13 @@ func (m *Manager) findClosestByTime(target time.Time) (objects.Hash, error) {
 	if len(m.history) == 0 {
 		return objects.Hash{}, fmt.Errorf("no history available")
 	}
-	
+
 	closest := m.history[0]
 	minDiff := target.Sub(closest.Timestamp)
 	if minDiff < 0 {
 		minDiff = -minDiff
 	}
-	
+
 	for _, pos := range m.history[1:] {
 		diff := target.Sub(pos.Timestamp)
 		if diff < 0 {
@@ -189,7 +189,7 @@ func (m *Manager) findClosestByTime(target time.Time) (objects.Hash, error) {
 			closest = pos
 		}
 	}
-	
+
 	return closest.Hash, nil
 }
 
@@ -249,7 +249,7 @@ func (m *Manager) Load() error {
 	m.current = config.Current
 	m.history = config.History
 	m.aliases = config.Aliases
-	
+
 	m.nameMap = make(map[objects.Hash]string)
 	for _, entry := range config.NameEntries {
 		var hash objects.Hash
@@ -257,7 +257,7 @@ func (m *Manager) Load() error {
 			m.nameMap[hash] = entry.Name
 		}
 	}
-	
+
 	return nil
 }
 
@@ -268,12 +268,12 @@ func (m *Manager) saveUnsafe() error {
 	}
 
 	configPath := filepath.Join(positionDir, "config.json")
-	
+
 	type SerializableNameEntry struct {
 		Hash string `json:"hash"`
 		Name string `json:"name"`
 	}
-	
+
 	var nameEntries []SerializableNameEntry
 	for hash, name := range m.nameMap {
 		nameEntries = append(nameEntries, SerializableNameEntry{
@@ -281,7 +281,7 @@ func (m *Manager) saveUnsafe() error {
 			Name: name,
 		})
 	}
-	
+
 	config := struct {
 		Current     Position                `json:"current"`
 		History     []Position              `json:"history"`
@@ -325,7 +325,7 @@ func (m *Manager) SyncMemorableNamesFromReference(getNameFunc func(objects.Hash)
 			m.nameMap[pos.Hash] = name
 		}
 	}
-	
+
 	// Sync current position name
 	if name, exists := getNameFunc(m.current.Hash); exists {
 		m.nameMap[m.current.Hash] = name

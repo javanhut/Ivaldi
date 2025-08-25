@@ -45,60 +45,60 @@ type TimelineManager interface {
 
 // PeerSyncState tracks synchronization state with each peer
 type PeerSyncState struct {
-	PeerID           string                     `json:"peer_id"`
-	LastSync         time.Time                  `json:"last_sync"`
-	TimelineHeads    map[string]objects.Hash    `json:"timeline_heads"`
-	SyncedSeals      map[string]time.Time       `json:"synced_seals"`
-	ConflictCount    int                        `json:"conflict_count"`
-	BytesTransferred int64                      `json:"bytes_transferred"`
-	AutoSyncEnabled  bool                       `json:"auto_sync_enabled"`
+	PeerID           string                  `json:"peer_id"`
+	LastSync         time.Time               `json:"last_sync"`
+	TimelineHeads    map[string]objects.Hash `json:"timeline_heads"`
+	SyncedSeals      map[string]time.Time    `json:"synced_seals"`
+	ConflictCount    int                     `json:"conflict_count"`
+	BytesTransferred int64                   `json:"bytes_transferred"`
+	AutoSyncEnabled  bool                    `json:"auto_sync_enabled"`
 }
 
 // TimelineMetadata contains information about a timeline
 type TimelineMetadata struct {
-	Name        string            `json:"name"`
-	Description string            `json:"description"`
-	Head        objects.Hash      `json:"head"`
-	LastUpdate  time.Time         `json:"last_update"`
-	Author      objects.Identity  `json:"author"`
+	Name        string           `json:"name"`
+	Description string           `json:"description"`
+	Head        objects.Hash     `json:"head"`
+	LastUpdate  time.Time        `json:"last_update"`
+	Author      objects.Identity `json:"author"`
 }
 
 // SyncRequest represents a request to synchronize timelines
 type SyncRequest struct {
-	Timelines    []string                   `json:"timelines"`
-	LocalHeads   map[string]objects.Hash    `json:"local_heads"`
-	RequestType  string                     `json:"request_type"` // "full", "incremental", "check"
-	Timestamp    time.Time                  `json:"timestamp"`
+	Timelines   []string                `json:"timelines"`
+	LocalHeads  map[string]objects.Hash `json:"local_heads"`
+	RequestType string                  `json:"request_type"` // "full", "incremental", "check"
+	Timestamp   time.Time               `json:"timestamp"`
 }
 
 // SyncResponse contains the response to a sync request
 type SyncResponse struct {
-	Timelines     []string                   `json:"timelines"`
-	RemoteHeads   map[string]objects.Hash    `json:"remote_heads"`
-	MissingSeals  []objects.Hash             `json:"missing_seals"`
-	SealsData     []*objects.Seal            `json:"seals_data"`
-	TreesData     []*objects.Tree            `json:"trees_data"`
-	BlobsData     []*objects.Blob            `json:"blobs_data"`
-	Conflicts     []ConflictInfo             `json:"conflicts"`
-	Timestamp     time.Time                  `json:"timestamp"`
+	Timelines    []string                `json:"timelines"`
+	RemoteHeads  map[string]objects.Hash `json:"remote_heads"`
+	MissingSeals []objects.Hash          `json:"missing_seals"`
+	SealsData    []*objects.Seal         `json:"seals_data"`
+	TreesData    []*objects.Tree         `json:"trees_data"`
+	BlobsData    []*objects.Blob         `json:"blobs_data"`
+	Conflicts    []ConflictInfo          `json:"conflicts"`
+	Timestamp    time.Time               `json:"timestamp"`
 }
 
 // ConflictInfo represents a synchronization conflict
 type ConflictInfo struct {
-	Timeline    string        `json:"timeline"`
-	LocalHead   objects.Hash  `json:"local_head"`
-	RemoteHead  objects.Hash  `json:"remote_head"`
+	Timeline     string       `json:"timeline"`
+	LocalHead    objects.Hash `json:"local_head"`
+	RemoteHead   objects.Hash `json:"remote_head"`
 	ConflictType string       `json:"conflict_type"` // "diverged", "missing_parent"
 }
 
 // TimelineUpdate represents a real-time timeline update
 type TimelineUpdate struct {
-	Timeline    string        `json:"timeline"`
-	NewHead     objects.Hash  `json:"new_head"`
-	Seal        *objects.Seal `json:"seal"`
-	Author      string        `json:"author"`
-	Timestamp   time.Time     `json:"timestamp"`
-	Message     string        `json:"message"`
+	Timeline  string        `json:"timeline"`
+	NewHead   objects.Hash  `json:"new_head"`
+	Seal      *objects.Seal `json:"seal"`
+	Author    string        `json:"author"`
+	Timestamp time.Time     `json:"timestamp"`
+	Message   string        `json:"message"`
 }
 
 // NewP2PSyncManager creates a new P2P sync manager
@@ -117,10 +117,10 @@ func NewP2PSyncManager(p2pNetwork *P2PNetwork, storage Storage, timelineManager 
 func (psm *P2PSyncManager) Start() error {
 	// Start auto-sync service for continuous synchronization
 	go psm.autoSyncService()
-	
+
 	// Start timeline watch service for real-time updates
 	go psm.timelineWatchService()
-	
+
 	fmt.Println("P2P sync manager started with continuous sync enabled")
 	return nil
 }
@@ -170,7 +170,7 @@ func (psm *P2PSyncManager) timelineWatchService() {
 // checkForTimelineUpdates detects local timeline changes and broadcasts them
 func (psm *P2PSyncManager) checkForTimelineUpdates(lastKnownHeads map[string]objects.Hash) {
 	timelines := psm.timelineManager.ListTimelines()
-	
+
 	for _, timeline := range timelines {
 		currentHead, err := psm.timelineManager.GetHead(timeline)
 		if err != nil {
@@ -192,7 +192,7 @@ func (psm *P2PSyncManager) broadcastTimelineUpdate(timeline string, newHead obje
 	if newHead.IsZero() {
 		return
 	}
-	
+
 	seal, err := psm.storage.LoadSeal(newHead)
 	if err != nil {
 		// Use logging instead of fmt.Printf
@@ -232,7 +232,7 @@ func (psm *P2PSyncManager) syncWithPeer(peerID string) error {
 	// Get local timeline heads
 	timelines := psm.timelineManager.ListTimelines()
 	localHeads := make(map[string]objects.Hash)
-	
+
 	for _, timeline := range timelines {
 		head, err := psm.timelineManager.GetHead(timeline)
 		if err != nil {
@@ -271,14 +271,14 @@ func (psm *P2PSyncManager) handleSyncRequest(peer *Peer, message *Message) error
 
 	// Build sync response
 	response := SyncResponse{
-		Timelines:   []string{},
-		RemoteHeads: make(map[string]objects.Hash),
+		Timelines:    []string{},
+		RemoteHeads:  make(map[string]objects.Hash),
 		MissingSeals: []objects.Hash{},
-		SealsData:   []*objects.Seal{},
-		TreesData:   []*objects.Tree{},
-		BlobsData:   []*objects.Blob{},
-		Conflicts:   []ConflictInfo{},
-		Timestamp:   time.Now(),
+		SealsData:    []*objects.Seal{},
+		TreesData:    []*objects.Tree{},
+		BlobsData:    []*objects.Blob{},
+		Conflicts:    []ConflictInfo{},
+		Timestamp:    time.Now(),
 	}
 
 	// Check each requested timeline
@@ -366,7 +366,7 @@ func (psm *P2PSyncManager) handleSyncResponse(peer *Peer, message *Message) erro
 		return fmt.Errorf("failed to unmarshal sync response: %v", err)
 	}
 
-	fmt.Printf("Received sync response from peer %s: %d seals, %d conflicts\n", 
+	fmt.Printf("Received sync response from peer %s: %d seals, %d conflicts\n",
 		peer.ID, len(response.SealsData), len(response.Conflicts))
 
 	// Store received seals
@@ -430,7 +430,7 @@ func (psm *P2PSyncManager) handleTimelineUpdate(peer *Peer, message *Message) er
 		return fmt.Errorf("failed to unmarshal timeline update: %v", err)
 	}
 
-	fmt.Printf("Received timeline update from peer %s: %s -> %s\n", 
+	fmt.Printf("Received timeline update from peer %s: %s -> %s\n",
 		peer.ID, update.Timeline, update.NewHead.String()[:8])
 
 	// Store the new seal
@@ -482,7 +482,7 @@ func (psm *P2PSyncManager) findMissingSeals(oldHead, newHead objects.Hash) ([]ob
 	if oldHead.IsZero() {
 		return []objects.Hash{newHead}, nil
 	}
-	
+
 	// TODO: Implement proper ancestry traversal
 	return []objects.Hash{newHead}, nil
 }
@@ -521,22 +521,22 @@ func (psm *P2PSyncManager) shouldUpdateToRemoteHead(timeline string, localHead, 
 	if localHead == remoteHead {
 		return false
 	}
-	
+
 	return psm.storage.HasObject(remoteHead)
 }
 
 // handleSyncConflict handles synchronization conflicts
 func (psm *P2PSyncManager) handleSyncConflict(peerID string, conflict ConflictInfo) {
-	fmt.Printf("Sync conflict with peer %s on timeline %s: %s\n", 
+	fmt.Printf("Sync conflict with peer %s on timeline %s: %s\n",
 		peerID, conflict.Timeline, conflict.ConflictType)
-	
+
 	// Update conflict count in peer sync state
 	psm.syncMutex.Lock()
 	if state, exists := psm.syncState[peerID]; exists {
 		state.ConflictCount++
 	}
 	psm.syncMutex.Unlock()
-	
+
 	// TODO: Implement conflict resolution strategies
 }
 
@@ -567,7 +567,7 @@ func (psm *P2PSyncManager) updatePeerSyncStateFromResponse(peerID string, respon
 	if state, exists := psm.syncState[peerID]; exists {
 		state.LastSync = time.Now()
 		state.BytesTransferred += int64(len(response.SealsData) * 1024) // Rough estimate
-		
+
 		// Update synced seals
 		for _, seal := range response.SealsData {
 			state.SyncedSeals[seal.Name] = time.Now()
@@ -579,7 +579,7 @@ func (psm *P2PSyncManager) updatePeerSyncStateFromResponse(peerID string, respon
 func (psm *P2PSyncManager) GetPeerSyncState(peerID string) *PeerSyncState {
 	psm.syncMutex.RLock()
 	defer psm.syncMutex.RUnlock()
-	
+
 	if state, exists := psm.syncState[peerID]; exists {
 		return state
 	}
@@ -590,7 +590,7 @@ func (psm *P2PSyncManager) GetPeerSyncState(peerID string) *PeerSyncState {
 func (psm *P2PSyncManager) GetAllPeerSyncStates() map[string]*PeerSyncState {
 	psm.syncMutex.RLock()
 	defer psm.syncMutex.RUnlock()
-	
+
 	states := make(map[string]*PeerSyncState)
 	for peerID, state := range psm.syncState {
 		states[peerID] = state

@@ -10,22 +10,22 @@ import (
 	"ivaldi/core/network"
 	"ivaldi/core/objects"
 	"ivaldi/core/overwrite"
-	"ivaldi/storage/local"
 	"ivaldi/core/position"
 	"ivaldi/core/preservation"
 	"ivaldi/core/references"
 	"ivaldi/core/timeline"
 	"ivaldi/core/workspace"
 	"ivaldi/storage/index"
+	"ivaldi/storage/local"
 )
 
 // EnhancedRepository integrates all revolutionary features
 type EnhancedRepository struct {
 	*Repository // Embed existing repository
-	
+
 	// Revolutionary feature managers
-	references      *references.ReferenceManager
-	preservation    *preservation.PreservationManager
+	references       *references.ReferenceManager
+	preservation     *preservation.PreservationManager
 	overwriteTracker *overwrite.OverwriteTracker
 }
 
@@ -36,31 +36,31 @@ func NewEnhancedRepository(root string) (*EnhancedRepository, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Initialize revolutionary feature managers
 	refManager := references.NewReferenceManager(root)
-	
+
 	// Connect reference manager to index for database queries
 	refManager.SetIndex(baseRepo.index)
-	
+
 	if err := refManager.Load(); err != nil {
 		return nil, fmt.Errorf("failed to load references: %v", err)
 	}
-	
+
 	preservationManager := preservation.NewPreservationManager(root)
 	if err := preservationManager.Load(); err != nil {
 		return nil, fmt.Errorf("failed to load preservation: %v", err)
 	}
-	
+
 	overwriteTracker := overwrite.NewOverwriteTracker(root)
 	if err := overwriteTracker.Load(); err != nil {
 		return nil, fmt.Errorf("failed to load overwrite tracker: %v", err)
 	}
-	
+
 	return &EnhancedRepository{
 		Repository:       baseRepo,
-		references:      refManager,
-		preservation:    preservationManager,
+		references:       refManager,
+		preservation:     preservationManager,
 		overwriteTracker: overwriteTracker,
 	}, nil
 }
@@ -71,19 +71,19 @@ func (er *EnhancedRepository) EnhancedSeal(message string) (*objects.Seal, error
 	if len(er.workspace.AnvilFiles) == 0 {
 		return nil, fmt.Errorf("nothing gathered on the anvil to seal")
 	}
-	
+
 	// Generate memorable name
 	memorableName := er.references.GenerateMemorableName()
-	
+
 	// Get next iteration for current timeline
 	iteration := er.references.GetNextIteration(er.timeline.Current())
-	
+
 	// Create enhanced seal with memorable name
 	author := objects.Identity{
 		Name:  "Developer", // TODO: Get from config
 		Email: "dev@example.com",
 	}
-	
+
 	seal := &objects.Seal{
 		Name:      memorableName,
 		Iteration: iteration,
@@ -92,34 +92,34 @@ func (er *EnhancedRepository) EnhancedSeal(message string) (*objects.Seal, error
 		Timestamp: time.Now(),
 		Parents:   []objects.Hash{er.position.Current().Hash},
 	}
-	
+
 	// Store the seal
 	if err := er.storage.StoreSeal(seal); err != nil {
 		return nil, err
 	}
-	
+
 	if err := er.index.IndexSeal(seal); err != nil {
 		return nil, err
 	}
-	
+
 	// Update position
 	if err := er.position.SetPosition(seal.Hash, er.timeline.Current()); err != nil {
 		return nil, err
 	}
-	
+
 	// Register memorable name
 	if err := er.references.RegisterMemorableName(memorableName, seal.Hash, author.Name); err != nil {
 		return nil, err
 	}
-	
+
 	// Update timeline head
 	if err := er.timeline.UpdateHead(er.timeline.Current(), seal.Hash); err != nil {
 		return nil, err
 	}
-	
+
 	// Clear the anvil and reset file status
 	er.workspace.AnvilFiles = make(map[string]*workspace.FileState)
-	
+
 	// Reset all file statuses to unmodified after sealing
 	for path, fileState := range er.workspace.Files {
 		if fileState.OnAnvil {
@@ -128,43 +128,43 @@ func (er *EnhancedRepository) EnhancedSeal(message string) (*objects.Seal, error
 			er.workspace.Files[path] = fileState
 		}
 	}
-	
+
 	if err := er.workspace.SaveState(er.timeline.Current()); err != nil {
 		return seal, err
 	}
-	
+
 	return seal, nil
 }
 
 // EnhancedTimelineSwitch switches timelines with automatic work preservation
 func (er *EnhancedRepository) EnhancedTimelineSwitch(timelineName string) (*preservation.WorkspaceSnapshot, error) {
 	currentTimeline := er.timeline.Current()
-	
+
 	// Check if we're already on the target timeline
 	if currentTimeline == timelineName {
 		return nil, fmt.Errorf("already on timeline '%s'", timelineName)
 	}
-	
+
 	// Check if we have any uncommitted changes to preserve
 	var snapshot *preservation.WorkspaceSnapshot
 	if er.workspace.HasUncommittedChanges() || len(er.workspace.AnvilFiles) > 0 {
 		// Auto-preserve current workspace with a descriptive message
 		var err error
 		snapshot, err = er.preservation.AutoPreserve(
-			er.workspace, 
-			currentTimeline, 
+			er.workspace,
+			currentTimeline,
 			fmt.Sprintf("auto-shelf before switching to %s", timelineName),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to auto-shelf workspace: %v", err)
 		}
 	}
-	
+
 	// Switch timeline using base functionality
 	if err := er.SwitchTimeline(timelineName); err != nil {
 		return snapshot, err
 	}
-	
+
 	// Try to restore any previously shelved work for this timeline
 	targetSnapshots := er.preservation.GetSnapshotsByTimeline(timelineName)
 	if len(targetSnapshots) > 0 {
@@ -177,7 +177,7 @@ func (er *EnhancedRepository) EnhancedTimelineSwitch(timelineName string) (*pres
 				}
 			}
 		}
-		
+
 		// Restore the latest auto-shelf if found
 		if latestAutoShelf != nil {
 			if err := er.preservation.RestoreWorkspace(latestAutoShelf.ID, er.workspace); err == nil {
@@ -187,7 +187,7 @@ func (er *EnhancedRepository) EnhancedTimelineSwitch(timelineName string) (*pres
 			// If restore fails, just continue - don't block the timeline switch
 		}
 	}
-	
+
 	return snapshot, nil
 }
 
@@ -198,7 +198,7 @@ func (er *EnhancedRepository) EnhancedJump(reference string) error {
 	if err != nil {
 		return fmt.Errorf("could not resolve reference '%s': %v", reference, err)
 	}
-	
+
 	// Use base jump functionality
 	return er.Jump(hash.String())
 }
@@ -208,15 +208,15 @@ func (er *EnhancedRepository) EnhancedReshape(count int, justification string, c
 	if justification == "" {
 		return fmt.Errorf("justification required for history modification")
 	}
-	
+
 	// Get current and target positions
 	currentHash := er.position.Current().Hash
 	currentName, _ := er.references.GetMemorableName(currentHash)
-	
+
 	// TODO: Calculate what the new hash would be after reshape
 	newHash := currentHash // Placeholder
 	newName := er.references.GenerateMemorableName()
-	
+
 	// Record the overwrite
 	_, err := er.overwriteTracker.RequestOverwrite(
 		currentHash,
@@ -227,17 +227,17 @@ func (er *EnhancedRepository) EnhancedReshape(count int, justification string, c
 		category,
 		"current-user", // TODO: Get from config
 	)
-	
+
 	if err != nil {
 		return fmt.Errorf("overwrite request failed: %v", err)
 	}
-	
+
 	// TODO: Implement actual reshaping logic
 	// This would involve:
 	// 1. Interactive rebase-like functionality
 	// 2. Updating references and memorable names
 	// 3. Archiving original versions
-	
+
 	return nil
 }
 
@@ -267,7 +267,7 @@ func (er *EnhancedRepository) ProtectCommit(reference string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	return er.overwriteTracker.ProtectCommit(hash)
 }
 
@@ -277,7 +277,7 @@ func (er *EnhancedRepository) UnprotectCommit(reference string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	return er.overwriteTracker.UnprotectCommit(hash)
 }
 
@@ -302,23 +302,23 @@ func EnhancedInitialize(root string) (*EnhancedRepository, error) {
 	if err := os.MkdirAll(root, 0755); err != nil {
 		return nil, err
 	}
-	
+
 	ivaldiDir := filepath.Join(root, ".ivaldi")
 	if err := os.MkdirAll(ivaldiDir, 0755); err != nil {
 		return nil, err
 	}
-	
+
 	// Initialize storage
 	storage, err := local.NewStorage(root)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	idx, err := index.NewSQLiteIndex(root)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Initialize core systems
 	store, err := local.NewStore(root, objects.BLAKE3)
 	if err != nil {
@@ -327,7 +327,7 @@ func EnhancedInitialize(root string) (*EnhancedRepository, error) {
 	ws := workspace.New(root, store)
 	tm := timeline.NewManager(root)
 	pm := position.NewManager(root)
-	
+
 	// Create base repository
 	baseRepo := &Repository{
 		root:      root,
@@ -337,21 +337,21 @@ func EnhancedInitialize(root string) (*EnhancedRepository, error) {
 		timeline:  tm,
 		position:  pm,
 	}
-	
+
 	// Initialize timeline
 	if err := tm.Initialize(); err != nil {
 		return nil, err
 	}
-	
+
 	// Initialize revolutionary features
 	refManager := references.NewReferenceManager(root)
 	preservationManager := preservation.NewPreservationManager(root)
 	overwriteTracker := overwrite.NewOverwriteTracker(root)
-	
+
 	return &EnhancedRepository{
 		Repository:       baseRepo,
-		references:      refManager,
-		preservation:    preservationManager,
+		references:       refManager,
+		preservation:     preservationManager,
 		overwriteTracker: overwriteTracker,
 	}, nil
 }
@@ -363,18 +363,18 @@ func EnhancedMirror(url, dest string) (*EnhancedRepository, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Upgrade to enhanced repository
 	enhanced, err := NewEnhancedRepository(dest)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Import Git history with memorable names
 	if err := enhanced.importGitHistoryWithNames(); err != nil {
 		return nil, fmt.Errorf("failed to import Git history: %v", err)
 	}
-	
+
 	return enhanced, nil
 }
 
@@ -386,7 +386,7 @@ func (er *EnhancedRepository) importGitHistoryWithNames() error {
 	// 2. Assign memorable names to each commit
 	// 3. Create reference mappings
 	// 4. Build iteration numbers per timeline
-	
+
 	return nil
 }
 
@@ -423,7 +423,7 @@ func (er *EnhancedRepository) CreateTimeline(name string) error {
 	if err := er.timeline.Create(name, "Feature timeline"); err != nil {
 		return err
 	}
-	
+
 	// Save the current timeline state (if any) before creating new one
 	currentTimeline := er.timeline.Current()
 	if currentTimeline != name {
@@ -431,22 +431,22 @@ func (er *EnhancedRepository) CreateTimeline(name string) error {
 			return fmt.Errorf("failed to save current timeline state: %v", err)
 		}
 	}
-	
+
 	// Copy the current timeline's state as the divergence point for the new timeline
 	if err := er.Repository.saveTimelineState(name); err != nil {
 		return fmt.Errorf("failed to create initial state for timeline: %v", err)
 	}
-	
+
 	// Save current workspace state first
 	if err := er.workspace.SaveState(currentTimeline); err != nil {
 		return fmt.Errorf("failed to save current workspace state: %v", err)
 	}
-	
+
 	// Copy workspace state from current timeline to new timeline
 	if err := er.copyWorkspaceState(currentTimeline, name); err != nil {
 		return fmt.Errorf("failed to copy workspace state: %v", err)
 	}
-	
+
 	return nil
 }
 
@@ -460,13 +460,13 @@ func (er *EnhancedRepository) copyWorkspaceState(sourceTimeline, targetTimeline 
 		}
 		return err
 	}
-	
+
 	// Set the target timeline and save
 	sourceWorkspace.Timeline = targetTimeline
 	if err := sourceWorkspace.SaveState(targetTimeline); err != nil {
 		return err
 	}
-	
+
 	return nil
 }
 
@@ -483,17 +483,17 @@ func (er *EnhancedRepository) RenameTimeline(oldName, newName string) error {
 func (er *EnhancedRepository) GetStatus() *WorkspaceStatus {
 	// Extract modified and staged files from workspace
 	var modified, staged []string
-	
+
 	for path, file := range er.workspace.Files {
 		if file.Status == workspace.StatusModified {
 			modified = append(modified, path)
 		}
 	}
-	
+
 	for path := range er.workspace.AnvilFiles {
 		staged = append(staged, path)
 	}
-	
+
 	return &WorkspaceStatus{
 		Modified: modified,
 		Staged:   staged,
@@ -507,9 +507,9 @@ func (er *EnhancedRepository) GetHistory(limit int) []*objects.Seal {
 	if err != nil {
 		return []*objects.Seal{} // Return empty on error
 	}
-	
+
 	var seals []*objects.Seal
-	
+
 	// Load each seal from storage
 	for _, hash := range hashes {
 		seal, err := er.storage.LoadSeal(hash)
@@ -518,7 +518,7 @@ func (er *EnhancedRepository) GetHistory(limit int) []*objects.Seal {
 		}
 		seals = append(seals, seal)
 	}
-	
+
 	return seals
 }
 
@@ -576,7 +576,7 @@ func (er *EnhancedRepository) GetWorkspace() *workspace.Workspace {
 // RefreshIgnorePatterns refreshes the ignore patterns and removes ignored files from anvil
 func (er *EnhancedRepository) RefreshIgnorePatterns() error {
 	er.workspace.RefreshIgnorePatterns()
-	
+
 	// Remove any files that are now ignored from the anvil
 	var toRemove []string
 	for path := range er.workspace.AnvilFiles {
@@ -584,7 +584,7 @@ func (er *EnhancedRepository) RefreshIgnorePatterns() error {
 			toRemove = append(toRemove, path)
 		}
 	}
-	
+
 	for _, path := range toRemove {
 		delete(er.workspace.AnvilFiles, path)
 		if fileState, exists := er.workspace.Files[path]; exists {
@@ -592,7 +592,7 @@ func (er *EnhancedRepository) RefreshIgnorePatterns() error {
 			fileState.Status = workspace.StatusUnmodified
 		}
 	}
-	
+
 	return er.workspace.SaveState(er.timeline.Current())
 }
 
@@ -600,7 +600,7 @@ func (er *EnhancedRepository) RefreshIgnorePatterns() error {
 func (er *EnhancedRepository) ExcludeFiles(patterns []string) error {
 	// Read current .ivaldiignore file
 	ignorePath := filepath.Join(er.Root(), ".ivaldiignore")
-	
+
 	var existingPatterns []string
 	if data, err := os.ReadFile(ignorePath); err == nil {
 		lines := strings.Split(string(data), "\n")
@@ -610,20 +610,20 @@ func (er *EnhancedRepository) ExcludeFiles(patterns []string) error {
 			}
 		}
 	}
-	
+
 	// Add new patterns
 	existingPatterns = append(existingPatterns, "")
 	existingPatterns = append(existingPatterns, "# Added by ivaldi exclude command")
 	for _, pattern := range patterns {
 		existingPatterns = append(existingPatterns, pattern)
 	}
-	
+
 	// Write updated .ivaldiignore
 	content := strings.Join(existingPatterns, "\n") + "\n"
 	if err := os.WriteFile(ignorePath, []byte(content), 0644); err != nil {
 		return fmt.Errorf("failed to update .ivaldiignore: %v", err)
 	}
-	
+
 	// Refresh ignore patterns and clean workspace
 	return er.RefreshIgnorePatterns()
 }
@@ -631,7 +631,7 @@ func (er *EnhancedRepository) ExcludeFiles(patterns []string) error {
 // RemoveFiles removes files from repository and optionally excludes them
 func (er *EnhancedRepository) RemoveFiles(patterns []string, fromRemoteOnly bool, excludeAfter bool) error {
 	var filesToRemove []string
-	
+
 	// Expand patterns to actual files
 	for _, pattern := range patterns {
 		if strings.Contains(pattern, "*") {
@@ -651,7 +651,7 @@ func (er *EnhancedRepository) RemoveFiles(patterns []string, fromRemoteOnly bool
 			filesToRemove = append(filesToRemove, pattern)
 		}
 	}
-	
+
 	// Remove files from filesystem unless --from-remote only
 	if !fromRemoteOnly {
 		for _, file := range filesToRemove {
@@ -661,7 +661,7 @@ func (er *EnhancedRepository) RemoveFiles(patterns []string, fromRemoteOnly bool
 			}
 		}
 	}
-	
+
 	// Stage removal in workspace
 	for _, file := range filesToRemove {
 		if fileState, exists := er.workspace.Files[file]; exists {
@@ -670,14 +670,14 @@ func (er *EnhancedRepository) RemoveFiles(patterns []string, fromRemoteOnly bool
 			er.workspace.AnvilFiles[file] = fileState
 		}
 	}
-	
+
 	// Add to ignore file if requested
 	if excludeAfter {
 		if err := er.ExcludeFiles(patterns); err != nil {
 			return fmt.Errorf("failed to exclude files: %v", err)
 		}
 	}
-	
+
 	// Save workspace state
 	return er.workspace.SaveState(er.timeline.Current())
 }

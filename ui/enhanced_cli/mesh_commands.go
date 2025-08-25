@@ -27,7 +27,7 @@ func (ec *EnhancedCLI) createMeshStartCommand() *cobra.Command {
 			ec.output.Success("Mesh network started successfully!")
 			ec.output.Info(fmt.Sprintf("Node ID: %s", status.NodeID))
 			ec.output.Info("Network will automatically discover and connect to other mesh peers")
-			
+
 			// Check if daemon mode is requested
 			daemon, _ := cmd.Flags().GetBool("daemon")
 			if daemon {
@@ -35,11 +35,11 @@ func (ec *EnhancedCLI) createMeshStartCommand() *cobra.Command {
 				// Keep the process running
 				select {}
 			}
-			
+
 			return nil
 		},
 	}
-	
+
 	cmd.Flags().BoolP("daemon", "d", false, "Run as daemon (keep process running)")
 	return cmd
 }
@@ -74,7 +74,7 @@ func (ec *EnhancedCLI) createMeshStatusCommand() *cobra.Command {
 			repo := ec.currentRepo
 
 			status := repo.GetMeshStatus()
-			
+
 			if !status.Running {
 				ec.output.Info("Mesh Network: STOPPED")
 				ec.output.Info("Start with: mesh start")
@@ -100,7 +100,7 @@ func (ec *EnhancedCLI) createMeshStatusCommand() *cobra.Command {
 					if !peer.DirectConnect {
 						connectType = fmt.Sprintf("via %s (%d hops)", peer.NextHop, peer.Hops)
 					}
-					ec.output.Info(fmt.Sprintf("%s - %s:%d (%s)", 
+					ec.output.Info(fmt.Sprintf("%s - %s:%d (%s)",
 						peerID[:12], peer.Address, peer.Port, connectType))
 				}
 			}
@@ -172,7 +172,7 @@ func (ec *EnhancedCLI) createMeshTopologyCommand() *cobra.Command {
 
 			ec.output.Info("=== Mesh Network Topology ===")
 			ec.output.Info(fmt.Sprintf("Local Node: %s", status.NodeID))
-			
+
 			if len(topology) <= 1 {
 				ec.output.Info("No peers discovered yet")
 				return nil
@@ -222,10 +222,10 @@ func (ec *EnhancedCLI) createMeshRouteCommand() *cobra.Command {
 			}
 
 			ec.output.Info(fmt.Sprintf("Route to %s:", targetPeer))
-			
+
 			status := repo.GetMeshStatus()
 			ec.output.Info(fmt.Sprintf("└─ %s (local)", status.NodeID[:12]))
-			
+
 			for i, hop := range route {
 				if i == len(route)-1 {
 					ec.output.Info(fmt.Sprintf("   └─ %s (target)", hop[:12]))
@@ -233,7 +233,7 @@ func (ec *EnhancedCLI) createMeshRouteCommand() *cobra.Command {
 					ec.output.Info(fmt.Sprintf("   └─ %s", hop[:12]))
 				}
 			}
-			
+
 			ec.output.Info(fmt.Sprintf("Total hops: %d", len(route)))
 			return nil
 		},
@@ -253,9 +253,9 @@ func (ec *EnhancedCLI) createMeshPingCommand() *cobra.Command {
 			}
 
 			targetPeer := args[0]
-			
+
 			ec.output.Info(fmt.Sprintf("Pinging %s via mesh network...", targetPeer[:12]))
-			
+
 			start := time.Now()
 			if err := repo.PingMeshPeer(targetPeer); err != nil {
 				return fmt.Errorf("ping failed: %v", err)
@@ -264,7 +264,7 @@ func (ec *EnhancedCLI) createMeshPingCommand() *cobra.Command {
 
 			route := repo.GetMeshRoute(targetPeer)
 			hops := len(route)
-			
+
 			ec.output.Success(fmt.Sprintf("Ping successful! (%v, %d hops)", duration, hops))
 			return nil
 		},
@@ -283,29 +283,29 @@ func (ec *EnhancedCLI) createMeshPeersCommand() *cobra.Command {
 			}
 
 			peers := repo.GetMeshPeers()
-			
+
 			if len(peers) == 0 {
 				ec.output.Info("No peers discovered yet")
 				return nil
 			}
 
 			ec.output.Info(fmt.Sprintf("=== Mesh Peers (%d) ===", len(peers)))
-			
+
 			directPeers := repo.GetDirectMeshPeers()
 			indirectPeers := repo.GetIndirectMeshPeers()
-			
+
 			if len(directPeers) > 0 {
 				ec.output.Info(fmt.Sprintf("\nDirect Connections (%d):", len(directPeers)))
 				for _, peer := range directPeers {
-					ec.output.Info(fmt.Sprintf("  %s - %s:%d (1 hop)", 
+					ec.output.Info(fmt.Sprintf("  %s - %s:%d (1 hop)",
 						peer.ID[:12], peer.Address, peer.Port))
 				}
 			}
-			
+
 			if len(indirectPeers) > 0 {
 				ec.output.Info(fmt.Sprintf("\nIndirect Connections (%d):", len(indirectPeers)))
 				for _, peer := range indirectPeers {
-					ec.output.Info(fmt.Sprintf("  %s - %s:%d (%d hops via %s)", 
+					ec.output.Info(fmt.Sprintf("  %s - %s:%d (%d hops via %s)",
 						peer.ID[:12], peer.Address, peer.Port, peer.Hops, peer.NextHop[:12]))
 				}
 			}

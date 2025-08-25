@@ -82,7 +82,7 @@ func (cs *ChunkedStorage) RetrieveFromChunks(chunkHashes []string) ([]byte, erro
 // GetStorageStats returns current storage efficiency statistics
 func (cs *ChunkedStorage) GetStorageStats() chunking.StorageEfficiency {
 	dedupStats := cs.dedup.GetStats()
-	
+
 	// Simulate compression ratio (would be real with actual compression)
 	compressionRatio := 1.5 // 1.5:1 typical for code
 	if cs.compress {
@@ -114,12 +114,12 @@ func (cs *ChunkedStorage) StoreSeal(seal *objects.Seal) error {
 
 		// Store chunk metadata
 		return cs.base.StoreMetadata(seal.Hash.String(), &ChunkMetadata{
-			OriginalHash:   *hash,
-			ChunkHashes:    getChunkHashes(result.Chunks),
-			TotalSize:      result.TotalSize,
-			ChunkCount:     result.ChunkCount,
-			Deduplicated:   result.Dedup,
-			Compressed:     result.Compression != "none",
+			OriginalHash: *hash,
+			ChunkHashes:  getChunkHashes(result.Chunks),
+			TotalSize:    result.TotalSize,
+			ChunkCount:   result.ChunkCount,
+			Deduplicated: result.Dedup,
+			Compressed:   result.Compression != "none",
 		})
 	}
 
@@ -152,12 +152,12 @@ func (cs *ChunkedStorage) StoreBlob(data []byte) (objects.Hash, error) {
 
 	// Store chunk metadata
 	err = cs.base.StoreMetadata(hash.String(), &ChunkMetadata{
-		OriginalHash:   hash,
-		ChunkHashes:    getChunkHashes(result.Chunks),
-		TotalSize:      result.TotalSize,
-		ChunkCount:     result.ChunkCount,
-		Deduplicated:   result.Dedup,
-		Compressed:     result.Compression != "none",
+		OriginalHash: hash,
+		ChunkHashes:  getChunkHashes(result.Chunks),
+		TotalSize:    result.TotalSize,
+		ChunkCount:   result.ChunkCount,
+		Deduplicated: result.Dedup,
+		Compressed:   result.Compression != "none",
 	})
 
 	return hash, err
@@ -185,18 +185,18 @@ func (cs *ChunkedStorage) CompressData(data []byte) ([]byte, float64, error) {
 
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
-	
+
 	if _, err := gz.Write(data); err != nil {
 		return nil, 0, err
 	}
-	
+
 	if err := gz.Close(); err != nil {
 		return nil, 0, err
 	}
 
 	compressed := buf.Bytes()
 	ratio := float64(len(data)) / float64(len(compressed))
-	
+
 	return compressed, ratio, nil
 }
 
@@ -219,13 +219,13 @@ func (cs *ChunkedStorage) DecompressData(data []byte) ([]byte, error) {
 
 // ChunkMetadata stores information about chunked files
 type ChunkMetadata struct {
-	OriginalHash   objects.Hash `json:"originalHash"`
-	ChunkHashes    []string     `json:"chunkHashes"`
-	TotalSize      int          `json:"totalSize"`
-	ChunkCount     int          `json:"chunkCount"`
-	Deduplicated   bool         `json:"deduplicated"`
-	Compressed     bool         `json:"compressed"`
-	StorageRatio   float64      `json:"storageRatio"`
+	OriginalHash objects.Hash `json:"originalHash"`
+	ChunkHashes  []string     `json:"chunkHashes"`
+	TotalSize    int          `json:"totalSize"`
+	ChunkCount   int          `json:"chunkCount"`
+	Deduplicated bool         `json:"deduplicated"`
+	Compressed   bool         `json:"compressed"`
+	StorageRatio float64      `json:"storageRatio"`
 }
 
 // getChunkHashes extracts hashes from chunks
@@ -259,13 +259,13 @@ func (cs *ChunkedStorage) reconstructSealFromChunks(metadata *ChunkMetadata) (*o
 
 // StorageProfile provides detailed storage analysis
 type StorageProfile struct {
-	TotalFiles      int                           `json:"totalFiles"`
-	ChunkedFiles    int                           `json:"chunkedFiles"`
-	DirectFiles     int                           `json:"directFiles"`
-	TotalChunks     int                           `json:"totalChunks"`
-	UniqueChunks    int                           `json:"uniqueChunks"`
-	Efficiency      chunking.StorageEfficiency   `json:"efficiency"`
-	TopDedupFiles   []string                     `json:"topDedupFiles"`
+	TotalFiles    int                        `json:"totalFiles"`
+	ChunkedFiles  int                        `json:"chunkedFiles"`
+	DirectFiles   int                        `json:"directFiles"`
+	TotalChunks   int                        `json:"totalChunks"`
+	UniqueChunks  int                        `json:"uniqueChunks"`
+	Efficiency    chunking.StorageEfficiency `json:"efficiency"`
+	TopDedupFiles []string                   `json:"topDedupFiles"`
 }
 
 // GetStorageProfile returns comprehensive storage analysis
@@ -274,13 +274,13 @@ func (cs *ChunkedStorage) GetStorageProfile() *StorageProfile {
 	efficiency := cs.GetStorageStats()
 
 	return &StorageProfile{
-		TotalFiles:      0, // Would count from metadata
-		ChunkedFiles:    0, // Would count chunked files
-		DirectFiles:     0, // Would count direct files
-		TotalChunks:     stats.TotalReferences,
-		UniqueChunks:    stats.UniqueChunks,
-		Efficiency:      efficiency,
-		TopDedupFiles:   []string{}, // Would analyze most duplicated files
+		TotalFiles:    0, // Would count from metadata
+		ChunkedFiles:  0, // Would count chunked files
+		DirectFiles:   0, // Would count direct files
+		TotalChunks:   stats.TotalReferences,
+		UniqueChunks:  stats.UniqueChunks,
+		Efficiency:    efficiency,
+		TopDedupFiles: []string{}, // Would analyze most duplicated files
 	}
 }
 
@@ -288,13 +288,13 @@ func (cs *ChunkedStorage) GetStorageProfile() *StorageProfile {
 func (cs *ChunkedStorage) OptimizeStorage() (*OptimizationResult, error) {
 	// Analyze current storage
 	_ = cs.GetStorageProfile()
-	
+
 	// Perform optimization (placeholder)
 	result := &OptimizationResult{
-		SpaceReclaimed:   0,
-		ChunksCoalesced:  0,
-		OrphanedRemoved:  0,
-		CompressionGain:  0,
+		SpaceReclaimed:  0,
+		ChunksCoalesced: 0,
+		OrphanedRemoved: 0,
+		CompressionGain: 0,
 	}
 
 	return result, nil
@@ -302,8 +302,8 @@ func (cs *ChunkedStorage) OptimizeStorage() (*OptimizationResult, error) {
 
 // OptimizationResult contains storage optimization results
 type OptimizationResult struct {
-	SpaceReclaimed   int64   `json:"spaceReclaimed"`   // Bytes reclaimed
-	ChunksCoalesced  int     `json:"chunksCoalesced"`  // Small chunks merged
-	OrphanedRemoved  int     `json:"orphanedRemoved"`  // Unused chunks removed
-	CompressionGain  float64 `json:"compressionGain"`  // Additional compression %
+	SpaceReclaimed  int64   `json:"spaceReclaimed"`  // Bytes reclaimed
+	ChunksCoalesced int     `json:"chunksCoalesced"` // Small chunks merged
+	OrphanedRemoved int     `json:"orphanedRemoved"` // Unused chunks removed
+	CompressionGain float64 `json:"compressionGain"` // Additional compression %
 }

@@ -116,7 +116,7 @@ func (cm *ConfigManager) InteractiveSetup() error {
 
 	// GitHub token
 	fmt.Println()
-	
+
 	// Try to detect existing git credentials
 	if gitToken, gitErr := cm.LoadGitCredentials(); gitErr == nil && gitToken != "" {
 		fmt.Println("🔍 Found GitHub token in git credentials!")
@@ -131,7 +131,7 @@ func (cm *ConfigManager) InteractiveSetup() error {
 			fmt.Println("  2. Generate a new token with 'repo' permissions")
 			fmt.Println("  3. Copy the token and paste it here")
 			fmt.Printf("GitHub token [%s]: ", maskToken(creds.GitHubToken))
-			
+
 			token, err := cm.readSecureInput()
 			if err != nil {
 				return err
@@ -143,10 +143,10 @@ func (cm *ConfigManager) InteractiveSetup() error {
 	} else {
 		fmt.Println("GitHub Personal Access Token:")
 		fmt.Println("  1. Go to https://github.com/settings/tokens")
-		fmt.Println("  2. Generate a new token with 'repo' permissions") 
+		fmt.Println("  2. Generate a new token with 'repo' permissions")
 		fmt.Println("  3. Copy the token and paste it here")
 		fmt.Printf("GitHub token [%s]: ", maskToken(creds.GitHubToken))
-		
+
 		token, err := cm.readSecureInput()
 		if err != nil {
 			return err
@@ -317,12 +317,12 @@ func (cm *ConfigManager) LoadGitCredentials() (string, error) {
 	// Try to get GitHub token from git credential manager
 	cmd := exec.Command("git", "credential", "fill")
 	cmd.Stdin = strings.NewReader("protocol=https\nhost=github.com\n\n")
-	
+
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to get git credentials: %v", err)
 	}
-	
+
 	// Parse the output for password (which is the token for GitHub)
 	lines := strings.Split(string(output), "\n")
 	for _, line := range lines {
@@ -333,7 +333,7 @@ func (cm *ConfigManager) LoadGitCredentials() (string, error) {
 			}
 		}
 	}
-	
+
 	return "", fmt.Errorf("no GitHub token found in git credentials")
 }
 
@@ -343,30 +343,30 @@ func (cm *ConfigManager) GetGitHubTokenWithFallback() (string, error) {
 	if token, err := cm.GetGitHubToken(); err == nil && token != "" {
 		return token, nil
 	}
-	
+
 	// 2. Try git credentials
 	if token, err := cm.LoadGitCredentials(); err == nil && token != "" {
 		return token, nil
 	}
-	
+
 	// 3. Try global config
 	globalConfig := NewGlobalConfigManager()
 	if token, err := globalConfig.GetGitHubToken(); err == nil && token != "" {
 		return token, nil
 	}
-	
+
 	// 4. Check environment variable as final fallback
 	if envToken := os.Getenv("GITHUB_TOKEN"); envToken != "" {
 		return envToken, nil
 	}
-	
+
 	return "", fmt.Errorf("no GitHub token found in config or git credentials")
 }
 
 // LoadRepoConfig loads repository-specific configuration
 func (cm *ConfigManager) LoadRepoConfig() (*RepoConfig, error) {
 	repoConfigPath := filepath.Join(filepath.Dir(cm.configPath), "repo_config.json")
-	
+
 	data, err := os.ReadFile(repoConfigPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -394,7 +394,7 @@ func (cm *ConfigManager) LoadRepoConfig() (*RepoConfig, error) {
 // SaveRepoConfig saves repository-specific configuration
 func (cm *ConfigManager) SaveRepoConfig(config *RepoConfig) error {
 	repoConfigPath := filepath.Join(filepath.Dir(cm.configPath), "repo_config.json")
-	
+
 	// Ensure directory exists
 	if err := os.MkdirAll(filepath.Dir(repoConfigPath), 0755); err != nil {
 		return err
@@ -419,7 +419,7 @@ func (cm *ConfigManager) GetHashAlgorithm() (objects.HashAlgorithm, error) {
 	if err != nil {
 		return objects.BLAKE3, err
 	}
-	
+
 	return objects.ParseHashAlgorithm(config.HashAlgorithm)
 }
 
@@ -429,7 +429,7 @@ func (cm *ConfigManager) SetHashAlgorithm(algo objects.HashAlgorithm) error {
 	if err != nil {
 		return err
 	}
-	
+
 	config.HashAlgorithm = algo.String()
 	return cm.SaveRepoConfig(config)
 }
@@ -440,14 +440,14 @@ func (cm *ConfigManager) GetRepoUserInfo() (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	
+
 	// Fall back to global credentials if repo config doesn't have user info
 	if config.UserName == "" || config.UserEmail == "" {
 		globalName, globalEmail, err := cm.GetUserInfo()
 		if err != nil {
 			return config.UserName, config.UserEmail, nil // Return what we have
 		}
-		
+
 		if config.UserName == "" {
 			config.UserName = globalName
 		}
@@ -455,7 +455,7 @@ func (cm *ConfigManager) GetRepoUserInfo() (string, string, error) {
 			config.UserEmail = globalEmail
 		}
 	}
-	
+
 	return config.UserName, config.UserEmail, nil
 }
 
@@ -465,7 +465,7 @@ func (cm *ConfigManager) SetRepoUserInfo(name, email string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	config.UserName = name
 	config.UserEmail = email
 	return cm.SaveRepoConfig(config)

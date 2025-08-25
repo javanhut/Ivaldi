@@ -2,17 +2,28 @@ package p2p
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
+// SubscriptionID is an opaque handle for managing event subscriptions
+type SubscriptionID uint64
+
+// subscription tracks a handler with its ID for unsubscribe functionality
+type subscription struct {
+	id      SubscriptionID
+	handler EventHandler
+}
+
 // EventBus manages event distribution in the P2P network
 type EventBus struct {
-	subscribers map[string][]EventHandler
+	subscribers map[string][]subscription
 	mutex       sync.RWMutex
 	eventQueue  chan Event
 	ctx         chan struct{}
 	running     bool
 	runMutex    sync.Mutex
+	nextSubID   uint64 // atomic counter for generating subscription IDs
 }
 
 // EventHandler processes events
@@ -43,7 +54,7 @@ const (
 // NewEventBus creates a new event bus
 func NewEventBus() *EventBus {
 	return &EventBus{
-		subscribers: make(map[string][]EventHandler),
+		subscribers: make(map[string][]subscription),
 		eventQueue:  make(chan Event, 1000),
 		ctx:         make(chan struct{}),
 	}
@@ -53,7 +64,7 @@ func NewEventBus() *EventBus {
 func (eb *EventBus) Start() {
 	eb.runMutex.Lock()
 	defer eb.runMutex.Unlock()
-	
+
 	if !eb.running {
 		eb.running = true
 		go eb.processEvents()
@@ -64,19 +75,46 @@ func (eb *EventBus) Start() {
 func (eb *EventBus) Stop() {
 	eb.runMutex.Lock()
 	defer eb.runMutex.Unlock()
-	
+
 	if eb.running {
 		eb.running = false
 		close(eb.ctx)
 	}
 }
 
-// Subscribe adds an event handler for a specific event type
-func (eb *EventBus) Subscribe(eventType string, handler EventHandler) {
+// Subscribe adds an event handler for a specific event type and returns a subscription handle
+func (eb *EventBus) Subscribe(eventType string, handler EventHandler) SubscriptionID {
 	eb.mutex.Lock()
 	defer eb.mutex.Unlock()
 
-	eb.subscribers[eventType] = append(eb.subscribers[eventType], handler)
+	// Generate unique subscription ID using atomic counter
+	subID := SubscriptionID(atomic.AddUint64(&eb.nextSubID, 1))
+
+	// Create subscription and add to subscribers list
+	sub := subscription{
+		id:      subID,
+		handler: handler,
+	}
+	eb.subscribers[eventType] = append(eb.subscribers[eventType], sub)
+
+	return subID
+}
+
+// Unsubscribe removes an event handler using its subscription handle
+func (eb *EventBus) Unsubscribe(eventType string, subID SubscriptionID) {
+	eb.mutex.Lock()
+	defer eb.mutex.Unlock()
+
+	// Find and remove the subscription with matching ID
+	subs := eb.subscribers[eventType]
+	for i, sub := range subs {
+		if sub.id == subID {
+			// Remove this subscription by swapping with last element and truncating
+			subs[i] = subs[len(subs)-1]
+			eb.subscribers[eventType] = subs[:len(subs)-1]
+			break
+		}
+	}
 }
 
 // Publish sends an event to all subscribers
@@ -103,15 +141,15 @@ func (eb *EventBus) processEvents() {
 // dispatchEvent sends an event to all relevant subscribers
 func (eb *EventBus) dispatchEvent(event Event) {
 	eb.mutex.RLock()
-	handlers := eb.subscribers[event.Type]
+	subs := eb.subscribers[event.Type]
 	eb.mutex.RUnlock()
 
-	for _, handler := range handlers {
-		go func(h EventHandler) {
-			if err := h(event); err != nil {
+	for _, sub := range subs {
+		go func(handler EventHandler) {
+			if err := handler(event); err != nil {
 				// Log error but continue processing
 			}
-		}(handler)
+		}(sub.handler)
 	}
 }
 

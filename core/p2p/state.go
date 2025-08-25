@@ -77,7 +77,7 @@ func (sm *P2PStateManager) Load() (*P2PState, error) {
 	if state.PID > 0 {
 		oldRunning := state.Running
 		state.Running = isProcessAlive(state.PID)
-		
+
 		// Only save state if the running status changed
 		if state.Running != oldRunning {
 			if err := sm.Save(&state); err != nil {

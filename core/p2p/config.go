@@ -16,23 +16,23 @@ type P2PConfig struct {
 	MaxPeers          int      `json:"max_peers"`
 	EnableAutoConnect bool     `json:"enable_auto_connect"`
 	KnownPeers        []string `json:"known_peers"`
-	
+
 	// Sync settings
-	AutoSyncEnabled   bool          `json:"auto_sync_enabled"`
-	SyncInterval      time.Duration `json:"sync_interval"`
-	SyncTimeout       time.Duration `json:"sync_timeout"`
-	ConflictStrategy  string        `json:"conflict_strategy"` // "manual", "auto_merge", "prefer_remote", "prefer_local"
-	
+	AutoSyncEnabled  bool          `json:"auto_sync_enabled"`
+	SyncInterval     time.Duration `json:"sync_interval"`
+	SyncTimeout      time.Duration `json:"sync_timeout"`
+	ConflictStrategy string        `json:"conflict_strategy"` // "manual", "auto_merge", "prefer_remote", "prefer_local"
+
 	// Performance settings
-	MaxConcurrentSync int   `json:"max_concurrent_sync"`
-	MaxMessageSize    int64 `json:"max_message_size"`
+	MaxConcurrentSync int           `json:"max_concurrent_sync"`
+	MaxMessageSize    int64         `json:"max_message_size"`
 	HeartbeatInterval time.Duration `json:"heartbeat_interval"`
-	
+
 	// Security settings
 	EnableEncryption bool     `json:"enable_encryption"`
 	TrustedPeers     []string `json:"trusted_peers"`
 	AllowedNetworks  []string `json:"allowed_networks"`
-	
+
 	// Storage settings
 	DataDir       string `json:"data_dir"`
 	EnableMetrics bool   `json:"enable_metrics"`
@@ -46,20 +46,20 @@ func DefaultP2PConfig() *P2PConfig {
 		MaxPeers:          50,
 		EnableAutoConnect: true,
 		KnownPeers:        []string{},
-		
-		AutoSyncEnabled:   true,
-		SyncInterval:      30 * time.Second,
-		SyncTimeout:       60 * time.Second,
-		ConflictStrategy:  "manual",
-		
+
+		AutoSyncEnabled:  true,
+		SyncInterval:     30 * time.Second,
+		SyncTimeout:      60 * time.Second,
+		ConflictStrategy: "manual",
+
 		MaxConcurrentSync: 5,
 		MaxMessageSize:    10 * 1024 * 1024, // 10MB
 		HeartbeatInterval: 30 * time.Second,
-		
+
 		EnableEncryption: false,
 		TrustedPeers:     []string{},
 		AllowedNetworks:  []string{"192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"},
-		
+
 		DataDir:       ".ivaldi/p2p",
 		EnableMetrics: true,
 	}
@@ -157,14 +157,14 @@ func (cm *P2PConfigManager) UpdateSyncInterval(interval time.Duration) error {
 // AddKnownPeer adds a peer to the known peers list
 func (cm *P2PConfigManager) AddKnownPeer(peerAddr string) error {
 	config := cm.Get()
-	
+
 	// Check if peer already exists
 	for _, peer := range config.KnownPeers {
 		if peer == peerAddr {
 			return nil // Already exists
 		}
 	}
-	
+
 	config.KnownPeers = append(config.KnownPeers, peerAddr)
 	return cm.Save(config)
 }
@@ -172,14 +172,14 @@ func (cm *P2PConfigManager) AddKnownPeer(peerAddr string) error {
 // RemoveKnownPeer removes a peer from the known peers list
 func (cm *P2PConfigManager) RemoveKnownPeer(peerAddr string) error {
 	config := cm.Get()
-	
+
 	var newPeers []string
 	for _, peer := range config.KnownPeers {
 		if peer != peerAddr {
 			newPeers = append(newPeers, peer)
 		}
 	}
-	
+
 	config.KnownPeers = newPeers
 	return cm.Save(config)
 }
@@ -199,11 +199,11 @@ func (cm *P2PConfigManager) SetConflictStrategy(strategy string) error {
 		"prefer_remote": true,
 		"prefer_local":  true,
 	}
-	
+
 	if !validStrategies[strategy] {
 		return fmt.Errorf("invalid conflict strategy: %s", strategy)
 	}
-	
+
 	config := cm.Get()
 	config.ConflictStrategy = strategy
 	return cm.Save(config)
@@ -212,14 +212,14 @@ func (cm *P2PConfigManager) SetConflictStrategy(strategy string) error {
 // AddTrustedPeer adds a peer to the trusted peers list
 func (cm *P2PConfigManager) AddTrustedPeer(peerID string) error {
 	config := cm.Get()
-	
+
 	// Check if peer already exists
 	for _, peer := range config.TrustedPeers {
 		if peer == peerID {
 			return nil // Already exists
 		}
 	}
-	
+
 	config.TrustedPeers = append(config.TrustedPeers, peerID)
 	return cm.Save(config)
 }
@@ -227,14 +227,14 @@ func (cm *P2PConfigManager) AddTrustedPeer(peerID string) error {
 // RemoveTrustedPeer removes a peer from the trusted peers list
 func (cm *P2PConfigManager) RemoveTrustedPeer(peerID string) error {
 	config := cm.Get()
-	
+
 	var newPeers []string
 	for _, peer := range config.TrustedPeers {
 		if peer != peerID {
 			newPeers = append(newPeers, peer)
 		}
 	}
-	
+
 	config.TrustedPeers = newPeers
 	return cm.Save(config)
 }
@@ -244,51 +244,51 @@ func (cm *P2PConfigManager) ValidateConfig(config *P2PConfig) error {
 	if config.Port <= 0 || config.Port > 65535 {
 		return fmt.Errorf("invalid port: %d", config.Port)
 	}
-	
+
 	if config.DiscoveryPort <= 0 || config.DiscoveryPort > 65535 {
 		return fmt.Errorf("invalid discovery port: %d", config.DiscoveryPort)
 	}
-	
+
 	if config.MaxPeers <= 0 {
 		return fmt.Errorf("max peers must be positive: %d", config.MaxPeers)
 	}
-	
+
 	if config.SyncInterval <= 0 {
 		return fmt.Errorf("sync interval must be positive: %v", config.SyncInterval)
 	}
-	
+
 	if config.SyncTimeout <= 0 {
 		return fmt.Errorf("sync timeout must be positive: %v", config.SyncTimeout)
 	}
-	
+
 	validStrategies := map[string]bool{
 		"manual":        true,
 		"auto_merge":    true,
 		"prefer_remote": true,
 		"prefer_local":  true,
 	}
-	
+
 	if !validStrategies[config.ConflictStrategy] {
 		return fmt.Errorf("invalid conflict strategy: %s", config.ConflictStrategy)
 	}
-	
+
 	return nil
 }
 
 // GetConfigSummary returns a human-readable summary of the configuration
 func (cm *P2PConfigManager) GetConfigSummary() string {
 	config := cm.Get()
-	
+
 	status := "disabled"
 	if config.AutoSyncEnabled {
 		status = "enabled"
 	}
-	
+
 	autoConnect := "disabled"
 	if config.EnableAutoConnect {
 		autoConnect = "enabled"
 	}
-	
+
 	return fmt.Sprintf(`P2P Configuration:
   Port: %d
   Discovery Port: %d

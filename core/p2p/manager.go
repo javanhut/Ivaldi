@@ -38,7 +38,7 @@ func NewP2PManager(rootDir string, storage Storage, timelineManager TimelineMana
 
 	// Create P2P network with sync callback (syncManager will be set later)
 	var syncManager *P2PSyncManager
-	
+
 	network, err := NewP2PNetwork(config.Port, eventBus, func(peerID string, event SyncEvent, data interface{}) error {
 		// Handle sync events and publish to event bus
 		switch event {
@@ -81,7 +81,7 @@ func NewP2PManager(rootDir string, storage Storage, timelineManager TimelineMana
 	// Create discovery service
 	discovery := NewDiscoveryService(network, config.DiscoveryPort)
 
-	// Set up message handlers
+	// Set up message handlers (subscription IDs not stored as these are internal handlers)
 	eventBus.Subscribe(EventTypePeerConnected, func(event Event) error {
 		fmt.Printf("Peer connected: %s\n", event.Source)
 		return nil
@@ -94,7 +94,7 @@ func NewP2PManager(rootDir string, storage Storage, timelineManager TimelineMana
 
 	// Create state manager and check if P2P is already running
 	stateManager := NewP2PStateManager(rootDir)
-	
+
 	pm := &P2PManager{
 		network:         network,
 		syncManager:     syncManager,
@@ -107,7 +107,7 @@ func NewP2PManager(rootDir string, storage Storage, timelineManager TimelineMana
 		rootDir:         rootDir,
 		running:         false,
 	}
-	
+
 	// Check if P2P is already running from a previous session
 	if state, ok := stateManager.GetRunningState(); ok {
 		pm.running = true
@@ -115,7 +115,7 @@ func NewP2PManager(rootDir string, storage Storage, timelineManager TimelineMana
 		// This just indicates that P2P was started in a previous command
 		fmt.Printf("P2P network already running (NodeID: %s, Port: %d)\n", state.NodeID, state.Port)
 	}
-	
+
 	return pm, nil
 }
 
@@ -157,7 +157,7 @@ func (pm *P2PManager) Start() error {
 	}
 
 	pm.running = true
-	
+
 	// Save state to disk
 	state := &P2PState{
 		Running:       true,
@@ -170,7 +170,7 @@ func (pm *P2PManager) Start() error {
 	if err := pm.stateManager.Save(state); err != nil {
 		fmt.Printf("Warning: Failed to save P2P state: %v\n", err)
 	}
-	
+
 	fmt.Println("P2P manager started successfully")
 	return nil
 }
@@ -198,12 +198,12 @@ func (pm *P2PManager) Stop() error {
 	}
 
 	pm.running = false
-	
+
 	// Clear state from disk
 	if err := pm.stateManager.Clear(); err != nil {
 		fmt.Printf("Warning: Failed to clear P2P state: %v\n", err)
 	}
-	
+
 	fmt.Println("P2P manager stopped")
 	return nil
 }
@@ -212,12 +212,12 @@ func (pm *P2PManager) Stop() error {
 func (pm *P2PManager) IsRunning() bool {
 	pm.mutex.RLock()
 	defer pm.mutex.RUnlock()
-	
+
 	// First check in-memory state
 	if pm.running {
 		return true
 	}
-	
+
 	// Then check persistent state
 	return pm.stateManager.IsRunning()
 }
@@ -387,10 +387,18 @@ func (pm *P2PManager) BroadcastTimelineUpdate(timeline string, newHead objects.H
 	return nil
 }
 
-// Subscribe to P2P events
-func (pm *P2PManager) Subscribe(eventType string, handler EventHandler) {
+// Subscribe to P2P events and return a subscription handle
+func (pm *P2PManager) Subscribe(eventType string, handler EventHandler) SubscriptionID {
 	if pm.eventBus != nil {
-		pm.eventBus.Subscribe(eventType, handler)
+		return pm.eventBus.Subscribe(eventType, handler)
+	}
+	return 0 // Invalid subscription ID when no event bus
+}
+
+// Unsubscribe from P2P events using the subscription handle
+func (pm *P2PManager) Unsubscribe(eventType string, subID SubscriptionID) {
+	if pm.eventBus != nil {
+		pm.eventBus.Unsubscribe(eventType, subID)
 	}
 }
 
@@ -439,7 +447,6 @@ func (pm *P2PManager) getRepositoryList() []string {
 	return []string{repoName}
 }
 
-
 // Sync context types for passing to sync callback
 type SyncRequestContext struct {
 	Peer    *Peer
@@ -452,4 +459,3 @@ type SyncResponseContext struct {
 }
 
 // P2P message handlers (called by network layer)
-

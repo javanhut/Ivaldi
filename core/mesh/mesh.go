@@ -33,6 +33,9 @@ type MeshNetwork struct {
 	onPeerJoin       func(peerID string)
 	onPeerLeave      func(peerID string)
 	onTopologyChange func()
+	// Subscription IDs for cleanup
+	peerConnectedSub    p2p.SubscriptionID
+	peerDisconnectedSub p2p.SubscriptionID
 }
 
 // MeshPeer represents a peer in the mesh network
@@ -112,9 +115,9 @@ func (mn *MeshNetwork) Start() error {
 		}
 	}
 
-	// Subscribe to P2P events
-	mn.p2pManager.Subscribe(p2p.EventTypePeerConnected, mn.handlePeerConnected)
-	mn.p2pManager.Subscribe(p2p.EventTypePeerDisconnected, mn.handlePeerDisconnected)
+	// Subscribe to P2P events and store subscription IDs for cleanup
+	mn.peerConnectedSub = mn.p2pManager.Subscribe(p2p.EventTypePeerConnected, mn.handlePeerConnected)
+	mn.peerDisconnectedSub = mn.p2pManager.Subscribe(p2p.EventTypePeerDisconnected, mn.handlePeerDisconnected)
 
 	// Add ourselves to topology
 	mn.addSelfToTopology()
@@ -137,6 +140,14 @@ func (mn *MeshNetwork) Stop() error {
 
 	if !mn.running {
 		return nil
+	}
+
+	// Unsubscribe from P2P events to prevent handler leaks
+	if mn.peerConnectedSub != 0 {
+		mn.p2pManager.Unsubscribe(p2p.EventTypePeerConnected, mn.peerConnectedSub)
+	}
+	if mn.peerDisconnectedSub != 0 {
+		mn.p2pManager.Unsubscribe(p2p.EventTypePeerDisconnected, mn.peerDisconnectedSub)
 	}
 
 	mn.cancel()

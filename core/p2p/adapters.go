@@ -40,21 +40,21 @@ func (sa *StorageAdapter) StoreBlob(blob *objects.Blob) error {
 // ListSeals returns all seal hashes in storage
 func (sa *StorageAdapter) ListSeals() ([]objects.Hash, error) {
 	var sealHashes []objects.Hash
-	
+
 	// Get the objects directory path from the underlying storage
 	objectsDir := sa.Storage.GetObjectsDir()
-	
+
 	// Walk through all object files in the storage directory
 	err := filepath.Walk(objectsDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		
+
 		// Skip directories
 		if info.IsDir() {
 			return nil
 		}
-		
+
 		// Parse the file path to reconstruct the hash
 		// Objects are stored as: objectsDir/xx/xxxxx...
 		// where xx is the first two chars of the hex hash
@@ -62,35 +62,35 @@ func (sa *StorageAdapter) ListSeals() ([]objects.Hash, error) {
 		if err != nil {
 			return nil // Skip malformed paths
 		}
-		
+
 		// Reconstruct hash string from directory structure
 		// Objects are stored as: objectsDir/xx/yyyyyyyy...
 		// where xx is first 2 chars of hex hash, yyyyyy is remaining chars
 		dir, file := filepath.Split(relativePath)
 		dir = strings.TrimSuffix(dir, "/") // Remove trailing slash
-		
+
 		if len(dir) == 2 && len(file) > 0 {
 			// The filename is double-hex-encoded, so we need to decode twice
 			doubleHexStr := dir + file
-			
-			// First decode: hex -> original hex string  
+
+			// First decode: hex -> original hex string
 			hexStrBytes, err := hex.DecodeString(doubleHexStr)
 			if err != nil {
 				return nil // Skip invalid hex
 			}
-			
+
 			// The decoded bytes should form a hex string representing the actual hash
 			actualHashStr := string(hexStrBytes)
-			
+
 			// Second decode: hex string -> hash bytes
 			hashBytes, err := hex.DecodeString(actualHashStr)
 			if err != nil || len(hashBytes) != 32 {
 				return nil // Skip invalid hashes
 			}
-			
+
 			var hash objects.Hash
 			copy(hash[:], hashBytes)
-			
+
 			// Try to load as a seal to verify it's actually a seal object
 			seal, err := sa.Storage.LoadSeal(hash)
 			if err == nil && seal != nil {
@@ -102,14 +102,14 @@ func (sa *StorageAdapter) ListSeals() ([]objects.Hash, error) {
 			}
 			// If it fails to load as seal or doesn't look like a seal, skip silently
 		}
-		
+
 		return nil
 	})
-	
+
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return sealHashes, nil
 }
 

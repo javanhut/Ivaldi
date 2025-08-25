@@ -153,11 +153,11 @@ func (wpm *WebSocketP2PManager) ConnectToPeer(address string, port int) error {
 	// Add peer to our local list
 	peerID := fmt.Sprintf("%s:%d", address, port)
 	peer := &Peer{
-		ID:        peerID,
-		Address:   address,
-		Port:      port,
+		ID:       peerID,
+		Address:  address,
+		Port:     port,
 		Status:   PeerStatusConnected,
-		LastSeen:  time.Now(),
+		LastSeen: time.Now(),
 	}
 
 	wpm.peerMutex.Lock()
@@ -244,10 +244,18 @@ func (wpm *WebSocketP2PManager) startPeerDiscovery() {
 }
 
 // Subscribe is a compatibility method for event handling (placeholder)
-func (wpm *WebSocketP2PManager) Subscribe(eventType string, handler EventHandler) {
+func (wpm *WebSocketP2PManager) Subscribe(eventType string, handler EventHandler) SubscriptionID {
 	// WebSocket-based P2P uses a different event model
 	// This is a placeholder for compatibility with existing mesh code
 	fmt.Printf("WebSocket P2P: Event subscription for %v (placeholder)\n", eventType)
+	return 0 // Return invalid subscription ID for placeholder
+}
+
+// Unsubscribe is a compatibility method for event handling (placeholder)
+func (wpm *WebSocketP2PManager) Unsubscribe(eventType string, subID SubscriptionID) {
+	// WebSocket-based P2P uses a different event model
+	// This is a placeholder for compatibility with existing mesh code
+	fmt.Printf("WebSocket P2P: Event unsubscription for %v, ID %d (placeholder)\n", eventType, subID)
 }
 
 // GetConfig returns the P2P configuration
@@ -287,7 +295,7 @@ func (wpm *WebSocketP2PManager) GetDiscoveredPeers() []*DiscoveredPeer {
 	discovered := make([]*DiscoveredPeer, 0, len(wpm.peers))
 	wpm.peerMutex.RLock()
 	defer wpm.peerMutex.RUnlock()
-	
+
 	for _, peer := range wpm.peers {
 		discovered = append(discovered, &DiscoveredPeer{
 			NodeID:       peer.ID,
@@ -298,7 +306,7 @@ func (wpm *WebSocketP2PManager) GetDiscoveredPeers() []*DiscoveredPeer {
 			Version:      "websocket-p2p",
 		})
 	}
-	
+
 	return discovered
 }
 
@@ -313,7 +321,7 @@ func (wpm *WebSocketP2PManager) GetSyncState() map[string]*PeerSyncState {
 	syncState := make(map[string]*PeerSyncState)
 	wpm.peerMutex.RLock()
 	defer wpm.peerMutex.RUnlock()
-	
+
 	for id, peer := range wpm.peers {
 		syncState[id] = &PeerSyncState{
 			PeerID:           peer.ID,
@@ -325,7 +333,7 @@ func (wpm *WebSocketP2PManager) GetSyncState() map[string]*PeerSyncState {
 			AutoSyncEnabled:  true,
 		}
 	}
-	
+
 	return syncState
 }
 
@@ -334,20 +342,20 @@ func (wpm *WebSocketP2PManager) SyncWithAllPeers() error {
 	if !wpm.IsRunning() {
 		return fmt.Errorf("WebSocket P2P manager is not running")
 	}
-	
+
 	wpm.peerMutex.RLock()
 	peerIDs := make([]string, 0, len(wpm.peers))
 	for id := range wpm.peers {
 		peerIDs = append(peerIDs, id)
 	}
 	wpm.peerMutex.RUnlock()
-	
+
 	// Sync with each peer
 	for _, peerID := range peerIDs {
 		if err := wpm.SyncWithPeer(peerID); err != nil {
 			fmt.Printf("Failed to sync with peer %s: %v\n", peerID, err)
 		}
 	}
-	
+
 	return nil
 }

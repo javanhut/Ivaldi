@@ -111,13 +111,13 @@ func (gen *CommitMessageGenerator) Generate(ws *workspace.Workspace) (*Generated
 func (gen *CommitMessageGenerator) analyzeFile(filePath string, fileState *workspace.FileState) ChangeAnalysis {
 	ext := filepath.Ext(filePath)
 	language := gen.detectLanguage(ext)
-	
+
 	// Simulate change analysis (in real implementation, would diff file contents)
 	analysis := ChangeAnalysis{
 		File:         filePath,
-		ChangeType:   string(fileState.Status),
-		LinesAdded:   10,  // Placeholder
-		LinesRemoved: 2,   // Placeholder
+		ChangeType:   fmt.Sprint(fileState.Status),
+		LinesAdded:   10, // Placeholder
+		LinesRemoved: 2,  // Placeholder
 		Language:     language,
 		Patterns:     []string{},
 		Confidence:   0.8,
@@ -140,7 +140,7 @@ func (gen *CommitMessageGenerator) detectLanguage(ext string) string {
 	languages := map[string]string{
 		".go":   "Go",
 		".js":   "JavaScript",
-		".ts":   "TypeScript", 
+		".ts":   "TypeScript",
 		".py":   "Python",
 		".java": "Java",
 		".rs":   "Rust",
@@ -225,7 +225,7 @@ func (gen *CommitMessageGenerator) determineCommitType(analyses []ChangeAnalysis
 			Emoji:       "",
 		},
 		"fix": {
-			Type:        "fix", 
+			Type:        "fix",
 			Description: "Bug fix",
 			Emoji:       "",
 		},
@@ -342,7 +342,7 @@ func (gen *CommitMessageGenerator) generateDescription(commitType CommitType, an
 		// Single file change
 		analysis := analyses[0]
 		fileName := filepath.Base(analysis.File)
-		
+
 		switch commitType.Type {
 		case "feat":
 			return fmt.Sprintf("add %s functionality", extractFeatureName(fileName))
@@ -378,7 +378,7 @@ func (gen *CommitMessageGenerator) generateAlternatives(commitType CommitType, s
 
 	// Generate variations
 	if scope != "" {
-		alternatives = append(alternatives, 
+		alternatives = append(alternatives,
 			fmt.Sprintf("%s: %s in %s module", commitType.Type, commitType.Description, scope))
 	}
 
@@ -401,14 +401,14 @@ func (gen *CommitMessageGenerator) generateExplanation(analyses []ChangeAnalysis
 	var explanation strings.Builder
 
 	explanation.WriteString("Analysis of changes:\n")
-	
+
 	for _, analysis := range analyses {
 		explanation.WriteString(fmt.Sprintf("• %s: %s (%s, +%d/-%d lines)\n",
-			analysis.File, analysis.ChangeType, analysis.Language, 
+			analysis.File, analysis.ChangeType, analysis.Language,
 			analysis.LinesAdded, analysis.LinesRemoved))
-		
+
 		if len(analysis.Patterns) > 0 {
-			explanation.WriteString(fmt.Sprintf("  Patterns: %s\n", 
+			explanation.WriteString(fmt.Sprintf("  Patterns: %s\n",
 				strings.Join(analysis.Patterns, ", ")))
 		}
 	}
@@ -420,11 +420,11 @@ func (gen *CommitMessageGenerator) generateExplanation(analyses []ChangeAnalysis
 func extractFeatureName(fileName string) string {
 	// Remove extension
 	name := strings.TrimSuffix(fileName, filepath.Ext(fileName))
-	
+
 	// Convert camelCase/snake_case to readable form
 	name = strings.ReplaceAll(name, "_", " ")
 	name = regexp.MustCompile(`([a-z])([A-Z])`).ReplaceAllString(name, `$1 $2`)
-	
+
 	return strings.ToLower(name)
 }
 
@@ -444,15 +444,15 @@ func (gen *CommitMessageGenerator) initializePatterns() {
 // initializeKeywords sets up keyword mappings
 func (gen *CommitMessageGenerator) initializeKeywords() {
 	gen.keywords = map[string]CommitType{
-		"add":      {Type: "feat", Description: "New feature", Emoji: ""},
-		"create":   {Type: "feat", Description: "New feature", Emoji: ""},
+		"add":       {Type: "feat", Description: "New feature", Emoji: ""},
+		"create":    {Type: "feat", Description: "New feature", Emoji: ""},
 		"implement": {Type: "feat", Description: "New feature", Emoji: ""},
-		"fix":      {Type: "fix", Description: "Bug fix", Emoji: ""},
-		"resolve":  {Type: "fix", Description: "Bug fix", Emoji: ""},
-		"update":   {Type: "chore", Description: "Update", Emoji: ""},
-		"refactor": {Type: "refactor", Description: "Refactor", Emoji: ""},
-		"test":     {Type: "test", Description: "Tests", Emoji: ""},
-		"doc":      {Type: "docs", Description: "Documentation", Emoji: ""},
+		"fix":       {Type: "fix", Description: "Bug fix", Emoji: ""},
+		"resolve":   {Type: "fix", Description: "Bug fix", Emoji: ""},
+		"update":    {Type: "chore", Description: "Update", Emoji: ""},
+		"refactor":  {Type: "refactor", Description: "Refactor", Emoji: ""},
+		"test":      {Type: "test", Description: "Tests", Emoji: ""},
+		"doc":       {Type: "docs", Description: "Documentation", Emoji: ""},
 	}
 }
 
@@ -467,14 +467,14 @@ func (gen *CommitMessageGenerator) AnalyzeCodeChanges(oldContent, newContent str
 	// - Performance optimizations
 	// - Security improvements
 	// - Breaking changes
-	
+
 	return &CodeAnalysis{
-		FunctionsAdded:   []string{},
-		FunctionsRemoved: []string{},
+		FunctionsAdded:    []string{},
+		FunctionsRemoved:  []string{},
 		FunctionsModified: []string{},
-		Complexity:       0,
-		BreakingChanges:  false,
-		SecurityChanges:  false,
+		Complexity:        0,
+		BreakingChanges:   false,
+		SecurityChanges:   false,
 	}
 }
 
@@ -494,18 +494,18 @@ type CodeAnalysis struct {
 func (gen *CommitMessageGenerator) RefineMessage(original *GeneratedMessage, userInput string) *GeneratedMessage {
 	// This would implement interactive refinement based on user feedback
 	refined := *original
-	
+
 	// Parse user input for refinements
 	if strings.Contains(userInput, "more specific") {
 		// Make message more specific
 		refined.Primary = gen.makeMoreSpecific(original.Primary, original.Analysis)
 	}
-	
+
 	if strings.Contains(userInput, "shorter") {
 		// Make message shorter
 		refined.Primary = gen.makeShorten(original.Primary)
 	}
-	
+
 	return &refined
 }
 

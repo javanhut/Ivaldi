@@ -3,6 +3,7 @@
 package p2p
 
 import (
+	"errors"
 	"os"
 	"syscall"
 )
@@ -22,5 +23,11 @@ func isProcessAlive(pid int) bool {
 	// Try to send signal 0 to check if process is alive
 	// On Unix systems, signal 0 can be used to check if a process exists
 	err = process.Signal(syscall.Signal(0))
-	return err == nil
+	if err == nil {
+		return true // Process exists and we have permission to signal it
+	}
+	if errors.Is(err, syscall.EPERM) {
+		return true // Process exists but we don't have permission (still alive)
+	}
+	return false // ESRCH or other errors mean process is dead
 }

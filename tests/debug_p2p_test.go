@@ -3,7 +3,6 @@ package tests
 import (
 	"net"
 	"os"
-	"strconv"
 	"testing"
 
 	"ivaldi/forge"
@@ -42,20 +41,20 @@ func TestP2PManagerCreation(t *testing.T) {
 	t.Logf("P2P Config: %+v", config)
 
 	// Check if UpdateP2PConfig works (this is what fails in the robust test)
-	// Use dynamic port allocation to avoid conflicts
-	listener, err := net.Listen("tcp", ":0")
+	// Use dynamic port allocation to avoid conflicts (localhost only)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Failed to allocate ephemeral port: %v", err)
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
 	listener.Close()
-	
+
 	config.Port = port
 	t.Logf("Using dynamic port: %d", port)
 	err = repo.UpdateP2PConfig(config)
 	if err != nil {
 		t.Errorf("UpdateP2PConfig failed: %v", err)
-		
+
 		// The issue is likely that p2pMgr is nil
 		// Let's check the repo struct directly by trying to start P2P
 		t.Log("Attempting to start P2P to see if manager exists...")

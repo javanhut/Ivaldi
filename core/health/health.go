@@ -45,9 +45,9 @@ type HealthChecker struct {
 	mu         sync.RWMutex
 	logger     *logging.Logger
 	// Periodic health check control
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	mutex      sync.Mutex // protects cancel and wg operations
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+	mutex  sync.Mutex // protects cancel and wg operations
 }
 
 // NewHealthChecker creates a new health checker
@@ -84,7 +84,14 @@ func (hc *HealthChecker) UpdateComponentHealth(name string, status HealthStatus,
 		component.Message = message
 		component.LastCheck = time.Now()
 		if details != nil {
-			component.Details = details
+			// Create defensive copy of details map to prevent external mutations
+			detailsCopy := make(map[string]interface{}, len(details))
+			for k, v := range details {
+				detailsCopy[k] = v
+			}
+			component.Details = detailsCopy
+		} else {
+			component.Details = nil
 		}
 
 		hc.logger.Info("Component health updated",
@@ -112,12 +119,15 @@ func (hc *HealthChecker) GetComponentHealth(name string) (*ComponentHealth, bool
 		Status:    component.Status,
 		Message:   component.Message,
 		LastCheck: component.LastCheck,
-		Details:   make(map[string]interface{}),
+		Details:   nil,
 	}
 
-	// Deep copy the Details map
-	for k, v := range component.Details {
-		copy.Details[k] = v
+	// Deep copy the Details map if it's not nil
+	if component.Details != nil {
+		copy.Details = make(map[string]interface{}, len(component.Details))
+		for k, v := range component.Details {
+			copy.Details[k] = v
+		}
 	}
 
 	return copy, true

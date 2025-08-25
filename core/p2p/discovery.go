@@ -24,12 +24,12 @@ type DiscoveryService struct {
 
 // DiscoveredPeer represents a peer discovered through the discovery service
 type DiscoveredPeer struct {
-	NodeID      string    `json:"node_id"`
-	Address     string    `json:"address"`
-	Port        int       `json:"port"`
-	LastSeen    time.Time `json:"last_seen"`
+	NodeID       string    `json:"node_id"`
+	Address      string    `json:"address"`
+	Port         int       `json:"port"`
+	LastSeen     time.Time `json:"last_seen"`
 	Repositories []string  `json:"repositories"`
-	Version     string    `json:"version"`
+	Version      string    `json:"version"`
 }
 
 // DiscoveryAnnouncement is broadcast to announce presence on the network
@@ -44,7 +44,7 @@ type DiscoveryAnnouncement struct {
 // NewDiscoveryService creates a new peer discovery service
 func NewDiscoveryService(p2pNetwork *P2PNetwork, broadcastPort int) *DiscoveryService {
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	return &DiscoveryService{
 		p2pNetwork:    p2pNetwork,
 		broadcastPort: broadcastPort,
@@ -58,13 +58,13 @@ func NewDiscoveryService(p2pNetwork *P2PNetwork, broadcastPort int) *DiscoverySe
 func (ds *DiscoveryService) Start(repositories []string) error {
 	// Start UDP listener for discovery messages
 	go ds.listenForAnnouncements()
-	
+
 	// Start periodic announcements
 	go ds.announcePresence(repositories)
-	
+
 	// Start auto-connect service
 	go ds.autoConnectService()
-	
+
 	fmt.Printf("Peer discovery service started on port %d\n", ds.broadcastPort)
 	return nil
 }
@@ -72,7 +72,7 @@ func (ds *DiscoveryService) Start(repositories []string) error {
 // Stop shuts down the discovery service
 func (ds *DiscoveryService) Stop() {
 	ds.cancel()
-	
+
 	// Close UDP connection if it exists
 	ds.connMutex.Lock()
 	if ds.udpConn != nil {
@@ -80,7 +80,7 @@ func (ds *DiscoveryService) Stop() {
 		ds.udpConn = nil
 	}
 	ds.connMutex.Unlock()
-	
+
 	fmt.Println("Peer discovery service stopped")
 }
 
@@ -97,12 +97,12 @@ func (ds *DiscoveryService) listenForAnnouncements() {
 		fmt.Printf("Failed to listen for UDP announcements: %v\n", err)
 		return
 	}
-	
+
 	// Store connection for proper cleanup
 	ds.connMutex.Lock()
 	ds.udpConn = conn
 	ds.connMutex.Unlock()
-	
+
 	defer func() {
 		ds.connMutex.Lock()
 		if ds.udpConn == conn {
@@ -295,8 +295,8 @@ func (ds *DiscoveryService) handleDiscoveryAnnouncement(announcement *DiscoveryA
 	}
 
 	ds.knownPeers[announcement.NodeID] = peer
-	
-	fmt.Printf("Discovered peer: %s at %s:%d (repos: %v)\n", 
+
+	fmt.Printf("Discovered peer: %s at %s:%d (repos: %v)\n",
 		announcement.NodeID, sourceIP, announcement.Port, announcement.Repositories)
 }
 
@@ -444,7 +444,7 @@ func (p2p *P2PNetwork) handlePeerDiscovery(peer *Peer, message *Message) error {
 			// Send our peer list
 			peers := p2p.GetPeers()
 			peerList := make([]map[string]interface{}, 0, len(peers))
-			
+
 			for _, p := range peers {
 				if p.ID != peer.ID { // Don't send back the requester
 					peerList = append(peerList, map[string]interface{}{
@@ -469,7 +469,7 @@ func (p2p *P2PNetwork) handlePeerDiscovery(peer *Peer, message *Message) error {
 				if peerMap, ok := peerData.(map[string]interface{}); ok {
 					address, _ := peerMap["address"].(string)
 					port, _ := peerMap["port"].(float64)
-					
+
 					if address != "" && port > 0 {
 						// Try to connect to this peer if not already connected
 						go func(addr string, p int) {
