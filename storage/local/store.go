@@ -356,26 +356,25 @@ func (s *Store) Stats() (StoreStats, error) {
 			if strings.HasPrefix(path, algoDir) {
 				stats.AlgorithmCounts[algo]++
 
-				// Try to read object kind
-				relPath, err := filepath.Rel(algoDir, path)
-				if err == nil && len(relPath) >= 3 && relPath[2] == '/' {
-					hashStr := relPath[:2] + relPath[3:]
-					hash, err := objects.ParseCAHash(algo.String() + ":" + hashStr)
-					if err == nil {
-						_, kind, err := s.Get(hash)
-						if err == nil {
-							switch kind {
-							case KindBlob:
-								stats.BlobCount++
-							case KindTree:
-								stats.TreeCount++
-							case KindSeal:
-								stats.SealCount++
-							case KindTag:
-								stats.TagCount++
-							}
+				// Try to read object kind by directly reading the first byte of the file
+				// This is more efficient than reconstructing the hash and calling Get
+				file, err := os.Open(path)
+				if err == nil {
+					kindBuf := make([]byte, 1)
+					if n, readErr := file.Read(kindBuf); readErr == nil && n == 1 {
+						kind := ObjectKind(kindBuf[0])
+						switch kind {
+						case KindBlob:
+							stats.BlobCount++
+						case KindTree:
+							stats.TreeCount++
+						case KindSeal:
+							stats.SealCount++
+						case KindTag:
+							stats.TagCount++
 						}
 					}
+					file.Close()
 				}
 				break
 			}
