@@ -27,16 +27,18 @@ func TestEnhancedWorkspace(t *testing.T) {
 
 	// Create workspace
 	ws := workspace.New(tempDir, store)
-	
+
 	// Test 1: Create test files
 	testFiles := map[string][]byte{
-		"file1.txt": []byte("This is file 1 content"),
-		"file2.txt": []byte("This is file 2 content"),
-		"subdir/file3.txt": []byte("This is file 3 in subdir"),
+		"file1.txt":                          []byte("This is file 1 content"),
+		"file2.txt":                          []byte("This is file 2 content"),
+		filepath.Join("subdir", "file3.txt"): []byte("This is file 3 in subdir"),
 	}
 
 	for path, content := range testFiles {
-		fullPath := filepath.Join(tempDir, path)
+		// Convert to OS-specific path
+		osPath := filepath.FromSlash(path)
+		fullPath := filepath.Join(tempDir, osPath)
 		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 			t.Fatalf("Failed to create directory: %v", err)
 		}
@@ -239,16 +241,18 @@ test_data/
 
 	// Create test files - some should be ignored
 	testFiles := map[string]bool{
-		"normal.txt":          false, // should not be ignored
-		"temp.tmp":            true,  // should be ignored
-		"debug.log":           true,  // should be ignored
-		"build/output.bin":    true,  // should be ignored
-		"test_data/data.csv":  true,  // should be ignored
-		"src/main.go":         false, // should not be ignored
+		"normal.txt":                              false, // should not be ignored
+		"temp.tmp":                                true,  // should be ignored
+		"debug.log":                               true,  // should be ignored
+		filepath.Join("build", "output.bin"):      true,  // should be ignored
+		filepath.Join("test_data", "data.csv"):    true,  // should be ignored
+		filepath.Join("src", "main.go"):           false, // should not be ignored
 	}
 
 	for path, shouldIgnore := range testFiles {
-		fullPath := filepath.Join(tempDir, path)
+		// Convert to OS-specific path
+		osPath := filepath.FromSlash(path)
+		fullPath := filepath.Join(tempDir, osPath)
 		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 			t.Fatalf("Failed to create directory for %s: %v", path, err)
 		}
@@ -259,7 +263,7 @@ test_data/
 
 		// Test ignore check
 		if ws.ShouldIgnore(path) != shouldIgnore {
-			t.Errorf("File %s ignore status mismatch: expected %v, got %v", 
+			t.Errorf("File %s ignore status mismatch: expected %v, got %v",
 				path, shouldIgnore, ws.ShouldIgnore(path))
 		}
 	}

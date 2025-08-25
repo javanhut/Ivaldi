@@ -51,22 +51,32 @@ type CAHash struct {
 }
 
 // NewCAHash creates a hash using the specified algorithm
-func NewCAHash(data []byte, algo HashAlgorithm) CAHash {
+func NewCAHash(data []byte, algo HashAlgorithm) (CAHash, error) {
+	// Treat nil data as empty byte slice
+	if data == nil {
+		data = []byte{}
+	}
+
+	// Validate algorithm using membership check in algorithmNames map
+	if _, ok := algorithmNames[algo]; !ok {
+		return CAHash{}, fmt.Errorf("invalid hash algorithm: %v", algo)
+	}
+
 	var value [32]byte
-	
+
 	switch algo {
 	case BLAKE3:
 		value = blake3.Sum256(data)
 	case SHA256:
 		value = sha256.Sum256(data)
 	default:
-		panic(fmt.Sprintf("unsupported hash algorithm: %v", algo))
+		return CAHash{}, fmt.Errorf("unsupported hash algorithm: %v", algo)
 	}
-	
+
 	return CAHash{
 		Algorithm: algo,
 		Value:     value,
-	}
+	}, nil
 }
 
 func (h CAHash) String() string {
@@ -98,12 +108,12 @@ func (h *CAHash) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return err
 	}
-	
+
 	parsed, err := ParseCAHash(s)
 	if err != nil {
 		return err
 	}
-	
+
 	*h = parsed
 	return nil
 }
@@ -112,7 +122,7 @@ func ParseCAHash(s string) (CAHash, error) {
 	if s == "" {
 		return CAHash{}, nil
 	}
-	
+
 	for algo, name := range algorithmNames {
 		prefix := name + ":"
 		if len(s) > len(prefix) && s[:len(prefix)] == prefix {
@@ -124,13 +134,13 @@ func ParseCAHash(s string) (CAHash, error) {
 			if len(bytes) != 32 {
 				return CAHash{}, fmt.Errorf("invalid hash length: %d", len(bytes))
 			}
-			
+
 			var value [32]byte
 			copy(value[:], bytes)
 			return CAHash{Algorithm: algo, Value: value}, nil
 		}
 	}
-	
+
 	bytes, err := hex.DecodeString(s)
 	if err != nil {
 		return CAHash{}, fmt.Errorf("invalid hex in hash: %v", err)
@@ -138,14 +148,17 @@ func ParseCAHash(s string) (CAHash, error) {
 	if len(bytes) != 32 {
 		return CAHash{}, fmt.Errorf("invalid hash length: %d", len(bytes))
 	}
-	
+
 	var value [32]byte
 	copy(value[:], bytes)
 	return CAHash{Algorithm: BLAKE3, Value: value}, nil
 }
 
 func (h CAHash) Verify(data []byte) bool {
-	expected := NewCAHash(data, h.Algorithm)
+	expected, err := NewCAHash(data, h.Algorithm)
+	if err != nil {
+		return false
+	}
 	return h.Equal(expected)
 }
 
@@ -170,16 +183,16 @@ func (h *Hash) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return err
 	}
-	
+
 	bytes, err := hex.DecodeString(s)
 	if err != nil {
 		return err
 	}
-	
+
 	if len(bytes) != 32 {
 		return fmt.Errorf("invalid hash length: %d", len(bytes))
 	}
-	
+
 	copy(h[:], bytes)
 	return nil
 }
@@ -284,10 +297,10 @@ const (
 
 // CA TreeEntry represents a single entry in a content-addressed tree
 type CATreeEntry struct {
-	Mode uint32 
-	Name string 
-	Hash CAHash   
-	Kind ObjectKind 
+	Mode uint32
+	Name string
+	Hash CAHash
+	Kind ObjectKind
 }
 
 // CA Tree represents a directory tree structure
@@ -298,11 +311,11 @@ type CATree struct {
 func NewCATree(entries []CATreeEntry) *CATree {
 	sortedEntries := make([]CATreeEntry, len(entries))
 	copy(sortedEntries, entries)
-	
+
 	sort.Slice(sortedEntries, func(i, j int) bool {
 		return sortedEntries[i].Name < sortedEntries[j].Name
 	})
-	
+
 	return &CATree{Entries: sortedEntries}
 }
 
@@ -318,14 +331,14 @@ func (t *CATree) Encode() ([]byte, error) {
 	})
 
 	var result []byte
-	
+
 	for _, entry := range entries {
 		modeBuf := make([]byte, 4)
 		binary.BigEndian.PutUint32(modeBuf, entry.Mode)
 		result = append(result, modeBuf...)
-		
+
 		result = append(result, byte(entry.Kind))
-		
+
 		nameBytes := []byte(entry.Name)
 		if len(nameBytes) > 65535 {
 			return nil, fmt.Errorf("entry name too long: %d bytes", len(nameBytes))
@@ -333,13 +346,13 @@ func (t *CATree) Encode() ([]byte, error) {
 		nameLenBuf := make([]byte, 2)
 		binary.BigEndian.PutUint16(nameLenBuf, uint16(len(nameBytes)))
 		result = append(result, nameLenBuf...)
-		
+
 		result = append(result, nameBytes...)
-		
+
 		result = append(result, byte(entry.Hash.Algorithm))
 		result = append(result, entry.Hash.Value[:]...)
 	}
-	
+
 	return result, nil
 }
 
@@ -350,44 +363,49 @@ func DecodeCATree(data []byte) (*CATree, error) {
 
 	var entries []CATreeEntry
 	offset := 0
-	
+
 	for offset < len(data) {
 		if offset+41 > len(data) {
 			return nil, fmt.Errorf("incomplete tree entry at offset %d", offset)
 		}
-		
+
 		mode := binary.BigEndian.Uint32(data[offset : offset+4])
 		offset += 4
-		
+
 		kind := ObjectKind(data[offset])
 		offset++
-		
+
 		nameLen := binary.BigEndian.Uint16(data[offset : offset+2])
 		offset += 2
-		
+
 		if offset+int(nameLen) > len(data) {
 			return nil, fmt.Errorf("incomplete name at offset %d", offset)
 		}
-		
+
 		name := string(data[offset : offset+int(nameLen)])
 		offset += int(nameLen)
-		
+
 		if offset+33 > len(data) {
 			return nil, fmt.Errorf("incomplete hash at offset %d", offset)
 		}
-		
+
 		hashAlgo := HashAlgorithm(data[offset])
 		offset++
-		
+
+		// Validate hash algorithm
+		if _, ok := algorithmNames[hashAlgo]; !ok {
+			return nil, fmt.Errorf("unknown hash algorithm %d at offset %d", hashAlgo, offset-1)
+		}
+
 		var hashValue [32]byte
 		copy(hashValue[:], data[offset:offset+32])
 		offset += 32
-		
+
 		hash := CAHash{
 			Algorithm: hashAlgo,
 			Value:     hashValue,
 		}
-		
+
 		entries = append(entries, CATreeEntry{
 			Mode: mode,
 			Name: name,
@@ -395,18 +413,18 @@ func DecodeCATree(data []byte) (*CATree, error) {
 			Kind: kind,
 		})
 	}
-	
+
 	return NewCATree(entries), nil
 }
 
 // CA Seal represents a commit-like object
 type CASeal struct {
-	TreeHash  CAHash      
-	Parents   []CAHash    
-	Author    Identity  
-	Committer Identity  
-	Message   string    
-	Timestamp time.Time 
+	TreeHash  CAHash
+	Parents   []CAHash
+	Author    Identity
+	Committer Identity
+	Message   string
+	Timestamp time.Time
 }
 
 func NewCASeal(treeHash CAHash, parents []CAHash, author, committer Identity, message string) *CASeal {
@@ -422,22 +440,22 @@ func NewCASeal(treeHash CAHash, parents []CAHash, author, committer Identity, me
 
 func (s *CASeal) Encode() ([]byte, error) {
 	var result []byte
-	
+
 	result = append(result, byte(s.TreeHash.Algorithm))
 	result = append(result, s.TreeHash.Value[:]...)
-	
+
 	if len(s.Parents) > 65535 {
 		return nil, fmt.Errorf("too many parents: %d", len(s.Parents))
 	}
 	parentCountBuf := make([]byte, 2)
 	binary.BigEndian.PutUint16(parentCountBuf, uint16(len(s.Parents)))
 	result = append(result, parentCountBuf...)
-	
+
 	for _, parent := range s.Parents {
 		result = append(result, byte(parent.Algorithm))
 		result = append(result, parent.Value[:]...)
 	}
-	
+
 	authorNameBytes := []byte(s.Author.Name)
 	if len(authorNameBytes) > 65535 {
 		return nil, fmt.Errorf("author name too long: %d bytes", len(authorNameBytes))
@@ -446,7 +464,7 @@ func (s *CASeal) Encode() ([]byte, error) {
 	binary.BigEndian.PutUint16(authorNameLenBuf, uint16(len(authorNameBytes)))
 	result = append(result, authorNameLenBuf...)
 	result = append(result, authorNameBytes...)
-	
+
 	authorEmailBytes := []byte(s.Author.Email)
 	if len(authorEmailBytes) > 65535 {
 		return nil, fmt.Errorf("author email too long: %d bytes", len(authorEmailBytes))
@@ -455,7 +473,7 @@ func (s *CASeal) Encode() ([]byte, error) {
 	binary.BigEndian.PutUint16(authorEmailLenBuf, uint16(len(authorEmailBytes)))
 	result = append(result, authorEmailLenBuf...)
 	result = append(result, authorEmailBytes...)
-	
+
 	committerNameBytes := []byte(s.Committer.Name)
 	if len(committerNameBytes) > 65535 {
 		return nil, fmt.Errorf("committer name too long: %d bytes", len(committerNameBytes))
@@ -464,7 +482,7 @@ func (s *CASeal) Encode() ([]byte, error) {
 	binary.BigEndian.PutUint16(committerNameLenBuf, uint16(len(committerNameBytes)))
 	result = append(result, committerNameLenBuf...)
 	result = append(result, committerNameBytes...)
-	
+
 	committerEmailBytes := []byte(s.Committer.Email)
 	if len(committerEmailBytes) > 65535 {
 		return nil, fmt.Errorf("committer email too long: %d bytes", len(committerEmailBytes))
@@ -473,11 +491,11 @@ func (s *CASeal) Encode() ([]byte, error) {
 	binary.BigEndian.PutUint16(committerEmailLenBuf, uint16(len(committerEmailBytes)))
 	result = append(result, committerEmailLenBuf...)
 	result = append(result, committerEmailBytes...)
-	
+
 	timestampBuf := make([]byte, 8)
 	binary.BigEndian.PutUint64(timestampBuf, uint64(s.Timestamp.UnixNano()))
 	result = append(result, timestampBuf...)
-	
+
 	messageBytes := []byte(s.Message)
 	if len(messageBytes) > 4294967295 {
 		return nil, fmt.Errorf("message too long: %d bytes", len(messageBytes))
@@ -486,7 +504,7 @@ func (s *CASeal) Encode() ([]byte, error) {
 	binary.BigEndian.PutUint32(messageLenBuf, uint32(len(messageBytes)))
 	result = append(result, messageLenBuf...)
 	result = append(result, messageBytes...)
-	
+
 	return result, nil
 }
 
@@ -494,112 +512,122 @@ func DecodeCASeal(data []byte) (*CASeal, error) {
 	if len(data) < 33 {
 		return nil, fmt.Errorf("seal data too short: %d bytes", len(data))
 	}
-	
+
 	offset := 0
-	
+
 	treeHashAlgo := HashAlgorithm(data[offset])
 	offset++
-	
+
+	// Validate hash algorithm
+	if _, ok := algorithmNames[treeHashAlgo]; !ok {
+		return nil, fmt.Errorf("unknown hash algorithm %d at offset %d", treeHashAlgo, offset-1)
+	}
+
 	var treeHashValue [32]byte
 	copy(treeHashValue[:], data[offset:offset+32])
 	offset += 32
-	
+
 	treeHash := CAHash{
 		Algorithm: treeHashAlgo,
 		Value:     treeHashValue,
 	}
-	
+
 	if offset+2 > len(data) {
 		return nil, fmt.Errorf("incomplete parent count at offset %d", offset)
 	}
 	parentCount := binary.BigEndian.Uint16(data[offset : offset+2])
 	offset += 2
-	
+
 	var parents []CAHash
 	for i := 0; i < int(parentCount); i++ {
 		if offset+33 > len(data) {
 			return nil, fmt.Errorf("incomplete parent hash at offset %d", offset)
 		}
-		
+
 		parentHashAlgo := HashAlgorithm(data[offset])
 		offset++
-		
+
+		// Validate hash algorithm
+		if _, ok := algorithmNames[parentHashAlgo]; !ok {
+			return nil, fmt.Errorf("unknown hash algorithm %d at offset %d", parentHashAlgo, offset-1)
+		}
+
 		var parentHashValue [32]byte
 		copy(parentHashValue[:], data[offset:offset+32])
 		offset += 32
-		
+
 		parents = append(parents, CAHash{
 			Algorithm: parentHashAlgo,
 			Value:     parentHashValue,
 		})
 	}
-	
+
 	if offset+2 > len(data) {
 		return nil, fmt.Errorf("incomplete author name length at offset %d", offset)
 	}
 	authorNameLen := binary.BigEndian.Uint16(data[offset : offset+2])
 	offset += 2
-	
+
 	if offset+int(authorNameLen) > len(data) {
 		return nil, fmt.Errorf("incomplete author name at offset %d", offset)
 	}
 	authorName := string(data[offset : offset+int(authorNameLen)])
 	offset += int(authorNameLen)
-	
+
 	if offset+2 > len(data) {
 		return nil, fmt.Errorf("incomplete author email length at offset %d", offset)
 	}
 	authorEmailLen := binary.BigEndian.Uint16(data[offset : offset+2])
 	offset += 2
-	
+
 	if offset+int(authorEmailLen) > len(data) {
 		return nil, fmt.Errorf("incomplete author email at offset %d", offset)
 	}
 	authorEmail := string(data[offset : offset+int(authorEmailLen)])
 	offset += int(authorEmailLen)
-	
+
 	if offset+2 > len(data) {
 		return nil, fmt.Errorf("incomplete committer name length at offset %d", offset)
 	}
 	committerNameLen := binary.BigEndian.Uint16(data[offset : offset+2])
 	offset += 2
-	
+
 	if offset+int(committerNameLen) > len(data) {
 		return nil, fmt.Errorf("incomplete committer name at offset %d", offset)
 	}
 	committerName := string(data[offset : offset+int(committerNameLen)])
 	offset += int(committerNameLen)
-	
+
 	if offset+2 > len(data) {
 		return nil, fmt.Errorf("incomplete committer email length at offset %d", offset)
 	}
 	committerEmailLen := binary.BigEndian.Uint16(data[offset : offset+2])
 	offset += 2
-	
+
 	if offset+int(committerEmailLen) > len(data) {
 		return nil, fmt.Errorf("incomplete committer email at offset %d", offset)
 	}
 	committerEmail := string(data[offset : offset+int(committerEmailLen)])
 	offset += int(committerEmailLen)
-	
+
 	if offset+8 > len(data) {
 		return nil, fmt.Errorf("incomplete timestamp at offset %d", offset)
 	}
 	timestampNanos := binary.BigEndian.Uint64(data[offset : offset+8])
 	offset += 8
 	timestamp := time.Unix(0, int64(timestampNanos)).UTC()
-	
+
 	if offset+4 > len(data) {
 		return nil, fmt.Errorf("incomplete message length at offset %d", offset)
 	}
 	messageLen := binary.BigEndian.Uint32(data[offset : offset+4])
 	offset += 4
-	
+
 	if offset+int(messageLen) > len(data) {
 		return nil, fmt.Errorf("incomplete message at offset %d", offset)
 	}
 	message := string(data[offset : offset+int(messageLen)])
-	
+
 	return &CASeal{
 		TreeHash: treeHash,
 		Parents:  parents,

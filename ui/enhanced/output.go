@@ -19,19 +19,19 @@ const (
 	ColorGray   = "\033[37m"
 	ColorBold   = "\033[1m"
 	ColorDim    = "\033[2m"
-	
+
 	// Symbols
-	SymbolSuccess    = "✓"
-	SymbolError      = "✗"
-	SymbolWarning    = "!"
-	SymbolInfo       = "i"
-	SymbolPosition   = "*"
-	SymbolForge      = "*"
-	SymbolSeal       = "*"
-	SymbolTimeline   = "*"
-	SymbolPortal     = "*"
-	SymbolOverwrite  = "*"
-	SymbolProtected  = "*"
+	SymbolSuccess     = "✓"
+	SymbolError       = "✗"
+	SymbolWarning     = "!"
+	SymbolInfo        = "i"
+	SymbolPosition    = "*"
+	SymbolForge       = "*"
+	SymbolSeal        = "*"
+	SymbolTimeline    = "*"
+	SymbolPortal      = "*"
+	SymbolOverwrite   = "*"
+	SymbolProtected   = "*"
 	SymbolCollaborate = "*"
 )
 
@@ -83,7 +83,7 @@ func (eo *EnhancedOutput) Error(message string, solutions []string) {
 	} else {
 		fmt.Printf("Error: %s\n", message)
 	}
-	
+
 	if len(solutions) > 0 {
 		fmt.Println()
 		fmt.Println("Your options:")
@@ -165,11 +165,11 @@ func (eo *EnhancedOutput) ShowWorkspaceStatus(status *WorkspaceStatus) {
 	} else {
 		fmt.Println("Workspace Status")
 	}
-	
+
 	// Timeline and position
 	fmt.Printf("Timeline: %s\n", eo.colorize(status.Timeline, ColorCyan))
 	fmt.Printf("Position: %s", eo.colorize(status.Position, ColorBlue))
-	
+
 	if status.OverwriteCount > 0 {
 		if eo.style.UseEmoji {
 			fmt.Printf(" %s%d", SymbolOverwrite, status.OverwriteCount)
@@ -177,7 +177,7 @@ func (eo *EnhancedOutput) ShowWorkspaceStatus(status *WorkspaceStatus) {
 			fmt.Printf(" (♻%d)", status.OverwriteCount)
 		}
 	}
-	
+
 	if status.IsProtected {
 		if eo.style.UseEmoji {
 			fmt.Printf(" %s", SymbolProtected)
@@ -186,12 +186,12 @@ func (eo *EnhancedOutput) ShowWorkspaceStatus(status *WorkspaceStatus) {
 		}
 	}
 	fmt.Println()
-	
+
 	// Time information
 	if eo.style.RelativeTime && !status.LastSealTime.IsZero() {
 		fmt.Printf("Last sealed: %s\n", eo.relativeTime(status.LastSealTime))
 	}
-	
+
 	// Anvil files
 	if len(status.AnvilFiles) > 0 {
 		fmt.Println()
@@ -203,7 +203,7 @@ func (eo *EnhancedOutput) ShowWorkspaceStatus(status *WorkspaceStatus) {
 			fmt.Printf("  %s %s\n", eo.colorize("gathered:", ColorGreen), file)
 		}
 	}
-	
+
 	// Modified files
 	if len(status.ModifiedFiles) > 0 {
 		fmt.Println()
@@ -212,7 +212,7 @@ func (eo *EnhancedOutput) ShowWorkspaceStatus(status *WorkspaceStatus) {
 			fmt.Printf("  %s %s\n", eo.colorize("modified:", ColorYellow), file)
 		}
 	}
-	
+
 	// Untracked files
 	if len(status.UntrackedFiles) > 0 {
 		fmt.Println()
@@ -221,7 +221,7 @@ func (eo *EnhancedOutput) ShowWorkspaceStatus(status *WorkspaceStatus) {
 			fmt.Printf("  %s\n", eo.colorize(file, ColorGray))
 		}
 	}
-	
+
 	// Workspace snapshots
 	if len(status.Snapshots) > 0 {
 		fmt.Println()
@@ -240,9 +240,9 @@ func (eo *EnhancedOutput) ShowSealHistory(seals []*SealInfo) {
 	if eo.style.UseColors {
 		fmt.Printf("%sSealing Chronicle%s\n\n", ColorBold, ColorReset)
 	} else {
-		fmt.Println("Sealing Chronicle\n")
+		fmt.Println("Sealing Chronicle")
 	}
-	
+
 	for i, seal := range seals {
 		// Seal name with overwrite indicator
 		sealName := seal.Name
@@ -253,7 +253,7 @@ func (eo *EnhancedOutput) ShowSealHistory(seals []*SealInfo) {
 				sealName += fmt.Sprintf(" ♻%d", seal.OverwriteCount)
 			}
 		}
-		
+
 		// Protection indicator
 		if seal.IsProtected {
 			if eo.style.UseEmoji {
@@ -262,25 +262,25 @@ func (eo *EnhancedOutput) ShowSealHistory(seals []*SealInfo) {
 				sealName += " [PROTECTED]"
 			}
 		}
-		
-		fmt.Printf("%s (#%d) - %s\n", 
+
+		fmt.Printf("%s (#%d) - %s\n",
 			eo.colorize(sealName, ColorBlue),
 			seal.Iteration,
 			seal.Message,
 		)
-		
+
 		// Author and time
 		timeStr := seal.Timestamp.Format("2006-01-02 15:04:05")
 		if eo.style.RelativeTime {
 			timeStr = eo.relativeTime(seal.Timestamp)
 		}
-		
+
 		fmt.Printf("  %s <%s> - %s\n",
 			eo.colorize(seal.Author.Name, ColorCyan),
 			eo.colorize(seal.Author.Email, ColorGray),
 			eo.colorize(timeStr, ColorGray),
 		)
-		
+
 		// Add spacing between entries
 		if i < len(seals)-1 {
 			fmt.Println()
@@ -298,22 +298,22 @@ func (eo *EnhancedOutput) ShowTimelines(timelines []*TimelineInfo, current strin
 	} else {
 		fmt.Println("Timelines")
 	}
-	
+
 	for _, timeline := range timelines {
 		marker := " "
 		nameColor := ColorReset
-		
+
 		if timeline.Name == current {
 			marker = "*"
 			nameColor = ColorGreen
 		}
-		
+
 		fmt.Printf("%s %s", marker, eo.colorize(timeline.Name, nameColor))
-		
+
 		if timeline.Description != "" {
 			fmt.Printf(" - %s", eo.colorize(timeline.Description, ColorGray))
 		}
-		
+
 		fmt.Printf(" (%d seals)\n", timeline.SealCount)
 	}
 }
@@ -328,16 +328,16 @@ func (eo *EnhancedOutput) ShowPortals(portals map[string]*PortalInfo) {
 	} else {
 		fmt.Println("Portals")
 	}
-	
+
 	if len(portals) == 0 {
 		fmt.Printf("  %s\n", eo.colorize("No portals configured", ColorGray))
 		return
 	}
-	
+
 	for name, portal := range portals {
 		status := ""
 		statusColor := ColorGray
-		
+
 		switch portal.Status {
 		case "connected":
 			status = "✓ connected"
@@ -351,13 +351,13 @@ func (eo *EnhancedOutput) ShowPortals(portals map[string]*PortalInfo) {
 		default:
 			status = "? unknown"
 		}
-		
+
 		fmt.Printf("  %s -> %s [%s]\n",
 			eo.colorize(name, ColorCyan),
 			portal.URL,
 			eo.colorize(status, statusColor),
 		)
-		
+
 		if portal.LastSync != nil && !portal.LastSync.IsZero() {
 			fmt.Printf("    Last sync: %s\n", eo.relativeTime(*portal.LastSync))
 		}
@@ -369,16 +369,16 @@ func (eo *EnhancedOutput) Progress(current, total int, message string) {
 	if !eo.style.UseProgress {
 		return
 	}
-	
+
 	percentage := float64(current) / float64(total) * 100
 	barLength := 40
 	filled := int(float64(barLength) * float64(current) / float64(total))
-	
+
 	bar := strings.Repeat("█", filled) + strings.Repeat("░", barLength-filled)
-	
+
 	fmt.Printf("\r%s [%s] %3.0f%% (%d/%d)",
 		message, bar, percentage, current, total)
-	
+
 	if current == total {
 		fmt.Println() // New line when complete
 	}
@@ -395,7 +395,7 @@ func (eo *EnhancedOutput) colorize(text, color string) string {
 
 func (eo *EnhancedOutput) relativeTime(t time.Time) string {
 	duration := time.Since(t)
-	
+
 	if duration < time.Minute {
 		return "just now"
 	} else if duration < time.Hour {
@@ -438,10 +438,10 @@ type WorkspaceStatus struct {
 }
 
 type SealInfo struct {
-	Name           string
-	Iteration      int
-	Message        string
-	Author         struct {
+	Name      string
+	Iteration int
+	Message   string
+	Author    struct {
 		Name  string
 		Email string
 	}

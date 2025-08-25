@@ -174,8 +174,14 @@ func TestHashAlgorithms(t *testing.T) {
 
 func TestTreeEncoding(t *testing.T) {
 	// Create test tree
-	hash1 := objects.NewCAHash([]byte("file1"), objects.BLAKE3)
-	hash2 := objects.NewCAHash([]byte("file2"), objects.BLAKE3)
+	hash1, err := objects.NewCAHash([]byte("file1"), objects.BLAKE3)
+	if err != nil {
+		t.Fatalf("Failed to create hash1: %v", err)
+	}
+	hash2, err := objects.NewCAHash([]byte("file2"), objects.BLAKE3)
+	if err != nil {
+		t.Fatalf("Failed to create hash2: %v", err)
+	}
 
 	entries := []objects.CATreeEntry{
 		{Mode: objects.ModeFile, Name: "file1.txt", Hash: hash1, Kind: objects.KindBlob},
@@ -209,8 +215,14 @@ func TestTreeEncoding(t *testing.T) {
 
 func TestSealEncoding(t *testing.T) {
 	// Create test seal
-	treeHash := objects.NewCAHash([]byte("tree"), objects.BLAKE3)
-	parentHash := objects.NewCAHash([]byte("parent"), objects.BLAKE3)
+	treeHash, err := objects.NewCAHash([]byte("tree"), objects.BLAKE3)
+	if err != nil {
+		t.Fatalf("Failed to create treeHash: %v", err)
+	}
+	parentHash, err := objects.NewCAHash([]byte("parent"), objects.BLAKE3)
+	if err != nil {
+		t.Fatalf("Failed to create parentHash: %v", err)
+	}
 
 	author := objects.Identity{Name: "Test Author", Email: "test@example.com"}
 	committer := objects.Identity{Name: "Test Committer", Email: "committer@example.com"}

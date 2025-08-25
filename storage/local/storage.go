@@ -15,7 +15,6 @@ type Storage struct {
 	root       string
 	objectsDir string
 	compressor *zstd.Encoder
-	
 }
 
 func NewStorage(root string) (*Storage, error) {
@@ -156,7 +155,7 @@ func (s *Storage) Exists(hash objects.Hash) bool {
 func (s *Storage) writeObject(hash objects.Hash, data []byte, compressed bool) error {
 	path := s.objectPath(hash)
 	dir := filepath.Dir(path)
-	
+
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
@@ -170,7 +169,7 @@ func (s *Storage) writeObject(hash objects.Hash, data []byte, compressed bool) e
 
 func (s *Storage) readObject(hash objects.Hash) ([]byte, error) {
 	path := s.objectPath(hash)
-	
+
 	if _, err := os.Stat(path); err != nil {
 		compressedPath := path + ".zst"
 		if _, err := os.Stat(compressedPath); err == nil {
@@ -194,23 +193,28 @@ func (s *Storage) objectPath(hash objects.Hash) string {
 	return filepath.Join(s.objectsDir, hashStr[:2], hashStr[2:])
 }
 
+// GetObjectsDir returns the path to the objects directory for iteration purposes
+func (s *Storage) GetObjectsDir() string {
+	return s.objectsDir
+}
+
 func (s *Storage) GC() error {
 	return nil
 }
 
 func (s *Storage) Stats() (StorageStats, error) {
 	var stats StorageStats
-	
+
 	err := filepath.Walk(s.objectsDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		
+
 		if !info.IsDir() {
 			stats.ObjectCount++
 			stats.TotalSize += info.Size()
 		}
-		
+
 		return nil
 	})
 

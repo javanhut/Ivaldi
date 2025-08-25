@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"ivaldi/forge"
 	"ivaldi/core/objects"
+	"ivaldi/forge"
 )
 
 func TestSealCreation(t *testing.T) {
@@ -35,8 +35,8 @@ func TestSealCreation(t *testing.T) {
 
 	// Test 2: Create test files and gather them
 	testFiles := map[string]string{
-		"file1.txt": "Content of file 1",
-		"file2.txt": "Content of file 2", 
+		"file1.txt":     "Content of file 1",
+		"file2.txt":     "Content of file 2",
 		"dir/file3.txt": "Content of file 3 in directory",
 	}
 
@@ -93,13 +93,13 @@ func TestSealCreation(t *testing.T) {
 	if err != nil {
 		t.Errorf("Failed to get store stats: %v", err)
 	} else {
-		t.Logf("Store stats: %d objects (%d blobs, %d trees, %d seals)", 
+		t.Logf("Store stats: %d objects (%d blobs, %d trees, %d seals)",
 			stats.ObjectCount, stats.BlobCount, stats.TreeCount, stats.SealCount)
 
 		if stats.TreeCount < 1 {
 			t.Error("Expected at least 1 tree to be stored")
 		}
-		
+
 		if stats.SealCount < 1 {
 			t.Error("Expected at least 1 seal to be stored")
 		}
@@ -191,7 +191,7 @@ func TestSealChaining(t *testing.T) {
 
 	// Create multiple seals to test chaining
 	var seals []*objects.Seal
-	
+
 	for i := 1; i <= 3; i++ {
 		// Create and write a file
 		fileName := filepath.Join(tempDir, fmt.Sprintf("file%d.txt", i))
@@ -231,7 +231,7 @@ func TestSealChaining(t *testing.T) {
 
 		expectedIteration := i + 1
 		if seal.Iteration != expectedIteration {
-			t.Errorf("Seal %d has wrong iteration: expected %d, got %d", 
+			t.Errorf("Seal %d has wrong iteration: expected %d, got %d",
 				i, expectedIteration, seal.Iteration)
 		}
 	}

@@ -9,7 +9,7 @@ import (
 
 func TestFastCDCBasicChunking(t *testing.T) {
 	chunker := chunks.NewChunker()
-	
+
 	data := make([]byte, 64*1024)
 	for i := range data {
 		data[i] = byte(i % 256)
@@ -27,11 +27,11 @@ func TestFastCDCBasicChunking(t *testing.T) {
 	var totalSize int64
 	for _, chunk := range chunkList {
 		totalSize += chunk.Size
-		
+
 		if chunk.Size < chunks.MinChunkSize && chunk != chunkList[len(chunkList)-1] {
 			t.Errorf("Chunk size %d is below minimum %d", chunk.Size, chunks.MinChunkSize)
 		}
-		
+
 		if chunk.Size > chunks.MaxChunkSize {
 			t.Errorf("Chunk size %d exceeds maximum %d", chunk.Size, chunks.MaxChunkSize)
 		}
@@ -44,9 +44,9 @@ func TestFastCDCBasicChunking(t *testing.T) {
 
 func TestChunkDeduplication(t *testing.T) {
 	chunker := chunks.NewChunker()
-	
+
 	basePattern := []byte("Hello, this is a test pattern for deduplication! ")
-	
+
 	data := make([]byte, 0)
 	for i := 0; i < 20; i++ {
 		data = append(data, basePattern...)
@@ -58,7 +58,7 @@ func TestChunkDeduplication(t *testing.T) {
 	}
 
 	stats := chunker.AnalyzeDeduplication(chunkList)
-	
+
 	if stats.OriginalSize != int64(len(data)) {
 		t.Errorf("Expected original size %d, got %d", len(data), stats.OriginalSize)
 	}
@@ -70,7 +70,7 @@ func TestChunkDeduplication(t *testing.T) {
 
 func TestChunkReaderInterface(t *testing.T) {
 	chunker := chunks.NewChunker()
-	
+
 	data := []byte("Hello, this is a test for the chunk reader interface!")
 	reader := bytes.NewReader(data)
 
@@ -95,7 +95,7 @@ func TestChunkReaderInterface(t *testing.T) {
 
 func TestEmptyDataChunking(t *testing.T) {
 	chunker := chunks.NewChunker()
-	
+
 	chunkList, err := chunker.ChunkData([]byte{})
 	if err != nil {
 		t.Fatalf("Failed to chunk empty data: %v", err)
@@ -108,7 +108,7 @@ func TestEmptyDataChunking(t *testing.T) {
 
 func TestSmallDataChunking(t *testing.T) {
 	chunker := chunks.NewChunker()
-	
+
 	data := []byte("small")
 	chunkList, err := chunker.ChunkData(data)
 	if err != nil {

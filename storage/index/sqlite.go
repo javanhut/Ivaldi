@@ -18,7 +18,7 @@ type SQLiteIndex struct {
 
 func NewSQLiteIndex(root string) (*SQLiteIndex, error) {
 	indexPath := filepath.Join(root, ".ivaldi", "index.db")
-	
+
 	// Configure SQLite for concurrent access
 	db, err := sql.Open("sqlite", indexPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=synchronous(NORMAL)&_pragma=cache_size(10000)")
 	if err != nil {
@@ -135,7 +135,7 @@ func (idx *SQLiteIndex) initialize() error {
 func (idx *SQLiteIndex) IndexSeal(seal *objects.Seal) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	
+
 	tx, err := idx.db.Begin()
 	if err != nil {
 		return err
@@ -185,7 +185,7 @@ func (idx *SQLiteIndex) IndexSeal(seal *objects.Seal) error {
 func (idx *SQLiteIndex) IndexChunk(chunk *objects.Chunk) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	
+
 	tx, err := idx.db.Begin()
 	if err != nil {
 		return err
@@ -210,7 +210,7 @@ func (idx *SQLiteIndex) IndexChunk(chunk *objects.Chunk) error {
 func (idx *SQLiteIndex) IndexTree(tree *objects.Tree) error {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	
+
 	tx, err := idx.db.Begin()
 	if err != nil {
 		return err
@@ -305,7 +305,7 @@ func (idx *SQLiteIndex) GetSealHistory(limit int) ([]objects.Hash, error) {
 
 func (idx *SQLiteIndex) GetChunkStats() (ChunkStats, error) {
 	var stats ChunkStats
-	
+
 	err := idx.db.QueryRow(`
 		SELECT 
 			COUNT(*) as count,
@@ -467,8 +467,8 @@ func (idx *SQLiteIndex) GetSealByTimeline(timeline string, iteration int) (*obje
 }
 
 type ChunkStats struct {
-	Count               int64
-	TotalSize           int64
-	DeduplicatedSize    int64
-	DeduplicationRatio  float64
+	Count              int64
+	TotalSize          int64
+	DeduplicatedSize   int64
+	DeduplicationRatio float64
 }

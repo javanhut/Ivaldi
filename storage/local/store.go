@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"ivaldi/core/objects"
@@ -22,7 +23,7 @@ const (
 
 var kindNames = map[ObjectKind]string{
 	KindBlob: "blob",
-	KindTree: "tree", 
+	KindTree: "tree",
 	KindSeal: "seal",
 	KindTag:  "tag",
 }
@@ -62,8 +63,11 @@ func (s *Store) Put(data []byte, kind ObjectKind) (objects.CAHash, error) {
 	defer s.mu.Unlock()
 
 	// Calculate hash
-	hash := objects.NewCAHash(data, s.algorithm)
-	
+	hash, err := objects.NewCAHash(data, s.algorithm)
+	if err != nil {
+		return objects.CAHash{}, fmt.Errorf("failed to create hash: %w", err)
+	}
+
 	// Check if object already exists
 	if s.exists(hash) {
 		return hash, nil
@@ -82,14 +86,14 @@ func (s *Store) Put(data []byte, kind ObjectKind) (objects.CAHash, error) {
 	if err != nil {
 		return objects.CAHash{}, fmt.Errorf("failed to create temp file: %v", err)
 	}
-	
+
 	// Write kind header and data
 	if _, err := tempFile.Write([]byte{byte(kind)}); err != nil {
 		tempFile.Close()
 		os.Remove(tempPath)
 		return objects.CAHash{}, fmt.Errorf("failed to write kind: %v", err)
 	}
-	
+
 	if _, err := tempFile.Write(data); err != nil {
 		tempFile.Close()
 		os.Remove(tempPath)
@@ -102,7 +106,7 @@ func (s *Store) Put(data []byte, kind ObjectKind) (objects.CAHash, error) {
 		os.Remove(tempPath)
 		return objects.CAHash{}, fmt.Errorf("failed to sync temp file: %v", err)
 	}
-	
+
 	if err := tempFile.Close(); err != nil {
 		os.Remove(tempPath)
 		return objects.CAHash{}, fmt.Errorf("failed to close temp file: %v", err)
@@ -130,7 +134,7 @@ func (s *Store) Get(hash objects.CAHash) ([]byte, ObjectKind, error) {
 	defer s.mu.RUnlock()
 
 	objectPath := filepath.Join(s.objectDir, hash.ObjectPath())
-	
+
 	file, err := os.Open(objectPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -202,7 +206,7 @@ func (s *Store) List(kind ObjectKind) ([]objects.CAHash, error) {
 	defer s.mu.RUnlock()
 
 	var hashes []objects.CAHash
-	
+
 	// Walk through all algorithm directories
 	for algo := range map[objects.HashAlgorithm]bool{objects.BLAKE3: true, objects.SHA256: true} {
 		algoDir := filepath.Join(s.objectDir, algo.String())
@@ -214,7 +218,7 @@ func (s *Store) List(kind ObjectKind) ([]objects.CAHash, error) {
 			if err != nil {
 				return err
 			}
-			
+
 			if d.IsDir() {
 				return nil
 			}
@@ -224,12 +228,12 @@ func (s *Store) List(kind ObjectKind) ([]objects.CAHash, error) {
 			if err != nil {
 				return err
 			}
-			
+
 			// Skip if not in correct format (should be xx/xxxxx...)
 			if len(relPath) < 3 || relPath[2] != '/' {
 				return nil
 			}
-			
+
 			hashStr := relPath[:2] + relPath[3:]
 			hash, err := objects.ParseCAHash(algo.String() + ":" + hashStr)
 			if err != nil {
@@ -241,14 +245,14 @@ func (s *Store) List(kind ObjectKind) ([]objects.CAHash, error) {
 			if err != nil {
 				return nil // Skip unreadable objects
 			}
-			
+
 			if objKind == kind {
 				hashes = append(hashes, hash)
 			}
 
 			return nil
 		})
-		
+
 		if err != nil {
 			return nil, fmt.Errorf("failed to walk objects: %v", err)
 		}
@@ -273,7 +277,7 @@ func (s *Store) GC(referencedHashes map[objects.CAHash]bool) error {
 			if err != nil {
 				return err
 			}
-			
+
 			if d.IsDir() {
 				return nil
 			}
@@ -283,11 +287,11 @@ func (s *Store) GC(referencedHashes map[objects.CAHash]bool) error {
 			if err != nil {
 				return err
 			}
-			
+
 			if len(relPath) < 3 || relPath[2] != '/' {
 				return nil
 			}
-			
+
 			hashStr := relPath[:2] + relPath[3:]
 			hash, err := objects.ParseCAHash(algo.String() + ":" + hashStr)
 			if err != nil {
@@ -301,7 +305,7 @@ func (s *Store) GC(referencedHashes map[objects.CAHash]bool) error {
 
 			return nil
 		})
-		
+
 		if err != nil {
 			return fmt.Errorf("failed to walk objects during GC: %v", err)
 		}
@@ -312,12 +316,12 @@ func (s *Store) GC(referencedHashes map[objects.CAHash]bool) error {
 
 // Stats returns statistics about the object store
 type StoreStats struct {
-	ObjectCount    int64
-	TotalSize      int64
-	BlobCount      int64
-	TreeCount      int64
-	SealCount      int64
-	TagCount       int64
+	ObjectCount     int64
+	TotalSize       int64
+	BlobCount       int64
+	TreeCount       int64
+	SealCount       int64
+	TagCount        int64
 	AlgorithmCounts map[objects.HashAlgorithm]int64
 }
 
@@ -333,7 +337,7 @@ func (s *Store) Stats() (StoreStats, error) {
 		if err != nil {
 			return err
 		}
-		
+
 		if d.IsDir() {
 			return nil
 		}
@@ -349,29 +353,28 @@ func (s *Store) Stats() (StoreStats, error) {
 		// Try to determine object kind and algorithm
 		for algo := range map[objects.HashAlgorithm]bool{objects.BLAKE3: true, objects.SHA256: true} {
 			algoDir := filepath.Join(s.objectDir, algo.String())
-			if filepath.HasPrefix(path, algoDir) {
+			if strings.HasPrefix(path, algoDir) {
 				stats.AlgorithmCounts[algo]++
-				
-				// Try to read object kind
-				relPath, err := filepath.Rel(algoDir, path)
-				if err == nil && len(relPath) >= 3 && relPath[2] == '/' {
-					hashStr := relPath[:2] + relPath[3:]
-					hash, err := objects.ParseCAHash(algo.String() + ":" + hashStr)
-					if err == nil {
-						_, kind, err := s.Get(hash)
-						if err == nil {
-							switch kind {
-							case KindBlob:
-								stats.BlobCount++
-							case KindTree:
-								stats.TreeCount++
-							case KindSeal:
-								stats.SealCount++
-							case KindTag:
-								stats.TagCount++
-							}
+
+				// Try to read object kind by directly reading the first byte of the file
+				// This is more efficient than reconstructing the hash and calling Get
+				file, err := os.Open(path)
+				if err == nil {
+					kindBuf := make([]byte, 1)
+					if n, readErr := file.Read(kindBuf); readErr == nil && n == 1 {
+						kind := ObjectKind(kindBuf[0])
+						switch kind {
+						case KindBlob:
+							stats.BlobCount++
+						case KindTree:
+							stats.TreeCount++
+						case KindSeal:
+							stats.SealCount++
+						case KindTag:
+							stats.TagCount++
 						}
 					}
+					file.Close()
 				}
 				break
 			}

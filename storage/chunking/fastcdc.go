@@ -13,7 +13,7 @@ type FastCDC struct {
 	minSize int    // Minimum chunk size (512 bytes default)
 	maxSize int    // Maximum chunk size (64KB default)
 	mask    uint64 // Rolling hash mask
-	
+
 	// Rolling hash state
 	gear [256]uint64 // Gear table for rolling hash
 }
@@ -48,10 +48,10 @@ func NewFastCDCWithSizes(avgSize, minSize, maxSize int) *FastCDC {
 		maxSize: maxSize,
 		mask:    uint64(avgSize - 1), // For 8KB: 0x1FFF
 	}
-	
+
 	// Initialize gear table for rolling hash
 	cdc.initializeGear()
-	
+
 	return cdc
 }
 
@@ -73,26 +73,26 @@ func (cdc *FastCDC) ChunkData(data []byte) (*ChunkResult, error) {
 			ChunkCount: 0,
 		}, nil
 	}
-	
+
 	var chunks []*Chunk
 	var offset int64 = 0
-	
+
 	for offset < int64(len(data)) {
 		chunk, err := cdc.findNextChunk(data[offset:])
 		if err != nil {
 			return nil, err
 		}
-		
+
 		chunk.Offset = offset
 		chunks = append(chunks, chunk)
 		offset += int64(chunk.Size)
 	}
-	
+
 	return &ChunkResult{
-		Chunks:     chunks,
-		TotalSize:  len(data),
-		ChunkCount: len(chunks),
-		Dedup:      true,
+		Chunks:      chunks,
+		TotalSize:   len(data),
+		ChunkCount:  len(chunks),
+		Dedup:       true,
 		Compression: "none", // Would be zstd/lz4 in production
 	}, nil
 }
@@ -102,36 +102,36 @@ func (cdc *FastCDC) findNextChunk(data []byte) (*Chunk, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("no data to chunk")
 	}
-	
+
 	// If remaining data is smaller than minSize, take it all
 	if len(data) <= cdc.minSize {
 		return cdc.createChunk(data), nil
 	}
-	
+
 	// Rolling hash state
 	var hash uint64 = 0
-	
+
 	// Build initial hash window (minimum size)
 	for i := 0; i < cdc.minSize && i < len(data); i++ {
 		hash = cdc.updateHash(hash, data[i])
 	}
-	
+
 	// Look for chunk boundary starting from minSize
 	for pos := cdc.minSize; pos < len(data) && pos < cdc.maxSize; pos++ {
 		hash = cdc.updateHash(hash, data[pos])
-		
+
 		// Check if this is a chunk boundary
 		if cdc.isChunkBoundary(hash) {
 			return cdc.createChunk(data[:pos+1]), nil
 		}
 	}
-	
+
 	// If we reach maxSize, force a boundary
 	size := cdc.maxSize
 	if size > len(data) {
 		size = len(data)
 	}
-	
+
 	return cdc.createChunk(data[:size]), nil
 }
 
@@ -154,11 +154,11 @@ func (cdc *FastCDC) createChunk(data []byte) *Chunk {
 	hasher := sha256.New()
 	hasher.Write(data)
 	hash := fmt.Sprintf("%x", hasher.Sum(nil))
-	
+
 	// Copy data to avoid reference issues
 	chunkData := make([]byte, len(data))
 	copy(chunkData, data)
-	
+
 	return &Chunk{
 		Data: chunkData,
 		Hash: hash,
@@ -174,7 +174,7 @@ func (cdc *FastCDC) ChunkReader(reader io.Reader) (*ChunkResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read data: %v", err)
 	}
-	
+
 	return cdc.ChunkData(data)
 }
 
@@ -199,7 +199,7 @@ func (dm *DeduplicationManager) AddChunk(chunk *Chunk) bool {
 		dm.refCounts[chunk.Hash]++
 		return true // Deduplicated
 	}
-	
+
 	// New chunk, store it
 	dm.chunks[chunk.Hash] = chunk
 	dm.refCounts[chunk.Hash] = 1
@@ -234,29 +234,29 @@ func (dm *DeduplicationManager) GetStats() DeduplicationStats {
 	totalChunks := len(dm.chunks)
 	totalRefs := 0
 	totalSize := 0
-	
+
 	for hash, chunk := range dm.chunks {
 		refs := dm.refCounts[hash]
 		totalRefs += refs
 		totalSize += chunk.Size * refs // Size if not deduplicated
 	}
-	
+
 	actualSize := 0
 	for _, chunk := range dm.chunks {
 		actualSize += chunk.Size
 	}
-	
+
 	var ratio float64 = 1.0
 	if actualSize > 0 {
 		ratio = float64(totalSize) / float64(actualSize)
 	}
-	
+
 	return DeduplicationStats{
-		UniqueChunks:     totalChunks,
-		TotalReferences:  totalRefs,
+		UniqueChunks:       totalChunks,
+		TotalReferences:    totalRefs,
 		DeduplicationRatio: ratio,
-		StorageSize:      actualSize,
-		LogicalSize:      totalSize,
+		StorageSize:        actualSize,
+		LogicalSize:        totalSize,
 	}
 }
 
@@ -265,8 +265,8 @@ type DeduplicationStats struct {
 	UniqueChunks       int     `json:"uniqueChunks"`
 	TotalReferences    int     `json:"totalReferences"`
 	DeduplicationRatio float64 `json:"deduplicationRatio"`
-	StorageSize        int     `json:"storageSize"`      // Actual storage used
-	LogicalSize        int     `json:"logicalSize"`      // Size without deduplication
+	StorageSize        int     `json:"storageSize"` // Actual storage used
+	LogicalSize        int     `json:"logicalSize"` // Size without deduplication
 }
 
 // Compression support (placeholder for zstd/lz4)
@@ -281,21 +281,21 @@ const (
 // CompressedChunk represents a compressed chunk
 type CompressedChunk struct {
 	*Chunk
-	OriginalSize    int             `json:"originalSize"`
-	CompressedSize  int             `json:"compressedSize"`
-	CompressionType CompressionType `json:"compressionType"`
-	CompressionRatio float64        `json:"compressionRatio"`
+	OriginalSize     int             `json:"originalSize"`
+	CompressedSize   int             `json:"compressedSize"`
+	CompressionType  CompressionType `json:"compressionType"`
+	CompressionRatio float64         `json:"compressionRatio"`
 }
 
 // CompressChunk compresses a chunk (placeholder implementation)
 func CompressChunk(chunk *Chunk, compressionType CompressionType) *CompressedChunk {
 	// Placeholder - in production this would use actual zstd/lz4
 	originalSize := len(chunk.Data)
-	
+
 	// Simulate compression
 	var compressedData []byte
 	var ratio float64
-	
+
 	switch compressionType {
 	case CompressionZstd:
 		// Simulate zstd compression (typically 60-70% reduction)
@@ -311,19 +311,19 @@ func CompressChunk(chunk *Chunk, compressionType CompressionType) *CompressedChu
 		compressedData = chunk.Data
 		ratio = 1.0
 	}
-	
+
 	compressedChunk := &Chunk{
-		Data: compressedData,
-		Hash: chunk.Hash,
-		Size: len(compressedData),
+		Data:   compressedData,
+		Hash:   chunk.Hash,
+		Size:   len(compressedData),
 		Offset: chunk.Offset,
 	}
-	
+
 	return &CompressedChunk{
-		Chunk:           compressedChunk,
-		OriginalSize:    originalSize,
-		CompressedSize:  len(compressedData),
-		CompressionType: compressionType,
+		Chunk:            compressedChunk,
+		OriginalSize:     originalSize,
+		CompressedSize:   len(compressedData),
+		CompressionType:  compressionType,
 		CompressionRatio: ratio,
 	}
 }
@@ -332,7 +332,7 @@ func CompressChunk(chunk *Chunk, compressionType CompressionType) *CompressedChu
 func CalculateStorageEfficiency(deduplicationRatio, compressionRatio float64) StorageEfficiency {
 	totalRatio := deduplicationRatio * compressionRatio
 	savings := (1.0 - (1.0 / totalRatio)) * 100.0
-	
+
 	return StorageEfficiency{
 		DeduplicationRatio: deduplicationRatio,
 		CompressionRatio:   compressionRatio,

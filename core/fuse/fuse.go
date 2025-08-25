@@ -13,7 +13,7 @@ type Storage interface {
 	StoreSeal(seal *objects.Seal) error
 }
 
-// TimelineManager interface for timeline operations  
+// TimelineManager interface for timeline operations
 type TimelineManager interface {
 	Current() string
 	GetHead(timeline string) (objects.Hash, error)
@@ -49,20 +49,20 @@ type FuseOptions struct {
 type FuseStrategy int
 
 const (
-	FuseStrategyAutomatic FuseStrategy = iota // Automatic non-conflicting merge
-	FuseStrategyManual                        // Require manual conflict resolution
-	FuseStrategyFastForward                   // Fast-forward only
-	FuseStrategySquash                        // Squash all commits into one
+	FuseStrategyAutomatic   FuseStrategy = iota // Automatic non-conflicting merge
+	FuseStrategyManual                          // Require manual conflict resolution
+	FuseStrategyFastForward                     // Fast-forward only
+	FuseStrategySquash                          // Squash all commits into one
 )
 
 // FuseResult contains the outcome of a fuse operation
 type FuseResult struct {
-	MergeCommit    *objects.Seal
-	ConflictCount  int
-	FilesChanged   []string
-	DeletedSource  bool
-	Strategy       FuseStrategy
-	Success        bool
+	MergeCommit   *objects.Seal
+	ConflictCount int
+	FilesChanged  []string
+	DeletedSource bool
+	Strategy      FuseStrategy
+	Success       bool
 }
 
 func NewFuseManager(storage Storage, timeline TimelineManager, workspace WorkspaceManager) *FuseManager {
@@ -177,7 +177,7 @@ func (fm *FuseManager) analyzeFuse(sourceHead, targetHead objects.Hash, strategy
 	case FuseStrategySquash:
 		result.FilesChanged = []string{fmt.Sprintf("All commits from %s will be squashed", opts.SourceTimeline)}
 	default:
-		result.FilesChanged = []string{fmt.Sprintf("Merge %s (%s) into %s (%s)", 
+		result.FilesChanged = []string{fmt.Sprintf("Merge %s (%s) into %s (%s)",
 			opts.SourceTimeline, sourceSeal.Name,
 			opts.TargetTimeline, targetSeal.Name)}
 	}
@@ -300,7 +300,7 @@ func (fm *FuseManager) performMerge(sourceHead, targetHead objects.Hash, opts Fu
 	// Create merge commit message
 	mergeMessage := opts.FuseMessage
 	if mergeMessage == "" {
-		mergeMessage = fmt.Sprintf("Fuse %s (%s) into %s", 
+		mergeMessage = fmt.Sprintf("Fuse %s (%s) into %s",
 			opts.SourceTimeline, sourceSeal.Name, opts.TargetTimeline)
 	}
 
@@ -353,11 +353,11 @@ func (fm *FuseManager) performMerge(sourceHead, targetHead objects.Hash, opts Fu
 func (fm *FuseManager) generateMergeCommitName() string {
 	adjectives := []string{"unified", "merged", "fused", "joined", "combined", "blended"}
 	nouns := []string{"timeline", "stream", "branch", "path", "flow", "current"}
-	
+
 	adj := adjectives[time.Now().Unix()%int64(len(adjectives))]
 	noun := nouns[time.Now().Unix()%int64(len(nouns))]
 	num := time.Now().Unix() % 999
-	
+
 	return fmt.Sprintf("%s-%s-%d", adj, noun, num)
 }
 
@@ -370,10 +370,10 @@ func (fm *FuseManager) getNextIteration(timeline string) int {
 // GetFuseStrategies returns available fuse strategies with descriptions
 func GetFuseStrategies() map[string]string {
 	return map[string]string{
-		"auto":        "Automatic merge with conflict detection",
-		"ff":          "Fast-forward only (no merge commit)",
-		"squash":      "Squash all commits into one",
-		"manual":      "Manual conflict resolution required",
+		"auto":   "Automatic merge with conflict detection",
+		"ff":     "Fast-forward only (no merge commit)",
+		"squash": "Squash all commits into one",
+		"manual": "Manual conflict resolution required",
 	}
 }
 

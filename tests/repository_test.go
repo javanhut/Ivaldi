@@ -164,7 +164,7 @@ func TestWorkspaceStatus(t *testing.T) {
 	}
 
 	status := repo.Status()
-	
+
 	if len(status.Untracked) != 1 || status.Untracked[0] != "test.txt" {
 		t.Errorf("Expected 1 untracked file 'test.txt', got %v", status.Untracked)
 	}
@@ -174,7 +174,7 @@ func TestWorkspaceStatus(t *testing.T) {
 	}
 
 	status = repo.Status()
-	
+
 	if len(status.Gathered) != 1 || status.Gathered[0] != "test.txt" {
 		t.Errorf("Expected 1 gathered file 'test.txt', got %v", status.Gathered)
 	}

@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -19,6 +21,8 @@ import (
 	"ivaldi/core/commands"
 	"ivaldi/core/config"
 	"ivaldi/core/fuse"
+	"ivaldi/core/network"
+	"ivaldi/core/p2p"
 	"ivaldi/core/reshape"
 	"ivaldi/core/search"
 	"ivaldi/core/semantic"
@@ -29,9 +33,9 @@ import (
 
 // EnhancedCLI integrates all revolutionary features into the command interface
 type EnhancedCLI struct {
-	output         *enhanced.EnhancedOutput
-	nlParser       *commands.NaturalLanguageParser
-	currentRepo    *forge.EnhancedRepository
+	output      *enhanced.EnhancedOutput
+	nlParser    *commands.NaturalLanguageParser
+	currentRepo *forge.EnhancedRepository
 }
 
 // NewEnhancedCLI creates a new enhanced CLI with all revolutionary features
@@ -79,6 +83,7 @@ Workshop Commands:
   upload [branch]          Upload current branch to portal
   sync <timeline> --with <remote>  Sync local timeline with remote timeline
   scout [portal]           Discover remote timelines
+  p2p                      Peer-to-peer collaboration and sync
   
 Natural Language Examples:
   jump to "yesterday before lunch"
@@ -113,7 +118,7 @@ Natural Language Examples:
 // Initialize repository and load enhanced features
 func (ec *EnhancedCLI) initializeRepository(cmd *cobra.Command, args []string) error {
 	// Skip repo check for init commands
-	if cmd.Name() == "forge" || cmd.Name() == "download" || cmd.Name() == "mirror" || cmd.Name() == "config" || cmd.Name() == "help" {
+	if cmd.Name() == "forge" || cmd.Name() == "download" || cmd.Name() == "mirror" || cmd.Name() == "migrate" || cmd.Name() == "config" || cmd.Name() == "help" {
 		return nil
 	}
 
@@ -154,6 +159,7 @@ func (ec *EnhancedCLI) addEnhancedCommands(rootCmd *cobra.Command) {
 	rootCmd.AddCommand(ec.createForgeCommand())
 	rootCmd.AddCommand(ec.createDownloadCommand())
 	rootCmd.AddCommand(ec.createMirrorCommand())
+	rootCmd.AddCommand(ec.createMigrateCommand())
 	rootCmd.AddCommand(ec.createGatherCommand())
 	rootCmd.AddCommand(ec.createExcludeCommand())
 	rootCmd.AddCommand(ec.createRemoveCommand())
@@ -166,28 +172,29 @@ func (ec *EnhancedCLI) addEnhancedCommands(rootCmd *cobra.Command) {
 	rootCmd.AddCommand(ec.createUploadCommand())
 	rootCmd.AddCommand(ec.createSyncCommand())
 	rootCmd.AddCommand(ec.createScoutCommand())
-	
+	rootCmd.AddCommand(ec.createP2PCommand())
+
 	// Information commands
 	rootCmd.AddCommand(ec.createStatusCommand())
 	rootCmd.AddCommand(ec.createWhereAmICommand())
 	rootCmd.AddCommand(ec.createWhatChangedCommand())
 	rootCmd.AddCommand(ec.createLogCommand())
 	rootCmd.AddCommand(ec.createSearchCommand())
-	
+
 	// Advanced commands
 	rootCmd.AddCommand(ec.createReshapeCommand())
 	rootCmd.AddCommand(ec.createFuseCommand())
 	rootCmd.AddCommand(ec.createPluckCommand())
 	rootCmd.AddCommand(ec.createHuntCommand())
 	rootCmd.AddCommand(ec.createSquashCommand())
-	
+
 	// Workspace commands
 	rootCmd.AddCommand(ec.createWorkspaceCommand())
-	
+
 	// Collaboration commands
 	rootCmd.AddCommand(ec.createMeshCommand())
 	rootCmd.AddCommand(ec.createCollaborateCommand())
-	
+
 	// Utility commands
 	rootCmd.AddCommand(ec.createVersionCommand())
 	rootCmd.AddCommand(ec.createConfigCommand())
@@ -217,14 +224,14 @@ Example:
 			if len(args) > 0 {
 				path = args[0]
 			}
-			
+
 			absPath, err := filepath.Abs(path)
 			if err != nil {
 				return err
 			}
 
 			ec.output.Info(fmt.Sprintf("Forging new repository in %s", absPath))
-			
+
 			repo, err := forge.EnhancedInitialize(absPath)
 			if err != nil {
 				ec.output.Error("Failed to forge repository", []string{
@@ -241,7 +248,7 @@ Example:
 			ec.output.Info("- gather <files>     - Stage files for sealing")
 			ec.output.Info("- seal \"message\"     - Create your first commit")
 			ec.output.Info("- timeline create    - Create development timelines")
-			
+
 			return nil
 		},
 	}
@@ -251,44 +258,164 @@ Example:
 func (ec *EnhancedCLI) createMirrorCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "mirror <url> [destination]",
-		Short: "Mirror a Git repository with full history import",
-		Long: `Mirror a Git repository and import its complete commit history into Ivaldi format
+		Short: "Clone and convert a remote Git repository to Ivaldi with full history",
+		Long: `Clone a remote Git repository and convert it to Ivaldi format with complete history preservation
 
 This command:
-- Clones the Git repository with full commit history
-- Converts all Git commits to Ivaldi seals with memorable names
-- Preserves the complete development history and branching structure
-- Maintains Git compatibility while adding Ivaldi's revolutionary features
+- Clones the Git repository from a remote URL (GitHub/GitLab/etc)
+- Automatically detects repository name from URL if destination not specified
+- Converts ALL Git commits to Ivaldi seals with memorable names
+- Preserves complete commit history with proper parent relationships
+- Converts Git branches to Ivaldi timelines
+- Migrates .gitmodules to .ivaldimodules format
+- Downloads and indexes all files for immediate use
 
-Use this when you want to preserve and enhance the existing Git history.
+Use this to clone and convert remote Git repositories to Ivaldi.
 
-Example:
-  mirror https://github.com/user/repo
-  mirror git@github.com:user/repo.git my-local-name`,
+Examples:
+  mirror https://github.com/user/repo              # Creates ./repo directory
+  mirror git@github.com:user/project.git           # Creates ./project directory
+  mirror https://github.com/org/tool custom-name   # Creates ./custom-name directory`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			url := args[0]
 			dest := ""
+
+			// Extract repository name from URL if destination not specified
 			if len(args) > 1 {
 				dest = args[1]
+			} else {
+				dest = ec.extractRepoNameFromURL(url)
+				if dest == "" {
+					ec.output.Error("Could not determine repository name from URL", []string{
+						"Please specify a destination directory",
+						"Example: mirror " + url + " my-repo",
+					})
+					return fmt.Errorf("could not extract repository name from URL")
+				}
 			}
 
-			ec.output.Info(fmt.Sprintf("Mirroring repository from %s", url))
-			
-			repo, err := forge.EnhancedMirror(url, dest)
+			// Check if destination already exists
+			if _, err := os.Stat(dest); err == nil {
+				ec.output.Error("Destination already exists", []string{
+					fmt.Sprintf("Directory '%s' already exists", dest),
+					"Choose a different name or remove the existing directory",
+					"Example: mirror " + url + " " + dest + "-new",
+				})
+				return fmt.Errorf("destination directory already exists: %s", dest)
+			}
+
+			ec.output.Info(fmt.Sprintf("Mirroring repository from %s to %s", url, dest))
+			ec.output.Info("")
+
+			// Perform the enhanced mirror operation with full history
+			repo, err := ec.performEnhancedMirror(url, dest)
 			if err != nil {
 				ec.output.Error("Failed to mirror repository", []string{
-					"Check URL accessibility",
-					"Verify authentication if required",
-					"Ensure destination path is available",
+					"Check URL accessibility and format",
+					"Verify authentication if repository is private",
+					"Ensure you have network connectivity",
 				})
 				return err
 			}
 
 			ec.currentRepo = repo
-			ec.output.Success("Repository mirrored and enhanced!")
-			ec.output.Info("All Git commits now have memorable names")
-			
+			ec.output.Success(fmt.Sprintf("✓ Repository mirrored to %s with complete history!", dest))
+			ec.output.Info("")
+			ec.output.Info("Repository successfully converted:")
+			ec.output.Info("- All Git commits converted to Ivaldi seals")
+			ec.output.Info("- Branches converted to Ivaldi timelines")
+			ec.output.Info("- Submodules converted to .ivaldimodules")
+			ec.output.Info("")
+			ec.output.Info("Next steps:")
+			ec.output.Info(fmt.Sprintf("- cd %s", dest))
+			ec.output.Info("- ivaldi status")
+			ec.output.Info("- ivaldi log")
+
+			return nil
+		},
+	}
+}
+
+// Create migrate command (convert Git to Ivaldi)
+func (ec *EnhancedCLI) createMigrateCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "migrate [directory]",
+		Short: "Migrate a Git repository to Ivaldi with complete history preservation",
+		Long: `Convert an existing Git repository to Ivaldi format while preserving complete commit history
+
+This command performs a complete migration:
+- Converts all Git commits to Ivaldi seals with memorable names and proper relationships
+- Converts Git branches to Ivaldi timelines
+- Migrates .gitmodules to .ivaldimodules format
+- Creates backup of original .git directory
+- Preserves all commit metadata, timestamps, and authorship
+- Maintains complete branching and merging history
+
+Use this to migrate existing Git projects to Ivaldi while keeping full history.
+The original .git directory will be backed up to .git.backup for safety.
+
+Examples:
+  migrate                    # Migrate current directory Git repository
+  migrate ./my-git-project   # Migrate specific Git repository`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dir := "."
+			if len(args) > 0 {
+				dir = args[0]
+			}
+
+			absDir, err := filepath.Abs(dir)
+			if err != nil {
+				return err
+			}
+
+			// Check if this is a git repository
+			gitDir := filepath.Join(absDir, ".git")
+			if _, err := os.Stat(gitDir); os.IsNotExist(err) {
+				ec.output.Error("Not a Git repository", []string{
+					"Navigate to a Git repository directory",
+					"Or use 'forge' to create a new Ivaldi repository",
+					"Or use 'mirror <url>' to clone and convert a remote Git repository",
+				})
+				return fmt.Errorf("no .git directory found")
+			}
+
+			// Check if Ivaldi repository already exists
+			ivaldiDir := filepath.Join(absDir, ".ivaldi")
+			if _, err := os.Stat(ivaldiDir); err == nil {
+				ec.output.Error("Ivaldi repository already exists", []string{
+					"This directory already contains an Ivaldi repository",
+					"Remove .ivaldi directory if you want to re-migrate",
+					"Or use 'sync' to update from remote",
+				})
+				return fmt.Errorf("ivaldi repository already exists")
+			}
+
+			ec.output.Info(fmt.Sprintf("Migrating Git repository to Ivaldi: %s", absDir))
+			ec.output.Info("")
+
+			if err := ec.performGitToIvaldiMigration(absDir); err != nil {
+				ec.output.Error("Migration failed", []string{
+					"Check repository permissions",
+					"Ensure Git repository is valid",
+					"Verify remote access if repository has remotes",
+				})
+				return err
+			}
+
+			ec.output.Success("✓ Git repository successfully migrated to Ivaldi!")
+			ec.output.Info("")
+			ec.output.Info("Migration complete:")
+			ec.output.Info("- Git commits converted to Ivaldi seals with memorable names")
+			ec.output.Info("- Git branches converted to Ivaldi timelines")
+			ec.output.Info("- .gitmodules converted to .ivaldimodules")
+			ec.output.Info("- Original .git directory backed up to .git.backup")
+			ec.output.Info("")
+			ec.output.Info("Next steps:")
+			ec.output.Info("- Run 'ivaldi status' to see your current workspace")
+			ec.output.Info("- Use 'ivaldi timeline' to explore converted branches")
+			ec.output.Info("- Continue development with Ivaldi's enhanced commands")
+
 			return nil
 		},
 	}
@@ -335,7 +462,7 @@ Examples:
 					})
 					return err
 				}
-				
+
 				// Count what was gathered
 				ws := ec.currentRepo.GetWorkspace()
 				gatheredCount := len(ws.AnvilFiles)
@@ -355,7 +482,7 @@ Examples:
 					})
 					return err
 				}
-				
+
 				// Count what was gathered
 				ws := ec.currentRepo.GetWorkspace()
 				gatheredCount := len(ws.AnvilFiles)
@@ -366,14 +493,14 @@ Examples:
 					return nil
 				}
 			}
-			
+
 			return nil
 		},
 	}
 
 	cmd.Flags().BoolP("interactive", "i", false, "Interactive file selection")
 	cmd.Flags().BoolP("all", "a", false, "Gather all files (including untracked)")
-	
+
 	return cmd
 }
 
@@ -407,7 +534,7 @@ Examples:
 			// If no message provided, auto-generate using semantic analysis
 			if message == "" {
 				ec.output.Info("Analyzing changes for semantic commit message...")
-				
+
 				generator := semantic.NewCommitMessageGenerator()
 				generated, err := generator.Generate(ec.currentRepo.GetWorkspace())
 				if err != nil {
@@ -418,7 +545,7 @@ Examples:
 					message = generated.Primary
 					ec.output.Success(fmt.Sprintf("Generated: %s", message))
 					ec.output.Info(fmt.Sprintf("Confidence: %.1f%% (%s)", generated.Confidence*100, generated.Type.Description))
-					
+
 					// Show alternatives
 					if len(generated.Alternative) > 0 {
 						ec.output.Info("Alternatives:")
@@ -445,7 +572,7 @@ Examples:
 			ec.output.Success(fmt.Sprintf("Sealed as: %s", seal.Name))
 			ec.output.Info(fmt.Sprintf("Message: %s", seal.Message))
 			ec.output.Info(fmt.Sprintf("Iteration: #%d", seal.Iteration))
-			
+
 			return nil
 		},
 	}
@@ -490,7 +617,7 @@ Examples:
 					ec.output.Info(fmt.Sprintf("    %s", timeline))
 				}
 			}
-			
+
 			return nil
 		},
 	}
@@ -501,7 +628,7 @@ Examples:
 	cmd.AddCommand(ec.createTimelineListCommand())
 	cmd.AddCommand(ec.createTimelineDeleteCommand())
 	cmd.AddCommand(ec.createTimelineRenameCommand())
-	
+
 	return cmd
 }
 
@@ -532,7 +659,7 @@ Examples:
 			}
 
 			reference := strings.Join(args, " ")
-			
+
 			// Remove common words for natural parsing
 			reference = strings.TrimPrefix(reference, "to ")
 			reference = strings.TrimPrefix(reference, "back ")
@@ -549,7 +676,7 @@ Examples:
 			}
 
 			ec.output.Success(fmt.Sprintf("Jumped to: %s", reference))
-			
+
 			return nil
 		},
 	}
@@ -593,17 +720,17 @@ func (ec *EnhancedCLI) createTimelineSwitchCommand() *cobra.Command {
 
 			targetTimeline := args[0]
 			currentTimeline := ec.currentRepo.GetCurrentTimeline()
-			
+
 			// Check if already on target timeline
 			if currentTimeline == targetTimeline {
 				ec.output.Info(fmt.Sprintf("Already on timeline '%s'", targetTimeline))
 				return nil
 			}
-			
+
 			// Check for uncommitted changes before switching
 			hasChanges := ec.currentRepo.GetWorkspace().HasUncommittedChanges()
 			hasStaged := len(ec.currentRepo.GetWorkspace().AnvilFiles) > 0
-			
+
 			if hasChanges || hasStaged {
 				ec.output.Info("Auto-shelving uncommitted work...")
 				if hasStaged {
@@ -635,11 +762,11 @@ func (ec *EnhancedCLI) createTimelineSwitchCommand() *cobra.Command {
 			}
 
 			ec.output.Success(fmt.Sprintf("Switched to timeline: %s", targetTimeline))
-			
+
 			if snapshot != nil {
 				ec.output.Info("Work auto-shelved and will restore when you return")
 			}
-			
+
 			// Check if work was restored on the new timeline
 			if hasChanges || hasStaged {
 				newStatus := ec.currentRepo.GetStatus()
@@ -647,7 +774,7 @@ func (ec *EnhancedCLI) createTimelineSwitchCommand() *cobra.Command {
 					ec.output.Info("Previous work automatically restored on this timeline")
 				}
 			}
-			
+
 			return nil
 		},
 	}
@@ -728,7 +855,7 @@ Examples:
 
 			oldName := args[0]
 			newName, _ := cmd.Flags().GetString("to")
-			
+
 			if newName == "" {
 				ec.output.Error("Missing required --to flag", []string{
 					"Specify the new timeline name",
@@ -746,7 +873,7 @@ Examples:
 					break
 				}
 			}
-			
+
 			if !oldExists {
 				ec.output.Error(fmt.Sprintf("Timeline '%s' does not exist", oldName), []string{
 					"Use: timeline list (to see available timelines)",
@@ -771,7 +898,7 @@ Examples:
 
 			// Perform the rename
 			ec.output.Info(fmt.Sprintf("Renaming timeline '%s' to '%s'...", oldName, newName))
-			
+
 			err := ec.currentRepo.RenameTimeline(oldName, newName)
 			if err != nil {
 				ec.output.Error("Failed to rename timeline", []string{
@@ -784,11 +911,11 @@ Examples:
 
 			// Success messages
 			ec.output.Success(fmt.Sprintf("Timeline renamed: %s → %s", oldName, newName))
-			
+
 			if isCurrentTimeline {
 				ec.output.Info("You are now on the renamed timeline")
 			}
-			
+
 			ec.output.Info("Timeline history and metadata preserved")
 			ec.output.Info("")
 			ec.output.Info("When uploading to remote:")
@@ -802,7 +929,7 @@ Examples:
 
 	cmd.Flags().String("to", "", "New timeline name (required)")
 	cmd.MarkFlagRequired("to")
-	
+
 	return cmd
 }
 
@@ -828,7 +955,7 @@ Examples:
 
 			var oldName string
 			newName, _ := cmd.Flags().GetString("to")
-			
+
 			if newName == "" {
 				ec.output.Error("Missing required --to flag", []string{
 					"Specify the new timeline name",
@@ -856,7 +983,7 @@ Examples:
 					break
 				}
 			}
-			
+
 			if !oldExists {
 				ec.output.Error(fmt.Sprintf("Timeline '%s' does not exist", oldName), []string{
 					"Use: timeline list (to see available timelines)",
@@ -880,7 +1007,7 @@ Examples:
 			if err != nil {
 				ec.output.Error("Failed to rename timeline", []string{
 					"Timeline might not exist",
-					"New name might already be in use", 
+					"New name might already be in use",
 					"Check for file permission issues",
 				})
 				return err
@@ -889,14 +1016,14 @@ Examples:
 			// Success messages
 			ec.output.Success(fmt.Sprintf("Timeline renamed: %s → %s", oldName, newName))
 			ec.output.Info("Timeline history and metadata preserved")
-			
+
 			return nil
 		},
 	}
-	
+
 	cmd.Flags().String("to", "", "New timeline name (required)")
 	cmd.MarkFlagRequired("to")
-	
+
 	return cmd
 }
 
@@ -973,7 +1100,7 @@ Subcommands:
 func (ec *EnhancedCLI) createUploadCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "upload",
-		Short: "Upload to remote repository", 
+		Short: "Upload to remote repository",
 		Long: `Upload the current timeline to the remote repository (like 'git push').
 
 Automatically uploads to origin/main by default. No arguments needed for typical usage.
@@ -1009,7 +1136,7 @@ Examples:
 					break
 				}
 			}
-			
+
 			// Smart upload messaging
 			if portalName == "origin" {
 				if isNewTimeline && branch != "main" {
@@ -1028,19 +1155,19 @@ Examples:
 			err := ec.currentRepo.UploadToPortal(portalName, branch)
 			if err != nil {
 				// Check if it's a branch not found error or similar new timeline scenarios
-				if strings.Contains(err.Error(), "does not match any") || 
-				   strings.Contains(err.Error(), "Reference does not exist") ||
-				   strings.Contains(err.Error(), "Creating new branch") {
+				if strings.Contains(err.Error(), "does not match any") ||
+					strings.Contains(err.Error(), "Reference does not exist") ||
+					strings.Contains(err.Error(), "Creating new branch") {
 					// This is a new timeline - that's fine, the upload should have created it automatically
 					// If we're here, there might be a different issue, so show helpful guidance
 					ec.output.Info(fmt.Sprintf("Creating new timeline '%s' on remote...", branch))
-					
+
 					// Try the upload again - the new logic should handle branch creation
 					err = ec.currentRepo.UploadToPortal(portalName, branch)
 					if err != nil {
 						ec.output.Error("Failed to create new timeline on remote", []string{
 							"Check network connection",
-							"Verify portal URL and credentials", 
+							"Verify portal URL and credentials",
 							"Ensure you have push permissions to the repository",
 							"Make sure the repository exists on remote",
 						})
@@ -1049,7 +1176,7 @@ Examples:
 				} else {
 					ec.output.Error("Failed to upload to portal", []string{
 						"Check network connection",
-						"Verify portal URL and credentials", 
+						"Verify portal URL and credentials",
 						"Ensure repository exists on remote",
 						"Try: portal add origin <url> (if no portal configured)",
 					})
@@ -1063,7 +1190,7 @@ Examples:
 			} else {
 				fmt.Printf("Upload complete: %s/%s\n", portalName, branch)
 			}
-			
+
 			// Show helpful next steps for new timelines
 			if isNewTimeline && branch != "main" {
 				ec.output.Info("New timeline uploaded with automatic upstream tracking")
@@ -1073,7 +1200,7 @@ Examples:
 			return nil
 		},
 	}
-	
+
 	// Add branch flag
 	cmd.Flags().StringP("branch", "b", "", "Branch to upload (defaults to current timeline)")
 	return cmd
@@ -1118,7 +1245,7 @@ Examples:
 			}
 
 			currentTimeline := ec.currentRepo.GetCurrentTimeline()
-			
+
 			ec.output.Info(fmt.Sprintf("Syncing local timeline '%s' with remote timeline '%s' from portal '%s'", localTimeline, remoteBranch, portalName))
 
 			// Step 1: Switch to the target local timeline if different from current
@@ -1134,40 +1261,40 @@ Examples:
 			// Step 2: Handle any uncommitted changes first
 			if ec.currentRepo.GetWorkspace().HasUncommittedChanges() {
 				ec.output.Info("Step 2: Auto-sealing uncommitted changes...")
-				
+
 				// Auto-gather and seal uncommitted changes
 				err := ec.currentRepo.GetWorkspace().Scan()
 				if err != nil {
 					return fmt.Errorf("failed to scan workspace: %v", err)
 				}
-				
+
 				err = ec.currentRepo.Gather([]string{"."})
 				if err != nil {
 					return fmt.Errorf("failed to gather changes: %v", err)
 				}
-				
+
 				_, err = ec.currentRepo.Seal(fmt.Sprintf("Auto-seal before sync with %s", remoteBranch))
 				if err != nil {
 					return fmt.Errorf("failed to seal changes: %v", err)
 				}
-				
+
 				// Force workspace refresh after sealing
 				err = ec.currentRepo.GetWorkspace().Scan()
 				if err != nil {
 					return fmt.Errorf("failed to refresh workspace: %v", err)
 				}
-				
+
 				// Reload the workspace state to ensure it reflects the sealed state
 				err = ec.currentRepo.GetWorkspace().LoadState(ec.currentRepo.GetCurrentTimeline())
 				if err != nil {
 					fmt.Printf("Warning: failed to reload workspace state after sealing: %v\n", err)
 				}
-				
+
 				// Double-check that we no longer have uncommitted changes
 				if ec.currentRepo.GetWorkspace().HasUncommittedChanges() {
 					return fmt.Errorf("workspace still has uncommitted changes after sealing - please check ivaldi status")
 				}
-				
+
 				ec.output.Success("Auto-sealed uncommitted changes")
 			}
 
@@ -1177,13 +1304,13 @@ Examples:
 			if err != nil {
 				ec.output.Error("Failed to sync with remote", []string{
 					"Check network connection",
-					"Verify portal URL and credentials", 
+					"Verify portal URL and credentials",
 					"Ensure remote timeline exists: " + remoteBranch,
 					"Try: portal add " + portalName + " <url> (if portal not configured)",
 				})
 				return err
 			}
-			
+
 			ec.output.Success(fmt.Sprintf("Successfully synced local timeline '%s' with %s/%s!", localTimeline, portalName, remoteBranch))
 			ec.output.Info("Your timeline is now up-to-date with remote changes")
 			ec.output.Info("Next: Continue working or 'ivaldi upload' to push your changes")
@@ -1270,7 +1397,7 @@ The output shows:
 			// Display discovered timelines
 			ec.output.Success(fmt.Sprintf("Found %d remote timeline(s):", len(remoteTimelines)))
 			ec.output.Info("")
-			
+
 			for _, ref := range remoteTimelines {
 				status := "remote only"
 				statusSymbol := "↓"
@@ -1278,7 +1405,7 @@ The output shows:
 					status = "exists locally"
 					statusSymbol = "✓"
 				}
-				
+
 				// Format the output
 				ec.output.Info(fmt.Sprintf("  %s %s (%s)", statusSymbol, ref.Name, status))
 			}
@@ -1312,19 +1439,19 @@ func (ec *EnhancedCLI) createStatusCommand() *cobra.Command {
 			// Show enhanced status with rich output
 			status := ec.currentRepo.GetStatus()
 			ws := ec.currentRepo.GetWorkspace()
-			
+
 			ec.output.Info("=== Workspace Status ===")
 			ec.output.Info("")
 			ec.output.Info(fmt.Sprintf("Timeline: %s", ec.currentRepo.GetCurrentTimeline()))
-			
+
 			if currentName, exists := ec.currentRepo.GetMemorableName(ec.currentRepo.GetCurrentPosition()); exists {
 				ec.output.Info(fmt.Sprintf("Position: %s", currentName))
 			}
 			ec.output.Info("")
-			
+
 			// Check for different types of changes
 			hasChanges := false
-			
+
 			// Files gathered on anvil (staged)
 			if len(status.Staged) > 0 {
 				hasChanges = true
@@ -1346,7 +1473,7 @@ func (ec *EnhancedCLI) createStatusCommand() *cobra.Command {
 				}
 				ec.output.Info("")
 			}
-			
+
 			// Modified files (not staged)
 			if len(status.Modified) > 0 {
 				hasChanges = true
@@ -1367,9 +1494,12 @@ func (ec *EnhancedCLI) createStatusCommand() *cobra.Command {
 				}
 				ec.output.Info("")
 			}
-			
+
 			// Check for untracked files
-			untracked := ec.getUntrackedFiles()
+			untracked, err := ec.getUntrackedFiles()
+			if err != nil {
+				return fmt.Errorf("failed to get untracked files: %w", err)
+			}
 			if len(untracked) > 0 {
 				hasChanges = true
 				ec.output.Info("Untracked files:")
@@ -1378,7 +1508,7 @@ func (ec *EnhancedCLI) createStatusCommand() *cobra.Command {
 				}
 				ec.output.Info("")
 			}
-			
+
 			// Check for ignored files that were attempted to be tracked
 			ignored := ec.getIgnoredFiles()
 			if len(ignored) > 0 {
@@ -1388,20 +1518,20 @@ func (ec *EnhancedCLI) createStatusCommand() *cobra.Command {
 				}
 				ec.output.Info("")
 			}
-			
+
 			// No changes
 			if !hasChanges {
 				ec.output.Success("Workspace is clean - no changes to gather")
 				ec.output.Info("")
 			}
-			
+
 			// Helpful next steps
 			if len(status.Staged) > 0 {
 				ec.output.Info("Next: ivaldi seal \"your message\" (to commit changes)")
 			} else if len(status.Modified) > 0 || len(untracked) > 0 {
 				ec.output.Info("Next: ivaldi gather <files> (to stage changes)")
 			}
-			
+
 			return nil
 		},
 	}
@@ -1419,20 +1549,30 @@ func (ec *EnhancedCLI) getCurrentTimeline() string {
 	return ec.currentRepo.GetCurrentTimeline()
 }
 
-func (ec *EnhancedCLI) getUntrackedFiles() []string {
+func (ec *EnhancedCLI) getUntrackedFiles() ([]string, error) {
 	if ec.currentRepo == nil {
-		return []string{}
+		return []string{}, nil
 	}
-	
+
 	ws := ec.currentRepo.GetWorkspace()
 	var untracked []string
-	
+
+	// Get list of submodule paths to skip
+	submodulePaths, err := workspace.GetSubmodulePaths(ec.currentRepo.Root())
+	if err != nil {
+		return nil, fmt.Errorf("failed to get submodule paths for repository at %s: %w", ec.currentRepo.Root(), err)
+	}
+	submoduleMap := make(map[string]bool)
+	for _, path := range submodulePaths {
+		submoduleMap[filepath.FromSlash(path)] = true
+	}
+
 	// Walk through directory and find files not in workspace
-	err := filepath.Walk(ec.currentRepo.Root(), func(path string, info os.FileInfo, err error) error {
+	err = filepath.Walk(ec.currentRepo.Root(), func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil // Skip errors
 		}
-		
+
 		// Skip .ivaldi directory and its contents
 		if strings.Contains(path, ".ivaldi") {
 			if info.IsDir() {
@@ -1440,18 +1580,28 @@ func (ec *EnhancedCLI) getUntrackedFiles() []string {
 			}
 			return nil
 		}
-		
-		// Skip directories
-		if info.IsDir() {
-			return nil
-		}
-		
-		// Get relative path
+
+		// Get relative path first to check for submodules
 		relPath, err := filepath.Rel(ec.currentRepo.Root(), path)
 		if err != nil {
 			return nil
 		}
-		
+
+		// Skip submodule directories
+		if info.IsDir() {
+			if submoduleMap[relPath] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// Skip files inside submodules
+		for submodulePath := range submoduleMap {
+			if strings.HasPrefix(relPath, submodulePath+string(filepath.Separator)) {
+				return nil
+			}
+		}
+
 		// Skip if already tracked or ignored
 		if _, tracked := ws.Files[relPath]; tracked {
 			return nil
@@ -1459,32 +1609,32 @@ func (ec *EnhancedCLI) getUntrackedFiles() []string {
 		if ws.ShouldIgnore(relPath) {
 			return nil
 		}
-		
+
 		untracked = append(untracked, relPath)
 		return nil
 	})
-	
+
 	if err != nil {
-		return []string{}
+		return nil, fmt.Errorf("failed to walk directory tree: %w", err)
 	}
-	
-	return untracked
+
+	return untracked, nil
 }
 
 func (ec *EnhancedCLI) getIgnoredFiles() []string {
 	if ec.currentRepo == nil {
 		return []string{}
 	}
-	
+
 	ws := ec.currentRepo.GetWorkspace()
 	var ignored []string
-	
+
 	// Check if there are common ignored files present
 	commonIgnored := []string{
 		"build/", "node_modules/", "target/", "dist/",
 		"*.log", "*.tmp", ".DS_Store", "CLAUDE.md", "cleanup.sh",
 	}
-	
+
 	for _, pattern := range commonIgnored {
 		if strings.HasSuffix(pattern, "/") {
 			// Directory pattern
@@ -1516,10 +1666,9 @@ func (ec *EnhancedCLI) getIgnoredFiles() []string {
 			}
 		}
 	}
-	
+
 	return ignored
 }
-
 
 func (ec *EnhancedCLI) createLogCommand() *cobra.Command {
 	return &cobra.Command{
@@ -1532,10 +1681,10 @@ func (ec *EnhancedCLI) createLogCommand() *cobra.Command {
 
 			// Show enhanced log with memorable names
 			seals := ec.currentRepo.GetHistory(10) // Last 10 seals
-			
+
 			ec.output.Info("Timeline History:")
 			ec.output.Info("")
-			
+
 			for _, seal := range seals {
 				if name, exists := ec.currentRepo.GetMemorableName(seal.Hash); exists {
 					ec.output.Info(fmt.Sprintf("%s (#%d)", name, seal.Iteration))
@@ -1546,7 +1695,7 @@ func (ec *EnhancedCLI) createLogCommand() *cobra.Command {
 				ec.output.Info(fmt.Sprintf("   %s - %s", seal.Author.Name, seal.Timestamp.Format("2006-01-02 15:04")))
 				ec.output.Info("")
 			}
-			
+
 			return nil
 		},
 	}
@@ -1704,27 +1853,92 @@ Subcommands:
 }
 
 func (ec *EnhancedCLI) createMeshCommand() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "mesh",
-		Short: "Local peer-to-peer networking",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			ec.output.Info("P2P networking")
-			ec.output.Info("(Implementation coming soon)")
-			return nil
-		},
+		Short: "Mesh networking for automatic peer discovery and multi-hop routing",
+		Long: `Mesh networking provides true mesh connectivity on top of P2P.
+
+Unlike simple P2P that requires manual connections, mesh networking automatically:
+- Discovers all peers in the network through gossip protocols
+- Establishes full connectivity where every node can reach every other node
+- Routes messages through intermediate peers when direct connections aren't possible
+- Self-heals when nodes join or leave the network
+- Maintains topology awareness for efficient routing
+
+Commands:
+  start                    Start mesh networking
+  stop                     Stop mesh networking  
+  status                   Show mesh status and topology
+  join <address:port>      Join mesh via bootstrap peer
+  topology                 Show network topology
+  route <peer-id>          Show route to specific peer
+  ping <peer-id>           Ping peer via mesh routing
+  peers                    List all mesh peers
+  heal                     Manually trigger network healing
+  refresh                  Refresh topology information
+
+Examples:
+  ivaldi mesh start                        # Start mesh networking
+  ivaldi mesh join 192.168.1.100:9090     # Join mesh via bootstrap
+  ivaldi mesh topology                     # View network topology
+  ivaldi mesh ping abc123def               # Ping peer through mesh`,
 	}
+
+	cmd.AddCommand(ec.createMeshStartCommand())
+	cmd.AddCommand(ec.createMeshStopCommand())
+	cmd.AddCommand(ec.createMeshStatusCommand())
+	cmd.AddCommand(ec.createMeshJoinCommand())
+	cmd.AddCommand(ec.createMeshTopologyCommand())
+	cmd.AddCommand(ec.createMeshRouteCommand())
+	cmd.AddCommand(ec.createMeshPingCommand())
+	cmd.AddCommand(ec.createMeshPeersCommand())
+	cmd.AddCommand(ec.createMeshHealCommand())
+	cmd.AddCommand(ec.createMeshRefreshCommand())
+
+	return cmd
 }
 
 func (ec *EnhancedCLI) createCollaborateCommand() *cobra.Command {
-	return &cobra.Command{
+	// Create the same command structure as P2P but with collaborate-friendly naming
+	cmd := &cobra.Command{
 		Use:   "collaborate",
 		Short: "Real-time collaboration session",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			ec.output.Info("Real-time collaboration")
-			ec.output.Info("(Implementation coming soon)")
-			return nil
-		},
+		Long: `Start real-time collaboration with other Ivaldi repositories.
+
+This is an alias for the P2P system that enables direct synchronization 
+between repositories without needing a central server, perfect for:
+- Real-time collaboration on local networks
+- Offline sync when internet is unavailable  
+- Faster transfers between nearby peers
+- Private networks for sensitive projects
+
+Commands:
+  start                    Start collaboration network
+  stop                     Stop collaboration network
+  status                   Show collaboration status and connections
+  connect <address:port>   Connect to a collaborator
+  peers                    List all connected collaborators
+  discover                 Show discovered collaborators on network
+  sync [peer-id]           Sync with specific collaborator or all
+  config                   View or update collaboration configuration
+
+Examples:
+  ivaldi collaborate start                    # Start collaboration
+  ivaldi collaborate connect 192.168.1.100:9090  # Connect to collaborator
+  ivaldi collaborate sync                     # Sync with all collaborators`,
 	}
+
+	// Add all the same subcommands as P2P
+	cmd.AddCommand(ec.createP2PStartCommand())
+	cmd.AddCommand(ec.createP2PStopCommand())
+	cmd.AddCommand(ec.createP2PStatusCommand())
+	cmd.AddCommand(ec.createP2PConnectCommand())
+	cmd.AddCommand(ec.createP2PPeersCommand())
+	cmd.AddCommand(ec.createP2PDiscoverCommand())
+	cmd.AddCommand(ec.createP2PSyncCommand())
+	cmd.AddCommand(ec.createP2PConfigCommand())
+
+	return cmd
 }
 
 func (ec *EnhancedCLI) createVersionCommand() *cobra.Command {
@@ -1768,7 +1982,7 @@ Examples:
 			// Interactive setup
 			ec.output.Info("Starting interactive global configuration...")
 			ec.output.Info("This will be stored at ~/.ivaldi/config.json for all repositories")
-			
+
 			if err := configMgr.InteractiveSetup(); err != nil {
 				ec.output.Error("Configuration failed", []string{
 					err.Error(),
@@ -1810,10 +2024,10 @@ Examples:
 			}
 
 			squashAll, _ := cmd.Flags().GetBool("all")
-			
+
 			var count int
 			var message string
-			
+
 			if squashAll {
 				count = -1 // Special value for all commits
 				if len(args) > 0 {
@@ -1834,7 +2048,7 @@ Examples:
 						return fmt.Errorf("count must be at least 2")
 					}
 				}
-				
+
 				if len(args) > 1 {
 					message = args[1]
 				} else {
@@ -1843,13 +2057,13 @@ Examples:
 			}
 
 			ec.output.Info(fmt.Sprintf("Squashing commits with message: %s", message))
-			
+
 			// Get portal info
 			portals := ec.currentRepo.ListPortals()
 			if len(portals) == 0 {
 				return fmt.Errorf("no portals configured, use 'ivaldi portal add' first")
 			}
-			
+
 			portalName := "origin"
 			portalURL, exists := portals[portalName]
 			if !exists {
@@ -1889,13 +2103,13 @@ func (ec *EnhancedCLI) performSquash(portalURL string, count int, message string
 	if len(urlParts) < 2 {
 		return fmt.Errorf("invalid portal URL format: %s", portalURL)
 	}
-	
+
 	owner := urlParts[len(urlParts)-2]
 	repo := urlParts[len(urlParts)-1]
-	
+
 	// Get network manager
 	configMgr := config.NewConfigManager(ec.currentRepo.Root())
-	
+
 	// Create a single commit with all current files
 	return ec.createCleanCommit(owner, repo, message, configMgr)
 }
@@ -1907,49 +2121,49 @@ func (ec *EnhancedCLI) createCleanCommit(owner, repo, message string, configMgr 
 		fmt.Printf("Warning: failed to load ignore patterns: %v\n", err)
 		ignorePatterns = []string{}
 	}
-	
+
 	// Collect all files in the repository
 	var filesToUpload []FileToUpload
 	err = filepath.Walk(ec.currentRepo.Root(), func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		
+
 		if info.IsDir() {
 			return nil
 		}
-		
+
 		relPath, err := filepath.Rel(ec.currentRepo.Root(), path)
 		if err != nil {
 			return err
 		}
-		
+
 		relPath = strings.ReplaceAll(relPath, "\\", "/")
-		
+
 		if ec.shouldIgnoreFile(relPath, ignorePatterns) {
 			return nil
 		}
-		
+
 		content, err := os.ReadFile(path)
 		if err != nil {
 			fmt.Printf("Skipping %s: %v\n", relPath, err)
 			return nil
 		}
-		
+
 		filesToUpload = append(filesToUpload, FileToUpload{
 			Path:    relPath,
 			Content: content,
 		})
-		
+
 		return nil
 	})
-	
+
 	if err != nil {
 		return fmt.Errorf("failed to collect files: %v", err)
 	}
-	
+
 	fmt.Printf("Creating clean commit with %d files...\n", len(filesToUpload))
-	
+
 	// Create the commit using GitHub API
 	return ec.createGitHubCommit(owner, repo, filesToUpload, message, configMgr, true) // true for force push
 }
@@ -1968,7 +2182,7 @@ func (ec *EnhancedCLI) loadIgnorePatterns() ([]string, error) {
 		}
 		return nil, err
 	}
-	
+
 	var patterns []string
 	lines := strings.Split(string(content), "\n")
 	for _, line := range lines {
@@ -1977,7 +2191,7 @@ func (ec *EnhancedCLI) loadIgnorePatterns() ([]string, error) {
 			patterns = append(patterns, line)
 		}
 	}
-	
+
 	return patterns, nil
 }
 
@@ -1985,15 +2199,15 @@ func (ec *EnhancedCLI) shouldIgnoreFile(filePath string, patterns []string) bool
 	builtInIgnores := []string{
 		".ivaldi/", ".git/", "build/", "*.tmp", "*.temp", "*~", ".DS_Store", "*.log", "*.bak",
 	}
-	
+
 	allPatterns := append(patterns, builtInIgnores...)
-	
+
 	for _, pattern := range allPatterns {
 		if ec.matchesPattern(filePath, pattern) {
 			return true
 		}
 	}
-	
+
 	return false
 }
 
@@ -2002,18 +2216,18 @@ func (ec *EnhancedCLI) matchesPattern(filePath, pattern string) bool {
 	pattern = strings.ReplaceAll(pattern, ".", "\\.")
 	pattern = strings.ReplaceAll(pattern, "*", ".*")
 	pattern = strings.ReplaceAll(pattern, "?", ".")
-	
+
 	if strings.HasSuffix(pattern, "/") {
 		pattern = pattern + ".*"
 	}
-	
+
 	pattern = "^" + pattern + "$"
-	
+
 	matched, err := regexp.MatchString(pattern, filePath)
 	if err != nil {
 		return strings.Contains(filePath, strings.ReplaceAll(pattern, ".*", ""))
 	}
-	
+
 	return matched
 }
 
@@ -2022,9 +2236,9 @@ func (ec *EnhancedCLI) createGitHubCommit(owner, repo string, files []FileToUplo
 	if err != nil {
 		return fmt.Errorf("failed to get GitHub token: %v", err)
 	}
-	
+
 	client := &http.Client{Timeout: 30 * time.Second}
-	
+
 	// Create tree with all files
 	treeItems := make([]map[string]interface{}, 0, len(files))
 	for _, file := range files {
@@ -2035,61 +2249,61 @@ func (ec *EnhancedCLI) createGitHubCommit(owner, repo string, files []FileToUplo
 			"content": string(file.Content),
 		})
 	}
-	
+
 	tree := map[string]interface{}{
 		"tree": treeItems,
 	}
-	
+
 	treeData, err := json.Marshal(tree)
 	if err != nil {
 		return fmt.Errorf("failed to marshal tree: %v", err)
 	}
-	
+
 	// Create tree
-	treeSHA, err := ec.makeGitHubAPICall(client, token, "POST", 
-		fmt.Sprintf("https://api.github.com/repos/%s/%s/git/trees", owner, repo), 
+	treeSHA, err := ec.makeGitHubAPICall(client, token, "POST",
+		fmt.Sprintf("https://api.github.com/repos/%s/%s/git/trees", owner, repo),
 		treeData)
 	if err != nil {
 		return fmt.Errorf("failed to create tree: %v", err)
 	}
-	
+
 	// Create commit (no parents for clean history)
 	commit := map[string]interface{}{
 		"message": message,
 		"tree":    treeSHA,
 		"parents": []string{}, // Empty parents for clean history
 	}
-	
+
 	commitData, err := json.Marshal(commit)
 	if err != nil {
 		return fmt.Errorf("failed to marshal commit: %v", err)
 	}
-	
+
 	commitSHA, err := ec.makeGitHubAPICall(client, token, "POST",
 		fmt.Sprintf("https://api.github.com/repos/%s/%s/git/commits", owner, repo),
 		commitData)
 	if err != nil {
 		return fmt.Errorf("failed to create commit: %v", err)
 	}
-	
+
 	// Force update the main branch
 	updateData := map[string]interface{}{
 		"sha":   commitSHA,
 		"force": forcePush,
 	}
-	
+
 	updateJSON, err := json.Marshal(updateData)
 	if err != nil {
 		return fmt.Errorf("failed to marshal update: %v", err)
 	}
-	
+
 	_, err = ec.makeGitHubAPICall(client, token, "PATCH",
 		fmt.Sprintf("https://api.github.com/repos/%s/%s/git/refs/heads/main", owner, repo),
 		updateJSON)
 	if err != nil {
 		return fmt.Errorf("failed to update branch: %v", err)
 	}
-	
+
 	fmt.Printf("Successfully created clean commit: %s\n", commitSHA[:8])
 	return nil
 }
@@ -2097,50 +2311,50 @@ func (ec *EnhancedCLI) createGitHubCommit(owner, repo string, files []FileToUplo
 func (ec *EnhancedCLI) makeGitHubAPICall(client *http.Client, token, method, url string, data []byte) (string, error) {
 	var req *http.Request
 	var err error
-	
+
 	if data != nil {
 		req, err = http.NewRequest(method, url, bytes.NewBuffer(data))
 	} else {
 		req, err = http.NewRequest(method, url, nil)
 	}
-	
+
 	if err != nil {
 		return "", err
 	}
-	
+
 	req.Header.Set("Authorization", "token "+token)
 	req.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
 	req.Header.Set("Content-Type", "application/json")
-	
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-	
+
 	body, _ := io.ReadAll(resp.Body)
-	
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body))
 	}
-	
+
 	var result map[string]interface{}
 	if err := json.Unmarshal(body, &result); err != nil {
 		return "", fmt.Errorf("failed to parse response: %v", err)
 	}
-	
+
 	// Debug: print the response
 	fmt.Printf("API Response: %+v\n", result)
-	
+
 	if sha, ok := result["sha"].(string); ok {
 		return sha, nil
 	}
-	
+
 	// For PATCH operations, sometimes the response is different
 	if method == "PATCH" {
 		return "success", nil // PATCH operations may not return SHA
 	}
-	
+
 	return "", fmt.Errorf("no SHA in response: %+v", result)
 }
 
@@ -2152,36 +2366,36 @@ func (ec *EnhancedCLI) showCurrentConfig(configMgr *config.ConfigManager) error 
 
 	ec.output.Info("=== Current Configuration ===")
 	ec.output.Info("")
-	
+
 	if creds.UserName != "" {
 		ec.output.Info(fmt.Sprintf("User Name: %s", creds.UserName))
 	} else {
 		ec.output.Info("User Name: not set")
 	}
-	
+
 	if creds.UserEmail != "" {
 		ec.output.Info(fmt.Sprintf("User Email: %s", creds.UserEmail))
 	} else {
 		ec.output.Info("User Email: not set")
 	}
-	
+
 	ec.output.Info("")
-	
+
 	if creds.GitHubToken != "" {
 		ec.output.Info(fmt.Sprintf("GitHub Token: %s", maskToken(creds.GitHubToken)))
 	} else {
 		ec.output.Info("GitHub Token: not set")
 	}
-	
+
 	if creds.GitLabToken != "" {
 		ec.output.Info(fmt.Sprintf("GitLab Token: %s", maskToken(creds.GitLabToken)))
 	} else {
 		ec.output.Info("GitLab Token: not set")
 	}
-	
+
 	ec.output.Info("")
 	ec.output.Info("Run 'ivaldi config' to update configuration")
-	
+
 	return nil
 }
 
@@ -2252,7 +2466,7 @@ func findRepositoryRoot(path string) string {
 		if _, err := os.Stat(ivaldiPath); err == nil {
 			return current
 		}
-		
+
 		parent := filepath.Dir(current)
 		if parent == current {
 			break // Reached root
@@ -2287,7 +2501,7 @@ func (ec *EnhancedCLI) handleSearch(query string) error {
 	results, err := searchMgr.Search(query)
 	if err != nil {
 		ec.output.Warning(fmt.Sprintf("Search failed: %v", err))
-		
+
 		// Show suggestions
 		suggestions := searchMgr.SearchSuggestions()
 		ec.output.Info("Try these search examples:")
@@ -2307,26 +2521,26 @@ func (ec *EnhancedCLI) handleSearch(query string) error {
 	}
 
 	ec.output.Success(fmt.Sprintf("Found %d result(s):", len(results)))
-	
+
 	for i, result := range results {
 		if i >= 10 { // Limit to 10 results
 			ec.output.Info(fmt.Sprintf("... and %d more results", len(results)-10))
 			break
 		}
-		
+
 		// Display seal information
 		ec.output.Info("")
 		ec.output.Info(fmt.Sprintf("  %s (#%d)", result.Seal.Name, result.Seal.Iteration))
 		ec.output.Info(fmt.Sprintf("    %s", result.Seal.Message))
-		ec.output.Info(fmt.Sprintf("    %s - %s", 
-			result.Seal.Author.Name, 
+		ec.output.Info(fmt.Sprintf("    %s - %s",
+			result.Seal.Author.Name,
 			result.Seal.Timestamp.Format("2006-01-02 15:04")))
-		
+
 		// Show what matched
 		if len(result.Matches) > 0 {
 			ec.output.Info(fmt.Sprintf("    Matched: %s", strings.Join(result.Matches, ", ")))
 		}
-		
+
 		// Show relevance score
 		if result.Score > 0 {
 			scorePercent := int(result.Score * 100)
@@ -2431,7 +2645,7 @@ func (ec *EnhancedCLI) handleFuse(sourceTimeline, strategyStr, message string, d
 
 	ec.output.Info(fmt.Sprintf("Fusing timeline '%s' into current", sourceTimeline))
 	ec.output.Info(fmt.Sprintf("Strategy: %s", strategyStr))
-	
+
 	if dryRun {
 		ec.output.Info("DRY RUN - No changes will be made")
 	}
@@ -2442,7 +2656,7 @@ func (ec *EnhancedCLI) handleFuse(sourceTimeline, strategyStr, message string, d
 
 	// Create fuse manager with repository components
 	fuseMgr := fuse.NewFuseManager(
-		ec.currentRepo.GetStorage(), 
+		ec.currentRepo.GetStorage(),
 		ec.currentRepo, // Repository implements TimelineManager interface
 		ec.currentRepo, // Repository implements WorkspaceManager interface
 	)
@@ -2461,7 +2675,7 @@ func (ec *EnhancedCLI) handleFuse(sourceTimeline, strategyStr, message string, d
 	result, err := fuseMgr.Fuse(opts)
 	if err != nil {
 		ec.output.Warning(fmt.Sprintf("Fuse failed: %v", err))
-		
+
 		// Show helpful suggestions
 		ec.output.Info("Troubleshooting:")
 		ec.output.Info("  - Check that source timeline exists: timeline list")
@@ -2480,7 +2694,7 @@ func (ec *EnhancedCLI) handleFuse(sourceTimeline, strategyStr, message string, d
 	}
 
 	ec.output.Info(fmt.Sprintf("  Strategy: %s", ec.formatFuseStrategy(result.Strategy)))
-	
+
 	if result.MergeCommit != nil {
 		ec.output.Info(fmt.Sprintf("  Merge commit: %s - %s", result.MergeCommit.Name, result.MergeCommit.Message))
 	}
@@ -2592,7 +2806,7 @@ func (ec *EnhancedCLI) createPortalSyncCommand() *cobra.Command {
 			}
 
 			ec.output.Info(fmt.Sprintf("Syncing with portal: %s", portalName))
-			
+
 			err := ec.currentRepo.Push(portalName)
 			if err != nil {
 				ec.output.Error("Failed to sync with portal", []string{
@@ -2631,7 +2845,7 @@ func (ec *EnhancedCLI) createPortalPushCommand() *cobra.Command {
 			if branch != "" {
 				ec.output.Info(fmt.Sprintf("Target branch: %s", branch))
 			}
-			
+
 			err := ec.currentRepo.PushToBranch(portalName, branch, setUpstream)
 			if err != nil {
 				ec.output.Error("Failed to push to portal", []string{
@@ -2675,7 +2889,7 @@ func (ec *EnhancedCLI) createPortalPullCommand() *cobra.Command {
 			if branch != "" {
 				ec.output.Info(fmt.Sprintf("Source branch: %s", branch))
 			}
-			
+
 			err := ec.currentRepo.PullFromBranch(portalName, branch)
 			if err != nil {
 				ec.output.Error("Failed to pull from portal", []string{
@@ -2809,7 +3023,7 @@ Examples:
 			// Get current timeline and position from Ivaldi
 			currentTimeline := ec.currentRepo.GetCurrentTimeline()
 			currentPosition := ec.currentRepo.GetCurrentPosition()
-			
+
 			// Get memorable name if available
 			memorableName := "unknown"
 			if name, exists := ec.currentRepo.GetMemorableName(currentPosition); exists {
@@ -2819,7 +3033,7 @@ Examples:
 			ec.output.Info("Current Location:")
 			ec.output.Info(fmt.Sprintf("  Timeline: %s", currentTimeline))
 			ec.output.Info(fmt.Sprintf("  Position: %s", memorableName))
-			
+
 			// Show portal tracking info
 			portals := ec.currentRepo.ListPortals()
 			if len(portals) > 0 {
@@ -2933,7 +3147,7 @@ This replaces 'git diff' with human-friendly change visualization.`,
 
 			ec.output.Info("Analyzing changes...")
 
-			// Get current workspace status  
+			// Get current workspace status
 			status := ec.currentRepo.GetStatus()
 			_ = ec.currentRepo.GetWorkspace() // workspace for future use
 
@@ -2959,7 +3173,7 @@ This replaces 'git diff' with human-friendly change visualization.`,
 				ec.output.Info("Modified files:")
 				for _, file := range status.Modified {
 					ec.output.Info(fmt.Sprintf("  ~ %s", file))
-					
+
 					// Try to show file diff using git (since we have git compatibility)
 					diffCmd := exec.Command("git", "diff", file)
 					diffCmd.Dir = ec.currentRepo.Root()
@@ -2988,7 +3202,7 @@ This replaces 'git diff' with human-friendly change visualization.`,
 			// Show summary
 			totalChanges := len(status.Modified) + len(status.Staged)
 			ec.output.Info(fmt.Sprintf("Summary: %d files changed", totalChanges))
-			
+
 			if len(status.Staged) > 0 {
 				ec.output.Info("Next step: ivaldi seal \"<message>\" to commit staged changes")
 			} else if len(status.Modified) > 0 {
@@ -3146,11 +3360,11 @@ This replaces complex 'git rm' workflows with intuitive file removal.`,
 			} else {
 				ec.output.Info("Files removed from filesystem and staged for removal")
 			}
-			
+
 			if excludeAfter {
 				ec.output.Info("Files also added to .ivaldiignore to prevent re-tracking")
 			}
-			
+
 			ec.output.Info("")
 			ec.output.Info("Next step: ivaldi seal \"remove unused files\" to commit removal")
 
@@ -3187,7 +3401,7 @@ perfect for starting development without historical complexity.`,
 		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			url := args[0]
-			
+
 			// Determine destination directory
 			dest := ""
 			if len(args) > 1 {
@@ -3243,6 +3457,639 @@ perfect for starting development without historical complexity.`,
 	}
 
 	return cmd
+}
+
+// Create P2P command for peer-to-peer collaboration
+func (ec *EnhancedCLI) createP2PCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "p2p",
+		Short: "Peer-to-peer collaboration and sync",
+		Long: `Manage peer-to-peer (P2P) connections for direct collaboration.
+
+P2P allows direct synchronization between Ivaldi repositories without
+needing a central server, enabling:
+- Real-time collaboration on local networks
+- Offline sync when internet is unavailable  
+- Faster transfers between nearby peers
+- Private networks for sensitive projects
+
+Commands:
+  start                    Start P2P network
+  stop                     Stop P2P network
+  status                   Show P2P status and connections
+  connect <address:port>   Connect to a specific peer
+  peers                    List all connected peers
+  discover                 Show discovered peers on network
+  sync [peer-id]           Sync with specific peer or all peers
+  config                   View or update P2P configuration
+
+Examples:
+  ivaldi p2p start                    # Start P2P networking
+  ivaldi p2p connect 192.168.1.100:9090  # Connect to peer
+  ivaldi p2p sync                     # Sync with all peers
+  ivaldi p2p sync abc123def            # Sync with specific peer
+  ivaldi p2p config --auto-sync=true  # Enable automatic sync`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				status := ec.currentRepo.GetP2PStatus()
+				ec.showP2PStatus(status)
+				return nil
+			}
+			return fmt.Errorf("unknown P2P subcommand: %s", args[0])
+		},
+	}
+
+	// Add subcommands
+	cmd.AddCommand(ec.createP2PStartCommand())
+	cmd.AddCommand(ec.createP2PStopCommand())
+	cmd.AddCommand(ec.createP2PStatusCommand())
+	cmd.AddCommand(ec.createP2PConnectCommand())
+	cmd.AddCommand(ec.createP2PPeersCommand())
+	cmd.AddCommand(ec.createP2PDiscoverCommand())
+	cmd.AddCommand(ec.createP2PSyncCommand())
+	cmd.AddCommand(ec.createP2PConfigCommand())
+
+	return cmd
+}
+
+// Create P2P start command
+func (ec *EnhancedCLI) createP2PStartCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "start",
+		Short: "Start P2P network",
+		Long:  "Start the peer-to-peer network for this repository, enabling discovery and sync with other peers.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			daemon, _ := cmd.Flags().GetBool("daemon")
+
+			if ec.currentRepo.IsP2PRunning() {
+				ec.output.Info("P2P network is already running")
+				return nil
+			}
+
+			ec.output.Info("Starting P2P network...")
+			if err := ec.currentRepo.StartP2P(); err != nil {
+				ec.output.Error("Failed to start P2P network", []string{
+					"Check if port is already in use",
+					"Verify network configuration",
+					"Try: p2p config to check settings",
+				})
+				return err
+			}
+
+			config := ec.currentRepo.GetP2PConfig()
+			ec.output.Success("P2P network started successfully!")
+			ec.output.Info(fmt.Sprintf("Listening on port: %d", config.Port))
+			ec.output.Info(fmt.Sprintf("Discovery port: %d", config.DiscoveryPort))
+			if config.AutoSyncEnabled {
+				ec.output.Info(fmt.Sprintf("Auto-sync enabled (every %v)", config.SyncInterval))
+			}
+			ec.output.Info("Other Ivaldi repositories on the network can now discover and connect to this peer")
+
+			// If daemon mode, keep running
+			if daemon {
+				ec.output.Info("Running in daemon mode. Press Ctrl+C to stop.")
+
+				// Set up signal handling for graceful shutdown
+				sigChan := make(chan os.Signal, 1)
+				signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+				// Wait for signal
+				<-sigChan
+
+				ec.output.Info("\nStopping P2P network...")
+				if err := ec.currentRepo.StopP2P(); err != nil {
+					ec.output.Error("Failed to stop P2P network", []string{err.Error()})
+				}
+				ec.output.Info("P2P network stopped")
+			}
+
+			return nil
+		},
+	}
+
+	cmd.Flags().BoolP("daemon", "d", false, "Run as daemon (keep process running)")
+	return cmd
+}
+
+// Create P2P stop command
+func (ec *EnhancedCLI) createP2PStopCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "stop",
+		Short: "Stop P2P network",
+		Long:  "Stop the peer-to-peer network, disconnecting from all peers.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !ec.currentRepo.IsP2PRunning() {
+				ec.output.Info("P2P network is not running")
+				return nil
+			}
+
+			ec.output.Info("Stopping P2P network...")
+			if err := ec.currentRepo.StopP2P(); err != nil {
+				ec.output.Error("Failed to stop P2P network", []string{
+					"Check system logs for errors",
+				})
+				return err
+			}
+
+			ec.output.Success("P2P network stopped")
+			return nil
+		},
+	}
+}
+
+// Create P2P status command
+func (ec *EnhancedCLI) createP2PStatusCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "status",
+		Short: "Show P2P status and connections",
+		Long:  "Display current P2P network status, connected peers, and sync information.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			status := ec.currentRepo.GetP2PStatus()
+			ec.showP2PStatus(status)
+			return nil
+		},
+	}
+}
+
+// Create P2P connect command
+func (ec *EnhancedCLI) createP2PConnectCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "connect <address:port>",
+		Short: "Connect to a specific peer",
+		Long:  "Connect to a peer at the specified address and port (e.g., 192.168.1.100:9090).",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !ec.currentRepo.IsP2PRunning() {
+				return fmt.Errorf("P2P network is not running. Start it with: p2p start")
+			}
+
+			peerAddr := args[0]
+			parts := strings.Split(peerAddr, ":")
+			if len(parts) != 2 {
+				return fmt.Errorf("invalid address format. Use: address:port (e.g., 192.168.1.100:9090)")
+			}
+
+			address := parts[0]
+			port, err := strconv.Atoi(parts[1])
+			if err != nil {
+				return fmt.Errorf("invalid port number: %s", parts[1])
+			}
+
+			ec.output.Info(fmt.Sprintf("Connecting to peer: %s", peerAddr))
+			if err := ec.currentRepo.ConnectToPeer(address, port); err != nil {
+				ec.output.Error("Failed to connect to peer", []string{
+					"Check the address and port are correct",
+					"Verify the peer is running and accepting connections",
+					"Ensure network connectivity",
+					"Try: p2p discover to find peers automatically",
+				})
+				return err
+			}
+
+			ec.output.Success(fmt.Sprintf("Successfully connected to peer: %s", peerAddr))
+			return nil
+		},
+	}
+}
+
+// Create P2P peers command
+func (ec *EnhancedCLI) createP2PPeersCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "peers",
+		Short: "List all connected peers",
+		Long:  "Show all currently connected P2P peers and their sync status.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			peers := ec.currentRepo.GetP2PPeers()
+			syncStates := ec.currentRepo.GetP2PSyncState()
+
+			if len(peers) == 0 {
+				ec.output.Info("No connected peers")
+				if !ec.currentRepo.IsP2PRunning() {
+					ec.output.Info("P2P network is not running. Start with: p2p start")
+				} else {
+					ec.output.Info("Try: p2p discover to find peers on the network")
+				}
+				return nil
+			}
+
+			ec.output.Info(fmt.Sprintf("Connected peers (%d):", len(peers)))
+			for _, peer := range peers {
+				syncState := syncStates[peer.ID]
+				lastSync := "never"
+				if syncState != nil && !syncState.LastSync.IsZero() {
+					lastSync = formatTimeSince(syncState.LastSync)
+				}
+
+				ec.output.Info(fmt.Sprintf("  %s", peer.ID))
+				ec.output.Info(fmt.Sprintf("    Address: %s:%d", peer.Address, peer.Port))
+				ec.output.Info(fmt.Sprintf("    Status: %s", peer.Status))
+				ec.output.Info(fmt.Sprintf("    Last sync: %s", lastSync))
+				if syncState != nil {
+					ec.output.Info(fmt.Sprintf("    Conflicts: %d", syncState.ConflictCount))
+				}
+			}
+
+			return nil
+		},
+	}
+}
+
+// Create P2P discover command
+func (ec *EnhancedCLI) createP2PDiscoverCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "discover",
+		Short: "Show discovered peers on network",
+		Long:  "Show all Ivaldi repositories discovered on the local network that can be connected to.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !ec.currentRepo.IsP2PRunning() {
+				return fmt.Errorf("P2P network is not running. Start it with: p2p start")
+			}
+
+			discovered := ec.currentRepo.GetDiscoveredPeers()
+
+			if len(discovered) == 0 {
+				ec.output.Info("No peers discovered on network")
+				ec.output.Info("Make sure other Ivaldi repositories are running P2P")
+				return nil
+			}
+
+			ec.output.Info(fmt.Sprintf("Discovered peers (%d):", len(discovered)))
+			for _, peer := range discovered {
+				ec.output.Info(fmt.Sprintf("  %s", peer.NodeID))
+				ec.output.Info(fmt.Sprintf("    Address: %s:%d", peer.Address, peer.Port))
+				ec.output.Info(fmt.Sprintf("    Last seen: %s", formatTimeSince(peer.LastSeen)))
+				if len(peer.Repositories) > 0 {
+					ec.output.Info(fmt.Sprintf("    Repositories: %v", peer.Repositories))
+				}
+				ec.output.Info(fmt.Sprintf("    Connect with: p2p connect %s:%d", peer.Address, peer.Port))
+			}
+
+			return nil
+		},
+	}
+}
+
+// Create P2P sync command
+func (ec *EnhancedCLI) createP2PSyncCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "sync [peer-id]",
+		Short: "Sync with specific peer or all peers",
+		Long: `Synchronize timelines with P2P peers.
+
+Without arguments, syncs with all connected peers.
+With peer-id, syncs only with that specific peer.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !ec.currentRepo.IsP2PRunning() {
+				return fmt.Errorf("P2P network is not running. Start it with: p2p start")
+			}
+
+			if len(args) == 0 {
+				// Sync with all peers
+				ec.output.Info("Syncing with all connected peers...")
+				if err := ec.currentRepo.SyncWithAllP2PPeers(); err != nil {
+					ec.output.Error("Failed to sync with peers", []string{
+						"Check network connectivity",
+						"Verify peers are still connected: p2p peers",
+					})
+					return err
+				}
+				ec.output.Success("Sync completed with all peers")
+			} else {
+				// Sync with specific peer
+				peerID := args[0]
+				ec.output.Info(fmt.Sprintf("Syncing with peer: %s", peerID))
+				if err := ec.currentRepo.SyncWithP2PPeer(peerID); err != nil {
+					ec.output.Error("Failed to sync with peer", []string{
+						"Check the peer ID is correct: p2p peers",
+						"Verify peer is still connected",
+						"Check network connectivity",
+					})
+					return err
+				}
+				ec.output.Success(fmt.Sprintf("Sync completed with peer: %s", peerID))
+			}
+
+			return nil
+		},
+	}
+}
+
+// Create P2P config command
+func (ec *EnhancedCLI) createP2PConfigCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "config",
+		Short: "View or update P2P configuration",
+		Long: `View or update P2P network configuration.
+
+Examples:
+  ivaldi p2p config                     # Show current config
+  ivaldi p2p config --auto-sync=true    # Enable auto sync
+  ivaldi p2p config --sync-interval=1m  # Set sync interval`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			config := ec.currentRepo.GetP2PConfig()
+			if config == nil {
+				return fmt.Errorf("P2P configuration not available")
+			}
+
+			// Handle flag updates
+			autoSync, _ := cmd.Flags().GetBool("auto-sync")
+			syncInterval, _ := cmd.Flags().GetString("sync-interval")
+
+			updated := false
+
+			if cmd.Flags().Changed("auto-sync") {
+				if err := ec.currentRepo.EnableP2PAutoSync(autoSync); err != nil {
+					return fmt.Errorf("failed to update auto-sync setting: %v", err)
+				}
+				ec.output.Success(fmt.Sprintf("Auto-sync %s", map[bool]string{true: "enabled", false: "disabled"}[autoSync]))
+				updated = true
+			}
+
+			if cmd.Flags().Changed("sync-interval") {
+				duration, err := time.ParseDuration(syncInterval)
+				if err != nil {
+					return fmt.Errorf("invalid sync interval format: %v", err)
+				}
+				if err := ec.currentRepo.SetP2PSyncInterval(duration); err != nil {
+					return fmt.Errorf("failed to update sync interval: %v", err)
+				}
+				ec.output.Success(fmt.Sprintf("Sync interval set to %s", syncInterval))
+				updated = true
+			}
+
+			if updated {
+				// Reload config after updates
+				config = ec.currentRepo.GetP2PConfig()
+			}
+
+			// Show current configuration
+			ec.output.Info("P2P Configuration:")
+			ec.output.Info(fmt.Sprintf("  Port: %d", config.Port))
+			ec.output.Info(fmt.Sprintf("  Discovery Port: %d", config.DiscoveryPort))
+			ec.output.Info(fmt.Sprintf("  Max Peers: %d", config.MaxPeers))
+			ec.output.Info(fmt.Sprintf("  Auto-connect: %t", config.EnableAutoConnect))
+			ec.output.Info(fmt.Sprintf("  Auto-sync: %t", config.AutoSyncEnabled))
+			if config.AutoSyncEnabled {
+				ec.output.Info(fmt.Sprintf("  Sync Interval: %v", config.SyncInterval))
+			}
+			ec.output.Info(fmt.Sprintf("  Conflict Strategy: %s", config.ConflictStrategy))
+			ec.output.Info(fmt.Sprintf("  Known Peers: %d", len(config.KnownPeers)))
+
+			return nil
+		},
+	}
+
+	cmd.Flags().Bool("auto-sync", false, "Enable or disable automatic sync")
+	cmd.Flags().String("sync-interval", "", "Set sync interval (e.g., 30s, 1m, 5m)")
+
+	return cmd
+}
+
+// Helper function to show P2P status
+func (ec *EnhancedCLI) showP2PStatus(status *p2p.P2PStatus) {
+	if status.Running {
+		ec.output.Success("P2P Network: RUNNING")
+		ec.output.Info(fmt.Sprintf("Node ID: %s", status.NodeID))
+		ec.output.Info(fmt.Sprintf("Port: %d", status.Port))
+		ec.output.Info(fmt.Sprintf("Connected Peers: %d", status.ConnectedPeers))
+		ec.output.Info(fmt.Sprintf("Discovered Peers: %d", status.DiscoveredPeers))
+
+		autoSyncStatus := "disabled"
+		if status.AutoSyncEnabled {
+			autoSyncStatus = fmt.Sprintf("enabled (every %v)", status.SyncInterval)
+		}
+		ec.output.Info(fmt.Sprintf("Auto-sync: %s", autoSyncStatus))
+
+		if status.TotalSyncs > 0 {
+			ec.output.Info(fmt.Sprintf("Total Syncs: %d", status.TotalSyncs))
+		}
+		if status.ConflictCount > 0 {
+			ec.output.Info(fmt.Sprintf("Conflicts: %d", status.ConflictCount))
+		}
+	} else {
+		ec.output.Info("P2P Network: STOPPED")
+		ec.output.Info("Start with: p2p start")
+	}
+}
+
+// Helper function to format time since
+func formatTimeSince(t time.Time) string {
+	if t.IsZero() {
+		return "never"
+	}
+
+	duration := time.Since(t)
+	if duration < time.Minute {
+		return fmt.Sprintf("%d seconds ago", int(duration.Seconds()))
+	} else if duration < time.Hour {
+		return fmt.Sprintf("%d minutes ago", int(duration.Minutes()))
+	} else if duration < 24*time.Hour {
+		return fmt.Sprintf("%d hours ago", int(duration.Hours()))
+	} else {
+		return fmt.Sprintf("%d days ago", int(duration.Hours()/24))
+	}
+}
+
+// extractRepoNameFromURL extracts the repository name from a Git URL
+func (ec *EnhancedCLI) extractRepoNameFromURL(url string) string {
+	// Remove trailing .git if present
+	url = strings.TrimSuffix(url, ".git")
+
+	// Handle different URL formats
+	if strings.Contains(url, "://") {
+		// HTTPS format: https://github.com/user/repo
+		parts := strings.Split(url, "/")
+		if len(parts) > 0 {
+			return parts[len(parts)-1]
+		}
+	} else if strings.HasPrefix(url, "git@") {
+		// SSH format: git@github.com:user/repo
+		// Split by colon first
+		parts := strings.Split(url, ":")
+		if len(parts) == 2 {
+			// Get the path part and extract repo name
+			pathParts := strings.Split(parts[1], "/")
+			if len(pathParts) > 0 {
+				return pathParts[len(pathParts)-1]
+			}
+		}
+	}
+
+	// Fallback: try to get last path component
+	parts := strings.Split(url, "/")
+	if len(parts) > 0 && parts[len(parts)-1] != "" {
+		return parts[len(parts)-1]
+	}
+
+	return ""
+}
+
+// performEnhancedMirror performs the mirror operation with full history conversion
+func (ec *EnhancedCLI) performEnhancedMirror(url, dest string) (*forge.EnhancedRepository, error) {
+	// Step 1: Create destination directory
+	ec.output.Info("Step 1: Creating destination directory...")
+	if err := os.MkdirAll(dest, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create destination directory: %v", err)
+	}
+
+	// Step 2: Initialize Ivaldi repository
+	ec.output.Info("Step 2: Initializing Ivaldi repository...")
+	absPath, err := filepath.Abs(dest)
+	if err != nil {
+		return nil, err
+	}
+
+	repo, err := forge.EnhancedInitialize(absPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize Ivaldi repository: %v", err)
+	}
+
+	// Step 3: Add origin portal
+	ec.output.Info("Step 3: Adding origin portal...")
+	if err := repo.AddPortal("origin", url); err != nil {
+		return nil, fmt.Errorf("failed to add origin portal: %v", err)
+	}
+
+	// Step 4: Detect default branch (try main, then master, then fallback)
+	ec.output.Info("Step 4: Detecting default branch...")
+	branch := "main"
+	// TODO: Implement branch detection from remote
+
+	// Step 5: Fetch with complete history
+	ec.output.Info("Step 5: Fetching complete commit history...")
+	networkMgr := repo.Network()
+
+	// Use the history-enabled fetch
+	fetchResult, err := networkMgr.FetchFromPortalWithHistory(url, branch)
+	if err != nil {
+		// Try with master branch if main failed
+		ec.output.Info("Trying 'master' branch...")
+		fetchResult, err = networkMgr.FetchFromPortalWithHistory(url, "master")
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch repository history: %v", err)
+		}
+		branch = "master"
+	}
+
+	ec.output.Info(fmt.Sprintf("Fetched %d commits from %s branch", len(fetchResult.Seals), branch))
+
+	// Step 6: Store all seals
+	ec.output.Info("Step 6: Converting and storing Git commits as Ivaldi seals...")
+	storage := repo.Storage()
+	for i, seal := range fetchResult.Seals {
+		if err := storage.StoreSeal(seal); err != nil {
+			return nil, fmt.Errorf("failed to store seal %d: %v", i, err)
+		}
+	}
+
+	// Step 7: Create timeline for the main branch
+	ec.output.Info("Step 7: Creating timeline for main branch...")
+	timelineMgr := repo.Timeline()
+
+	// First ensure the timeline exists or create it
+	if err := timelineMgr.Create(branch, "Mirrored branch"); err != nil {
+		// Check if it already exists - that's expected, not an error
+		if _, headErr := timelineMgr.GetHead(branch); headErr != nil {
+			// Timeline doesn't exist and creation failed
+			return nil, fmt.Errorf("failed to create timeline '%s': %v", branch, err)
+		}
+		ec.output.Info(fmt.Sprintf("Timeline '%s' already exists", branch))
+	} else {
+		ec.output.Info(fmt.Sprintf("Created timeline '%s'", branch))
+	}
+
+	// Update timeline head - find the ref that matches current branch
+	if len(fetchResult.Refs) == 0 {
+		return nil, fmt.Errorf("no refs found in fetch result")
+	}
+
+	// Look for a ref that matches our current branch
+	var targetRef *network.RemoteRef
+	expectedRefName := fmt.Sprintf("refs/heads/%s", branch)
+
+	for i := range fetchResult.Refs {
+		if fetchResult.Refs[i].Name == expectedRefName {
+			targetRef = &fetchResult.Refs[i]
+			break
+		}
+	}
+
+	// Fall back to first ref if no exact match found
+	if targetRef == nil {
+		ec.output.Info(fmt.Sprintf("No ref found matching '%s', using first ref '%s'", expectedRefName, fetchResult.Refs[0].Name))
+		targetRef = &fetchResult.Refs[0]
+	}
+
+	// Update the timeline head
+	if err := timelineMgr.UpdateHead(branch, targetRef.Hash); err != nil {
+		return nil, fmt.Errorf("failed to update timeline head for '%s' with ref '%s': %v", branch, targetRef.Name, err)
+	}
+	ec.output.Info(fmt.Sprintf("Updated timeline '%s' head to %s", branch, targetRef.Hash.String()[:8]))
+
+	// Step 8: Download all files
+	ec.output.Info("Step 8: Downloading repository files...")
+	if err := networkMgr.DownloadIvaldiRepo(url, absPath); err != nil {
+		return nil, fmt.Errorf("failed to download repository files: %v", err)
+	}
+
+	// Step 9: Convert .gitmodules to .ivaldimodules
+	ec.output.Info("Step 9: Converting submodules...")
+	if err := workspace.CreateIvaldimodulesFromGitmodules(absPath); err != nil {
+		ec.output.Info("No submodules to convert")
+	}
+
+	// Step 10: Switch to the main branch
+	if err := timelineMgr.Switch(branch); err != nil {
+		ec.output.Info(fmt.Sprintf("Warning: could not switch to timeline '%s'", branch))
+	}
+
+	ec.output.Info("✓ Mirror operation completed successfully!")
+	return repo, nil
+}
+
+// performGitToIvaldiMigration performs the actual migration from Git to Ivaldi
+func (ec *EnhancedCLI) performGitToIvaldiMigration(repoPath string) error {
+	// Step 1: Initialize Ivaldi repository
+	ec.output.Info("Step 1: Initializing Ivaldi repository...")
+	repo, err := forge.EnhancedInitialize(repoPath)
+	if err != nil {
+		return fmt.Errorf("failed to initialize Ivaldi repository: %v", err)
+	}
+
+	ec.currentRepo = repo
+
+	// Step 2: Convert .gitmodules to .ivaldimodules
+	ec.output.Info("Step 2: Converting .gitmodules to .ivaldimodules...")
+	if err := workspace.CreateIvaldimodulesFromGitmodules(repoPath); err != nil {
+		ec.output.Info("Warning: could not convert .gitmodules - continuing without submodule conversion")
+	}
+
+	// Step 3: Create backup of .git directory
+	ec.output.Info("Step 3: Creating backup of .git directory...")
+	gitPath := filepath.Join(repoPath, ".git")
+	backupPath := filepath.Join(repoPath, ".git.backup")
+
+	if err := os.Rename(gitPath, backupPath); err != nil {
+		return fmt.Errorf("failed to backup .git directory: %v", err)
+	}
+
+	ec.output.Info("✓ Git directory backed up to .git.backup")
+
+	// Step 4: Gather all files for initial commit
+	ec.output.Info("Step 4: Gathering all files for initial Ivaldi commit...")
+	if err := repo.Gather([]string{"."}); err != nil {
+		return fmt.Errorf("failed to gather files: %v", err)
+	}
+
+	// Step 5: Create initial Ivaldi commit
+	ec.output.Info("Step 5: Creating initial Ivaldi commit...")
+	_, err = repo.Seal("Migrated from Git repository")
+	if err != nil {
+		return fmt.Errorf("failed to create initial commit: %v", err)
+	}
+
+	ec.output.Info("✓ Migration completed successfully!")
+	return nil
 }
 
 // Execute runs the enhanced CLI

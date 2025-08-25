@@ -10,7 +10,7 @@ import (
 func main() {
 	fmt.Println("Ivaldi Content-Defined Chunking Demo")
 	fmt.Println("====================================")
-	
+
 	// Create sample data that shows deduplication benefits
 	sourceCode := `package main
 
@@ -95,7 +95,7 @@ func greet(name string) {
 
 	// Show storage efficiency
 	stats := storage.GetStorageStats()
-	
+
 	fmt.Println("\nStorage Efficiency")
 	fmt.Println("------------------")
 	fmt.Printf("Deduplication ratio: %.1f:1\n", stats.DeduplicationRatio)
@@ -106,9 +106,9 @@ func greet(name string) {
 	// Demonstrate chunk-level analysis
 	fmt.Println("\nChunk Analysis")
 	fmt.Println("--------------")
-	
+
 	cdc := chunking.NewFastCDC()
-	
+
 	// Analyze chunking patterns
 	result, err := cdc.ChunkData([]byte(sourceCode))
 	if err != nil {
@@ -119,7 +119,7 @@ func greet(name string) {
 	fmt.Printf("Chunks found: %d\n", len(result.Chunks))
 	for i, chunk := range result.Chunks {
 		if i < 3 { // Show first 3 chunks
-			fmt.Printf("   Chunk %d: %d bytes, hash %s...\n", 
+			fmt.Printf("   Chunk %d: %d bytes, hash %s...\n",
 				i+1, chunk.Size, chunk.Hash[:12])
 		}
 	}
@@ -139,10 +139,10 @@ func greet(name string) {
 
 	fmt.Println("\nRevolutionary Features Enabled:")
 	fmt.Println("• Content-defined chunking with FastCDC")
-	fmt.Println("• Automatic deduplication") 
+	fmt.Println("• Automatic deduplication")
 	fmt.Println("• Transparent compression")
 	fmt.Println("• Storage efficiency optimization")
 	fmt.Println("• Zero-copy chunk management")
-	
+
 	fmt.Println("\nIvaldi - Content-defined chunking working!")
 }

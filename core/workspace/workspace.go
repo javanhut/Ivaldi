@@ -3,6 +3,7 @@ package workspace
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -25,34 +26,34 @@ const (
 )
 
 type FileState struct {
-	Path         string
-	Status       FileStatus
-	Hash         objects.CAHash
-	Size         int64
-	ModTime      time.Time
-	OnAnvil      bool
-	WorkingHash  objects.CAHash
-	BlobHash     objects.CAHash  // Hash when stored as blob in content store
+	Path        string
+	Status      FileStatus
+	Hash        objects.CAHash
+	Size        int64
+	ModTime     time.Time
+	OnAnvil     bool
+	WorkingHash objects.CAHash
+	BlobHash    objects.CAHash // Hash when stored as blob in content store
 }
 
 type Workspace struct {
-	Root         string
-	Files        map[string]*FileState
-	Timeline     string
-	Position     objects.CAHash
-	AnvilFiles   map[string]*FileState
+	Root          string
+	Files         map[string]*FileState
+	Timeline      string
+	Position      objects.CAHash
+	AnvilFiles    map[string]*FileState
 	IgnorePattern []string
-	Store        *local.Store
-	CandidateTree *objects.CATree  // Built from staged files
+	Store         *local.Store
+	CandidateTree *objects.CATree // Built from staged files
 }
 
 func New(root string, store *local.Store) *Workspace {
 	ws := &Workspace{
-		Root:         root,
-		Files:        make(map[string]*FileState),
-		AnvilFiles:   make(map[string]*FileState),
+		Root:          root,
+		Files:         make(map[string]*FileState),
+		AnvilFiles:    make(map[string]*FileState),
 		IgnorePattern: []string{},
-		Store:        store,
+		Store:         store,
 	}
 	ws.loadIgnorePatterns()
 	return ws
@@ -64,11 +65,21 @@ func (w *Workspace) Scan() error {
 	for k, v := range w.AnvilFiles {
 		anvilBackup[k] = v
 	}
-	
+
 	// Track which files we've seen during scan
 	seenFiles := make(map[string]bool)
-	
-	err := filepath.WalkDir(w.Root, func(path string, d fs.DirEntry, err error) error {
+
+	// Get list of submodule paths to skip
+	submodulePaths, err := GetSubmodulePaths(w.Root)
+	if err != nil {
+		return fmt.Errorf("failed to get submodule paths for workspace at %s: %w", w.Root, err)
+	}
+	submoduleMap := make(map[string]bool)
+	for _, path := range submodulePaths {
+		submoduleMap[filepath.FromSlash(path)] = true
+	}
+
+	err = filepath.WalkDir(w.Root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -77,6 +88,14 @@ func (w *Workspace) Scan() error {
 			if d.Name() == ".ivaldi" || d.Name() == ".git" || d.Name() == "build" {
 				return filepath.SkipDir
 			}
+
+			// Check if this directory is a submodule
+			relPath, err := filepath.Rel(w.Root, path)
+			if err == nil && submoduleMap[relPath] {
+				// Skip submodule directories
+				return filepath.SkipDir
+			}
+
 			return nil
 		}
 
@@ -84,7 +103,7 @@ func (w *Workspace) Scan() error {
 		if err != nil {
 			return err
 		}
-		
+
 		// Skip ignored files
 		if w.shouldIgnore(relPath) {
 			return nil
@@ -100,11 +119,11 @@ func (w *Workspace) Scan() error {
 		if err != nil {
 			return err
 		}
-		
+
 		// Check if file was on anvil
 		onAnvil := false
 		status := StatusUnmodified
-		
+
 		// First determine the actual status based on changes
 		if existing, exists := w.Files[relPath]; exists {
 			if existing.Hash != hash {
@@ -115,20 +134,20 @@ func (w *Workspace) Scan() error {
 		} else {
 			status = StatusAdded
 		}
-		
+
 		// Then restore anvil state if it was previously gathered
-		if anvilFile, wasOnAnvil := anvilBackup[relPath]; wasOnAnvil {
+		if _, wasOnAnvil := anvilBackup[relPath]; wasOnAnvil {
 			onAnvil = true
-			// Preserve the actual change status, don't override with StatusGathered
-			w.AnvilFiles[relPath] = anvilFile
 		}
-		
-		// Preserve BlobHash from existing file state if it exists
+
+		// Preserve BlobHash from existing file state only if file is unchanged
 		var blobHash objects.CAHash
-		if existing, exists := w.Files[relPath]; exists {
+		if existing, exists := w.Files[relPath]; exists && status == StatusUnmodified {
+			// File is unchanged, safe to reuse existing BlobHash
 			blobHash = existing.BlobHash
 		}
-		
+		// If file is modified or new, leave blobHash as zero value to force re-upload
+
 		fileState := &FileState{
 			Path:        relPath,
 			Status:      status,
@@ -142,13 +161,18 @@ func (w *Workspace) Scan() error {
 
 		w.Files[relPath] = fileState
 		seenFiles[relPath] = true
+
+		// Update AnvilFiles with the newly created fileState if it was on anvil
+		if onAnvil {
+			w.AnvilFiles[relPath] = fileState
+		}
 		return nil
 	})
-	
+
 	if err != nil {
 		return err
 	}
-	
+
 	// Check for deleted files - files that were tracked but no longer exist
 	for path, fileState := range w.Files {
 		if !seenFiles[path] && fileState.Status != StatusDeleted {
@@ -156,14 +180,14 @@ func (w *Workspace) Scan() error {
 			fileState.Status = StatusDeleted
 			// Keep it in Files map but marked as deleted
 			w.Files[path] = fileState
-			
+
 			// If it was on the anvil, update there too
 			if fileState.OnAnvil {
 				w.AnvilFiles[path] = fileState
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -176,7 +200,7 @@ func (w *Workspace) Gather(patterns []string) error {
 	} else {
 		for _, pattern := range patterns {
 			absPattern := filepath.Join(w.Root, pattern)
-			
+
 			// Check if it's a file or directory
 			info, err := os.Stat(absPattern)
 			if err != nil {
@@ -185,7 +209,7 @@ func (w *Workspace) Gather(patterns []string) error {
 				if err != nil {
 					return err
 				}
-				
+
 				for _, match := range matches {
 					if err := w.gatherPath(match); err != nil {
 						return err
@@ -197,14 +221,14 @@ func (w *Workspace) Gather(patterns []string) error {
 					if err != nil {
 						return err
 					}
-					
+
 					if d.IsDir() {
 						if d.Name() == ".ivaldi" || d.Name() == ".git" {
 							return filepath.SkipDir
 						}
 						return nil
 					}
-					
+
 					return w.gatherPath(path)
 				})
 				if err != nil {
@@ -232,7 +256,7 @@ func (w *Workspace) GatherChanged() error {
 	if w.Files == nil {
 		w.Files = make(map[string]*FileState)
 	}
-	
+
 	for path, fileState := range w.Files {
 		if fileState.Status == StatusModified || fileState.Status == StatusAdded || fileState.Status == StatusDeleted {
 			fileState.OnAnvil = true
@@ -247,12 +271,12 @@ func (w *Workspace) gatherPath(path string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	// Skip ignored files
 	if w.shouldIgnore(relPath) {
 		return nil
 	}
-	
+
 	// Ensure maps are initialized
 	if w.AnvilFiles == nil {
 		w.AnvilFiles = make(map[string]*FileState)
@@ -260,7 +284,7 @@ func (w *Workspace) gatherPath(path string) error {
 	if w.Files == nil {
 		w.Files = make(map[string]*FileState)
 	}
-	
+
 	// First, ensure we've scanned for changes
 	if fileState, exists := w.Files[relPath]; exists {
 		// Only gather files that have actually changed
@@ -268,19 +292,26 @@ func (w *Workspace) gatherPath(path string) error {
 			fileState.OnAnvil = true
 			// Keep the original status (Modified/Added/Deleted) instead of changing to Gathered
 			w.AnvilFiles[relPath] = fileState
+		} else if fileState.Status == StatusUnmodified {
+			// For unmodified files, we still want to gather them if explicitly requested
+			fileState.OnAnvil = true
+			w.AnvilFiles[relPath] = fileState
 		}
-		// If file is unmodified, don't gather it
+		// Note: unmodified files may still be gathered when explicitly requested
 	} else {
 		// File not in workspace yet - it's new, scan it first
 		info, err := os.Stat(path)
 		if err != nil {
-			return nil // File might have been deleted, skip
+			if os.IsNotExist(err) {
+				return nil // deleted between selection and stat
+			}
+			return err
 		}
-		
+
 		if !info.IsDir() {
 			hash, err := w.computeFileHash(path)
 			if err != nil {
-				return nil
+				return err
 			}
 			fileState := &FileState{
 				Path:        relPath,
@@ -291,7 +322,7 @@ func (w *Workspace) gatherPath(path string) error {
 				WorkingHash: hash,
 				OnAnvil:     true,
 			}
-			
+
 			w.Files[relPath] = fileState
 			w.AnvilFiles[relPath] = fileState
 		}
@@ -307,13 +338,13 @@ func (w *Workspace) SaveState(timeline string) error {
 
 	// Create workspace state data without the Store field (not serializable)
 	state := struct {
-		Root          string                    `json:"root"`
-		Files         map[string]*FileState     `json:"files"`
-		Timeline      string                    `json:"timeline"`
-		Position      objects.CAHash           `json:"position"`
-		AnvilFiles    map[string]*FileState     `json:"anvil_files"`
-		IgnorePattern []string                  `json:"ignore_patterns"`
-		CandidateTree *objects.CATree          `json:"candidate_tree,omitempty"`
+		Root          string                `json:"root"`
+		Files         map[string]*FileState `json:"files"`
+		Timeline      string                `json:"timeline"`
+		Position      objects.CAHash        `json:"position"`
+		AnvilFiles    map[string]*FileState `json:"anvil_files"`
+		IgnorePattern []string              `json:"ignore_patterns"`
+		CandidateTree *objects.CATree       `json:"candidate_tree,omitempty"`
 	}{
 		Root:          w.Root,
 		Files:         w.Files,
@@ -345,13 +376,13 @@ func (w *Workspace) LoadState(timeline string) error {
 
 	// Load state data without overwriting the Store field
 	state := struct {
-		Root          string                    `json:"root"`
-		Files         map[string]*FileState     `json:"files"`
-		Timeline      string                    `json:"timeline"`
-		Position      objects.CAHash           `json:"position"`
-		AnvilFiles    map[string]*FileState     `json:"anvil_files"`
-		IgnorePattern []string                  `json:"ignore_patterns"`
-		CandidateTree *objects.CATree          `json:"candidate_tree,omitempty"`
+		Root          string                `json:"root"`
+		Files         map[string]*FileState `json:"files"`
+		Timeline      string                `json:"timeline"`
+		Position      objects.CAHash        `json:"position"`
+		AnvilFiles    map[string]*FileState `json:"anvil_files"`
+		IgnorePattern []string              `json:"ignore_patterns"`
+		CandidateTree *objects.CATree       `json:"candidate_tree,omitempty"`
 	}{}
 
 	if err := json.Unmarshal(data, &state); err != nil {
@@ -405,20 +436,29 @@ func (w *Workspace) loadIgnorePatterns() {
 			patterns = append(patterns, line)
 		}
 	}
-	
+
 	// Add default patterns that should always be ignored
 	patterns = append(patterns, ".ivaldi/*", ".git/*")
 	w.IgnorePattern = patterns
 }
 
+// forwardSlashMatch performs filepath.Match with consistent forward-slash semantics
+// by ensuring both pattern and name use forward slashes
+func forwardSlashMatch(pattern, name string) (matched bool, err error) {
+	// Normalize both pattern and name to forward slashes
+	normalizedPattern := filepath.ToSlash(pattern)
+	normalizedName := filepath.ToSlash(name)
+	return filepath.Match(normalizedPattern, normalizedName)
+}
+
 func (w *Workspace) shouldIgnore(path string) bool {
 	// Clean path and convert to forward slashes for consistent matching
 	cleanPath := filepath.ToSlash(path)
-	
+
 	for _, pattern := range w.IgnorePattern {
 		// Clean pattern and convert to forward slashes
 		cleanPattern := filepath.ToSlash(pattern)
-		
+
 		// Handle directory patterns (ending with /)
 		if strings.HasSuffix(cleanPattern, "/") {
 			dirPattern := strings.TrimSuffix(cleanPattern, "/")
@@ -428,10 +468,10 @@ func (w *Workspace) shouldIgnore(path string) bool {
 			}
 			continue
 		}
-		
+
 		// Handle wildcard patterns
 		if strings.Contains(cleanPattern, "*") {
-			matched, _ := filepath.Match(cleanPattern, cleanPath)
+			matched, _ := forwardSlashMatch(cleanPattern, cleanPath)
 			if matched {
 				return true
 			}
@@ -439,19 +479,19 @@ func (w *Workspace) shouldIgnore(path string) bool {
 			pathParts := strings.Split(cleanPath, "/")
 			for i := range pathParts {
 				partialPath := strings.Join(pathParts[:i+1], "/")
-				matched, _ := filepath.Match(cleanPattern, partialPath)
+				matched, _ := forwardSlashMatch(cleanPattern, partialPath)
 				if matched {
 					return true
 				}
 			}
 			continue
 		}
-		
+
 		// Exact match
 		if cleanPath == cleanPattern {
 			return true
 		}
-		
+
 		// Check if it's a file in a directory that should be ignored
 		if strings.Contains(cleanPattern, "/") {
 			if strings.HasPrefix(cleanPath, cleanPattern+"/") || cleanPath == cleanPattern {
@@ -474,10 +514,10 @@ func (w *Workspace) ShouldIgnore(path string) bool {
 
 func (w *Workspace) Discard(patterns []string) (int, error) {
 	count := 0
-	
+
 	for _, pattern := range patterns {
 		absPattern := filepath.Join(w.Root, pattern)
-		
+
 		// Check if it's a file or directory
 		info, err := os.Stat(absPattern)
 		if err != nil {
@@ -486,7 +526,7 @@ func (w *Workspace) Discard(patterns []string) (int, error) {
 			if err != nil {
 				continue
 			}
-			
+
 			for _, match := range matches {
 				if c := w.discardPath(match); c > 0 {
 					count += c
@@ -498,7 +538,7 @@ func (w *Workspace) Discard(patterns []string) (int, error) {
 				if err != nil {
 					return err
 				}
-				
+
 				if !d.IsDir() {
 					if c := w.discardPath(path); c > 0 {
 						count += c
@@ -516,7 +556,7 @@ func (w *Workspace) Discard(patterns []string) (int, error) {
 			}
 		}
 	}
-	
+
 	return count, nil
 }
 
@@ -525,10 +565,10 @@ func (w *Workspace) discardPath(path string) int {
 	if err != nil {
 		return 0
 	}
-	
+
 	if _, exists := w.AnvilFiles[relPath]; exists {
 		delete(w.AnvilFiles, relPath)
-		
+
 		// Update file state
 		if fileState, exists := w.Files[relPath]; exists {
 			fileState.OnAnvil = false
@@ -536,10 +576,10 @@ func (w *Workspace) discardPath(path string) int {
 				fileState.Status = StatusModified // or StatusAdded based on original state
 			}
 		}
-		
+
 		return 1
 	}
-	
+
 	return 0
 }
 
@@ -568,7 +608,11 @@ func (w *Workspace) computeFileHash(path string) (objects.CAHash, error) {
 		return objects.CAHash{}, err
 	}
 
-	return objects.NewCAHash(data, w.Store.GetAlgorithm()), nil
+	hash, err := objects.NewCAHash(data, w.Store.GetAlgorithm())
+	if err != nil {
+		return objects.CAHash{}, fmt.Errorf("failed to compute hash: %w", err)
+	}
+	return hash, nil
 }
 
 // computeStreamingHash computes hash of large files using streaming
@@ -579,7 +623,11 @@ func (w *Workspace) computeStreamingHash(reader io.Reader) (objects.CAHash, erro
 		return objects.CAHash{}, err
 	}
 
-	return objects.NewCAHash(data, w.Store.GetAlgorithm()), nil
+	hash, err := objects.NewCAHash(data, w.Store.GetAlgorithm())
+	if err != nil {
+		return objects.CAHash{}, fmt.Errorf("failed to compute hash: %w", err)
+	}
+	return hash, nil
 }
 
 // BuildCandidateTree builds a tree from currently staged files
@@ -590,13 +638,13 @@ func (w *Workspace) BuildCandidateTree() error {
 	}
 
 	var entries []objects.CATreeEntry
-	
+
 	// Sort paths for deterministic tree construction
 	var paths []string
 	for path := range w.AnvilFiles {
 		paths = append(paths, path)
 	}
-	
+
 	// Simple sort (could be improved with proper path sorting)
 	for i := 0; i < len(paths); i++ {
 		for j := i + 1; j < len(paths); j++ {
@@ -608,7 +656,7 @@ func (w *Workspace) BuildCandidateTree() error {
 
 	for _, path := range paths {
 		fileState := w.AnvilFiles[path]
-		
+
 		// Skip deleted files
 		if fileState.Status == StatusDeleted {
 			continue
@@ -638,7 +686,7 @@ func (w *Workspace) BuildCandidateTree() error {
 // storeBlobForFile stores a file as a blob in the content store
 func (w *Workspace) storeBlobForFile(path string, fileState *FileState) error {
 	fullPath := filepath.Join(w.Root, path)
-	
+
 	// Open file for reading
 	file, err := os.Open(fullPath)
 	if err != nil {

@@ -28,9 +28,9 @@ type OverwriteTracker interface {
 
 // ReshapeManager handles history modification with full accountability
 type ReshapeManager struct {
-	index       Index
-	storage     Storage
-	overwrite   OverwriteTracker
+	index     Index
+	storage   Storage
+	overwrite OverwriteTracker
 }
 
 type ReshapeOptions struct {
@@ -42,9 +42,9 @@ type ReshapeOptions struct {
 }
 
 type ReshapeResult struct {
-	OriginalSeals []*objects.Seal
-	NewSeals      []*objects.Seal
-	OverwriteID   string
+	OriginalSeals  []*objects.Seal
+	NewSeals       []*objects.Seal
+	OverwriteID    string
 	ArchivedHashes []objects.Hash
 }
 
@@ -69,7 +69,7 @@ func (rm *ReshapeManager) Reshape(opts ReshapeOptions) (*ReshapeResult, error) {
 	// Validate category
 	validCategories := []string{"security", "cleanup", "mistake", "refactor", "rebase", "squash", "amend"}
 	if !contains(validCategories, opts.Category) {
-		return nil, fmt.Errorf("invalid category '%s', must be one of: %s", 
+		return nil, fmt.Errorf("invalid category '%s', must be one of: %s",
 			opts.Category, strings.Join(validCategories, ", "))
 	}
 
@@ -117,9 +117,9 @@ func (rm *ReshapeManager) Reshape(opts ReshapeOptions) (*ReshapeResult, error) {
 	overwriteID := ""
 	if rm.overwrite != nil && len(newSeals) > 0 && len(originalSeals) > 0 {
 		err = rm.overwrite.RecordOverwrite(
-			originalSeals[0].Hash, 
-			newSeals[0].Hash, 
-			opts.Justification, 
+			originalSeals[0].Hash,
+			newSeals[0].Hash,
+			opts.Justification,
 			opts.Category)
 		if err != nil {
 			return nil, fmt.Errorf("failed to record overwrite: %v", err)
@@ -163,7 +163,7 @@ func (rm *ReshapeManager) squashSeals(seals []*objects.Seal, justification strin
 	}
 
 	combinedMessage := strings.Join(messages, "; ")
-	
+
 	// Create new squashed seal
 	newSeal := &objects.Seal{
 		Name:      rm.generateMemorableName(),
@@ -199,7 +199,7 @@ func (rm *ReshapeManager) amendLastSeal(seals []*objects.Seal, justification str
 	}
 
 	original := seals[0]
-	
+
 	// Create amended seal
 	amended := &objects.Seal{
 		Name:      rm.generateMemorableName(),
@@ -229,7 +229,7 @@ func (rm *ReshapeManager) amendLastSeal(seals []*objects.Seal, justification str
 func (rm *ReshapeManager) rebaseSeals(seals []*objects.Seal, justification string) ([]*objects.Seal, error) {
 	// For now, just mark them as rebased
 	var newSeals []*objects.Seal
-	
+
 	for i, seal := range seals {
 		rebased := &objects.Seal{
 			Name:      rm.generateMemorableName(),
@@ -265,7 +265,7 @@ func (rm *ReshapeManager) rebaseSeals(seals []*objects.Seal, justification strin
 // cleanupSeals performs general cleanup on seals
 func (rm *ReshapeManager) cleanupSeals(seals []*objects.Seal, justification string) ([]*objects.Seal, error) {
 	var newSeals []*objects.Seal
-	
+
 	for i, seal := range seals {
 		cleaned := &objects.Seal{
 			Name:      rm.generateMemorableName(),
@@ -301,7 +301,7 @@ func (rm *ReshapeManager) cleanupSeals(seals []*objects.Seal, justification stri
 func (rm *ReshapeManager) defaultReshape(seals []*objects.Seal, justification string) ([]*objects.Seal, error) {
 	// Default: just add overwrite tracking without changing content
 	var newSeals []*objects.Seal
-	
+
 	for i, seal := range seals {
 		reshaped := &objects.Seal{
 			Name:      seal.Name, // Keep original name
@@ -344,19 +344,19 @@ func (rm *ReshapeManager) cleanupMessage(message string) string {
 func (rm *ReshapeManager) generateMemorableName() string {
 	adjectives := []string{"bright", "swift", "bold", "calm", "wise", "strong"}
 	nouns := []string{"river", "mountain", "forest", "ocean", "star", "moon"}
-	
+
 	// Simple generation for now
 	adj := adjectives[time.Now().Unix()%int64(len(adjectives))]
 	noun := nouns[time.Now().Unix()%int64(len(nouns))]
 	num := time.Now().Unix() % 999
-	
+
 	return fmt.Sprintf("%s-%s-%d", adj, noun, num)
 }
 
 // ParseReshapeCommand parses natural language reshape commands
 func ParseReshapeCommand(command string) (*ReshapeOptions, error) {
 	command = strings.ToLower(strings.TrimSpace(command))
-	
+
 	// Parse "reshape last N"
 	if strings.HasPrefix(command, "reshape last ") {
 		countStr := strings.TrimPrefix(command, "reshape last ")
@@ -364,13 +364,13 @@ func ParseReshapeCommand(command string) (*ReshapeOptions, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid count: %s", countStr)
 		}
-		
+
 		return &ReshapeOptions{
 			Count:    count,
 			Category: "cleanup",
 		}, nil
 	}
-	
+
 	// Parse "squash last N"
 	if strings.HasPrefix(command, "squash last ") {
 		countStr := strings.TrimPrefix(command, "squash last ")
@@ -378,13 +378,13 @@ func ParseReshapeCommand(command string) (*ReshapeOptions, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid count: %s", countStr)
 		}
-		
+
 		return &ReshapeOptions{
 			Count:    count,
 			Category: "squash",
 		}, nil
 	}
-	
+
 	return nil, fmt.Errorf("unrecognized reshape command: %s", command)
 }
 
@@ -401,12 +401,12 @@ func contains(slice []string, item string) bool {
 // GetReshapeCategories returns valid reshape categories with descriptions
 func GetReshapeCategories() map[string]string {
 	return map[string]string{
-		"security":  "Fix security vulnerabilities",
-		"cleanup":   "Clean up commit messages or structure", 
-		"mistake":   "Fix mistakes in previous commits",
-		"refactor":  "Refactor without changing functionality",
-		"rebase":    "Rebase commits onto new base",
-		"squash":    "Combine multiple commits into one",
-		"amend":     "Modify the most recent commit",
+		"security": "Fix security vulnerabilities",
+		"cleanup":  "Clean up commit messages or structure",
+		"mistake":  "Fix mistakes in previous commits",
+		"refactor": "Refactor without changing functionality",
+		"rebase":   "Rebase commits onto new base",
+		"squash":   "Combine multiple commits into one",
+		"amend":    "Modify the most recent commit",
 	}
 }

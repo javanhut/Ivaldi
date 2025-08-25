@@ -42,6 +42,7 @@ func init() {
 	rootCmd.AddCommand(syncCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(logCmd)
+	rootCmd.AddCommand(migrateCmd)
 }
 
 func checkRepo() error {

@@ -10,11 +10,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"ivaldi/core/fuse"
+	"ivaldi/core/mesh"
 	"ivaldi/core/network"
 	"ivaldi/core/objects"
+	"ivaldi/core/p2p"
 	"ivaldi/core/position"
 	"ivaldi/core/references"
 	"ivaldi/core/sync"
@@ -35,6 +38,8 @@ type Repository struct {
 	syncMgr   *sync.SyncManager
 	fuseMgr   *fuse.FuseManager
 	network   *network.NetworkManager
+	p2pMgr    p2p.P2PManagerInterface
+	meshMgr   *mesh.MeshManager
 }
 
 type Status struct {
@@ -75,7 +80,7 @@ func Initialize(root string) (*Repository, error) {
 
 	// Configure reference manager with index
 	rm.SetIndex(idx)
-	
+
 	// Configure position manager with reference resolver
 	pm.SetReferenceResolver(rm)
 
@@ -100,7 +105,7 @@ func Initialize(root string) (*Repository, error) {
 func Mirror(url, dest string) (*Repository, error) {
 	// Use git clone to get full history
 	networkMgr := network.NewNetworkManager(dest)
-	
+
 	// Clone the Git repository with full history
 	if err := networkMgr.CloneGitRepo(url, dest); err != nil {
 		return nil, fmt.Errorf("failed to clone Git repository: %v", err)
@@ -114,7 +119,7 @@ func Mirror(url, dest string) (*Repository, error) {
 
 	// Check for optimized import flag (can be set via environment variable)
 	useOptimized := os.Getenv("IVALDI_OPTIMIZED_IMPORT") != "false"
-	
+
 	if useOptimized {
 		// Use optimized import for better performance
 		fmt.Println("Using optimized Git import (set IVALDI_OPTIMIZED_IMPORT=false to use legacy)")
@@ -154,7 +159,7 @@ func Mirror(url, dest string) (*Repository, error) {
 func Download(url, dest string) (*Repository, error) {
 	// Use HTTP-based download for current files only
 	networkMgr := network.NewNetworkManager(dest)
-	
+
 	// Download repository contents using API (no Git history)
 	if err := networkMgr.DownloadRepoFiles(url, dest); err != nil {
 		return nil, fmt.Errorf("failed to download repository files: %v", err)
@@ -190,12 +195,12 @@ func (r *Repository) importGitHistory() error {
 	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
 		return fmt.Errorf("no Git repository found")
 	}
-	
+
 	// First, get all Git branches and import them as timelines
 	if err := r.importGitBranches(); err != nil {
 		return fmt.Errorf("failed to import Git branches: %v", err)
 	}
-	
+
 	// Get current Git branch to know which timeline to activate
 	currentBranchCmd := exec.Command("git", "-C", r.root, "branch", "--show-current")
 	currentBranchOutput, err := currentBranchCmd.Output()
@@ -206,39 +211,39 @@ func (r *Repository) importGitHistory() error {
 	if currentBranch == "" {
 		currentBranch = "main" // fallback
 	}
-	
+
 	// Import commits for all branches
 	branchesCmd := exec.Command("git", "-C", r.root, "branch", "-r")
 	branchOutput, err := branchesCmd.Output()
 	if err != nil {
 		return fmt.Errorf("failed to list Git branches: %v", err)
 	}
-	
+
 	branchLines := strings.Split(string(branchOutput), "\n")
 	allCommitMaps := make(map[string]map[string]objects.Hash) // branch -> (Git SHA -> Ivaldi Hash)
-	
+
 	for _, branchLine := range branchLines {
 		branchName := strings.TrimSpace(branchLine)
 		if branchName == "" || strings.Contains(branchName, "HEAD") {
 			continue
 		}
-		
+
 		// Remove origin/ prefix if present
 		if strings.HasPrefix(branchName, "origin/") {
 			branchName = strings.TrimPrefix(branchName, "origin/")
 		}
-		
+
 		// Import commits for this branch
 		commitMap, err := r.importCommitsForBranch(branchName)
 		if err != nil {
 			fmt.Printf("Warning: failed to import commits for branch %s: %v\n", branchName, err)
 			continue
 		}
-		
+
 		allCommitMaps[branchName] = commitMap
 		fmt.Printf("Imported %d commits for branch %s\n", len(commitMap), branchName)
 	}
-	
+
 	// Switch to the current Git branch timeline
 	if err := r.timeline.Switch(currentBranch); err != nil {
 		fmt.Printf("Warning: failed to switch to timeline %s: %v\n", currentBranch, err)
@@ -258,15 +263,15 @@ func (r *Repository) importGitHistory() error {
 			}
 		}
 	}
-	
+
 	totalCommits := 0
 	for _, commitMap := range allCommitMaps {
 		totalCommits += len(commitMap)
 	}
-	
+
 	// Sync memorable names between reference manager and position manager
 	r.position.SyncMemorableNamesFromReference(r.refMgr.GetMemorableName)
-	
+
 	fmt.Printf("Successfully imported %d Git commits across %d branches to Ivaldi\n", totalCommits, len(allCommitMaps))
 	return nil
 }
@@ -279,24 +284,24 @@ func (r *Repository) importGitBranches() error {
 	if err != nil {
 		return fmt.Errorf("failed to list Git branches: %v", err)
 	}
-	
+
 	lines := strings.Split(string(output), "\n")
 	for _, line := range lines {
 		branchName := strings.TrimSpace(line)
 		if branchName == "" {
 			continue
 		}
-		
+
 		// Remove markers and prefixes
 		branchName = strings.TrimPrefix(branchName, "* ")
 		branchName = strings.TrimPrefix(branchName, "  ")
 		branchName = strings.TrimPrefix(branchName, "remotes/origin/")
-		
+
 		// Skip HEAD references
 		if strings.Contains(branchName, "HEAD") || branchName == "" {
 			continue
 		}
-		
+
 		// Create timeline if it doesn't exist
 		if !r.timeline.Exists(branchName) {
 			if err := r.timeline.Create(branchName, fmt.Sprintf("Imported from Git branch %s", branchName)); err != nil {
@@ -304,7 +309,7 @@ func (r *Repository) importGitBranches() error {
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -321,44 +326,44 @@ func (r *Repository) importCommitsForBranch(branchName string) (map[string]objec
 			return nil, fmt.Errorf("failed to get Git log for branch %s: %v", branchName, err)
 		}
 	}
-	
+
 	lines := strings.Split(string(output), "\n")
 	commitMap := make(map[string]objects.Hash) // Git SHA -> Ivaldi Hash
-	
+
 	for i, line := range lines {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		
+
 		parts := strings.Split(line, "|")
 		if len(parts) < 6 {
 			continue
 		}
-		
+
 		gitSHA := parts[0]
 		parentSHAs := strings.Fields(parts[1])
 		authorName := parts[2]
 		authorEmail := parts[3]
 		timestamp := parts[4]
 		message := strings.Join(parts[5:], "|")
-		
+
 		// Convert timestamp
 		ts, _ := strconv.ParseInt(timestamp, 10, 64)
-		
+
 		// Checkout this specific commit temporarily
 		checkoutCmd := exec.Command("git", "-C", r.root, "checkout", gitSHA, "--quiet")
 		if err := checkoutCmd.Run(); err != nil {
 			fmt.Printf("Warning: failed to checkout commit %s: %v\n", gitSHA[:8], err)
 			continue
 		}
-		
+
 		// Create tree snapshot of current state
 		treeHash, err := r.createTreeFromWorkspace()
 		if err != nil {
 			fmt.Printf("Warning: failed to create tree for commit %s: %v\n", gitSHA[:8], err)
 			continue
 		}
-		
+
 		// Convert parent Git SHAs to Ivaldi hashes
 		var parentHashes []objects.Hash
 		for _, parentSHA := range parentSHAs {
@@ -366,13 +371,13 @@ func (r *Repository) importCommitsForBranch(branchName string) (map[string]objec
 				parentHashes = append(parentHashes, parentHash)
 			}
 		}
-		
+
 		// Create Ivaldi seal
 		author := objects.Identity{
 			Name:  authorName,
 			Email: authorEmail,
 		}
-		
+
 		seal := &objects.Seal{
 			Name:      r.generateMemorableName(),
 			Iteration: i + 1,
@@ -382,39 +387,39 @@ func (r *Repository) importCommitsForBranch(branchName string) (map[string]objec
 			Timestamp: time.Unix(ts, 0),
 			Parents:   parentHashes,
 		}
-		
+
 		// Store the seal (this will set seal.Hash)
 		if err := r.storage.StoreSeal(seal); err != nil {
 			return nil, fmt.Errorf("failed to store seal for commit %s: %v", gitSHA[:8], err)
 		}
-		
+
 		// Verify the seal hash was set properly
 		if seal.Hash.IsZero() {
 			return nil, fmt.Errorf("seal hash was not set during storage for commit %s", gitSHA[:8])
 		}
-		
+
 		// Index the seal
 		if err := r.index.IndexSeal(seal); err != nil {
 			return nil, fmt.Errorf("failed to index seal for commit %s: %v", gitSHA[:8], err)
 		}
-		
+
 		// Register memorable name with the properly set hash
 		if err := r.refMgr.RegisterMemorableName(seal.Name, seal.Hash, authorName); err != nil {
 			return nil, fmt.Errorf("failed to register memorable name for commit %s: %v", gitSHA[:8], err)
 		}
-		
+
 		// Add memorable name to position manager as well
 		r.position.AddMemorableName(seal.Hash, seal.Name)
-		
+
 		// Add this commit to position history for this timeline
 		if err := r.position.SetPosition(seal.Hash, branchName); err != nil {
 			fmt.Printf("Warning: failed to set position for commit %s: %v\n", gitSHA[:8], err)
 		}
-		
+
 		// Map Git SHA to Ivaldi hash
 		commitMap[gitSHA] = seal.Hash
 	}
-	
+
 	// Update timeline head to latest imported commit if we have any
 	if len(commitMap) > 0 {
 		// Get the latest commit hash (last one processed)
@@ -426,13 +431,13 @@ func (r *Repository) importCommitsForBranch(branchName string) (map[string]objec
 			return nil, fmt.Errorf("failed to update timeline head for %s: %v", branchName, err)
 		}
 	}
-	
+
 	// Return to HEAD
 	headCmd := exec.Command("git", "-C", r.root, "checkout", "HEAD", "--quiet")
 	if err := headCmd.Run(); err != nil {
 		fmt.Printf("Warning: failed to return to HEAD: %v\n", err)
 	}
-	
+
 	return commitMap, nil
 }
 
@@ -440,53 +445,53 @@ func (r *Repository) importCommitsForBranch(branchName string) (map[string]objec
 func (r *Repository) createTreeFromWorkspace() (objects.Hash, error) {
 	// Get all files in workspace (excluding .git and .ivaldi)
 	var entries []objects.TreeEntry
-	
+
 	err := filepath.Walk(r.root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		
+
 		relPath, err := filepath.Rel(r.root, path)
 		if err != nil {
 			return err
 		}
-		
-		// Skip .git and .ivaldi directories  
+
+		// Skip .git and .ivaldi directories
 		if strings.HasPrefix(relPath, ".git/") || strings.HasPrefix(relPath, ".ivaldi/") ||
-		   relPath == ".git" || relPath == ".ivaldi" {
+			relPath == ".git" || relPath == ".ivaldi" {
 			if info.IsDir() {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		
+
 		// Skip the root directory itself but continue walking
 		if relPath == "." {
 			return nil
 		}
-		
+
 		// Skip directories
 		if info.IsDir() {
 			return nil
 		}
-		
+
 		// Read file content
 		content, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		
+
 		// Create blob object
 		blob := &objects.Blob{
 			Data: content,
 		}
-		
+
 		// Store the blob using StoreObject
 		blobHash, err := r.storage.StoreObject(blob)
 		if err != nil {
 			return fmt.Errorf("failed to store blob for %s: %v", relPath, err)
 		}
-		
+
 		// Create tree entry
 		entry := objects.TreeEntry{
 			Name: relPath,
@@ -494,29 +499,29 @@ func (r *Repository) createTreeFromWorkspace() (objects.Hash, error) {
 			Hash: blobHash,
 			Mode: uint32(info.Mode()),
 		}
-		
+
 		entries = append(entries, entry)
 		return nil
 	})
-	
+
 	if err != nil {
 		return objects.Hash{}, err
 	}
-	
+
 	// Create tree object
 	tree := &objects.Tree{
 		Entries: entries,
 	}
-	
+
 	// Store the tree using StoreObject
 	treeHash, err := r.storage.StoreObject(tree)
 	if err != nil {
 		return objects.Hash{}, fmt.Errorf("failed to store tree: %v", err)
 	}
-	
+
 	// Set the hash on the tree for consistency
 	tree.Hash = treeHash
-	
+
 	return treeHash, nil
 }
 
@@ -542,7 +547,7 @@ func Open(root string) (*Repository, error) {
 
 	// Configure reference manager with index
 	rm.SetIndex(idx)
-	
+
 	// Configure position manager with reference resolver
 	pm.SetReferenceResolver(rm)
 
@@ -553,17 +558,17 @@ func Open(root string) (*Repository, error) {
 	if err := pm.Load(); err != nil {
 		return nil, err
 	}
-	
+
 	if err := rm.Load(); err != nil {
 		return nil, err
 	}
-	
+
 	// Load workspace state for current timeline
 	currentTimeline := tm.Current()
 	if err := ws.LoadState(currentTimeline); err != nil {
 		// Ignore error if state doesn't exist yet
 	}
-	
+
 	// Ensure workspace has correct root path after loading state
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
@@ -573,12 +578,23 @@ func Open(root string) (*Repository, error) {
 
 	// Create fuse manager
 	fuseMgr := fuse.NewFuseManager(storage, tm, ws)
-	
-	// Create sync manager  
+
+	// Create sync manager
 	syncMgr := sync.NewSyncManager(storage, tm, fuseMgr, root)
-	
+
 	// Create network manager
 	networkMgr := network.NewNetworkManager(root)
+
+	// Create P2P manager with adapters
+	storageAdapter := p2p.NewStorageAdapter(storage)
+	timelineAdapter := p2p.NewTimelineAdapter(tm)
+	p2pMgr, err := p2p.NewP2PManager(root, storageAdapter, timelineAdapter)
+	if err != nil {
+		// For now, just log the error and continue without P2P
+		// This allows the repository to be created even if P2P fails
+		fmt.Printf("Warning: Failed to create P2P manager: %v\n", err)
+		p2pMgr = nil
+	}
 
 	repo := &Repository{
 		root:      root,
@@ -591,6 +607,7 @@ func Open(root string) (*Repository, error) {
 		syncMgr:   syncMgr,
 		fuseMgr:   fuseMgr,
 		network:   networkMgr,
+		p2pMgr:    p2pMgr,
 	}
 
 	// Sync memorable names between reference manager and position manager on open
@@ -615,7 +632,7 @@ func (r *Repository) Gather(patterns []string) error {
 	if err := r.workspace.Gather(patterns); err != nil {
 		return err
 	}
-	
+
 	// Save workspace state after gathering
 	return r.workspace.SaveState(r.timeline.Current())
 }
@@ -625,22 +642,22 @@ func (r *Repository) Discard(patterns []string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	
+
 	// Save workspace state after discarding
 	if err := r.workspace.SaveState(r.timeline.Current()); err != nil {
 		return count, err
 	}
-	
+
 	return count, nil
 }
 
 func (r *Repository) DiscardAll() int {
 	count := len(r.workspace.AnvilFiles)
 	r.workspace.AnvilFiles = make(map[string]*workspace.FileState)
-	
+
 	// Save workspace state after discarding all
 	r.workspace.SaveState(r.timeline.Current())
-	
+
 	return count
 }
 
@@ -689,11 +706,11 @@ func (r *Repository) Seal(message string) (*objects.Seal, error) {
 	// Step 3: Determine parents (current head or empty for first seal)
 	var parents []objects.CAHash
 	currentHead, err := r.timeline.GetHead(r.timeline.Current())
-	
+
 	// Check if currentHead is zero (empty hash)
 	var zeroHash objects.Hash
 	isFirstSeal := err != nil || currentHead == zeroHash
-	
+
 	if !isFirstSeal {
 		// Get the previous seal's content-addressed hash
 		previousSealHash, err := r.getPreviousSealCAHash(currentHead)
@@ -728,13 +745,13 @@ func (r *Repository) Seal(message string) (*objects.Seal, error) {
 	// Step 7: Create legacy seal for compatibility with existing systems
 	name := r.generateMemorableName()
 	iteration := r.getNextIteration()
-	
+
 	// Use the actual hash returned by storing the legacy tree
 	fmt.Printf("Debug: creating seal with Position: %s\n", legacyTreeHash.String())
 	legacySeal := &objects.Seal{
 		Name:      name,
 		Iteration: iteration,
-		Position:  legacyTreeHash,  // Points to the actual stored legacy tree
+		Position:  legacyTreeHash, // Points to the actual stored legacy tree
 		Message:   message,
 		Author:    author,
 		Timestamp: caSeal.Timestamp,
@@ -758,7 +775,7 @@ func (r *Repository) Seal(message string) (*objects.Seal, error) {
 	if err := r.position.SetMemorableName(legacySeal.Hash, name); err != nil {
 		return nil, fmt.Errorf("failed to set memorable name: %v", err)
 	}
-	
+
 	// Register the memorable name with the reference manager
 	if err := r.refMgr.RegisterMemorableName(name, legacySeal.Hash, legacySeal.Author.Name); err != nil {
 		return nil, fmt.Errorf("failed to register memorable name: %v", err)
@@ -797,9 +814,9 @@ func (r *Repository) getAuthorInfo() (objects.Identity, objects.Identity) {
 		Name:  "Developer",
 		Email: "dev@example.com",
 	}
-	
+
 	committer := author // Same as author for now
-	
+
 	return author, committer
 }
 
@@ -827,7 +844,7 @@ func (r *Repository) updateWorkspaceAfterSeal() {
 			}
 		}
 	}
-	
+
 	// Clear the anvil
 	r.workspace.AnvilFiles = make(map[string]*workspace.FileState)
 	r.workspace.CandidateTree = nil // Clear the candidate tree
@@ -838,12 +855,12 @@ func (r *Repository) getPreviousSealCAHash(legacyHash objects.Hash) (objects.CAH
 	// Try to load the relationship from a mapping file
 	// For now, we'll implement a simple approach where we store the mapping
 	mappingPath := filepath.Join(r.root, ".ivaldi", "seal_mapping.json")
-	
+
 	type SealMapping struct {
 		LegacyToCA map[string]string `json:"legacy_to_ca"`
 		CAToLegacy map[string]string `json:"ca_to_legacy"`
 	}
-	
+
 	var mapping SealMapping
 	if data, err := os.ReadFile(mappingPath); err == nil {
 		json.Unmarshal(data, &mapping)
@@ -853,24 +870,24 @@ func (r *Repository) getPreviousSealCAHash(legacyHash objects.Hash) (objects.CAH
 			CAToLegacy: make(map[string]string),
 		}
 	}
-	
+
 	legacyHashStr := hex.EncodeToString(legacyHash[:])
 	if caHashStr, exists := mapping.LegacyToCA[legacyHashStr]; exists {
 		return objects.ParseCAHash(caHashStr)
 	}
-	
+
 	return objects.CAHash{}, fmt.Errorf("no content-addressed hash found for legacy hash %s", legacyHashStr)
 }
 
 // storeSealMapping stores the relationship between legacy and content-addressed seals
 func (r *Repository) storeSealMapping(legacyHash objects.Hash, caHash objects.CAHash) error {
 	mappingPath := filepath.Join(r.root, ".ivaldi", "seal_mapping.json")
-	
+
 	type SealMapping struct {
 		LegacyToCA map[string]string `json:"legacy_to_ca"`
 		CAToLegacy map[string]string `json:"ca_to_legacy"`
 	}
-	
+
 	var mapping SealMapping
 	if data, err := os.ReadFile(mappingPath); err == nil {
 		json.Unmarshal(data, &mapping)
@@ -880,29 +897,29 @@ func (r *Repository) storeSealMapping(legacyHash objects.Hash, caHash objects.CA
 			CAToLegacy: make(map[string]string),
 		}
 	}
-	
+
 	legacyHashStr := hex.EncodeToString(legacyHash[:])
 	caHashStr := caHash.FullString()
-	
+
 	mapping.LegacyToCA[legacyHashStr] = caHashStr
 	mapping.CAToLegacy[caHashStr] = legacyHashStr
-	
+
 	data, err := json.MarshalIndent(mapping, "", "  ")
 	if err != nil {
 		return err
 	}
-	
+
 	return os.WriteFile(mappingPath, data, 0644)
 }
 
 func (r *Repository) CreateTimeline(name, description string) error {
 	fmt.Printf("Creating timeline: %s\n", name)
-	
+
 	// Create the timeline
 	if err := r.timeline.Create(name, description); err != nil {
 		return err
 	}
-	
+
 	// Save the current timeline state (if any) before creating new one
 	currentTimeline := r.timeline.Current()
 	if currentTimeline != name {
@@ -911,48 +928,48 @@ func (r *Repository) CreateTimeline(name, description string) error {
 			return fmt.Errorf("failed to save current timeline state: %v", err)
 		}
 	}
-	
+
 	// Copy the current timeline's state as the divergence point for the new timeline
 	fmt.Printf("Creating initial state for timeline: %s from current working directory\n", name)
 	if err := r.saveTimelineState(name); err != nil {
 		return fmt.Errorf("failed to create initial state for timeline: %v", err)
 	}
-	
+
 	// Copy current workspace state to the new timeline
 	fmt.Printf("Saving current workspace state for timeline: %s\n", currentTimeline)
 	if err := r.workspace.SaveState(currentTimeline); err != nil {
 		return fmt.Errorf("failed to save current workspace state: %v", err)
 	}
-	
+
 	// Copy workspace state from current timeline to new timeline
 	fmt.Printf("Copying workspace state from %s to %s\n", currentTimeline, name)
 	if err := r.copyWorkspaceState(currentTimeline, name); err != nil {
 		return fmt.Errorf("failed to copy workspace state to new timeline: %v", err)
 	}
-	
+
 	fmt.Printf("Timeline %s created successfully\n", name)
 	return nil
 }
 
 func (r *Repository) SwitchTimeline(name string) error {
 	currentTimeline := r.timeline.Current()
-	
+
 	// If switching to the same timeline, do nothing
 	if currentTimeline == name {
 		return nil
 	}
-	
+
 	// Calculate the diff between current state and target timeline
 	diff, err := r.calculateTimelineDiff(currentTimeline, name)
 	if err != nil {
 		return fmt.Errorf("failed to calculate timeline diff: %v", err)
 	}
-	
+
 	// Save current timeline state before switching
 	if err := r.saveTimelineState(currentTimeline); err != nil {
 		return fmt.Errorf("failed to save timeline state for %s: %v", currentTimeline, err)
 	}
-	
+
 	// Save current workspace state before switching
 	if err := r.workspace.SaveState(currentTimeline); err != nil {
 		return fmt.Errorf("failed to save workspace state: %v", err)
@@ -981,6 +998,12 @@ func (r *Repository) SwitchTimeline(name string) error {
 		}
 	}
 
+	// Also restore any files that were committed on the target timeline
+	// This ensures files committed on other timelines are properly restored
+	if err := r.restoreTimelineFiles(name); err != nil {
+		return fmt.Errorf("failed to restore timeline files: %v", err)
+	}
+
 	// Force rescan to update file tracking after restoration
 	if err := r.workspace.Scan(); err != nil {
 		return fmt.Errorf("failed to scan workspace after switch: %v", err)
@@ -997,13 +1020,33 @@ func (r *Repository) SwitchTimeline(name string) error {
 	return nil
 }
 
+// restoreTimelineFiles restores files that were committed on the specified timeline
+func (r *Repository) restoreTimelineFiles(timelineName string) error {
+	// Get the head of the target timeline
+	head, err := r.timeline.GetHead(timelineName)
+	if err != nil || head.IsZero() {
+		// No commits on this timeline yet, nothing to restore
+		return nil
+	}
+
+	// Load the seal at the head
+	_, err = r.storage.LoadSeal(head)
+	if err != nil {
+		// Seal not found, nothing to restore
+		return nil
+	}
+
+	// Restore the working directory to match the seal
+	return r.RestoreWorkingDirectory(head)
+}
+
 // FileOperation represents a file change operation
 type FileOperation struct {
-	Type     string // "add", "modify", "delete", "unchanged"
-	Path     string
-	Content  []byte
-	Mode     os.FileMode
-	Hash     string // For content deduplication
+	Type    string // "add", "modify", "delete", "unchanged"
+	Path    string
+	Content []byte
+	Mode    os.FileMode
+	Hash    string // For content deduplication
 }
 
 // TimelineDiff represents the differences between two timeline states
@@ -1019,7 +1062,7 @@ func (r *Repository) calculateTimelineDiff(currentTimeline, targetTimeline strin
 		if err != nil {
 			return err
 		}
-		
+
 		// Skip .ivaldi directory
 		if strings.Contains(path, ".ivaldi") {
 			if info.IsDir() {
@@ -1027,18 +1070,18 @@ func (r *Repository) calculateTimelineDiff(currentTimeline, targetTimeline strin
 			}
 			return nil
 		}
-		
+
 		// Skip directories
 		if info.IsDir() {
 			return nil
 		}
-		
+
 		relPath, _ := filepath.Rel(r.root, path)
 		content, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		
+
 		currentFiles[relPath] = FileOperation{
 			Type:    "current",
 			Path:    relPath,
@@ -1051,15 +1094,15 @@ func (r *Repository) calculateTimelineDiff(currentTimeline, targetTimeline strin
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Get target timeline state
 	targetFiles, err := r.loadTimelineState(targetTimeline)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	var operations []FileOperation
-	
+
 	// Find files to add or modify
 	for path, targetFile := range targetFiles {
 		if currentFile, exists := currentFiles[path]; exists {
@@ -1086,7 +1129,7 @@ func (r *Repository) calculateTimelineDiff(currentTimeline, targetTimeline strin
 			})
 		}
 	}
-	
+
 	// Remaining files in currentFiles need to be deleted
 	for path := range currentFiles {
 		operations = append(operations, FileOperation{
@@ -1094,27 +1137,27 @@ func (r *Repository) calculateTimelineDiff(currentTimeline, targetTimeline strin
 			Path: path,
 		})
 	}
-	
+
 	return &TimelineDiff{Operations: operations}, nil
 }
 
 // saveTimelineState saves the current working directory state using content-addressed storage
 func (r *Repository) saveTimelineState(timelineName string) error {
 	stateFile := filepath.Join(r.root, ".ivaldi", "timeline_states", timelineName+".json")
-	
+
 	// Create state directory
 	if err := os.MkdirAll(filepath.Dir(stateFile), 0755); err != nil {
 		return err
 	}
-	
+
 	state := make(map[string]FileOperation)
-	
+
 	// Walk through working directory and record file states
 	err := filepath.Walk(r.root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		
+
 		// Skip .ivaldi directory
 		if strings.Contains(path, ".ivaldi") {
 			if info.IsDir() {
@@ -1122,20 +1165,20 @@ func (r *Repository) saveTimelineState(timelineName string) error {
 			}
 			return nil
 		}
-		
+
 		// Skip directories
 		if info.IsDir() {
 			return nil
 		}
-		
+
 		relPath, _ := filepath.Rel(r.root, path)
 		content, err := os.ReadFile(path)
 		if err != nil {
 			return err
 		}
-		
+
 		hash := r.hashContent(content)
-		
+
 		// Store content in content-addressed storage
 		contentPath := filepath.Join(r.root, ".ivaldi", "content", hash)
 		if _, err := os.Stat(contentPath); os.IsNotExist(err) {
@@ -1146,7 +1189,7 @@ func (r *Repository) saveTimelineState(timelineName string) error {
 				return err
 			}
 		}
-		
+
 		state[relPath] = FileOperation{
 			Type: "stored",
 			Path: relPath,
@@ -1158,36 +1201,36 @@ func (r *Repository) saveTimelineState(timelineName string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	// Save state metadata
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
 	}
-	
+
 	return os.WriteFile(stateFile, data, 0644)
 }
 
 // loadTimelineState loads a timeline state from storage
 func (r *Repository) loadTimelineState(timelineName string) (map[string]FileOperation, error) {
 	stateFile := filepath.Join(r.root, ".ivaldi", "timeline_states", timelineName+".json")
-	
+
 	// Check if state exists
 	if _, err := os.Stat(stateFile); os.IsNotExist(err) {
 		// No state yet - return empty state
 		return make(map[string]FileOperation), nil
 	}
-	
+
 	data, err := os.ReadFile(stateFile)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	var state map[string]FileOperation
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, err
 	}
-	
+
 	// Load content for each file
 	for path, file := range state {
 		contentPath := filepath.Join(r.root, ".ivaldi", "content", file.Hash)
@@ -1198,7 +1241,7 @@ func (r *Repository) loadTimelineState(timelineName string) (map[string]FileOper
 		file.Content = content
 		state[path] = file
 	}
-	
+
 	return state, nil
 }
 
@@ -1206,7 +1249,7 @@ func (r *Repository) loadTimelineState(timelineName string) (map[string]FileOper
 func (r *Repository) applyTimelineDiff(diff *TimelineDiff) error {
 	for _, op := range diff.Operations {
 		fullPath := filepath.Join(r.root, op.Path)
-		
+
 		switch op.Type {
 		case "add", "modify":
 			// Ensure directory exists
@@ -1217,7 +1260,7 @@ func (r *Repository) applyTimelineDiff(diff *TimelineDiff) error {
 			if err := os.WriteFile(fullPath, op.Content, op.Mode); err != nil {
 				return err
 			}
-			
+
 		case "delete":
 			// Remove file
 			if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
@@ -1225,7 +1268,7 @@ func (r *Repository) applyTimelineDiff(diff *TimelineDiff) error {
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -1249,18 +1292,18 @@ func (r *Repository) clearWorkingDirectory() error {
 	if err != nil {
 		return err
 	}
-	
+
 	for _, entry := range entries {
 		if entry.Name() == ".ivaldi" {
 			continue // Skip .ivaldi directory
 		}
-		
+
 		fullPath := filepath.Join(r.root, entry.Name())
 		if err := os.RemoveAll(fullPath); err != nil {
 			return err
 		}
 	}
-	
+
 	return nil
 }
 
@@ -1300,7 +1343,7 @@ func (r *Repository) Status() Status {
 		if file.OnAnvil {
 			continue
 		}
-		
+
 		switch file.Status {
 		case workspace.StatusModified:
 			modified = append(modified, path)
@@ -1311,7 +1354,7 @@ func (r *Repository) Status() Status {
 
 	currentPos := r.position.Current()
 	positionName := "unknown"
-	
+
 	if name, exists := r.position.GetMemorableName(currentPos.Hash); exists {
 		positionName = name
 	}
@@ -1385,7 +1428,7 @@ type PortalConfig struct {
 
 func (r *Repository) loadPortalConfig() (*PortalConfig, error) {
 	configPath := filepath.Join(r.root, ".ivaldi", "portals.json")
-	
+
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1393,27 +1436,27 @@ func (r *Repository) loadPortalConfig() (*PortalConfig, error) {
 		}
 		return nil, err
 	}
-	
+
 	var config PortalConfig
 	if err := json.Unmarshal(data, &config); err != nil {
 		return nil, err
 	}
-	
+
 	if config.Portals == nil {
 		config.Portals = make(map[string]string)
 	}
-	
+
 	return &config, nil
 }
 
 func (r *Repository) savePortalConfig(config *PortalConfig) error {
 	configPath := filepath.Join(r.root, ".ivaldi", "portals.json")
-	
+
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return err
 	}
-	
+
 	return os.WriteFile(configPath, data, 0644)
 }
 
@@ -1422,9 +1465,9 @@ func (r *Repository) AddPortal(name, url string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	config.Portals[name] = url
-	
+
 	// Save portal configuration (git-independent)
 	return r.savePortalConfig(config)
 }
@@ -1434,9 +1477,9 @@ func (r *Repository) RemovePortal(name string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	delete(config.Portals, name)
-	
+
 	// Save portal configuration (git-independent)
 	return r.savePortalConfig(config)
 }
@@ -1446,7 +1489,7 @@ func (r *Repository) ListPortals() map[string]string {
 	if err != nil {
 		return make(map[string]string)
 	}
-	
+
 	return config.Portals
 }
 
@@ -1455,15 +1498,15 @@ func (r *Repository) Push(portalName string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	if _, exists := config.Portals[portalName]; !exists {
 		return fmt.Errorf("portal '%s' not found", portalName)
 	}
-	
+
 	// Use Ivaldi-native push instead of git push
 	currentTimeline := r.timeline.Current()
 	portalURL := config.Portals[portalName]
-	
+
 	return r.syncMgr.Push(portalURL, currentTimeline)
 }
 
@@ -1472,25 +1515,25 @@ func (r *Repository) Scout(portalName string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	if _, exists := config.Portals[portalName]; !exists {
 		return fmt.Errorf("portal '%s' not found", portalName)
 	}
-	
+
 	// Use Ivaldi-native fetch without merging
 	portalURL := config.Portals[portalName]
 	fetchResult, err := r.network.FetchFromPortal(portalURL, "main")
 	if err != nil {
 		return fmt.Errorf("failed to scout: %v", err)
 	}
-	
+
 	// Store fetched seals for later use
 	for _, seal := range fetchResult.Seals {
 		if err := r.storage.StoreSeal(seal); err != nil {
 			return fmt.Errorf("failed to store fetched seal: %v", err)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -1499,16 +1542,16 @@ func (r *Repository) Pull(portalName string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	if _, exists := config.Portals[portalName]; !exists {
 		return fmt.Errorf("portal '%s' not found", portalName)
 	}
-	
+
 	// Check if we have local changes
 	if r.workspace.HasUncommittedChanges() {
 		return fmt.Errorf("you have uncommitted changes, please seal them first or discard them")
 	}
-	
+
 	// Use Ivaldi-native sync instead of git pull
 	opts := sync.SyncOptions{
 		PortalName:     portalName,
@@ -1518,17 +1561,17 @@ func (r *Repository) Pull(portalName string) error {
 		Force:          false,
 		DryRun:         false,
 	}
-	
+
 	portalURL := config.Portals[portalName]
 	result, err := r.syncMgr.Sync(portalURL, opts)
 	if err != nil {
 		return fmt.Errorf("failed to sync: %v", err)
 	}
-	
+
 	if !result.Success {
 		return fmt.Errorf("sync failed: %s", result.Message)
 	}
-	
+
 	return nil
 }
 
@@ -1538,26 +1581,26 @@ func (r *Repository) Sync(portalName, localTimeline, remoteTimeline string) erro
 	if err != nil {
 		return err
 	}
-	
+
 	if _, exists := config.Portals[portalName]; !exists {
 		return fmt.Errorf("portal '%s' not found", portalName)
 	}
-	
+
 	// Check if we have local changes
 	if r.workspace.HasUncommittedChanges() {
 		return fmt.Errorf("you have uncommitted changes, please seal them first or discard them")
 	}
-	
+
 	// Use default remote timeline if not specified
 	if remoteTimeline == "" {
 		remoteTimeline = "main"
 	}
-	
+
 	// Use default local timeline if not specified
 	if localTimeline == "" {
 		localTimeline = r.timeline.Current()
 	}
-	
+
 	// Use Ivaldi-native sync
 	opts := sync.SyncOptions{
 		PortalName:     portalName,
@@ -1567,17 +1610,17 @@ func (r *Repository) Sync(portalName, localTimeline, remoteTimeline string) erro
 		Force:          false,
 		DryRun:         false,
 	}
-	
+
 	portalURL := config.Portals[portalName]
 	result, err := r.syncMgr.Sync(portalURL, opts)
 	if err != nil {
 		return fmt.Errorf("failed to sync: %v", err)
 	}
-	
+
 	if !result.Success {
 		return fmt.Errorf("sync failed: %s", result.Message)
 	}
-	
+
 	return nil
 }
 
@@ -1595,20 +1638,20 @@ func (r *Repository) exportToGit() error {
 	if err := cmd.Run(); err != nil {
 		return err
 	}
-	
+
 	// Get latest seal for commit message
 	seals, err := r.History(1)
 	if err != nil || len(seals) == 0 {
 		return fmt.Errorf("no seals found")
 	}
-	
+
 	message := fmt.Sprintf("[%s] %s", seals[0].Name, seals[0].Message)
-	
+
 	// Commit changes
 	cmd = exec.Command("git", "commit", "-m", message)
 	cmd.Dir = r.root
 	cmd.Run() // Ignore error if nothing to commit
-	
+
 	return nil
 }
 
@@ -1617,7 +1660,7 @@ func (r *Repository) importFromGit() error {
 	if err := r.workspace.Scan(); err != nil {
 		return err
 	}
-	
+
 	// Save workspace state
 	return r.workspace.SaveState(r.timeline.Current())
 }
@@ -1630,18 +1673,18 @@ func (r *Repository) importFromGitHistory() error {
 	if err != nil {
 		return err
 	}
-	
+
 	parts := strings.Split(strings.TrimSpace(string(output)), "|")
 	if len(parts) < 5 {
 		return fmt.Errorf("unexpected git log format")
 	}
-	
+
 	_ = parts[0] // gitHash - not used for now
 	message := parts[1]
 	authorName := parts[2]
 	authorEmail := parts[3]
 	timestampStr := parts[4]
-	
+
 	// Check if we already have this seal
 	seals, err := r.History(1)
 	if err == nil && len(seals) > 0 {
@@ -1650,21 +1693,21 @@ func (r *Repository) importFromGitHistory() error {
 			return r.importFromGit()
 		}
 	}
-	
+
 	// Create a new seal from the git commit
 	name := r.generateMemorableName()
-	
+
 	author := objects.Identity{
 		Name:  authorName,
 		Email: authorEmail,
 	}
-	
+
 	// Parse timestamp
 	timestamp := time.Now()
 	if ts, err := strconv.ParseInt(timestampStr, 10, 64); err == nil {
 		timestamp = time.Unix(ts, 0)
 	}
-	
+
 	seal := &objects.Seal{
 		Name:      name,
 		Iteration: r.getNextIteration(),
@@ -1673,28 +1716,28 @@ func (r *Repository) importFromGitHistory() error {
 		Timestamp: timestamp,
 		Parents:   []objects.Hash{},
 	}
-	
+
 	// Store the seal
 	if err := r.storage.StoreSeal(seal); err != nil {
 		return err
 	}
-	
+
 	if err := r.index.IndexSeal(seal); err != nil {
 		return err
 	}
-	
+
 	if err := r.position.SetPosition(seal.Hash, r.timeline.Current()); err != nil {
 		return err
 	}
-	
+
 	if err := r.position.SetMemorableName(seal.Hash, name); err != nil {
 		return err
 	}
-	
+
 	if err := r.timeline.UpdateHead(r.timeline.Current(), seal.Hash); err != nil {
 		return err
 	}
-	
+
 	// Scan workspace and save state
 	return r.importFromGit()
 }
@@ -1713,7 +1756,7 @@ type VersionConfig struct {
 
 func (r *Repository) loadVersionConfig() (*VersionConfig, error) {
 	configPath := filepath.Join(r.root, ".ivaldi", "versions.json")
-	
+
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1721,23 +1764,23 @@ func (r *Repository) loadVersionConfig() (*VersionConfig, error) {
 		}
 		return nil, err
 	}
-	
+
 	var config VersionConfig
 	if err := json.Unmarshal(data, &config); err != nil {
 		return nil, err
 	}
-	
+
 	return &config, nil
 }
 
 func (r *Repository) saveVersionConfig(config *VersionConfig) error {
 	configPath := filepath.Join(r.root, ".ivaldi", "versions.json")
-	
+
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return err
 	}
-	
+
 	return os.WriteFile(configPath, data, 0644)
 }
 
@@ -1746,35 +1789,35 @@ func (r *Repository) CreateVersion(tag, message string) error {
 	if !strings.HasPrefix(tag, "v") {
 		tag = "v" + tag
 	}
-	
+
 	config, err := r.loadVersionConfig()
 	if err != nil {
 		return err
 	}
-	
+
 	// Check if version already exists
 	for _, v := range config.Versions {
 		if v.Tag == tag {
 			return fmt.Errorf("version %s already exists", tag)
 		}
 	}
-	
+
 	// Get current seal
 	currentPos := r.position.Current()
 	sealName := "unknown"
 	if name, exists := r.position.GetMemorableName(currentPos.Hash); exists {
 		sealName = name
 	}
-	
+
 	version := Version{
 		Tag:     tag,
 		Message: message,
 		Seal:    sealName,
 		Date:    time.Now(),
 	}
-	
+
 	config.Versions = append(config.Versions, version)
-	
+
 	// Create git tag
 	gitDir := filepath.Join(r.root, ".git")
 	if _, err := os.Stat(gitDir); err == nil {
@@ -1787,7 +1830,7 @@ func (r *Repository) CreateVersion(tag, message string) error {
 			cmd.Run()
 		}
 	}
-	
+
 	return r.saveVersionConfig(config)
 }
 
@@ -1796,7 +1839,7 @@ func (r *Repository) ListVersions() []Version {
 	if err != nil {
 		return []Version{}
 	}
-	
+
 	// Sort by date (newest first)
 	versions := config.Versions
 	for i := 0; i < len(versions)-1; i++ {
@@ -1806,7 +1849,7 @@ func (r *Repository) ListVersions() []Version {
 			}
 		}
 	}
-	
+
 	return versions
 }
 
@@ -1816,7 +1859,7 @@ func (r *Repository) PushVersion(tag string) error {
 	if len(portals) == 0 {
 		return fmt.Errorf("no portals configured, use 'ivaldi portal add' first")
 	}
-	
+
 	// Find the origin portal or use the first one
 	portalName := "origin"
 	if _, exists := portals[portalName]; !exists {
@@ -1825,17 +1868,17 @@ func (r *Repository) PushVersion(tag string) error {
 			break
 		}
 	}
-	
+
 	// Push the tag to remote
 	cmd := exec.Command("git", "push", portalName, tag)
 	cmd.Dir = r.root
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	
+
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to push version %s: %v", tag, err)
 	}
-	
+
 	return nil
 }
 
@@ -1845,7 +1888,7 @@ func (r *Repository) PushAllVersions() error {
 	if len(portals) == 0 {
 		return fmt.Errorf("no portals configured, use 'ivaldi portal add' first")
 	}
-	
+
 	// Find the origin portal or use the first one
 	portalName := "origin"
 	if _, exists := portals[portalName]; !exists {
@@ -1854,17 +1897,17 @@ func (r *Repository) PushAllVersions() error {
 			break
 		}
 	}
-	
+
 	// Push all tags to remote
 	cmd := exec.Command("git", "push", portalName, "--tags")
 	cmd.Dir = r.root
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	
+
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to push versions: %v", err)
 	}
-	
+
 	return nil
 }
 
@@ -1873,17 +1916,17 @@ func (r *Repository) PushToBranch(portalName, branch string, setUpstream bool) e
 	if err != nil {
 		return err
 	}
-	
+
 	if _, exists := config.Portals[portalName]; !exists {
 		return fmt.Errorf("portal '%s' not found", portalName)
 	}
-	
+
 	// Determine timeline to push
 	targetTimeline := branch
 	if targetTimeline == "" {
 		targetTimeline = r.timeline.Current() // Use current timeline as default
 	}
-	
+
 	// Use Ivaldi-native push instead of git push
 	portalURL := config.Portals[portalName]
 	return r.syncMgr.Push(portalURL, targetTimeline)
@@ -1894,22 +1937,22 @@ func (r *Repository) PullFromBranch(portalName, branch string) error {
 	if err != nil {
 		return err
 	}
-	
+
 	if _, exists := config.Portals[portalName]; !exists {
 		return fmt.Errorf("portal '%s' not found", portalName)
 	}
-	
+
 	// Check if we have local changes
 	if r.workspace.HasUncommittedChanges() {
 		return fmt.Errorf("you have uncommitted changes, please seal them first or discard them")
 	}
-	
+
 	// Determine branch to pull from
 	sourceBranch := branch
 	if sourceBranch == "" {
 		sourceBranch = r.timeline.Current() // Use current timeline as default
 	}
-	
+
 	// Use Ivaldi-native sync instead of git pull
 	opts := sync.SyncOptions{
 		PortalName:     portalName,
@@ -1919,17 +1962,17 @@ func (r *Repository) PullFromBranch(portalName, branch string) error {
 		Force:          false,
 		DryRun:         false,
 	}
-	
+
 	portalURL := config.Portals[portalName]
 	result, err := r.syncMgr.Sync(portalURL, opts)
 	if err != nil {
 		return fmt.Errorf("failed to sync: %v", err)
 	}
-	
+
 	if !result.Success {
 		return fmt.Errorf("sync failed: %s", result.Message)
 	}
-	
+
 	return nil
 }
 
@@ -1940,7 +1983,7 @@ func (r *Repository) CreateBranchAndMigrate(newBranch, fromBranch string) error 
 	if err := createCmd.Run(); err != nil {
 		return fmt.Errorf("failed to create branch %s: %v", newBranch, err)
 	}
-	
+
 	// If we need to migrate from a different branch
 	if fromBranch != "" && fromBranch != newBranch {
 		// Switch to the from branch to get its content
@@ -1949,21 +1992,21 @@ func (r *Repository) CreateBranchAndMigrate(newBranch, fromBranch string) error 
 		if err := checkoutCmd.Run(); err != nil {
 			return fmt.Errorf("failed to checkout %s: %v", fromBranch, err)
 		}
-		
+
 		// Merge the content into our new branch
 		switchBackCmd := exec.Command("git", "checkout", newBranch)
 		switchBackCmd.Dir = r.root
 		if err := switchBackCmd.Run(); err != nil {
 			return fmt.Errorf("failed to switch back to %s: %v", newBranch, err)
 		}
-		
+
 		mergeCmd := exec.Command("git", "merge", fromBranch)
 		mergeCmd.Dir = r.root
 		if err := mergeCmd.Run(); err != nil {
 			return fmt.Errorf("failed to merge %s into %s: %v", fromBranch, newBranch, err)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -1977,11 +2020,11 @@ func (r *Repository) RenameBranchOnPortal(portalName, oldBranch, newBranch strin
 	if err != nil {
 		return err
 	}
-	
+
 	if _, exists := config.Portals[portalName]; !exists {
 		return fmt.Errorf("portal '%s' not found", portalName)
 	}
-	
+
 	// First, create the new branch from the old branch on the remote
 	// We need to push the old branch content to the new branch name
 	pushCmd := exec.Command("git", "push", portalName, fmt.Sprintf("%s:%s", oldBranch, newBranch))
@@ -1989,14 +2032,14 @@ func (r *Repository) RenameBranchOnPortal(portalName, oldBranch, newBranch strin
 	if err := pushCmd.Run(); err != nil {
 		return fmt.Errorf("failed to create new branch %s from %s: %v", newBranch, oldBranch, err)
 	}
-	
+
 	// Then delete the old branch on the remote
 	deleteCmd := exec.Command("git", "push", portalName, "--delete", oldBranch)
 	deleteCmd.Dir = r.root
 	if err := deleteCmd.Run(); err != nil {
 		return fmt.Errorf("failed to delete old branch %s: %v", oldBranch, err)
 	}
-	
+
 	return nil
 }
 
@@ -2008,6 +2051,11 @@ func (r *Repository) GetIndex() *index.SQLiteIndex {
 // GetStorage returns the repository's storage for loading objects
 func (r *Repository) GetStorage() *local.Storage {
 	return r.storage
+}
+
+// GetTimelineManager returns the repository's timeline manager
+func (r *Repository) GetTimelineManager() *timeline.Manager {
+	return r.timeline
 }
 
 // TimelineManager interface implementation for FuseManager
@@ -2036,27 +2084,27 @@ func (r *Repository) RenameTimeline(oldName, newName string) error {
 	if err := r.timeline.Rename(oldName, newName); err != nil {
 		return err
 	}
-	
+
 	// Rename timeline state files if they exist
 	oldStatePath := filepath.Join(r.root, ".ivaldi", "timeline_states", oldName+".json")
 	newStatePath := filepath.Join(r.root, ".ivaldi", "timeline_states", newName+".json")
-	
+
 	if _, err := os.Stat(oldStatePath); err == nil {
 		if err := os.Rename(oldStatePath, newStatePath); err != nil {
 			return fmt.Errorf("failed to rename timeline state file: %v", err)
 		}
 	}
-	
+
 	// Rename workspace state files if they exist
 	oldWorkspacePath := filepath.Join(r.root, ".ivaldi", "workspace", oldName+".json")
 	newWorkspacePath := filepath.Join(r.root, ".ivaldi", "workspace", newName+".json")
-	
+
 	if _, err := os.Stat(oldWorkspacePath); err == nil {
 		if err := os.Rename(oldWorkspacePath, newWorkspacePath); err != nil {
 			return fmt.Errorf("failed to rename workspace state file: %v", err)
 		}
 	}
-	
+
 	return nil
 }
 
@@ -2078,7 +2126,7 @@ func (r *Repository) RestoreWorkingDirectory(targetHash objects.Hash) error {
 	// Check if target hash is empty (no commits yet)
 	emptyHash := objects.Hash{}
 	hashString := targetHash.String()
-	
+
 	// If target hash is empty or all zeros, clear working directory
 	if targetHash == emptyHash || hashString == "0000000000000000000000000000000000000000000000000000000000000000" {
 		return r.clearWorkingDirectory()
@@ -2095,7 +2143,6 @@ func (r *Repository) RestoreWorkingDirectory(targetHash objects.Hash) error {
 	if err != nil {
 		return fmt.Errorf("failed to load seal: %v", err)
 	}
-
 
 	// Check if seal has a valid position set
 	emptyPos := objects.Hash{}
@@ -2151,18 +2198,18 @@ func (r *Repository) restoreFromTree(tree *objects.Tree, basePath string) error 
 						fmt.Printf("Successfully loaded blob using hash mapping for file %s\n", entryPath)
 					}
 				}
-				
+
 				if err != nil {
 					return fmt.Errorf("failed to load blob %s for file %s: %v", entry.Hash.String(), entryPath, err)
 				}
 			}
-			
+
 			// Ensure directory exists
 			dir := filepath.Dir(fullPath)
 			if err := os.MkdirAll(dir, 0755); err != nil {
 				return err
 			}
-			
+
 			// Write file
 			if err := os.WriteFile(fullPath, blob.Data, os.FileMode(entry.Mode)); err != nil {
 				return err
@@ -2188,12 +2235,12 @@ func (r *Repository) isIgnored(path string) bool {
 // convertCATreeToLegacyTree converts a content-addressed tree to legacy Tree format
 func (r *Repository) convertCATreeToLegacyTree(caTree *objects.CATree, treeHash objects.CAHash) *objects.Tree {
 	var entries []objects.TreeEntry
-	
+
 	for _, caEntry := range caTree.Entries {
 		// Convert CAHash to legacy Hash
 		var legacyHash objects.Hash
 		copy(legacyHash[:], caEntry.Hash.Bytes())
-		
+
 		// Convert ObjectKind to ObjectType
 		var objType objects.ObjectType
 		switch caEntry.Kind {
@@ -2204,7 +2251,7 @@ func (r *Repository) convertCATreeToLegacyTree(caTree *objects.CATree, treeHash 
 		default:
 			objType = objects.ObjectTypeBlob // Default to blob
 		}
-		
+
 		entry := objects.TreeEntry{
 			Name: caEntry.Name,
 			Hash: legacyHash,
@@ -2213,11 +2260,11 @@ func (r *Repository) convertCATreeToLegacyTree(caTree *objects.CATree, treeHash 
 		}
 		entries = append(entries, entry)
 	}
-	
+
 	// Create legacy hash for tree
 	var legacyTreeHash objects.Hash
 	copy(legacyTreeHash[:], treeHash.Bytes())
-	
+
 	return &objects.Tree{
 		Hash:    legacyTreeHash,
 		Entries: entries,
@@ -2228,7 +2275,7 @@ func (r *Repository) convertCATreeToLegacyTree(caTree *objects.CATree, treeHash 
 func (r *Repository) storeCABlobsAsLegacy(caTree *objects.CATree) error {
 	// Create a mapping to track hash conversions
 	r.createBlobHashMapping(caTree)
-	
+
 	for _, entry := range caTree.Entries {
 		if entry.Kind == objects.KindBlob {
 			// Load blob data from CA store
@@ -2239,13 +2286,13 @@ func (r *Repository) storeCABlobsAsLegacy(caTree *objects.CATree) error {
 
 			// Create legacy blob with the data
 			legacyBlob := objects.NewBlob(data)
-			
+
 			// Store using StoreObject which will compute hash
 			storedHash, err := r.storage.StoreObject(legacyBlob)
 			if err != nil {
 				return fmt.Errorf("failed to store legacy blob: %v", err)
 			}
-			
+
 			// Store the hash mapping for restoration
 			expectedHash := objects.Hash{}
 			copy(expectedHash[:], entry.Hash.Bytes())
@@ -2268,13 +2315,13 @@ func (r *Repository) createBlobHashMapping(caTree *objects.CATree) {
 // storeBlobHashMapping stores a mapping between expected and actual blob hashes
 func (r *Repository) storeBlobHashMapping(expectedHash, actualHash objects.Hash, filename string) {
 	mappingPath := filepath.Join(r.root, ".ivaldi", "blob_mappings", "mapping.json")
-	
+
 	type BlobMapping struct {
 		ExpectedToActual map[string]string `json:"expected_to_actual"`
 		ActualToExpected map[string]string `json:"actual_to_expected"`
 		FileNames        map[string]string `json:"file_names"`
 	}
-	
+
 	var mapping BlobMapping
 	if data, err := os.ReadFile(mappingPath); err == nil {
 		json.Unmarshal(data, &mapping)
@@ -2285,14 +2332,14 @@ func (r *Repository) storeBlobHashMapping(expectedHash, actualHash objects.Hash,
 			FileNames:        make(map[string]string),
 		}
 	}
-	
+
 	expectedStr := expectedHash.String()
 	actualStr := actualHash.String()
-	
+
 	mapping.ExpectedToActual[expectedStr] = actualStr
 	mapping.ActualToExpected[actualStr] = expectedStr
 	mapping.FileNames[expectedStr] = filename
-	
+
 	if data, err := json.MarshalIndent(mapping, "", "  "); err == nil {
 		os.WriteFile(mappingPath, data, 0644)
 	}
@@ -2301,23 +2348,23 @@ func (r *Repository) storeBlobHashMapping(expectedHash, actualHash objects.Hash,
 // loadBlobHashMapping loads the actual hash for an expected hash
 func (r *Repository) loadBlobHashMapping(expectedHash objects.Hash) (objects.Hash, bool) {
 	mappingPath := filepath.Join(r.root, ".ivaldi", "blob_mappings", "mapping.json")
-	
+
 	type BlobMapping struct {
 		ExpectedToActual map[string]string `json:"expected_to_actual"`
 		ActualToExpected map[string]string `json:"actual_to_expected"`
 		FileNames        map[string]string `json:"file_names"`
 	}
-	
+
 	data, err := os.ReadFile(mappingPath)
 	if err != nil {
 		return objects.Hash{}, false
 	}
-	
+
 	var mapping BlobMapping
 	if err := json.Unmarshal(data, &mapping); err != nil {
 		return objects.Hash{}, false
 	}
-	
+
 	expectedStr := expectedHash.String()
 	if actualStr, exists := mapping.ExpectedToActual[expectedStr]; exists {
 		// Parse actual hash string back to Hash
@@ -2325,12 +2372,12 @@ func (r *Repository) loadBlobHashMapping(expectedHash objects.Hash) (objects.Has
 		if err != nil || len(bytes) != 32 {
 			return objects.Hash{}, false
 		}
-		
+
 		var actualHash objects.Hash
 		copy(actualHash[:], bytes)
 		return actualHash, true
 	}
-	
+
 	return objects.Hash{}, false
 }
 
@@ -2345,10 +2392,10 @@ func (r *Repository) copyWorkspaceState(sourceTimeline, targetTimeline string) e
 		}
 		return err
 	}
-	
+
 	// Update the timeline field and save as target timeline
 	sourceWorkspace.Timeline = targetTimeline
-	
+
 	// Save the complete workspace state to the target timeline
 	return sourceWorkspace.SaveState(targetTimeline)
 }
@@ -2359,20 +2406,20 @@ func (r *Repository) shelveUncommittedChanges(timeline string) error {
 	if err := os.MkdirAll(shelveDir, 0755); err != nil {
 		return err
 	}
-	
+
 	// Create a shelve entry
 	shelveTime := time.Now()
 	shelveID := fmt.Sprintf("auto-shelve-%d", shelveTime.Unix())
-	
+
 	type ShelveEntry struct {
-		ID          string                        `json:"id"`
-		Timeline    string                        `json:"timeline"`
-		Timestamp   time.Time                     `json:"timestamp"`
+		ID          string                          `json:"id"`
+		Timeline    string                          `json:"timeline"`
+		Timestamp   time.Time                       `json:"timestamp"`
 		Files       map[string]*workspace.FileState `json:"files"`
 		AnvilFiles  map[string]*workspace.FileState `json:"anvil_files"`
-		Description string                        `json:"description"`
+		Description string                          `json:"description"`
 	}
-	
+
 	shelve := ShelveEntry{
 		ID:          shelveID,
 		Timeline:    timeline,
@@ -2381,24 +2428,24 @@ func (r *Repository) shelveUncommittedChanges(timeline string) error {
 		AnvilFiles:  make(map[string]*workspace.FileState),
 		Description: "Auto-shelved before timeline switch",
 	}
-	
+
 	// Copy uncommitted and anvil files
 	for path, fileState := range r.workspace.Files {
 		if fileState.Status != workspace.StatusUnmodified {
 			shelve.Files[path] = fileState
 		}
 	}
-	
+
 	for path, fileState := range r.workspace.AnvilFiles {
 		shelve.AnvilFiles[path] = fileState
 	}
-	
+
 	// Save shelve to file
 	shelveData, err := json.MarshalIndent(shelve, "", "  ")
 	if err != nil {
 		return err
 	}
-	
+
 	shelveFile := filepath.Join(shelveDir, shelveID+".json")
 	return os.WriteFile(shelveFile, shelveData, 0644)
 }
@@ -2406,7 +2453,7 @@ func (r *Repository) shelveUncommittedChanges(timeline string) error {
 // restoreFromShelve restores the latest auto-shelve for a timeline
 func (r *Repository) restoreFromShelve(timeline string) error {
 	shelveDir := filepath.Join(r.root, ".ivaldi", "shelves", timeline)
-	
+
 	// Find the latest auto-shelve
 	files, err := os.ReadDir(shelveDir)
 	if err != nil {
@@ -2416,22 +2463,22 @@ func (r *Repository) restoreFromShelve(timeline string) error {
 		}
 		return err
 	}
-	
+
 	var latestShelve string
 	var latestTime time.Time
-	
+
 	for _, file := range files {
 		if strings.HasPrefix(file.Name(), "auto-shelve-") && strings.HasSuffix(file.Name(), ".json") {
 			shelveData, err := os.ReadFile(filepath.Join(shelveDir, file.Name()))
 			if err != nil {
 				continue
 			}
-			
+
 			var shelve map[string]interface{}
 			if err := json.Unmarshal(shelveData, &shelve); err != nil {
 				continue
 			}
-			
+
 			if timestampStr, ok := shelve["timestamp"].(string); ok {
 				if timestamp, err := time.Parse(time.RFC3339, timestampStr); err == nil {
 					if timestamp.After(latestTime) {
@@ -2442,34 +2489,34 @@ func (r *Repository) restoreFromShelve(timeline string) error {
 			}
 		}
 	}
-	
+
 	if latestShelve == "" {
 		// No auto-shelves found
 		return nil
 	}
-	
+
 	// Load and restore the latest shelve
 	shelveData, err := os.ReadFile(filepath.Join(shelveDir, latestShelve))
 	if err != nil {
 		return err
 	}
-	
+
 	type ShelveEntry struct {
-		ID          string                        `json:"id"`
-		Timeline    string                        `json:"timeline"`
-		Timestamp   time.Time                     `json:"timestamp"`
+		ID          string                          `json:"id"`
+		Timeline    string                          `json:"timeline"`
+		Timestamp   time.Time                       `json:"timestamp"`
 		Files       map[string]*workspace.FileState `json:"files"`
 		AnvilFiles  map[string]*workspace.FileState `json:"anvil_files"`
-		Description string                        `json:"description"`
+		Description string                          `json:"description"`
 	}
-	
+
 	var shelve ShelveEntry
 	if err := json.Unmarshal(shelveData, &shelve); err != nil {
 		return err
 	}
-	
+
 	fmt.Printf("Restoring auto-shelved changes from %s\n", shelve.Timestamp.Format("2006-01-02 15:04:05"))
-	
+
 	// Merge shelved files back into workspace
 	if r.workspace.Files == nil {
 		r.workspace.Files = make(map[string]*workspace.FileState)
@@ -2477,15 +2524,15 @@ func (r *Repository) restoreFromShelve(timeline string) error {
 	if r.workspace.AnvilFiles == nil {
 		r.workspace.AnvilFiles = make(map[string]*workspace.FileState)
 	}
-	
+
 	for path, fileState := range shelve.Files {
 		r.workspace.Files[path] = fileState
 	}
-	
+
 	for path, fileState := range shelve.AnvilFiles {
 		r.workspace.AnvilFiles[path] = fileState
 	}
-	
+
 	return nil
 }
 
@@ -2494,17 +2541,17 @@ func (r *Repository) restoreFilesFromWorkspaceState() error {
 	if r.workspace.Files == nil || len(r.workspace.Files) == 0 {
 		return nil // No files to restore
 	}
-	
+
 	for path, fileState := range r.workspace.Files {
 		if fileState.Status == workspace.StatusUnmodified {
 			// This file should exist on this timeline
 			fullPath := filepath.Join(r.root, path)
-			
+
 			// Check if file already exists
 			if _, err := os.Stat(fullPath); err == nil {
 				continue // File already exists
 			}
-			
+
 			// Try to restore from CA store using BlobHash
 			if !fileState.BlobHash.IsZero() {
 				if err := r.restoreFileFromStore(path, fileState.BlobHash); err != nil {
@@ -2515,7 +2562,7 @@ func (r *Repository) restoreFilesFromWorkspaceState() error {
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -2526,15 +2573,441 @@ func (r *Repository) restoreFileFromStore(path string, hash objects.CAHash) erro
 	if err != nil {
 		return err
 	}
-	
+
 	fullPath := filepath.Join(r.root, path)
-	
+
 	// Create directory if needed
 	dir := filepath.Dir(fullPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	
+
 	// Write file
 	return os.WriteFile(fullPath, data, 0644)
+}
+
+// P2P Methods
+
+// StartP2P starts the P2P network for this repository
+func (r *Repository) StartP2P() error {
+	if r.p2pMgr == nil {
+		// Initialize P2P manager if not already done
+		storageAdapter := p2p.NewStorageAdapter(r.storage)
+		timelineAdapter := p2p.NewTimelineAdapter(r.timeline)
+		p2pMgr, err := p2p.NewP2PManager(r.root, storageAdapter, timelineAdapter)
+		if err != nil {
+			return fmt.Errorf("failed to initialize P2P manager: %v", err)
+		}
+		r.p2pMgr = p2pMgr
+	}
+	return r.p2pMgr.Start()
+}
+
+// StopP2P stops the P2P network for this repository
+func (r *Repository) StopP2P() error {
+	if r.p2pMgr == nil {
+		return nil
+	}
+	err := r.p2pMgr.Stop()
+	r.p2pMgr = nil // Clear the manager after stopping
+	return err
+}
+
+// IsP2PRunning returns whether P2P is currently running
+func (r *Repository) IsP2PRunning() bool {
+	// First check if we have a P2P manager instance
+	if r.p2pMgr != nil {
+		return r.p2pMgr.IsRunning()
+	}
+
+	// If no manager instance, check if P2P state file indicates it's running
+	stateManager := p2p.NewP2PStateManager(r.root)
+	return stateManager.IsRunning()
+}
+
+// ConnectToPeer connects to a P2P peer
+func (r *Repository) ConnectToPeer(address string, port int) error {
+	// Initialize P2P manager if needed
+	if err := r.ensureP2PManager(); err != nil {
+		return err
+	}
+	return r.p2pMgr.ConnectToPeer(address, port)
+}
+
+// GetP2PPeers returns all connected P2P peers
+func (r *Repository) GetP2PPeers() []*p2p.Peer {
+	// Try to ensure P2P manager is initialized
+	if err := r.ensureP2PManager(); err != nil {
+		return []*p2p.Peer{}
+	}
+	return r.p2pMgr.GetPeers()
+}
+
+// GetDiscoveredPeers returns all discovered P2P peers
+func (r *Repository) GetDiscoveredPeers() []*p2p.DiscoveredPeer {
+	// Try to ensure P2P manager is initialized
+	if err := r.ensureP2PManager(); err != nil {
+		return []*p2p.DiscoveredPeer{}
+	}
+	return r.p2pMgr.GetDiscoveredPeers()
+}
+
+// SyncWithP2PPeer performs manual synchronization with a specific peer
+func (r *Repository) SyncWithP2PPeer(peerID string) error {
+	// Initialize P2P manager if needed
+	if err := r.ensureP2PManager(); err != nil {
+		return err
+	}
+	return r.p2pMgr.SyncWithPeer(peerID)
+}
+
+// SyncWithAllP2PPeers performs synchronization with all connected peers
+func (r *Repository) SyncWithAllP2PPeers() error {
+	// Initialize P2P manager if needed
+	if err := r.ensureP2PManager(); err != nil {
+		return err
+	}
+	return r.p2pMgr.SyncWithAllPeers()
+}
+
+// GetP2PSyncState returns synchronization state for all peers
+func (r *Repository) GetP2PSyncState() map[string]*p2p.PeerSyncState {
+	if r.p2pMgr == nil {
+		return make(map[string]*p2p.PeerSyncState)
+	}
+	return r.p2pMgr.GetSyncState()
+}
+
+// EnableP2PAutoSync enables or disables automatic P2P synchronization
+func (r *Repository) EnableP2PAutoSync(enabled bool) error {
+	if r.p2pMgr == nil {
+		// Initialize P2P manager if not already done
+		storageAdapter := p2p.NewStorageAdapter(r.storage)
+		timelineAdapter := p2p.NewTimelineAdapter(r.timeline)
+		p2pMgr, err := p2p.NewP2PManager(r.root, storageAdapter, timelineAdapter)
+		if err != nil {
+			return fmt.Errorf("failed to initialize P2P manager: %v", err)
+		}
+		r.p2pMgr = p2pMgr
+	}
+	return r.p2pMgr.EnableAutoSync(enabled)
+}
+
+// SetP2PSyncInterval sets the P2P synchronization interval
+func (r *Repository) SetP2PSyncInterval(interval time.Duration) error {
+	if r.p2pMgr == nil {
+		// Initialize P2P manager if not already done
+		storageAdapter := p2p.NewStorageAdapter(r.storage)
+		timelineAdapter := p2p.NewTimelineAdapter(r.timeline)
+		p2pMgr, err := p2p.NewP2PManager(r.root, storageAdapter, timelineAdapter)
+		if err != nil {
+			return fmt.Errorf("failed to initialize P2P manager: %v", err)
+		}
+		r.p2pMgr = p2pMgr
+	}
+	return r.p2pMgr.SetSyncInterval(interval)
+}
+
+// GetP2PConfig returns the current P2P configuration
+func (r *Repository) GetP2PConfig() *p2p.P2PConfig {
+	if r.p2pMgr == nil {
+		// Return default config if P2P manager not initialized
+		return p2p.DefaultP2PConfig()
+	}
+	return r.p2pMgr.GetConfig()
+}
+
+// UpdateP2PConfig updates the P2P configuration
+func (r *Repository) UpdateP2PConfig(config *p2p.P2PConfig) error {
+	// Always recreate the P2P manager with the new config to avoid port conflicts
+	// First, stop existing manager if running
+	if r.p2pMgr != nil && r.p2pMgr.IsRunning() {
+		r.p2pMgr.Stop()
+	}
+
+	// Save the config first
+	configManager := p2p.NewP2PConfigManager(r.root)
+	err := configManager.Save(config)
+	if err != nil {
+		return fmt.Errorf("failed to save P2P config: %v", err)
+	}
+
+	// Create P2P manager with updated config
+	storageAdapter := p2p.NewStorageAdapter(r.storage)
+	timelineAdapter := p2p.NewTimelineAdapter(r.timeline)
+	p2pMgr, err := p2p.NewP2PManager(r.root, storageAdapter, timelineAdapter)
+	if err != nil {
+		return fmt.Errorf("failed to initialize P2P manager: %v", err)
+	}
+	r.p2pMgr = p2pMgr
+
+	return nil
+}
+
+// GetP2PStatus returns current P2P status information
+func (r *Repository) GetP2PStatus() *p2p.P2PStatus {
+	// Check if we have a P2P manager instance
+	if r.p2pMgr != nil {
+		return r.p2pMgr.GetStatus()
+	}
+
+	// Check persistent state
+	stateManager := p2p.NewP2PStateManager(r.root)
+	if state, ok := stateManager.GetRunningState(); ok {
+		// P2P is running but we don't have a manager instance
+		// Return basic status from state file
+		return &p2p.P2PStatus{
+			Running:         true,
+			NodeID:          state.NodeID,
+			Port:            state.Port,
+			ConnectedPeers:  0, // We don't know actual peer count
+			DiscoveredPeers: 0, // We don't know actual discovered count
+		}
+	}
+
+	return &p2p.P2PStatus{Running: false}
+}
+
+// FindPeersWithRepository finds P2P peers that have a specific repository
+func (r *Repository) FindPeersWithRepository(repoName string) []*p2p.DiscoveredPeer {
+	if r.p2pMgr == nil {
+		return []*p2p.DiscoveredPeer{}
+	}
+	return r.p2pMgr.FindPeersWithRepository(repoName)
+}
+
+// Mesh Network Methods
+
+// StartMesh starts the mesh networking layer
+func (r *Repository) StartMesh() error {
+	if r.meshMgr == nil {
+		// Initialize mesh manager if not already done
+		if r.p2pMgr == nil {
+			// Initialize P2P manager first
+			if err := r.initializeP2PManager(); err != nil {
+				return fmt.Errorf("failed to initialize P2P manager for mesh: %v", err)
+			}
+		}
+		// Mesh manager currently only supports traditional P2P manager
+		if concreteMgr, ok := r.p2pMgr.(*p2p.P2PManager); ok {
+			r.meshMgr = mesh.NewMeshManager(concreteMgr, r.root)
+		} else {
+			return fmt.Errorf("mesh networking only supports traditional P2P manager, not WebSocket P2P")
+		}
+	}
+	return r.meshMgr.Start()
+}
+
+// StopMesh stops the mesh networking layer
+func (r *Repository) StopMesh() error {
+	if r.meshMgr != nil {
+		err := r.meshMgr.Stop()
+		r.meshMgr = nil
+		return err
+	}
+
+	// No local mesh manager, but check if mesh is running in another process
+	stateManager := mesh.NewMeshStateManager(r.root)
+	if state, ok := stateManager.GetRunningState(); ok {
+		// Mesh is running in another process, send termination signal
+		process, err := os.FindProcess(state.PID)
+		if err != nil {
+			// Process doesn't exist, just clear state
+			stateManager.Clear()
+			return nil
+		}
+
+		// Send SIGTERM to gracefully stop the process
+		err = process.Signal(syscall.SIGTERM)
+		if err != nil {
+			return fmt.Errorf("failed to stop mesh process (PID %d): %v", state.PID, err)
+		}
+
+		// Clear state file
+		stateManager.Clear()
+
+		fmt.Printf("Sent termination signal to mesh process (PID %d)\n", state.PID)
+		return nil
+	}
+
+	return nil
+}
+
+// IsMeshRunning returns whether mesh networking is active
+func (r *Repository) IsMeshRunning() bool {
+	if r.meshMgr != nil {
+		return r.meshMgr.IsRunning()
+	}
+
+	// Check persistent state as fallback
+	stateManager := mesh.NewMeshStateManager(r.root)
+	return stateManager.IsRunning()
+}
+
+// JoinMesh joins a mesh network via a bootstrap peer
+func (r *Repository) JoinMesh(bootstrapAddress string, bootstrapPort int) error {
+	if r.meshMgr == nil {
+		return fmt.Errorf("mesh manager not initialized")
+	}
+	return r.meshMgr.Join(bootstrapAddress, bootstrapPort)
+}
+
+// GetMeshStatus returns current mesh network status
+func (r *Repository) GetMeshStatus() *mesh.MeshStatus {
+	// Check if we have a mesh manager instance
+	if r.meshMgr != nil {
+		return r.meshMgr.GetStatus()
+	}
+
+	// Check persistent state
+	stateManager := mesh.NewMeshStateManager(r.root)
+	if state, ok := stateManager.GetRunningState(); ok {
+		// Mesh is running but we don't have a manager instance
+		// Return basic status from state file
+		return &mesh.MeshStatus{
+			Running:       true,
+			NodeID:        state.NodeID,
+			PeerCount:     0, // We don't know actual peer count without manager
+			DirectPeers:   0,
+			IndirectPeers: 0,
+			MaxHops:       0,
+			AvgHops:       0,
+			Topology:      make(map[string]*mesh.MeshPeer),
+			Routes:        make(map[string][]string),
+		}
+	}
+
+	// Not running
+	return &mesh.MeshStatus{Running: false}
+}
+
+// GetMeshTopology returns the current mesh topology
+func (r *Repository) GetMeshTopology() map[string]*mesh.MeshPeer {
+	if r.meshMgr != nil {
+		return r.meshMgr.GetTopology()
+	}
+
+	// If mesh manager is not available but mesh is running, return empty topology
+	// Commands that need full topology should initialize the manager first
+	stateManager := mesh.NewMeshStateManager(r.root)
+	if stateManager.IsRunning() {
+		return make(map[string]*mesh.MeshPeer)
+	}
+
+	return make(map[string]*mesh.MeshPeer)
+}
+
+// GetMeshRoute returns the route to a specific peer
+func (r *Repository) GetMeshRoute(targetPeerID string) []string {
+	if r.meshMgr == nil {
+		return nil
+	}
+	return r.meshMgr.GetRoute(targetPeerID)
+}
+
+// SendMeshMessage sends a message through the mesh network
+func (r *Repository) SendMeshMessage(targetPeerID string, messageType string, payload interface{}) error {
+	if r.meshMgr == nil {
+		return fmt.Errorf("mesh manager not initialized")
+	}
+	return r.meshMgr.SendMessage(targetPeerID, messageType, payload)
+}
+
+// PingMeshPeer sends a ping to a peer via mesh routing
+func (r *Repository) PingMeshPeer(targetPeerID string) error {
+	if r.meshMgr == nil {
+		return fmt.Errorf("mesh manager not initialized")
+	}
+	return r.meshMgr.Ping(targetPeerID)
+}
+
+// GetMeshPeers returns all peers in the mesh network
+func (r *Repository) GetMeshPeers() []*mesh.MeshPeer {
+	if r.meshMgr == nil {
+		return []*mesh.MeshPeer{}
+	}
+	return r.meshMgr.GetPeers()
+}
+
+// GetDirectMeshPeers returns only directly connected mesh peers
+func (r *Repository) GetDirectMeshPeers() []*mesh.MeshPeer {
+	if r.meshMgr == nil {
+		return []*mesh.MeshPeer{}
+	}
+	return r.meshMgr.GetDirectPeers()
+}
+
+// GetIndirectMeshPeers returns only indirectly connected mesh peers
+func (r *Repository) GetIndirectMeshPeers() []*mesh.MeshPeer {
+	if r.meshMgr == nil {
+		return []*mesh.MeshPeer{}
+	}
+	return r.meshMgr.GetIndirectPeers()
+}
+
+// HealMeshNetwork manually triggers mesh network healing
+func (r *Repository) HealMeshNetwork() error {
+	if r.meshMgr == nil {
+		return fmt.Errorf("mesh manager not initialized")
+	}
+	return r.meshMgr.HealNetwork()
+}
+
+// RefreshMeshTopology manually triggers mesh topology refresh
+func (r *Repository) RefreshMeshTopology() error {
+	if r.meshMgr == nil {
+		return fmt.Errorf("mesh manager not initialized")
+	}
+	return r.meshMgr.RefreshTopology()
+}
+
+// initializeP2PManager initializes the P2P manager if needed
+func (r *Repository) initializeP2PManager() error {
+	if r.p2pMgr != nil {
+		return nil
+	}
+
+	// Check if WebSocket P2P mode is enabled via environment variable
+	useWebSocket := os.Getenv("IVALDI_WEBSOCKET_P2P") == "true"
+	fmt.Printf("Debug: IVALDI_WEBSOCKET_P2P=%q, useWebSocket=%v\n", os.Getenv("IVALDI_WEBSOCKET_P2P"), useWebSocket)
+
+	if useWebSocket {
+		// Use Carrion WebSocket-based P2P
+		fmt.Println("Using WebSocket-based P2P networking (Carrion)")
+		websocketMgr, err := p2p.NewWebSocketP2PManager(r.root, 9092)
+		if err != nil {
+			return fmt.Errorf("failed to initialize WebSocket P2P manager: %v", err)
+		}
+
+		// WebSocketP2PManager implements P2PManagerInterface
+		r.p2pMgr = websocketMgr
+	} else {
+		// Use traditional Go-based P2P (fallback)
+		fmt.Println("Using traditional P2P networking (Go)")
+		storageAdapter := p2p.NewStorageAdapter(r.storage)
+		timelineAdapter := p2p.NewTimelineAdapter(r.timeline)
+		p2pMgr, err := p2p.NewP2PManager(r.root, storageAdapter, timelineAdapter)
+		if err != nil {
+			return fmt.Errorf("failed to initialize P2P manager: %v", err)
+		}
+		r.p2pMgr = p2pMgr
+	}
+
+	return nil
+}
+
+// ensureP2PManager ensures P2P manager is initialized if P2P is running
+func (r *Repository) ensureP2PManager() error {
+	if r.p2pMgr != nil {
+		return nil
+	}
+
+	// Check if P2P is running from state
+	stateManager := p2p.NewP2PStateManager(r.root)
+	if !stateManager.IsRunning() {
+		return fmt.Errorf("P2P network is not running. Start it with: p2p start")
+	}
+
+	// Initialize P2P manager to reconnect to running P2P
+	return r.initializeP2PManager()
 }
