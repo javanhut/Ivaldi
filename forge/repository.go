@@ -84,6 +84,9 @@ func Initialize(root string) (*Repository, error) {
 	// Configure position manager with reference resolver
 	pm.SetReferenceResolver(rm)
 
+	// Initialize network manager
+	nm := network.NewNetworkManager(root)
+
 	repo := &Repository{
 		root:      root,
 		storage:   storage,
@@ -92,6 +95,7 @@ func Initialize(root string) (*Repository, error) {
 		timeline:  tm,
 		position:  pm,
 		refMgr:    rm,
+		network:   nm,
 	}
 
 	if err := tm.Initialize(); err != nil {
@@ -959,12 +963,6 @@ func (r *Repository) SwitchTimeline(name string) error {
 		return nil
 	}
 
-	// Calculate the diff between current state and target timeline
-	diff, err := r.calculateTimelineDiff(currentTimeline, name)
-	if err != nil {
-		return fmt.Errorf("failed to calculate timeline diff: %v", err)
-	}
-
 	// Save current timeline state before switching
 	if err := r.saveTimelineState(currentTimeline); err != nil {
 		return fmt.Errorf("failed to save timeline state for %s: %v", currentTimeline, err)
@@ -975,14 +973,31 @@ func (r *Repository) SwitchTimeline(name string) error {
 		return fmt.Errorf("failed to save workspace state: %v", err)
 	}
 
+	// Check if target timeline has a saved state
+	targetStateFile := filepath.Join(r.root, ".ivaldi", "timeline_states", name+".json")
+	hasTargetState := false
+	if _, err := os.Stat(targetStateFile); err == nil {
+		hasTargetState = true
+	}
+
+	// Only apply diff if the target timeline has a saved state
+	// If it doesn't have a saved state, preserve the current working directory
+	if hasTargetState {
+		// Calculate the diff between current state and target timeline
+		diff, err := r.calculateTimelineDiff(currentTimeline, name)
+		if err != nil {
+			return fmt.Errorf("failed to calculate timeline diff: %v", err)
+		}
+
+		// Apply the diff to transform working directory
+		if err := r.applyTimelineDiff(diff); err != nil {
+			return fmt.Errorf("failed to apply timeline diff: %v", err)
+		}
+	}
+
 	// Switch timeline
 	if err := r.timeline.Switch(name); err != nil {
 		return err
-	}
-
-	// Apply the diff to transform working directory
-	if err := r.applyTimelineDiff(diff); err != nil {
-		return fmt.Errorf("failed to apply timeline diff: %v", err)
 	}
 
 	// Clear workspace state to prepare for new timeline
@@ -1025,14 +1040,16 @@ func (r *Repository) restoreTimelineFiles(timelineName string) error {
 	// Get the head of the target timeline
 	head, err := r.timeline.GetHead(timelineName)
 	if err != nil || head.IsZero() {
-		// No commits on this timeline yet, nothing to restore
+		// No commits on this timeline yet, preserve current working directory
+		// This is important: new timelines should inherit the current working state,
+		// not clear everything
 		return nil
 	}
 
 	// Load the seal at the head
 	_, err = r.storage.LoadSeal(head)
 	if err != nil {
-		// Seal not found, nothing to restore
+		// Seal not found, preserve current working directory
 		return nil
 	}
 
@@ -2055,6 +2072,18 @@ func (r *Repository) GetStorage() *local.Storage {
 
 // GetTimelineManager returns the repository's timeline manager
 func (r *Repository) GetTimelineManager() *timeline.Manager {
+	return r.timeline
+}
+
+func (r *Repository) Network() *network.NetworkManager {
+	return r.network
+}
+
+func (r *Repository) Storage() *local.Storage {
+	return r.storage
+}
+
+func (r *Repository) Timeline() *timeline.Manager {
 	return r.timeline
 }
 

@@ -327,6 +327,9 @@ func EnhancedInitialize(root string) (*EnhancedRepository, error) {
 	ws := workspace.New(root, store)
 	tm := timeline.NewManager(root)
 	pm := position.NewManager(root)
+	
+	// Initialize network manager
+	nm := network.NewNetworkManager(root)
 
 	// Create base repository
 	baseRepo := &Repository{
@@ -336,6 +339,7 @@ func EnhancedInitialize(root string) (*EnhancedRepository, error) {
 		workspace: ws,
 		timeline:  tm,
 		position:  pm,
+		network:   nm,
 	}
 
 	// Initialize timeline
@@ -345,8 +349,12 @@ func EnhancedInitialize(root string) (*EnhancedRepository, error) {
 
 	// Initialize revolutionary features
 	refManager := references.NewReferenceManager(root)
+	refManager.SetIndex(idx)  // Configure reference manager with index
 	preservationManager := preservation.NewPreservationManager(root)
 	overwriteTracker := overwrite.NewOverwriteTracker(root)
+
+	// Set the reference manager in the base repository as well
+	baseRepo.refMgr = refManager
 
 	return &EnhancedRepository{
 		Repository:       baseRepo,
