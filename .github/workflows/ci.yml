@@ -80,13 +80,10 @@ jobs:
       with:
         go-version: 1.24
 
-    - name: Install golangci-lint
+    - name: Run golangci-lint
       uses: golangci/golangci-lint-action@v6
       with:
-        version: v2.4.0
-
-    - name: Run golangci-lint
-      run: golangci-lint run
+        version: latest
 
   security:
     name: Security Scan
@@ -100,8 +97,7 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Run Trivy vulnerability scanner
-      # Using v0.32.0 (latest stable release as of 2025-08-25)
-      uses: aquasecurity/trivy-action@v0.32.0
+      uses: aquasecurity/trivy-action@v0.31.0
       with:
         scan-type: 'fs'
         scan-ref: '.'
