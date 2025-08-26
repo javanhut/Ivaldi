@@ -193,14 +193,30 @@ func (er *EnhancedRepository) EnhancedTimelineSwitch(timelineName string) (*pres
 
 // EnhancedJump jumps to any position using natural language references
 func (er *EnhancedRepository) EnhancedJump(reference string) error {
+	return er.EnhancedJumpWithOptions(reference, JumpOptions{
+		PreserveWorkspace: false,
+		SaveJumpHistory:   true,
+	})
+}
+
+// EnhancedJumpWithOptions jumps to any position using natural language references with options
+func (er *EnhancedRepository) EnhancedJumpWithOptions(reference string, options JumpOptions) error {
 	// Resolve natural language reference
 	hash, err := er.references.Resolve(reference, er.timeline.Current())
 	if err != nil {
 		return fmt.Errorf("could not resolve reference '%s': %v", reference, err)
 	}
 
-	// Use base jump functionality
-	return er.Jump(hash.String())
+	// Use base jump functionality with options
+	return er.JumpWithOptions(hash.String(), options)
+}
+
+// EnhancedJumpWithPreservation jumps while preserving workspace changes
+func (er *EnhancedRepository) EnhancedJumpWithPreservation(reference string) error {
+	return er.EnhancedJumpWithOptions(reference, JumpOptions{
+		PreserveWorkspace: true,
+		SaveJumpHistory:   true,
+	})
 }
 
 // EnhancedReshape modifies history with mandatory overwrite tracking
@@ -327,7 +343,7 @@ func EnhancedInitialize(root string) (*EnhancedRepository, error) {
 	ws := workspace.New(root, store)
 	tm := timeline.NewManager(root)
 	pm := position.NewManager(root)
-	
+
 	// Initialize network manager
 	nm := network.NewNetworkManager(root)
 
@@ -349,7 +365,7 @@ func EnhancedInitialize(root string) (*EnhancedRepository, error) {
 
 	// Initialize revolutionary features
 	refManager := references.NewReferenceManager(root)
-	refManager.SetIndex(idx)  // Configure reference manager with index
+	refManager.SetIndex(idx) // Configure reference manager with index
 	preservationManager := preservation.NewPreservationManager(root)
 	overwriteTracker := overwrite.NewOverwriteTracker(root)
 

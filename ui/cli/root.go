@@ -30,6 +30,7 @@ func init() {
 	rootCmd.AddCommand(gatherCmd)
 	rootCmd.AddCommand(discardCmd)
 	rootCmd.AddCommand(sealCmd)
+	rootCmd.AddCommand(overwriteCmd)
 	rootCmd.AddCommand(timelineCmd)
 	rootCmd.AddCommand(jumpCmd)
 	rootCmd.AddCommand(fuseCmd)

@@ -22,6 +22,7 @@ import (
 	"ivaldi/core/config"
 	"ivaldi/core/fuse"
 	"ivaldi/core/network"
+	"ivaldi/core/objects"
 	"ivaldi/core/p2p"
 	"ivaldi/core/reshape"
 	"ivaldi/core/search"
@@ -164,6 +165,7 @@ func (ec *EnhancedCLI) addEnhancedCommands(rootCmd *cobra.Command) {
 	rootCmd.AddCommand(ec.createExcludeCommand())
 	rootCmd.AddCommand(ec.createRemoveCommand())
 	rootCmd.AddCommand(ec.createSealCommand())
+	rootCmd.AddCommand(ec.createOverwriteCommand())
 	rootCmd.AddCommand(ec.createTimelineCommand())
 	rootCmd.AddCommand(ec.createRenameCommand())
 	rootCmd.AddCommand(ec.createJumpCommand())
@@ -578,6 +580,90 @@ Examples:
 	}
 }
 
+func (ec *EnhancedCLI) createOverwriteCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "overwrite [reference] -m <message> --reason <reason>",
+		Short: "Overwrite a seal with new content",
+		Long: `Overwrite an existing seal with the current workspace content.
+
+Supports natural language references and requires justification for audit purposes.
+
+If no reference is provided, overwrites the current/latest seal.
+
+Examples:
+  overwrite -m "Fixed typo" --reason "corrected error in commit message"
+  overwrite bright-river-42 -m "Added tests" --reason "forgot to include tests"
+  overwrite "yesterday's commit" -m "Security fix" --reason "patched vulnerability"
+  overwrite #150 -m "Updated docs" --reason "missing documentation"`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if ec.currentRepo == nil {
+				return fmt.Errorf("not in repository")
+			}
+
+			message, _ := cmd.Flags().GetString("message")
+			if message == "" {
+				ec.output.Error("Message is required", []string{
+					"overwrite -m \"Fixed typo\" --reason \"reason\"",
+					"overwrite bright-river-42 -m \"message\" --reason \"reason\"",
+				})
+				return fmt.Errorf("message is required")
+			}
+
+			reason, _ := cmd.Flags().GetString("reason")
+			if reason == "" {
+				ec.output.Error("Reason is required for audit purposes", []string{
+					"overwrite -m \"message\" --reason \"why overwriting\"",
+					"All overwrites must be justified for accountability",
+				})
+				return fmt.Errorf("reason is required")
+			}
+
+			var seal *objects.Seal
+			var err error
+
+			if len(args) == 0 {
+				// No reference provided, overwrite current seal
+				ec.output.Info("Overwriting current seal...")
+				seal, err = ec.currentRepo.OverwriteCurrentSeal(message, reason)
+			} else {
+				// Reference provided, overwrite specific seal
+				reference := args[0]
+				ec.output.Info(fmt.Sprintf("Overwriting seal '%s'...", reference))
+				seal, err = ec.currentRepo.OverwriteSeal(reference, message, reason)
+			}
+
+			if err != nil {
+				ec.output.Error("Failed to overwrite seal", []string{
+					"Ensure files are gathered (use: gather)",
+					"Check that the reference exists (use: chronicle)",
+					"Try: gather all, then overwrite",
+				})
+				return err
+			}
+
+			ec.output.Success(fmt.Sprintf("Overwritten as: %s", seal.Name))
+			ec.output.Info(fmt.Sprintf("New message: %s", seal.Message))
+			ec.output.Info(fmt.Sprintf("Reason: %s", reason))
+			ec.output.Info(fmt.Sprintf("Iteration: #%d", seal.Iteration))
+
+			if len(seal.Overwrites) > 0 {
+				ec.output.Info(fmt.Sprintf("Previous seal: %s", seal.Overwrites[0].PreviousHash.String()[:8]))
+			}
+
+			return nil
+		},
+	}
+
+	// Add flags
+	cmd.Flags().StringP("message", "m", "", "New seal message")
+	cmd.Flags().String("reason", "", "Reason for overwriting (required)")
+	cmd.MarkFlagRequired("message")
+	cmd.MarkFlagRequired("reason")
+
+	return cmd
+}
+
 // Create timeline command (branch management)
 func (ec *EnhancedCLI) createTimelineCommand() *cobra.Command {
 	cmd := &cobra.Command{
@@ -634,8 +720,12 @@ Examples:
 
 // Create jump command (checkout with natural language)
 func (ec *EnhancedCLI) createJumpCommand() *cobra.Command {
-	return &cobra.Command{
-		Use:   "jump <reference>",
+	var noPreserve bool
+	var force bool
+	var noHistory bool
+
+	jumpCmd := &cobra.Command{
+		Use:   "jump [to] <reference>",
 		Short: "Jump to any point using natural language",
 		Long: `Jump to any point in history using natural language references
 
@@ -646,12 +736,16 @@ Supported references:
 - Author references:      "Sarah's last commit"
 - Content references:     "where auth was added"
 
+Note: By default, uncommitted changes are preserved during jumps (auto-preserve).
+
 Examples:
   jump to bright-river-42
   jump to "yesterday before lunch"
   jump to "#150"
   jump to "Sarah's last commit"
-  jump back 3`,
+  jump back 3
+  jump --no-preserve to bright-river-42  # Don't preserve uncommitted changes
+  jump --force to prev-seal-001          # Force overwrite local changes`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if ec.currentRepo == nil {
@@ -664,19 +758,89 @@ Examples:
 			reference = strings.TrimPrefix(reference, "to ")
 			reference = strings.TrimPrefix(reference, "back ")
 
-			err := ec.currentRepo.EnhancedJump(reference)
+			// Special handling for "back" command
+			if reference == "" && strings.Contains(strings.Join(args, " "), "back") {
+				err := ec.currentRepo.JumpBack()
+				if err != nil {
+					ec.output.Error("Could not jump back", []string{
+						"No jump history available",
+						"Use regular jump commands first",
+					})
+					return err
+				}
+				ec.output.Success("Jumped back to previous position")
+				return nil
+			}
+
+			// Create jump options
+			options := forge.JumpOptions{
+				PreserveWorkspace: !noPreserve,
+				SaveJumpHistory:   !noHistory,
+				Force:             force,
+			}
+
+			err := ec.currentRepo.EnhancedJumpWithOptions(reference, options)
 			if err != nil {
 				ec.output.Error(fmt.Sprintf("Could not jump to '%s'", reference), []string{
 					"Try: jump to bright-river-42",
 					"Try: jump to \"yesterday\"",
 					"Try: jump to #150",
+					"Try: jump --preserve to prev-seal-001",
 					"Use: timeline list (to see available timelines)",
 				})
 				return err
 			}
 
-			ec.output.Success(fmt.Sprintf("Jumped to: %s", reference))
+			if !noPreserve {
+				ec.output.Success(fmt.Sprintf("Jumped to: %s (workspace preserved)", reference))
+			} else {
+				ec.output.Success(fmt.Sprintf("Jumped to: %s", reference))
+			}
 
+			return nil
+		},
+	}
+
+	// Add flags
+	jumpCmd.Flags().BoolVar(&noPreserve, "no-preserve", false, "Don't preserve uncommitted changes during jump")
+	jumpCmd.Flags().BoolVar(&noPreserve, "n", false, "Don't preserve uncommitted changes during jump (shorthand)")
+	jumpCmd.Flags().BoolVar(&force, "force", false, "Force jump even if it overwrites local changes")
+	jumpCmd.Flags().BoolVar(&force, "f", false, "Force jump even if it overwrites local changes (shorthand)")
+	jumpCmd.Flags().BoolVar(&noHistory, "no-history", false, "Don't save current position to jump history")
+
+	// Add subcommands
+	jumpCmd.AddCommand(ec.createJumpBackCommand())
+
+	return jumpCmd
+}
+
+func (ec *EnhancedCLI) createJumpBackCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "back",
+		Short: "Jump back to previous position",
+		Long: `Jump back to the previous position in jump history.
+
+This command restores both the position and any preserved workspace state.
+
+Examples:
+  jump back                    # Return to previous jump position
+  ivaldi jump back             # Same as above`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if ec.currentRepo == nil {
+				return fmt.Errorf("not in repository")
+			}
+
+			err := ec.currentRepo.JumpBack()
+			if err != nil {
+				ec.output.Error("Could not jump back", []string{
+					"No jump history available",
+					"Use regular jump commands first to build history",
+				})
+				return err
+			}
+
+			ec.output.Success("Jumped back to previous position")
 			return nil
 		},
 	}

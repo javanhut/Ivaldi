@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"ivaldi/core/objects"
 	"ivaldi/forge"
 )
 
@@ -192,6 +193,67 @@ var sealCmd = &cobra.Command{
 	},
 }
 
+var overwriteCmd = &cobra.Command{
+	Use:   "overwrite [reference] -m <message> --reason <reason>",
+	Short: "Overwrite a seal with new content",
+	Long: `Overwrite an existing seal with the current workspace content.
+
+If no reference is provided, overwrites the current/latest seal.
+A reason must be provided for all overwrites for audit purposes.
+
+Examples:
+  ivaldi overwrite -m "Fixed typo" --reason "corrected error in commit message"
+  ivaldi overwrite bright-river-42 -m "Added missing tests" --reason "forgot to include tests"
+  ivaldi overwrite #150 -m "Security fix" --reason "patched vulnerability"`,
+	Args: cobra.MaximumNArgs(1),
+	Run: func(cmd *cobra.Command, args []string) {
+		if err := checkRepo(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		message, _ := cmd.Flags().GetString("message")
+		if message == "" {
+			fmt.Fprintf(os.Stderr, "Error: message is required (-m flag)\n")
+			os.Exit(1)
+		}
+
+		reason, _ := cmd.Flags().GetString("reason")
+		if reason == "" {
+			fmt.Fprintf(os.Stderr, "Error: reason is required (--reason flag)\n")
+			os.Exit(1)
+		}
+
+		repo, err := forge.Open(".")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error opening repository: %v\n", err)
+			os.Exit(1)
+		}
+
+		var seal *objects.Seal
+		if len(args) == 0 {
+			// No reference provided, overwrite current seal
+			seal, err = repo.OverwriteCurrentSeal(message, reason)
+		} else {
+			// Reference provided, overwrite specific seal
+			reference := args[0]
+			seal, err = repo.OverwriteSeal(reference, message, reason)
+		}
+
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error overwriting seal: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("Overwritten seal: %s\n", seal.Name)
+		fmt.Printf("Message: %s\n", seal.Message)
+		fmt.Printf("Reason: %s\n", reason)
+		if len(seal.Overwrites) > 0 {
+			fmt.Printf("Previous seal: %s\n", seal.Overwrites[0].PreviousHash.String())
+		}
+	},
+}
+
 var timelineCmd = &cobra.Command{
 	Use:   "timeline",
 	Short: "Manage timelines (branches)",
@@ -286,17 +348,56 @@ var timelineSwitchCmd = &cobra.Command{
 }
 
 var jumpCmd = &cobra.Command{
-	Use:   "jump <reference>",
+	Use:   "jump [to] <reference>",
 	Short: "Jump to a specific position in history",
-	Long:  "Jump to any position using natural language, iteration numbers, or memorable names",
-	Args:  cobra.ExactArgs(1),
+	Long: `Jump to any position using natural language, iteration numbers, or memorable names
+
+Options:
+  --no-preserve, -n Don't preserve uncommitted changes during jump
+  --force, -f       Force jump even if it overwrites local changes
+  --no-history      Don't save current position to jump history
+
+Note: By default, uncommitted changes are preserved during jumps (auto-preserve).
+
+Examples:
+  ivaldi jump to prev-seal-001
+  ivaldi jump to bright-river-42
+  ivaldi jump prev-seal-001               # 'to' is optional
+  ivaldi jump --no-preserve to bright-river-42
+  ivaldi jump --force to main#150`,
+	Args: func(cmd *cobra.Command, args []string) error {
+		// Handle both "jump <reference>" and "jump to <reference>"
+		if len(args) == 0 {
+			return fmt.Errorf("requires a reference argument")
+		}
+		if len(args) == 1 {
+			return nil // "jump <reference>"
+		}
+		if len(args) == 2 && args[0] == "to" {
+			return nil // "jump to <reference>"
+		}
+		return fmt.Errorf("invalid arguments: use 'jump <reference>' or 'jump to <reference>'")
+	},
 	Run: func(cmd *cobra.Command, args []string) {
 		if err := checkRepo(); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 
-		reference := args[0]
+		// Extract reference, handling both "jump <reference>" and "jump to <reference>"
+		var reference string
+		if len(args) == 1 {
+			reference = args[0]
+		} else if len(args) == 2 && args[0] == "to" {
+			reference = args[1]
+		} else {
+			fmt.Fprintf(os.Stderr, "Error: invalid arguments\n")
+			os.Exit(1)
+		}
+
+		noPreserve, _ := cmd.Flags().GetBool("no-preserve")
+		force, _ := cmd.Flags().GetBool("force")
+		noHistory, _ := cmd.Flags().GetBool("no-history")
 
 		repo, err := forge.Open(".")
 		if err != nil {
@@ -304,12 +405,53 @@ var jumpCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		if err := repo.Jump(reference); err != nil {
+		// Use new jump functionality with options
+		// Default is to preserve workspace unless --no-preserve is specified
+		options := forge.JumpOptions{
+			PreserveWorkspace: !noPreserve,
+			SaveJumpHistory:   !noHistory,
+			Force:             force,
+		}
+
+		if err := repo.JumpWithOptions(reference, options); err != nil {
 			fmt.Fprintf(os.Stderr, "Error jumping to position: %v\n", err)
 			os.Exit(1)
 		}
 
-		fmt.Printf("Jumped to: %s\n", reference)
+		if !noPreserve {
+			fmt.Printf("Jumped to: %s (workspace preserved)\n", reference)
+		} else {
+			fmt.Printf("Jumped to: %s\n", reference)
+		}
+	},
+}
+
+// Add a jump back command
+var jumpBackCmd = &cobra.Command{
+	Use:   "back",
+	Short: "Jump back to previous position",
+	Long: `Jump back to the previous position in jump history.
+
+This command restores both the position and any preserved workspace state.`,
+	Args: cobra.NoArgs,
+	Run: func(cmd *cobra.Command, args []string) {
+		if err := checkRepo(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		repo, err := forge.Open(".")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error opening repository: %v\n", err)
+			os.Exit(1)
+		}
+
+		if err := repo.JumpBack(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error jumping back: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("Jumped back to previous position\n")
 	},
 }
 
@@ -1101,4 +1243,18 @@ func init() {
 
 	syncCmd.Flags().Bool("push", false, "Only push changes")
 	syncCmd.Flags().Bool("pull", false, "Only pull changes")
+
+	// Add flags to jump command
+	jumpCmd.Flags().BoolP("no-preserve", "n", false, "Don't preserve uncommitted changes during jump")
+	jumpCmd.Flags().BoolP("force", "f", false, "Force jump even if it overwrites local changes")
+	jumpCmd.Flags().Bool("no-history", false, "Don't save current position to jump history")
+
+	// Add jump back as subcommand
+	jumpCmd.AddCommand(jumpBackCmd)
+
+	// Add flags to overwrite command
+	overwriteCmd.Flags().StringP("message", "m", "", "New seal message")
+	overwriteCmd.Flags().String("reason", "", "Reason for overwriting (required)")
+	overwriteCmd.MarkFlagRequired("message")
+	overwriteCmd.MarkFlagRequired("reason")
 }

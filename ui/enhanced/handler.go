@@ -55,6 +55,8 @@ func (ech *EnhancedCommandHandler) ProcessCommand(input string) error {
 		return ech.handleSeal(cmd)
 	case "seal_auto":
 		return ech.handleSealAuto(cmd)
+	case "overwrite":
+		return ech.handleOverwrite(cmd)
 	case "unseal":
 		return ech.handleUnseal(cmd)
 	case "timeline_create":
@@ -339,10 +341,61 @@ func (ech *EnhancedCommandHandler) handleShowOverwrites(cmd *commands.ParsedComm
 
 	ech.output.Info(fmt.Sprintf("Overwrite history for '%s':", reference))
 	for _, record := range records {
-		fmt.Printf("  %s - %s (%s)\n",
-			record.Timestamp.Format("2006-01-02 15:04"),
-			record.Justification,
-			record.Category)
+		ech.output.Info(fmt.Sprintf("  %s: %s", record.ID, record.Justification))
+	}
+
+	return nil
+}
+
+func (ech *EnhancedCommandHandler) handleOverwrite(cmd *commands.ParsedCommand) error {
+	message := cmd.Arguments["message"]
+	reason := cmd.Arguments["reason"]
+	reference := cmd.Arguments["reference"]
+
+	if message == "" {
+		ech.output.Error("Message is required for overwrite", []string{
+			"overwrite \"Fixed typo\" because \"corrected error in commit message\"",
+			"overwrite bright-river-42 \"Updated docs\" because \"missing documentation\"",
+		})
+		return fmt.Errorf("message is required")
+	}
+
+	if reason == "" {
+		ech.output.Error("Reason is required for overwrite", []string{
+			"overwrite \"message\" because \"reason for overwriting\"",
+			"All overwrites must be justified for audit purposes",
+		})
+		return fmt.Errorf("reason is required")
+	}
+
+	var seal *objects.Seal
+	var err error
+
+	if reference == "" {
+		// No reference provided, overwrite current seal
+		ech.output.Info("Overwriting current seal...")
+		seal, err = ech.repo.OverwriteCurrentSeal(message, reason)
+	} else {
+		// Reference provided, overwrite specific seal
+		ech.output.Info(fmt.Sprintf("Overwriting seal '%s'...", reference))
+		seal, err = ech.repo.OverwriteSeal(reference, message, reason)
+	}
+
+	if err != nil {
+		ech.output.Error("Failed to overwrite seal", []string{
+			"gather all                    # Ensure changes are gathered first",
+			"chronicle                     # Check available seals to overwrite",
+			"Check that the reference exists and is valid",
+		})
+		return err
+	}
+
+	ech.output.Success(fmt.Sprintf("Overwritten as '%s' (#%d)", seal.Name, seal.Iteration))
+	ech.output.Info(fmt.Sprintf("New message: %s", seal.Message))
+	ech.output.Info(fmt.Sprintf("Reason: %s", reason))
+
+	if len(seal.Overwrites) > 0 {
+		ech.output.Info(fmt.Sprintf("Previous seal: %s", seal.Overwrites[0].PreviousHash.String()[:8]))
 	}
 
 	return nil

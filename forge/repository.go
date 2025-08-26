@@ -810,6 +810,182 @@ func (r *Repository) Seal(message string) (*objects.Seal, error) {
 	return legacySeal, nil
 }
 
+// OverwriteCurrentSeal overwrites the current/latest seal with new content and message
+func (r *Repository) OverwriteCurrentSeal(newMessage string, reason string) (*objects.Seal, error) {
+	// Get current position to identify the seal to overwrite
+	currentPos := r.position.Current()
+	if currentPos.Hash.IsZero() {
+		return nil, fmt.Errorf("no current seal to overwrite")
+	}
+
+	return r.OverwriteSeal(currentPos.Hash.String(), newMessage, reason)
+}
+
+// OverwriteSeal overwrites a specific seal identified by reference with new content and message
+func (r *Repository) OverwriteSeal(reference string, newMessage string, reason string) (*objects.Seal, error) {
+	if len(r.workspace.AnvilFiles) == 0 {
+		return nil, fmt.Errorf("nothing gathered on the anvil to seal")
+	}
+
+	if reason == "" {
+		return nil, fmt.Errorf("reason is required for overwriting seals")
+	}
+
+	// Step 1: Resolve the reference to get the original seal
+	originalHash, err := r.resolveReference(reference)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve reference '%s': %v", reference, err)
+	}
+
+	originalSeal, err := r.storage.LoadSeal(originalHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load original seal: %v", err)
+	}
+
+	// Step 2: Create the new seal with current workspace content (similar to regular Seal)
+	candidateTree := r.workspace.GetCandidateTree()
+	if candidateTree == nil {
+		if err := r.workspace.BuildCandidateTree(); err != nil {
+			return nil, fmt.Errorf("failed to build candidate tree: %v", err)
+		}
+		candidateTree = r.workspace.GetCandidateTree()
+		if candidateTree == nil {
+			return nil, fmt.Errorf("failed to create tree from staged files")
+		}
+	}
+
+	// Store the tree
+	treeData, err := candidateTree.Encode()
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode tree: %v", err)
+	}
+
+	treeHash, err := r.workspace.Store.Put(treeData, local.KindTree)
+	if err != nil {
+		return nil, fmt.Errorf("failed to store tree: %v", err)
+	}
+
+	// Store in legacy format as well
+	legacyTree := r.convertCATreeToLegacyTree(candidateTree, treeHash)
+	legacyTreeHash, err := r.storage.StoreObject(legacyTree)
+	if err != nil {
+		return nil, fmt.Errorf("failed to store legacy tree: %v", err)
+	}
+
+	// Store blobs in legacy format
+	if err := r.storeCABlobsAsLegacy(candidateTree); err != nil {
+		return nil, fmt.Errorf("failed to store legacy blobs: %v", err)
+	}
+
+	// Step 3: Get author info
+	author, committer := r.getAuthorInfo()
+
+	// Step 4: Create content-addressed seal with original parents
+	var parents []objects.CAHash
+	for _, p := range originalSeal.Parents {
+		// Convert Hash to CAHash - need to look up the mapping
+		if caHash, err := r.getPreviousSealCAHash(p); err == nil {
+			parents = append(parents, caHash)
+		}
+	}
+
+	caSeal := objects.NewCASeal(
+		objects.CAHash(treeHash),
+		parents, // Keep original parents to maintain history structure
+		author,
+		committer,
+		newMessage,
+	)
+
+	// Store CA seal
+	caData, err := caSeal.Encode()
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode CA seal: %v", err)
+	}
+
+	sealHash, err := r.workspace.Store.Put(caData, local.KindSeal)
+	if err != nil {
+		return nil, fmt.Errorf("failed to store CA seal: %v", err)
+	}
+
+	// Step 5: Record the overwrite using simple tracking for now
+	// In full implementation, this would use the OverwriteTracker system
+
+	// Step 6: Create new legacy seal with overwrite information
+	name := r.generateMemorableName()
+	iteration := r.getNextIteration()
+
+	newSeal := &objects.Seal{
+		Name:      name,
+		Iteration: iteration,
+		Position:  legacyTreeHash,
+		Parents:   originalSeal.Parents, // Maintain original parent structure
+		Message:   newMessage,
+		Author:    author,
+		Timestamp: caSeal.Timestamp,
+		Overwrites: []objects.Overwrite{
+			{
+				PreviousHash: originalSeal.Hash,
+				Reason:       reason,
+				Author:       author,
+				Timestamp:    caSeal.Timestamp,
+			},
+		},
+	}
+
+	// Step 7: Store and index the new seal
+	if err := r.storage.StoreSeal(newSeal); err != nil {
+		return nil, fmt.Errorf("failed to store new seal: %v", err)
+	}
+
+	if err := r.index.IndexSeal(newSeal); err != nil {
+		return nil, fmt.Errorf("failed to index new seal: %v", err)
+	}
+
+	// Step 8: Update position to point to new seal
+	if err := r.position.SetPosition(newSeal.Hash, r.timeline.Current()); err != nil {
+		return nil, fmt.Errorf("failed to set position: %v", err)
+	}
+
+	if err := r.position.SetMemorableName(newSeal.Hash, name); err != nil {
+		return nil, fmt.Errorf("failed to set memorable name: %v", err)
+	}
+
+	// Register the memorable name with the reference manager
+	if err := r.refMgr.RegisterMemorableName(name, newSeal.Hash, newSeal.Author.Name); err != nil {
+		return nil, fmt.Errorf("failed to register memorable name: %v", err)
+	}
+
+	// Step 9: Update timeline head
+	if err := r.timeline.UpdateHead(r.timeline.Current(), newSeal.Hash); err != nil {
+		return nil, fmt.Errorf("failed to update timeline head: %v", err)
+	}
+
+	// Update workspace Position to point to content-addressed seal for consistency
+	r.workspace.Position = sealHash
+
+	// Store the mapping between legacy and content-addressed seals for chaining
+	if err := r.storeSealMapping(newSeal.Hash, sealHash); err != nil {
+		// Log but don't fail - this is for optimization, not critical
+		fmt.Printf("Warning: failed to store seal mapping: %v\n", err)
+	}
+
+	// Step 10: Update workspace after seal
+	r.updateWorkspaceAfterSeal()
+
+	if err := r.workspace.SaveState(r.timeline.Current()); err != nil {
+		return newSeal, fmt.Errorf("failed to save workspace state: %v", err)
+	}
+
+	return newSeal, nil
+}
+
+// resolveReference resolves a reference (name, hash, etc.) to a seal hash
+func (r *Repository) resolveReference(reference string) (objects.Hash, error) {
+	// Use the existing position manager to parse the reference
+	return r.position.ParseReference(reference)
+}
+
 // getAuthorInfo retrieves author and committer information from config or defaults
 func (r *Repository) getAuthorInfo() (objects.Identity, objects.Identity) {
 	// Try to get from config first
@@ -1333,18 +1509,106 @@ func (r *Repository) ListTimelines() []*timeline.Timeline {
 }
 
 func (r *Repository) Jump(reference string) error {
+	return r.JumpWithOptions(reference, JumpOptions{
+		PreserveWorkspace: true,
+		SaveJumpHistory:   true,
+	})
+}
+
+// JumpOptions defines options for jump operations
+type JumpOptions struct {
+	PreserveWorkspace bool // If true, preserve uncommitted changes
+	SaveJumpHistory   bool // If true, save current position for jump back
+	Force             bool // If true, overwrite files even if they have changes
+}
+
+// JumpWithOptions performs a jump with specified options
+func (r *Repository) JumpWithOptions(reference string, options JumpOptions) error {
 	hash, err := r.position.ParseReference(reference)
 	if err != nil {
 		return err
 	}
 
+	currentPos := r.position.Current()
+	currentTimeline := r.timeline.Current()
+
+	// Save jump history if requested
+	if options.SaveJumpHistory {
+		if err := r.saveJumpHistory(&currentPos, currentTimeline); err != nil {
+			return fmt.Errorf("failed to save jump history: %v", err)
+		}
+	}
+
+	// Save current workspace state if preserving workspace
+	if options.PreserveWorkspace {
+		if err := r.shelveWorkspaceForJump(currentPos.Hash.String()); err != nil {
+			return fmt.Errorf("failed to shelve workspace: %v", err)
+		}
+	}
+
 	// Update position tracking
-	if err := r.position.SetPosition(hash, r.timeline.Current()); err != nil {
+	if err := r.position.SetPosition(hash, currentTimeline); err != nil {
 		return err
 	}
 
 	// Restore working directory to match the target commit
-	return r.RestoreWorkingDirectory(hash)
+	return r.RestoreWorkingDirectoryWithOptions(hash, RestoreOptions{
+		PreserveUncommitted: options.PreserveWorkspace,
+		Force:               options.Force,
+	})
+}
+
+// JumpWithPreservation jumps while preserving the current workspace
+func (r *Repository) JumpWithPreservation(reference string) error {
+	return r.JumpWithOptions(reference, JumpOptions{
+		PreserveWorkspace: true,
+		SaveJumpHistory:   true,
+	})
+}
+
+// JumpBack returns to the previous position saved in jump history
+func (r *Repository) JumpBack() error {
+	history, err := r.loadJumpHistory()
+	if err != nil {
+		return fmt.Errorf("failed to load jump history: %v", err)
+	}
+
+	if len(history.Entries) == 0 {
+		return fmt.Errorf("no jump history available")
+	}
+
+	// Get the most recent entry
+	lastEntry := history.Entries[len(history.Entries)-1]
+
+	// Restore to the previous position
+	if err := r.position.SetPosition(lastEntry.Hash, lastEntry.Timeline); err != nil {
+		return err
+	}
+
+	// Switch timeline if necessary
+	if r.timeline.Current() != lastEntry.Timeline {
+		if err := r.SwitchTimeline(lastEntry.Timeline); err != nil {
+			return fmt.Errorf("failed to switch to timeline %s: %v", lastEntry.Timeline, err)
+		}
+	}
+
+	// Restore workspace if it was shelved
+	if err := r.unshelveWorkspaceForJump(lastEntry.Hash.String()); err != nil {
+		// Don't fail if unshelving fails - just warn
+		fmt.Printf("Warning: failed to restore workspace state: %v\n", err)
+	}
+
+	// Remove this entry from history
+	history.Entries = history.Entries[:len(history.Entries)-1]
+	if err := r.saveJumpHistoryData(history); err != nil {
+		fmt.Printf("Warning: failed to update jump history: %v\n", err)
+	}
+
+	// Restore working directory
+	return r.RestoreWorkingDirectoryWithOptions(lastEntry.Hash, RestoreOptions{
+		PreserveUncommitted: true,
+		Force:               false,
+	})
 }
 
 func (r *Repository) Status() Status {
@@ -2152,19 +2416,39 @@ func (r *Repository) LoadState(timeline string) error {
 
 // RestoreWorkingDirectory restores the working directory to match a specific commit
 func (r *Repository) RestoreWorkingDirectory(targetHash objects.Hash) error {
+	return r.RestoreWorkingDirectoryWithOptions(targetHash, RestoreOptions{
+		PreserveUncommitted: false,
+		Force:               false,
+	})
+}
+
+// RestoreOptions defines options for workspace restoration
+type RestoreOptions struct {
+	PreserveUncommitted bool // If true, preserve uncommitted files that don't conflict
+	Force               bool // If true, overwrite all files regardless of local changes
+}
+
+// RestoreWorkingDirectoryWithOptions restores the working directory with specified options
+func (r *Repository) RestoreWorkingDirectoryWithOptions(targetHash objects.Hash, options RestoreOptions) error {
 	// Check if target hash is empty (no commits yet)
 	emptyHash := objects.Hash{}
 	hashString := targetHash.String()
 
 	// If target hash is empty or all zeros, clear working directory
 	if targetHash == emptyHash || hashString == "0000000000000000000000000000000000000000000000000000000000000000" {
-		return r.clearWorkingDirectory()
+		if !options.PreserveUncommitted {
+			return r.clearWorkingDirectory()
+		}
+		return nil // If preserving uncommitted, don't clear anything
 	}
 
 	// Check if the seal actually exists in storage
 	if !r.storage.Exists(targetHash) {
 		// Seal doesn't exist, treat as empty repository
-		return r.clearWorkingDirectory()
+		if !options.PreserveUncommitted {
+			return r.clearWorkingDirectory()
+		}
+		return nil
 	}
 
 	// Load the target seal
@@ -2177,7 +2461,10 @@ func (r *Repository) RestoreWorkingDirectory(targetHash objects.Hash) error {
 	emptyPos := objects.Hash{}
 	if seal.Position == emptyPos {
 		// Seal has no tree stored - treat as empty repository
-		return r.clearWorkingDirectory()
+		if !options.PreserveUncommitted {
+			return r.clearWorkingDirectory()
+		}
+		return nil
 	}
 
 	// Load the tree from the seal's position
@@ -2186,7 +2473,12 @@ func (r *Repository) RestoreWorkingDirectory(targetHash objects.Hash) error {
 		return fmt.Errorf("failed to load tree: %v", err)
 	}
 
-	// Clear working directory first
+	// If preserving uncommitted files, we need a more careful approach
+	if options.PreserveUncommitted {
+		return r.restoreFromTreePreservingChanges(tree, "", options.Force)
+	}
+
+	// Clear working directory first (original behavior)
 	if err := r.clearWorkingDirectory(); err != nil {
 		return err
 	}
@@ -3039,4 +3331,246 @@ func (r *Repository) ensureP2PManager() error {
 
 	// Initialize P2P manager to reconnect to running P2P
 	return r.initializeP2PManager()
+}
+
+// JumpHistoryEntry represents a single entry in jump history
+type JumpHistoryEntry struct {
+	Hash      objects.Hash `json:"hash"`
+	Timeline  string       `json:"timeline"`
+	Timestamp time.Time    `json:"timestamp"`
+	Message   string       `json:"message"`
+}
+
+// JumpHistory maintains the history of jump operations
+type JumpHistory struct {
+	Entries []JumpHistoryEntry `json:"entries"`
+}
+
+// saveJumpHistory saves the current position to jump history
+func (r *Repository) saveJumpHistory(pos *position.Position, timeline string) error {
+	history, err := r.loadJumpHistory()
+	if err != nil {
+		// If history doesn't exist, create a new one
+		history = &JumpHistory{Entries: []JumpHistoryEntry{}}
+	}
+
+	// Add new entry
+	entry := JumpHistoryEntry{
+		Hash:      pos.Hash,
+		Timeline:  timeline,
+		Timestamp: time.Now(),
+		Message:   fmt.Sprintf("Jump from %s on timeline %s", pos.Hash.String()[:8], timeline),
+	}
+
+	history.Entries = append(history.Entries, entry)
+
+	// Keep only the last 10 entries to avoid unlimited growth
+	if len(history.Entries) > 10 {
+		history.Entries = history.Entries[len(history.Entries)-10:]
+	}
+
+	return r.saveJumpHistoryData(history)
+}
+
+// loadJumpHistory loads the jump history from disk
+func (r *Repository) loadJumpHistory() (*JumpHistory, error) {
+	historyPath := filepath.Join(r.root, ".ivaldi", "jump_history.json")
+
+	if _, err := os.Stat(historyPath); os.IsNotExist(err) {
+		return &JumpHistory{Entries: []JumpHistoryEntry{}}, nil
+	}
+
+	data, err := os.ReadFile(historyPath)
+	if err != nil {
+		return nil, err
+	}
+
+	var history JumpHistory
+	if err := json.Unmarshal(data, &history); err != nil {
+		return nil, err
+	}
+
+	return &history, nil
+}
+
+// saveJumpHistoryData saves jump history data to disk
+func (r *Repository) saveJumpHistoryData(history *JumpHistory) error {
+	historyPath := filepath.Join(r.root, ".ivaldi", "jump_history.json")
+
+	// Ensure directory exists
+	if err := os.MkdirAll(filepath.Dir(historyPath), 0755); err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(history, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(historyPath, data, 0644)
+}
+
+// WorkspaceShelve represents shelved workspace state for a jump
+type WorkspaceShelve struct {
+	JumpHash   string                          `json:"jump_hash"`
+	Timeline   string                          `json:"timeline"`
+	Timestamp  time.Time                       `json:"timestamp"`
+	Files      map[string]*workspace.FileState `json:"files"`
+	AnvilFiles map[string]*workspace.FileState `json:"anvil_files"`
+}
+
+// shelveWorkspaceForJump shelves the current workspace state before a jump
+func (r *Repository) shelveWorkspaceForJump(jumpHash string) error {
+	shelveDir := filepath.Join(r.root, ".ivaldi", "jump_shelves")
+	if err := os.MkdirAll(shelveDir, 0755); err != nil {
+		return err
+	}
+
+	// Scan workspace to get current state
+	if err := r.workspace.Scan(); err != nil {
+		return err
+	}
+
+	shelve := WorkspaceShelve{
+		JumpHash:   jumpHash,
+		Timeline:   r.timeline.Current(),
+		Timestamp:  time.Now(),
+		Files:      make(map[string]*workspace.FileState),
+		AnvilFiles: make(map[string]*workspace.FileState),
+	}
+
+	// Copy current workspace state
+	for path, file := range r.workspace.Files {
+		if file.Status == workspace.StatusModified || file.Status == workspace.StatusAdded {
+			shelve.Files[path] = file
+		}
+	}
+
+	for path, file := range r.workspace.AnvilFiles {
+		shelve.AnvilFiles[path] = file
+	}
+
+	// Save shelve data
+	shelvePath := filepath.Join(shelveDir, jumpHash+".json")
+	data, err := json.MarshalIndent(shelve, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(shelvePath, data, 0644)
+}
+
+// unshelveWorkspaceForJump restores the workspace state from a jump shelve
+func (r *Repository) unshelveWorkspaceForJump(jumpHash string) error {
+	shelvePath := filepath.Join(r.root, ".ivaldi", "jump_shelves", jumpHash+".json")
+
+	if _, err := os.Stat(shelvePath); os.IsNotExist(err) {
+		// No shelve exists, which is fine
+		return nil
+	}
+
+	data, err := os.ReadFile(shelvePath)
+	if err != nil {
+		return err
+	}
+
+	var shelve WorkspaceShelve
+	if err := json.Unmarshal(data, &shelve); err != nil {
+		return err
+	}
+
+	// Restore workspace state
+	for path, file := range shelve.Files {
+		r.workspace.Files[path] = file
+	}
+
+	for path, file := range shelve.AnvilFiles {
+		r.workspace.AnvilFiles[path] = file
+	}
+
+	// Update workspace timeline
+	r.workspace.Timeline = shelve.Timeline
+
+	// Remove the shelve file after successful restoration
+	os.Remove(shelvePath)
+
+	return nil
+}
+
+// restoreFromTreePreservingChanges restores files from tree while preserving uncommitted changes
+func (r *Repository) restoreFromTreePreservingChanges(tree *objects.Tree, basePath string, force bool) error {
+	// Scan current workspace to understand what files exist and their status
+	if err := r.workspace.Scan(); err != nil {
+		return err
+	}
+
+	return r.restoreFromTreeRecursive(tree, basePath, force)
+}
+
+// restoreFromTreeRecursive recursively restores files from tree with preservation logic
+func (r *Repository) restoreFromTreeRecursive(tree *objects.Tree, basePath string, force bool) error {
+	for _, entry := range tree.Entries {
+		entryPath := filepath.Join(basePath, entry.Name)
+		fullPath := filepath.Join(r.root, entryPath)
+
+		switch entry.Type {
+		case objects.ObjectTypeTree:
+			// Create directory and recurse
+			if err := os.MkdirAll(fullPath, 0755); err != nil {
+				return err
+			}
+			subTree, err := r.storage.LoadTree(entry.Hash)
+			if err != nil {
+				return err
+			}
+			if err := r.restoreFromTreeRecursive(subTree, entryPath, force); err != nil {
+				return err
+			}
+
+		case objects.ObjectTypeBlob:
+			// Check if file exists and has uncommitted changes
+			shouldSkip := false
+			if !force {
+				if fileState, exists := r.workspace.Files[entryPath]; exists {
+					if fileState.Status == workspace.StatusModified || fileState.Status == workspace.StatusAdded {
+						fmt.Printf("Preserving uncommitted changes in: %s\n", entryPath)
+						shouldSkip = true
+					}
+				}
+			}
+
+			if shouldSkip {
+				continue
+			}
+
+			// Restore file
+			blob, err := r.storage.LoadBlob(entry.Hash)
+			if err != nil {
+				// Try to find actual blob hash using mapping
+				actualHash, found := r.loadBlobHashMapping(entry.Hash)
+				if found {
+					blob, err = r.storage.LoadBlob(actualHash)
+					if err == nil {
+						fmt.Printf("Successfully loaded blob using hash mapping for file %s\n", entryPath)
+					}
+				}
+
+				if err != nil {
+					return fmt.Errorf("failed to load blob %s for file %s: %v", entry.Hash.String(), entryPath, err)
+				}
+			}
+
+			// Ensure directory exists
+			dir := filepath.Dir(fullPath)
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return err
+			}
+
+			// Write file
+			if err := os.WriteFile(fullPath, blob.Data, os.FileMode(entry.Mode)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
