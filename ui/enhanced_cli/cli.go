@@ -693,7 +693,8 @@ func (ec *EnhancedCLI) createTimelineCreateCommand() *cobra.Command {
 				return fmt.Errorf("not in repository")
 			}
 
-			err := ec.currentRepo.CreateTimeline(args[0])
+			timelineName := args[0]
+			err := ec.currentRepo.CreateTimeline(timelineName)
 			if err != nil {
 				ec.output.Error("Failed to create timeline", []string{
 					"Check timeline name is valid",
@@ -702,7 +703,25 @@ func (ec *EnhancedCLI) createTimelineCreateCommand() *cobra.Command {
 				return err
 			}
 
-			ec.output.Success(fmt.Sprintf("Created timeline: %s", args[0]))
+			ec.output.Success(fmt.Sprintf("Created timeline: %s", timelineName))
+
+			// Auto-switch to the newly created timeline
+			currentTimeline := ec.currentRepo.GetCurrentTimeline()
+			if currentTimeline != timelineName {
+				ec.output.Info(fmt.Sprintf("Switching to new timeline '%s'...", timelineName))
+
+				snapshot, err := ec.currentRepo.EnhancedTimelineSwitch(timelineName)
+				if err != nil {
+					ec.output.Warning(fmt.Sprintf("Timeline created but failed to switch: %v", err))
+					ec.output.Info(fmt.Sprintf("Use: timeline switch %s (to switch manually)", timelineName))
+				} else {
+					ec.output.Success(fmt.Sprintf("Now on timeline: %s", timelineName))
+					if snapshot != nil {
+						ec.output.Info("Previous work auto-shelved and will restore when you return")
+					}
+				}
+			}
+
 			return nil
 		},
 	}
@@ -1099,27 +1118,30 @@ Subcommands:
 
 func (ec *EnhancedCLI) createUploadCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "upload",
-		Short: "Upload to remote repository",
-		Long: `Upload the current timeline to the remote repository (like 'git push').
+		Use:   "upload [portal]",
+		Short: "Upload current timeline to remote repository",
+		Long: `Upload the current timeline to the remote repository.
 
-Automatically uploads to origin/main by default. No arguments needed for typical usage.
+Always uploads the timeline you're currently on. No need to specify which timeline.
+Defaults to the 'origin' portal unless you specify a different one.
 
 Examples:
   ivaldi upload                    # Upload current timeline to origin (most common)
-  ivaldi upload upstream           # Upload to different portal 
-  ivaldi upload --branch feature   # Upload specific branch`,
+  ivaldi upload upstream           # Upload current timeline to upstream portal
+
+The upload automatically:
+- Uses your current timeline
+- Creates the remote branch if it doesn't exist  
+- Sets up upstream tracking for new timelines
+- Shows clear progress and success messages`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if ec.currentRepo == nil {
 				return fmt.Errorf("not in repository")
 			}
 
-			// Get branch flag or default to current timeline
-			branch, _ := cmd.Flags().GetString("branch")
-			if branch == "" {
-				branch = ec.getCurrentTimeline()
-			}
+			// Always use current timeline (no --branch flag needed)
+			currentTimeline := ec.getCurrentTimeline()
 
 			// Default to origin portal, or use argument
 			portalName := "origin"
@@ -1127,32 +1149,10 @@ Examples:
 				portalName = args[0]
 			}
 
-			// Check if timeline exists locally but might be new to remote
-			timelines := ec.currentRepo.ListTimelines()
-			isNewTimeline := true
-			for _, tl := range timelines {
-				if tl == branch && branch != ec.currentRepo.GetCurrentTimeline() {
-					isNewTimeline = false
-					break
-				}
-			}
+			// Clear messaging about what's being uploaded
+			ec.output.Info(fmt.Sprintf("Uploading timeline '%s' to portal '%s'", currentTimeline, portalName))
 
-			// Smart upload messaging
-			if portalName == "origin" {
-				if isNewTimeline && branch != "main" {
-					fmt.Printf("Uploading new timeline to origin/%s (will create branch)\n", branch)
-				} else {
-					fmt.Printf("Uploading to origin/%s\n", branch)
-				}
-			} else {
-				if isNewTimeline && branch != "main" {
-					fmt.Printf("Uploading new timeline to %s/%s (will create branch)\n", portalName, branch)
-				} else {
-					fmt.Printf("Uploading to %s/%s\n", portalName, branch)
-				}
-			}
-
-			err := ec.currentRepo.UploadToPortal(portalName, branch)
+			err := ec.currentRepo.UploadToPortal(portalName, currentTimeline)
 			if err != nil {
 				// Check if it's a branch not found error or similar new timeline scenarios
 				if strings.Contains(err.Error(), "does not match any") ||
@@ -1160,10 +1160,10 @@ Examples:
 					strings.Contains(err.Error(), "Creating new branch") {
 					// This is a new timeline - that's fine, the upload should have created it automatically
 					// If we're here, there might be a different issue, so show helpful guidance
-					ec.output.Info(fmt.Sprintf("Creating new timeline '%s' on remote...", branch))
+					ec.output.Info(fmt.Sprintf("Creating new timeline '%s' on remote...", currentTimeline))
 
 					// Try the upload again - the new logic should handle branch creation
-					err = ec.currentRepo.UploadToPortal(portalName, branch)
+					err = ec.currentRepo.UploadToPortal(portalName, currentTimeline)
 					if err != nil {
 						ec.output.Error("Failed to create new timeline on remote", []string{
 							"Check network connection",
@@ -1184,25 +1184,14 @@ Examples:
 				}
 			}
 
-			// Success messaging with helpful next steps
-			if portalName == "origin" {
-				fmt.Printf("Upload complete: origin/%s\n", branch)
-			} else {
-				fmt.Printf("Upload complete: %s/%s\n", portalName, branch)
-			}
-
-			// Show helpful next steps for new timelines
-			if isNewTimeline && branch != "main" {
-				ec.output.Info("New timeline uploaded with automatic upstream tracking")
-				ec.output.Info("Your timeline is now available on the remote repository")
-			}
+			// Success messaging
+			ec.output.Success(fmt.Sprintf("✓ Upload complete: %s/%s", portalName, currentTimeline))
+			ec.output.Info(fmt.Sprintf("Timeline '%s' is now available on the remote repository", currentTimeline))
 
 			return nil
 		},
 	}
 
-	// Add branch flag
-	cmd.Flags().StringP("branch", "b", "", "Branch to upload (defaults to current timeline)")
 	return cmd
 }
 
@@ -2740,27 +2729,46 @@ func (ec *EnhancedCLI) formatFuseStrategy(strategy fuse.FuseStrategy) string {
 // Portal subcommands
 func (ec *EnhancedCLI) createPortalAddCommand() *cobra.Command {
 	return &cobra.Command{
-		Use:   "add <name> <url>",
-		Short: "Add new portal",
-		Args:  cobra.ExactArgs(2),
+		Use:   "add <url> [name]",
+		Short: "Add new portal (defaults to 'origin')",
+		Long: `Add a new portal (remote connection) to the repository.
+
+If no name is provided, defaults to 'origin' for convenience.
+Most repositories only need one portal named 'origin'.
+
+Examples:
+  portal add https://github.com/user/repo.git          # Creates portal named 'origin'
+  portal add https://github.com/user/repo.git origin  # Explicitly names it 'origin'  
+  portal add https://github.com/user/repo.git upstream # Creates portal named 'upstream'`,
+		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if ec.currentRepo == nil {
 				return fmt.Errorf("not in repository")
 			}
 
-			name := args[0]
-			url := args[1]
+			url := args[0]
+			name := "origin" // Default to origin
+
+			// If name is provided as second argument, use it
+			if len(args) > 1 {
+				name = args[1]
+			}
 
 			err := ec.currentRepo.AddPortal(name, url)
 			if err != nil {
 				ec.output.Error("Failed to add portal", []string{
 					"Check URL format is correct",
 					"Ensure you have write access if needed",
+					"Portal name might already exist",
 				})
 				return err
 			}
 
-			ec.output.Success(fmt.Sprintf("Added portal: %s → %s", name, url))
+			if len(args) == 1 {
+				ec.output.Success(fmt.Sprintf("Added portal: %s → %s (default name)", name, url))
+			} else {
+				ec.output.Success(fmt.Sprintf("Added portal: %s → %s", name, url))
+			}
 			return nil
 		},
 	}
@@ -3424,9 +3432,110 @@ perfect for starting development without historical complexity.`,
 
 			ec.output.Info(fmt.Sprintf("Downloading repository from: %s", url))
 			ec.output.Info(fmt.Sprintf("Destination: %s", dest))
+			ec.output.Info("")
 
-			// Use the download functionality (files only, no Git history)
-			repo, err := forge.Download(url, dest)
+			// First, detect repository type
+			ec.output.Info("Step 1: Detecting repository type...")
+			networkMgr := network.NewNetworkManager(dest)
+			repoType, err := networkMgr.DetectRepositoryType(url)
+			if err != nil {
+				ec.output.Warning(fmt.Sprintf("Could not detect repository type: %v", err))
+				ec.output.Info("Proceeding with standard download...")
+				repoType = network.RepoTypeGit // Default to Git behavior
+			}
+
+			var repo *forge.Repository
+
+			if repoType == network.RepoTypeIvaldi {
+				ec.output.Success("✓ Detected existing Ivaldi repository")
+				ec.output.Info("Step 2: Fetching Ivaldi metadata...")
+
+				// Fetch existing Ivaldi metadata
+				metadata, err := networkMgr.FetchIvaldiRepoMetadata(url)
+				if err != nil {
+					ec.output.Warning(fmt.Sprintf("Could not fetch Ivaldi metadata: %v", err))
+					ec.output.Info("Proceeding with standard download...")
+					goto standardDownload
+				}
+
+				ec.output.Info(fmt.Sprintf("Found %d timelines in existing repository", len(metadata.Timelines)))
+				if metadata.CurrentTimeline != "" {
+					ec.output.Info(fmt.Sprintf("Current timeline: %s", metadata.CurrentTimeline))
+				}
+
+				ec.output.Info("Step 3: Downloading repository with metadata preservation...")
+
+				// Download repository preserving Ivaldi metadata
+				if err := networkMgr.DownloadIvaldiRepoWithMetadata(url, dest, metadata); err != nil {
+					ec.output.Error("Failed to download Ivaldi repository with metadata", []string{
+						"Check the URL is correct and accessible",
+						"Verify network connection",
+						"Falling back to standard download...",
+					})
+					goto standardDownload
+				}
+
+				// Initialize Ivaldi repository structure
+				repo, err = forge.Initialize(dest)
+				if err != nil {
+					ec.output.Error("Failed to initialize Ivaldi repository", []string{
+						"Check directory permissions",
+						"Try removing the destination directory and retrying",
+					})
+					return err
+				}
+
+				// Add origin portal
+				if err := repo.AddPortal("origin", url); err != nil {
+					ec.output.Warning(fmt.Sprintf("Failed to add origin portal: %v", err))
+				}
+
+				// If we have metadata about current timeline, try to set it
+				if metadata.CurrentTimeline != "" && len(metadata.Timelines) > 0 {
+					if err := repo.SwitchTimeline(metadata.CurrentTimeline); err != nil {
+						ec.output.Warning(fmt.Sprintf("Could not switch to timeline '%s': %v", metadata.CurrentTimeline, err))
+					} else {
+						ec.output.Info(fmt.Sprintf("Restored current timeline: %s", metadata.CurrentTimeline))
+					}
+				}
+
+				ec.output.Success(fmt.Sprintf("✓ Successfully downloaded Ivaldi repository to %s!", dest))
+				ec.output.Info("Repository downloaded with preserved:")
+				ec.output.Info("  • Timeline structure and positions")
+				ec.output.Info("  • Workspace states and configurations")
+				ec.output.Info("  • Memorable commit names and references")
+				ec.output.Info("  • All Ivaldi metadata and settings")
+			} else {
+				ec.output.Info("✓ Detected Git repository or proceeding with standard download")
+				ec.output.Info("Step 2: Downloading repository files...")
+
+				// Use the standard download functionality (files only, no Git history)
+				repo, err = forge.Download(url, dest)
+				if err != nil {
+					ec.output.Error("Failed to download repository", []string{
+						"Check the URL is correct and accessible",
+						"Verify network connection",
+						"Ensure you have access to the repository",
+						"Try: download <url> <destination-folder>",
+					})
+					return err
+				}
+
+				ec.output.Success(fmt.Sprintf("✓ Successfully downloaded repository files to %s!", dest))
+				ec.output.Info("Fresh Ivaldi repository created with current files (no Git history)")
+				ec.output.Info("Repository is now ready with all Ivaldi revolutionary features:")
+				ec.output.Info("  • Natural language references")
+				ec.output.Info("  • Automatic work preservation")
+				ec.output.Info("  • AI-powered commit generation")
+				ec.output.Info("  • Rich visual interface")
+			}
+
+		standardDownload:
+			ec.output.Info("✓ Detected Git repository or proceeding with standard download")
+			ec.output.Info("Step 2: Downloading repository files...")
+
+			// Use the standard download functionality (files only, no Git history)
+			repo, err = forge.Download(url, dest)
 			if err != nil {
 				ec.output.Error("Failed to download repository", []string{
 					"Check the URL is correct and accessible",
@@ -3437,15 +3546,16 @@ perfect for starting development without historical complexity.`,
 				return err
 			}
 
-			ec.output.Success(fmt.Sprintf("Successfully downloaded repository files to %s!", dest))
+			ec.output.Success(fmt.Sprintf("✓ Successfully downloaded repository files to %s!", dest))
 			ec.output.Info("Fresh Ivaldi repository created with current files (no Git history)")
 			ec.output.Info("Repository is now ready with all Ivaldi revolutionary features:")
 			ec.output.Info("  • Natural language references")
 			ec.output.Info("  • Automatic work preservation")
 			ec.output.Info("  • AI-powered commit generation")
 			ec.output.Info("  • Rich visual interface")
+
 			ec.output.Info("")
-			ec.output.Info(fmt.Sprintf("Next steps:"))
+			ec.output.Info("Next steps:")
 			ec.output.Info(fmt.Sprintf("  cd %s", dest))
 			ec.output.Info("  ivaldi status")
 
@@ -3932,8 +4042,80 @@ func (ec *EnhancedCLI) performEnhancedMirror(url, dest string) (*forge.EnhancedR
 		return nil, fmt.Errorf("failed to create destination directory: %v", err)
 	}
 
-	// Step 2: Initialize Ivaldi repository
-	ec.output.Info("Step 2: Initializing Ivaldi repository...")
+	// Step 2: Detect repository type
+	ec.output.Info("Step 2: Detecting repository type...")
+	networkMgr := network.NewNetworkManager(dest)
+	repoType, err := networkMgr.DetectRepositoryType(url)
+	if err != nil {
+		ec.output.Warning(fmt.Sprintf("Could not detect repository type: %v", err))
+		ec.output.Info("Proceeding with Git repository conversion...")
+		repoType = network.RepoTypeGit // Default to Git behavior
+	}
+
+	if repoType == network.RepoTypeIvaldi {
+		ec.output.Success("✓ Detected existing Ivaldi repository")
+		ec.output.Info("Step 3: Fetching Ivaldi metadata...")
+
+		// Fetch existing Ivaldi metadata
+		metadata, err := networkMgr.FetchIvaldiRepoMetadata(url)
+		if err != nil {
+			ec.output.Warning(fmt.Sprintf("Could not fetch Ivaldi metadata: %v", err))
+			ec.output.Info("Proceeding with Git-style mirroring...")
+			goto gitMirror
+		}
+
+		ec.output.Info(fmt.Sprintf("Found %d timelines in existing repository", len(metadata.Timelines)))
+		if metadata.CurrentTimeline != "" {
+			ec.output.Info(fmt.Sprintf("Current timeline: %s", metadata.CurrentTimeline))
+		}
+
+		ec.output.Info("Step 4: Downloading repository with metadata preservation...")
+
+		// Download repository preserving Ivaldi metadata
+		if err := networkMgr.DownloadIvaldiRepoWithMetadata(url, dest, metadata); err != nil {
+			ec.output.Error("Failed to download Ivaldi repository with metadata", []string{
+				"Check the URL is correct and accessible",
+				"Verify network connection",
+				"Falling back to Git-style mirroring...",
+			})
+			goto gitMirror
+		}
+
+		// Initialize enhanced Ivaldi repository structure
+		repo, err := forge.EnhancedInitialize(dest)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize enhanced Ivaldi repository: %v", err)
+		}
+
+		// Add origin portal
+		if err := repo.AddPortal("origin", url); err != nil {
+			ec.output.Warning(fmt.Sprintf("Failed to add origin portal: %v", err))
+		}
+
+		// If we have metadata about current timeline, try to set it
+		if metadata.CurrentTimeline != "" && len(metadata.Timelines) > 0 {
+			if err := repo.SwitchTimeline(metadata.CurrentTimeline); err != nil {
+				ec.output.Warning(fmt.Sprintf("Could not switch to timeline '%s': %v", metadata.CurrentTimeline, err))
+			} else {
+				ec.output.Success(fmt.Sprintf("✓ Restored current timeline: %s", metadata.CurrentTimeline))
+			}
+		}
+
+		ec.output.Success("✓ Ivaldi repository mirrored with complete metadata preservation!")
+		ec.output.Info("Repository mirrored with preserved:")
+		ec.output.Info("  • Timeline structure and positions")
+		ec.output.Info("  • Workspace states and configurations")
+		ec.output.Info("  • Memorable commit names and references")
+		ec.output.Info("  • All Ivaldi metadata and settings")
+
+		return repo, nil
+	}
+
+gitMirror:
+	ec.output.Info("✓ Detected Git repository - performing Git-to-Ivaldi conversion")
+
+	// Step 3: Initialize Ivaldi repository (original logic for Git repos)
+	ec.output.Info("Step 3: Initializing Ivaldi repository...")
 	absPath, err := filepath.Abs(dest)
 	if err != nil {
 		return nil, err
@@ -3944,20 +4126,20 @@ func (ec *EnhancedCLI) performEnhancedMirror(url, dest string) (*forge.EnhancedR
 		return nil, fmt.Errorf("failed to initialize Ivaldi repository: %v", err)
 	}
 
-	// Step 3: Add origin portal
-	ec.output.Info("Step 3: Adding origin portal...")
+	// Step 4: Add origin portal
+	ec.output.Info("Step 4: Adding origin portal...")
 	if err := repo.AddPortal("origin", url); err != nil {
 		return nil, fmt.Errorf("failed to add origin portal: %v", err)
 	}
 
-	// Step 4: Detect default branch (try main, then master, then fallback)
-	ec.output.Info("Step 4: Detecting default branch...")
+	// Step 5: Detect default branch (try main, then master, then fallback)
+	ec.output.Info("Step 5: Detecting default branch...")
 	branch := "main"
 	// TODO: Implement branch detection from remote
 
-	// Step 5: Fetch with complete history
-	ec.output.Info("Step 5: Fetching complete commit history...")
-	networkMgr := repo.Network()
+	// Step 6: Fetch with complete history
+	ec.output.Info("Step 6: Fetching complete commit history...")
+	networkMgr = repo.Network()
 
 	// Use the history-enabled fetch
 	fetchResult, err := networkMgr.FetchFromPortalWithHistory(url, branch)
@@ -3973,8 +4155,8 @@ func (ec *EnhancedCLI) performEnhancedMirror(url, dest string) (*forge.EnhancedR
 
 	ec.output.Info(fmt.Sprintf("Fetched %d commits from %s branch", len(fetchResult.Seals), branch))
 
-	// Step 6: Store all seals
-	ec.output.Info("Step 6: Converting and storing Git commits as Ivaldi seals...")
+	// Step 7: Store all seals
+	ec.output.Info("Step 7: Converting and storing Git commits as Ivaldi seals...")
 	storage := repo.Storage()
 	for i, seal := range fetchResult.Seals {
 		if err := storage.StoreSeal(seal); err != nil {
@@ -3982,8 +4164,8 @@ func (ec *EnhancedCLI) performEnhancedMirror(url, dest string) (*forge.EnhancedR
 		}
 	}
 
-	// Step 7: Create timeline for the main branch
-	ec.output.Info("Step 7: Creating timeline for main branch...")
+	// Step 8: Create timeline for the main branch
+	ec.output.Info("Step 8: Creating timeline for main branch...")
 	timelineMgr := repo.Timeline()
 
 	// First ensure the timeline exists or create it
@@ -4026,19 +4208,19 @@ func (ec *EnhancedCLI) performEnhancedMirror(url, dest string) (*forge.EnhancedR
 	}
 	ec.output.Info(fmt.Sprintf("Updated timeline '%s' head to %s", branch, targetRef.Hash.String()[:8]))
 
-	// Step 8: Download all files
-	ec.output.Info("Step 8: Downloading repository files...")
+	// Step 9: Download all files
+	ec.output.Info("Step 9: Downloading repository files...")
 	if err := networkMgr.DownloadIvaldiRepo(url, absPath); err != nil {
 		return nil, fmt.Errorf("failed to download repository files: %v", err)
 	}
 
-	// Step 9: Convert .gitmodules to .ivaldimodules
-	ec.output.Info("Step 9: Converting submodules...")
+	// Step 10: Convert .gitmodules to .ivaldimodules
+	ec.output.Info("Step 10: Converting submodules...")
 	if err := workspace.CreateIvaldimodulesFromGitmodules(absPath); err != nil {
 		ec.output.Info("No submodules to convert")
 	}
 
-	// Step 10: Switch to the main branch
+	// Step 11: Switch to the main branch
 	if err := timelineMgr.Switch(branch); err != nil {
 		ec.output.Info(fmt.Sprintf("Warning: could not switch to timeline '%s'", branch))
 	}

@@ -126,6 +126,355 @@ func (nm *NetworkManager) UploadToPortal(portalURL, timeline string, seals []*ob
 	}
 }
 
+// RepositoryType represents the type of repository detected
+type RepositoryType string
+
+const (
+	RepoTypeIvaldi  RepositoryType = "ivaldi"
+	RepoTypeGit     RepositoryType = "git"
+	RepoTypeUnknown RepositoryType = "unknown"
+)
+
+// IvaldiRepoMetadata contains metadata from an existing Ivaldi repository
+type IvaldiRepoMetadata struct {
+	Timelines       map[string]string `json:"timelines"` // timeline name -> head position
+	CurrentTimeline string            `json:"current_timeline"`
+	Positions       map[string]string `json:"positions"`        // memorable names -> hashes
+	WorkspaceStates map[string]string `json:"workspace_states"` // timeline -> workspace state
+}
+
+// DetectRepositoryType detects whether a remote repository is an Ivaldi repo or Git repo
+func (nm *NetworkManager) DetectRepositoryType(url string) (RepositoryType, error) {
+	if strings.Contains(url, "github.com") {
+		return nm.detectGitHubRepoType(url)
+	} else if strings.Contains(url, "gitlab.com") {
+		return nm.detectGitLabRepoType(url)
+	} else {
+		// Assume native Ivaldi repository for other URLs
+		return RepoTypeIvaldi, nil
+	}
+}
+
+// detectGitHubRepoType checks if a GitHub repository contains Ivaldi metadata
+func (nm *NetworkManager) detectGitHubRepoType(url string) (RepositoryType, error) {
+	// Extract owner and repo from URL
+	urlParts := strings.Split(strings.TrimSuffix(url, ".git"), "/")
+	if len(urlParts) < 2 {
+		return RepoTypeUnknown, fmt.Errorf("invalid GitHub URL format: %s", url)
+	}
+
+	owner := urlParts[len(urlParts)-2]
+	repo := urlParts[len(urlParts)-1]
+
+	// Check for .ivaldi directory in repository
+	ivaldiCheckURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/.ivaldi", owner, repo)
+
+	req, err := http.NewRequest("GET", ivaldiCheckURL, nil)
+	if err != nil {
+		return RepoTypeUnknown, err
+	}
+
+	// Add authentication if available
+	if token, err := nm.getGitHubToken(); err == nil && token != "" {
+		req.Header.Set("Authorization", "token "+token)
+	}
+
+	resp, err := nm.client.Do(req)
+	if err != nil {
+		return RepoTypeUnknown, err
+	}
+	defer resp.Body.Close()
+
+	// If .ivaldi directory exists, it's an Ivaldi repository
+	if resp.StatusCode == 200 {
+		return RepoTypeIvaldi, nil
+	} else if resp.StatusCode == 404 {
+		// No .ivaldi directory, check for .git-style content (it's a Git repo)
+		return RepoTypeGit, nil
+	}
+
+	return RepoTypeUnknown, fmt.Errorf("could not determine repository type (status: %d)", resp.StatusCode)
+}
+
+// detectGitLabRepoType checks if a GitLab repository contains Ivaldi metadata
+func (nm *NetworkManager) detectGitLabRepoType(url string) (RepositoryType, error) {
+	// For now, assume GitLab repos are Git repositories
+	// TODO: Implement GitLab API detection similar to GitHub
+	return RepoTypeGit, nil
+}
+
+// FetchIvaldiRepoMetadata downloads Ivaldi-specific metadata from a remote repository
+func (nm *NetworkManager) FetchIvaldiRepoMetadata(url string) (*IvaldiRepoMetadata, error) {
+	if strings.Contains(url, "github.com") {
+		return nm.fetchIvaldiMetadataFromGitHub(url)
+	} else if strings.Contains(url, "gitlab.com") {
+		return nil, fmt.Errorf("Ivaldi metadata fetch not implemented for GitLab")
+	} else {
+		return nm.fetchIvaldiMetadataFromNative(url)
+	}
+}
+
+// fetchIvaldiMetadataFromGitHub downloads .ivaldi directory contents from GitHub
+func (nm *NetworkManager) fetchIvaldiMetadataFromGitHub(url string) (*IvaldiRepoMetadata, error) {
+	// Extract owner and repo from URL
+	urlParts := strings.Split(strings.TrimSuffix(url, ".git"), "/")
+	if len(urlParts) < 2 {
+		return nil, fmt.Errorf("invalid GitHub URL format: %s", url)
+	}
+
+	owner := urlParts[len(urlParts)-2]
+	repo := urlParts[len(urlParts)-1]
+
+	metadata := &IvaldiRepoMetadata{
+		Timelines:       make(map[string]string),
+		Positions:       make(map[string]string),
+		WorkspaceStates: make(map[string]string),
+	}
+
+	// Fetch timelines directory to get timeline information
+	timelinesURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/.ivaldi/timelines", owner, repo)
+
+	req, err := http.NewRequest("GET", timelinesURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add authentication if available
+	if token, err := nm.getGitHubToken(); err == nil && token != "" {
+		req.Header.Set("Authorization", "token "+token)
+	}
+
+	resp, err := nm.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 200 {
+		var timelineContents []struct {
+			Name string `json:"name"`
+			Type string `json:"type"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&timelineContents); err != nil {
+			return nil, err
+		}
+
+		// Get current timeline from config.json
+		configURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/.ivaldi/timelines/config.json", owner, repo)
+		configReq, err := http.NewRequest("GET", configURL, nil)
+		if err == nil {
+			if token, err := nm.getGitHubToken(); err == nil && token != "" {
+				configReq.Header.Set("Authorization", "token "+token)
+			}
+
+			configResp, err := nm.client.Do(configReq)
+			if err == nil && configResp.StatusCode == 200 {
+				defer configResp.Body.Close()
+
+				var configContent struct {
+					Content  string `json:"content"`
+					Encoding string `json:"encoding"`
+				}
+
+				if err := json.NewDecoder(configResp.Body).Decode(&configContent); err == nil {
+					if configContent.Encoding == "base64" {
+						if decoded, err := base64.StdEncoding.DecodeString(configContent.Content); err == nil {
+							var timelineConfig struct {
+								Current string `json:"current"`
+							}
+							if err := json.Unmarshal(decoded, &timelineConfig); err == nil {
+								metadata.CurrentTimeline = timelineConfig.Current
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Process timeline files to extract timeline metadata
+		for _, item := range timelineContents {
+			if item.Type == "file" && strings.HasSuffix(item.Name, ".json") && item.Name != "config.json" {
+				timelineName := strings.TrimSuffix(item.Name, ".json")
+
+				// Fetch timeline file to get head position
+				timelineFileURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/.ivaldi/timelines/%s", owner, repo, item.Name)
+				timelineReq, err := http.NewRequest("GET", timelineFileURL, nil)
+				if err != nil {
+					continue
+				}
+
+				if token, err := nm.getGitHubToken(); err == nil && token != "" {
+					timelineReq.Header.Set("Authorization", "token "+token)
+				}
+
+				timelineResp, err := nm.client.Do(timelineReq)
+				if err != nil {
+					continue
+				}
+
+				if timelineResp.StatusCode == 200 {
+					var timelineContent struct {
+						Content  string `json:"content"`
+						Encoding string `json:"encoding"`
+					}
+
+					err := json.NewDecoder(timelineResp.Body).Decode(&timelineContent)
+					timelineResp.Body.Close()
+
+					if err == nil && timelineContent.Encoding == "base64" {
+						if decoded, err := base64.StdEncoding.DecodeString(timelineContent.Content); err == nil {
+							var timelineData struct {
+								Head string `json:"head"`
+							}
+							if err := json.Unmarshal(decoded, &timelineData); err == nil {
+								metadata.Timelines[timelineName] = timelineData.Head
+							}
+						}
+					}
+				} else {
+					timelineResp.Body.Close()
+				}
+			}
+		}
+	}
+
+	return metadata, nil
+}
+
+// fetchIvaldiMetadataFromNative downloads metadata from a native Ivaldi repository
+func (nm *NetworkManager) fetchIvaldiMetadataFromNative(url string) (*IvaldiRepoMetadata, error) {
+	// TODO: Implement native Ivaldi repository metadata fetching
+	return nil, fmt.Errorf("native Ivaldi repository metadata fetch not implemented")
+}
+
+// DownloadIvaldiRepoWithMetadata downloads an Ivaldi repository preserving all metadata
+func (nm *NetworkManager) DownloadIvaldiRepoWithMetadata(url, dest string, metadata *IvaldiRepoMetadata) error {
+	// First download the repository content normally
+	if err := nm.DownloadRepoFiles(url, dest); err != nil {
+		return fmt.Errorf("failed to download repository files: %v", err)
+	}
+
+	// Download and preserve .ivaldi directory structure
+	if strings.Contains(url, "github.com") {
+		return nm.downloadIvaldiMetadataFromGitHub(url, dest, metadata)
+	} else if strings.Contains(url, "gitlab.com") {
+		return fmt.Errorf("Ivaldi metadata download not implemented for GitLab")
+	} else {
+		return nm.downloadIvaldiMetadataFromNative(url, dest, metadata)
+	}
+}
+
+// downloadIvaldiMetadataFromGitHub downloads .ivaldi directory from GitHub
+func (nm *NetworkManager) downloadIvaldiMetadataFromGitHub(url, dest string, metadata *IvaldiRepoMetadata) error {
+	// Extract owner and repo from URL
+	urlParts := strings.Split(strings.TrimSuffix(url, ".git"), "/")
+	if len(urlParts) < 2 {
+		return fmt.Errorf("invalid GitHub URL format: %s", url)
+	}
+
+	owner := urlParts[len(urlParts)-2]
+	repo := urlParts[len(urlParts)-1]
+
+	// Create .ivaldi directory structure
+	ivaldiDir := filepath.Join(dest, ".ivaldi")
+	if err := os.MkdirAll(ivaldiDir, 0755); err != nil {
+		return fmt.Errorf("failed to create .ivaldi directory: %v", err)
+	}
+
+	// Download .ivaldi contents recursively
+	return nm.downloadGitHubDirectory(owner, repo, ".ivaldi", ivaldiDir)
+}
+
+// downloadIvaldiMetadataFromNative downloads metadata from native Ivaldi repository
+func (nm *NetworkManager) downloadIvaldiMetadataFromNative(url, dest string, metadata *IvaldiRepoMetadata) error {
+	// TODO: Implement native Ivaldi repository metadata download
+	return fmt.Errorf("native Ivaldi repository metadata download not implemented")
+}
+
+// downloadGitHubDirectory recursively downloads a directory from GitHub
+func (nm *NetworkManager) downloadGitHubDirectory(owner, repo, path, destDir string) error {
+	dirURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/%s", owner, repo, path)
+
+	req, err := http.NewRequest("GET", dirURL, nil)
+	if err != nil {
+		return err
+	}
+
+	if token, err := nm.getGitHubToken(); err == nil && token != "" {
+		req.Header.Set("Authorization", "token "+token)
+	}
+
+	resp, err := nm.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("failed to fetch directory %s (status: %d)", path, resp.StatusCode)
+	}
+
+	var contents []struct {
+		Name        string `json:"name"`
+		Type        string `json:"type"`
+		DownloadURL string `json:"download_url"`
+		Path        string `json:"path"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&contents); err != nil {
+		return err
+	}
+
+	for _, item := range contents {
+		if item.Type == "file" {
+			// Download file
+			filePath := filepath.Join(destDir, item.Name)
+			if err := nm.downloadFileFromURL(item.DownloadURL, filePath); err != nil {
+				return fmt.Errorf("failed to download file %s: %v", item.Name, err)
+			}
+		} else if item.Type == "dir" {
+			// Recursively download subdirectory
+			subDir := filepath.Join(destDir, item.Name)
+			if err := os.MkdirAll(subDir, 0755); err != nil {
+				return fmt.Errorf("failed to create subdirectory %s: %v", subDir, err)
+			}
+			if err := nm.downloadGitHubDirectory(owner, repo, item.Path, subDir); err != nil {
+				return fmt.Errorf("failed to download subdirectory %s: %v", item.Name, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// downloadFileFromURL downloads a file from a direct URL
+func (nm *NetworkManager) downloadFileFromURL(url, filePath string) error {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := nm.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("failed to download file (status: %d)", resp.StatusCode)
+	}
+
+	file, err := os.Create(filePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	_, err = io.Copy(file, resp.Body)
+	return err
+}
+
 // DownloadIvaldiRepo downloads an Ivaldi repository from a remote URL
 func (nm *NetworkManager) DownloadIvaldiRepo(url, dest string) error {
 	// Use HTTP-based download for all repository types
