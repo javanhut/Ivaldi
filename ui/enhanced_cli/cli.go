@@ -4048,12 +4048,17 @@ func (ec *EnhancedCLI) performEnhancedMirror(url, dest string) (*forge.EnhancedR
 
 	ec.output.Info(fmt.Sprintf("Fetched %d commits from %s branch", len(fetchResult.Seals), branch))
 
-	// Step 6: Store all seals
+	// Step 6: Store and index all seals
 	ec.output.Info("Step 6: Converting and storing Git commits as Ivaldi seals...")
 	storage := repo.Storage()
+	index := repo.GetIndex()
 	for i, seal := range fetchResult.Seals {
 		if err := storage.StoreSeal(seal); err != nil {
 			return nil, fmt.Errorf("failed to store seal %d: %v", i, err)
+		}
+		// CRITICAL: Index the seal in the database for ivaldi log to work
+		if err := index.IndexSeal(seal); err != nil {
+			return nil, fmt.Errorf("failed to index seal %d: %v", i, err)
 		}
 	}
 
