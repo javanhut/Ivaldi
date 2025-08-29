@@ -327,7 +327,7 @@ func EnhancedInitialize(root string) (*EnhancedRepository, error) {
 	ws := workspace.New(root, store)
 	tm := timeline.NewManager(root)
 	pm := position.NewManager(root)
-	
+
 	// Initialize network manager
 	nm := network.NewNetworkManager(root)
 
@@ -349,7 +349,7 @@ func EnhancedInitialize(root string) (*EnhancedRepository, error) {
 
 	// Initialize revolutionary features
 	refManager := references.NewReferenceManager(root)
-	refManager.SetIndex(idx)  // Configure reference manager with index
+	refManager.SetIndex(idx) // Configure reference manager with index
 	preservationManager := preservation.NewPreservationManager(root)
 	overwriteTracker := overwrite.NewOverwriteTracker(root)
 
@@ -745,4 +745,14 @@ func (er *EnhancedRepository) Storage() *local.Storage {
 
 func (er *EnhancedRepository) Timeline() *timeline.Manager {
 	return er.timeline
+}
+
+// References returns the reference manager
+func (er *EnhancedRepository) References() *references.ReferenceManager {
+	return er.references
+}
+
+// Position returns the position manager from embedded repository
+func (er *EnhancedRepository) Position() *position.Manager {
+	return er.position
 }

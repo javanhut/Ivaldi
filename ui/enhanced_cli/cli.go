@@ -4048,10 +4048,23 @@ func (ec *EnhancedCLI) performEnhancedMirror(url, dest string) (*forge.EnhancedR
 
 	ec.output.Info(fmt.Sprintf("Fetched %d commits from %s branch", len(fetchResult.Seals), branch))
 
-	// Step 6: Store and index all seals
+	// Step 6: Store, index, and register all seals with memorable names
 	ec.output.Info("Step 6: Converting and storing Git commits as Ivaldi seals...")
 	storage := repo.Storage()
 	index := repo.GetIndex()
+
+	// Get reference manager for registering memorable names
+	refMgr := repo.References()
+	if refMgr == nil {
+		return nil, fmt.Errorf("reference manager not available - repository not properly initialized")
+	}
+
+	// Get position manager for navigation support
+	positionMgr := repo.Position()
+	if positionMgr == nil {
+		return nil, fmt.Errorf("position manager not available - repository not properly initialized")
+	}
+
 	for i, seal := range fetchResult.Seals {
 		if err := storage.StoreSeal(seal); err != nil {
 			return nil, fmt.Errorf("failed to store seal %d: %v", i, err)
@@ -4060,7 +4073,19 @@ func (ec *EnhancedCLI) performEnhancedMirror(url, dest string) (*forge.EnhancedR
 		if err := index.IndexSeal(seal); err != nil {
 			return nil, fmt.Errorf("failed to index seal %d: %v", i, err)
 		}
+
+		// CRITICAL: Register memorable name for searchable seals and git commit history migration
+		if err := refMgr.RegisterMemorableName(seal.Name, seal.Hash, seal.Author.Name); err != nil {
+			return nil, fmt.Errorf("failed to register memorable name '%s' for seal %d: %v", seal.Name, i, err)
+		}
+
+		// Add memorable name to position manager for navigation support
+		positionMgr.AddMemorableName(seal.Hash, seal.Name)
+
+		ec.output.Info(fmt.Sprintf("Registered seal '%s' (%s)", seal.Name, seal.Hash.String()[:8]))
 	}
+
+	ec.output.Success(fmt.Sprintf("✓ Registered %d memorable names for Git commit history migration", len(fetchResult.Seals)))
 
 	// Step 7: Create timeline for the main branch
 	ec.output.Info("Step 7: Creating timeline for main branch...")

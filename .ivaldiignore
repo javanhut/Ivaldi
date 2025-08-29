@@ -46,6 +46,8 @@ build
 test-repo
 # Added by ivaldi exclude command
 test-repo
-
 # Added by ivaldi exclude command
 ./ivaldi
+
+# Added by ivaldi exclude command
+ivaldi

@@ -75,6 +75,46 @@ ivaldi mirror https://github.com/user/repo.git local_repo
 IVALDI_OPTIMIZED_IMPORT=false ivaldi mirror https://github.com/user/repo.git local_repo
 ```
 
+## Reference System Integration
+
+The mirror command now automatically creates a complete reference system for migrated Git repositories:
+
+### Features Added
+1. **Memorable Name Registration**: Each Git commit is converted to an Ivaldi seal with a memorable name (e.g., `bright-river-42`, `swift-mountain-156`)
+2. **Reference File Creation**: Automatically generates `.ivaldi/references.json` containing mappings between memorable names and Ivaldi hashes
+3. **Searchable History**: All seals are indexed and searchable using natural language references
+4. **Position Tracking**: Navigation support for jumping between seals using memorable names
+
+### Natural Language Navigation
+After mirroring, you can navigate the Git history using:
+
+```bash
+# Jump to seals by memorable name
+ivaldi jump to bright-river-42
+
+# Jump by iteration number
+ivaldi jump to #5
+ivaldi jump to main#15
+
+# Jump by temporal references
+ivaldi jump to "yesterday"
+ivaldi jump to "2 hours ago"
+
+# Jump by author
+ivaldi jump to "Sarah's last commit"
+
+# Jump by content
+ivaldi jump to "where auth was added"
+```
+
+### Reference File Structure
+The generated `.ivaldi/references.json` file contains:
+- **references**: Memorable name to hash mappings
+- **aliases**: Custom alias support
+- **iterations**: Timeline iteration tracking
+
+This enables complete Git commit history migration with full Ivaldi revolutionary features.
+
 ## Key Code Changes
 
 1. **repository_optimized.go**: New optimized import implementation
