@@ -91,11 +91,14 @@ make build
 # List timelines (branches)
 ./build/ivaldi timeline list
 
-# Create new timeline
+# Create new timeline (automatically switches to it)
 ./build/ivaldi timeline create feature-xyz "Working on XYZ feature"
 
 # Switch timeline
 ./build/ivaldi timeline switch feature-xyz
+
+# Switch back to main timeline
+./build/ivaldi timeline source
 
 # Fuse (merge) timelines
 ./build/ivaldi fuse feature-xyz                    # Merge feature-xyz into current

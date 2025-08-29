@@ -116,11 +116,10 @@ Timelines are Ivaldi's human-friendly alternative to branches:
 ### Creating and Switching Timelines
 
 ```bash
-# Create a new timeline for feature development
+# Create a new timeline for feature development (automatically switches to it)
 ivaldi timeline create auth-system
 
-# Switch to the timeline (with automatic work preservation)
-ivaldi timeline switch auth-system
+# You're now on the auth-system timeline - no need to manually switch!
 
 # All uncommitted work is automatically shelved and restored!
 ivaldi whereami
@@ -139,7 +138,7 @@ ivaldi whereami
 ivaldi gather all
 ivaldi seal "Add authentication middleware"
 
-# Switch back to main
+# Switch back to main (you can also use: ivaldi timeline source)
 ivaldi timeline switch main
 
 # Fuse the auth-system timeline into main

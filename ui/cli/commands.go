@@ -254,7 +254,12 @@ var timelineCreateCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		fmt.Printf("Created timeline: %s\n", name)
+		if err := repo.SwitchTimeline(name); err != nil {
+			fmt.Fprintf(os.Stderr, "Error switching to new timeline: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("Created and switched to timeline: %s\n", name)
 	},
 }
 
@@ -282,6 +287,31 @@ var timelineSwitchCmd = &cobra.Command{
 		}
 
 		fmt.Printf("Switched to timeline: %s\n", name)
+	},
+}
+
+var timelineSourceCmd = &cobra.Command{
+	Use:   "source",
+	Short: "Switch back to the main timeline",
+	Long:  "Switch back to the main/root timeline from any other timeline",
+	Run: func(cmd *cobra.Command, args []string) {
+		if err := checkRepo(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+
+		repo, err := forge.Open(".")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error opening repository: %v\n", err)
+			os.Exit(1)
+		}
+
+		if err := repo.SwitchTimeline("main"); err != nil {
+			fmt.Fprintf(os.Stderr, "Error switching to main timeline: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Println("Switched to main timeline")
 	},
 }
 
@@ -1088,6 +1118,7 @@ func init() {
 	timelineCmd.AddCommand(timelineListCmd)
 	timelineCmd.AddCommand(timelineCreateCmd)
 	timelineCmd.AddCommand(timelineSwitchCmd)
+	timelineCmd.AddCommand(timelineSourceCmd)
 
 	portalCmd.AddCommand(portalAddCmd)
 	portalCmd.AddCommand(portalListCmd)

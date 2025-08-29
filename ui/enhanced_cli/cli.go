@@ -588,6 +588,7 @@ func (ec *EnhancedCLI) createTimelineCommand() *cobra.Command {
 Subcommands:
   create <name>           Create new timeline
   switch <name>           Switch to timeline (with auto-preservation) 
+  source                  Switch back to main timeline
   list                    List all timelines
   delete <name>           Delete timeline
   rename <old> --to <new> Rename timeline
@@ -625,6 +626,7 @@ Examples:
 	// Add subcommands
 	cmd.AddCommand(ec.createTimelineCreateCommand())
 	cmd.AddCommand(ec.createTimelineSwitchCommand())
+	cmd.AddCommand(ec.createTimelineSourceCommand())
 	cmd.AddCommand(ec.createTimelineListCommand())
 	cmd.AddCommand(ec.createTimelineDeleteCommand())
 	cmd.AddCommand(ec.createTimelineRenameCommand())
@@ -702,7 +704,17 @@ func (ec *EnhancedCLI) createTimelineCreateCommand() *cobra.Command {
 				return err
 			}
 
-			ec.output.Success(fmt.Sprintf("Created timeline: %s", args[0]))
+			// Auto-switch to newly created timeline
+			_, err = ec.currentRepo.EnhancedTimelineSwitch(args[0])
+			if err != nil {
+				ec.output.Error("Created timeline but failed to switch", []string{
+					"Timeline created successfully but switch failed",
+					"Use: timeline switch " + args[0],
+				})
+				return err
+			}
+
+			ec.output.Success(fmt.Sprintf("Created and switched to timeline: %s", args[0]))
 			return nil
 		},
 	}
@@ -768,6 +780,69 @@ func (ec *EnhancedCLI) createTimelineSwitchCommand() *cobra.Command {
 			}
 
 			// Check if work was restored on the new timeline
+			if hasChanges || hasStaged {
+				newStatus := ec.currentRepo.GetStatus()
+				if len(newStatus.Staged) > 0 || len(newStatus.Modified) > 0 {
+					ec.output.Info("Previous work automatically restored on this timeline")
+				}
+			}
+
+			return nil
+		},
+	}
+}
+
+func (ec *EnhancedCLI) createTimelineSourceCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "source",
+		Short: "Switch back to the main timeline",
+		Long:  "Switch back to the main/root timeline from any other timeline",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if ec.currentRepo == nil {
+				return fmt.Errorf("not in repository")
+			}
+
+			currentTimeline := ec.currentRepo.GetCurrentTimeline()
+
+			if currentTimeline == "main" {
+				ec.output.Info("Already on main timeline")
+				return nil
+			}
+
+			hasChanges := ec.currentRepo.GetWorkspace().HasUncommittedChanges()
+			hasStaged := len(ec.currentRepo.GetWorkspace().AnvilFiles) > 0
+
+			if hasChanges || hasStaged {
+				ec.output.Info("Auto-shelving uncommitted work...")
+				if hasStaged {
+					ec.output.Info(fmt.Sprintf("  - %d gathered files on anvil", len(ec.currentRepo.GetWorkspace().AnvilFiles)))
+				}
+				if hasChanges {
+					changedCount := 0
+					for _, file := range ec.currentRepo.GetWorkspace().Files {
+						if file.Status == workspace.StatusModified || file.Status == workspace.StatusAdded || file.Status == workspace.StatusDeleted {
+							changedCount++
+						}
+					}
+					ec.output.Info(fmt.Sprintf("  - %d uncommitted changes", changedCount))
+				}
+			}
+
+			snapshot, err := ec.currentRepo.EnhancedTimelineSwitch("main")
+			if err != nil {
+				ec.output.Error("Failed to switch to main timeline", []string{
+					"Main timeline might not exist",
+					"Try: timeline list (to see available)",
+				})
+				return err
+			}
+
+			ec.output.Success("Switched to main timeline")
+
+			if snapshot != nil {
+				ec.output.Info("Work auto-shelved and will restore when you return")
+			}
+
 			if hasChanges || hasStaged {
 				newStatus := ec.currentRepo.GetStatus()
 				if len(newStatus.Staged) > 0 || len(newStatus.Modified) > 0 {

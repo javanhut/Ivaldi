@@ -147,6 +147,7 @@ The Oh My Zsh plugin provides many convenient aliases:
 - `icreate` → `ivaldi timeline create`
 - `ilist` → `ivaldi timeline list`
 - `irename` → `ivaldi rename`
+- `isource` → `ivaldi timeline source`
 
 ### Repository Operations
 - `iforge` → `ivaldi forge`
