@@ -227,9 +227,9 @@ ENV/
 ```bash
 ivaldi sync origin
 → Processing 100 files...
-→ ✅ Skipped 35 ignored files (.ivaldiignore)
-→ ✅ Skipped 12 built-in ignores
-→ ✅ Uploaded 53 source files
+→ CHECKMARK Skipped 35 ignored files (.ivaldiignore)
+→ CHECKMARK Skipped 12 built-in ignores
+→ CHECKMARK Uploaded 53 source files
 ```
 
 ### Ignore File Reporting
@@ -302,7 +302,7 @@ ivaldi refresh
 → Reloading .ivaldiignore patterns...
 → Found 23 patterns in .ivaldiignore
 → Applied 15 built-in patterns
-→ ✅ Ignore patterns refreshed
+→ CHECKMARK Ignore patterns refreshed
 ```
 
 ### Test Ignore Patterns

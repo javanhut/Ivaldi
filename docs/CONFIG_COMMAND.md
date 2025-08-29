@@ -23,8 +23,8 @@ $ ivaldi config
 → Enter GitHub username: your-username
 → Enter GitHub token: ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
 → Validating GitHub credentials...
-→ ✅ GitHub credentials configured successfully
-→ ✅ Token validated with GitHub API
+→ CHECKMARK GitHub credentials configured successfully
+→ CHECKMARK Token validated with GitHub API
 ```
 
 ### Reset Credentials
@@ -62,7 +62,7 @@ Every token is validated against GitHub's API before being stored:
 ```bash
 → Validating GitHub credentials...
 → Testing API access to github.com...
-→ ✅ Token validated successfully
+→ CHECKMARK Token validated successfully
 ```
 
 ### Best Practices
@@ -130,7 +130,7 @@ ivaldi forge
 ivaldi config
 → Enter GitHub username: myusername
 → Enter GitHub token: ghp_abc123...
-→ ✅ GitHub credentials configured successfully
+→ CHECKMARK GitHub credentials configured successfully
 
 # Add portal and sync
 ivaldi portal add origin https://github.com/user/repo.git
@@ -146,7 +146,7 @@ ivaldi config --reset
 ivaldi config
 → Enter GitHub username: newusername
 → Enter GitHub token: ghp_xyz789...
-→ ✅ GitHub credentials configured successfully
+→ CHECKMARK GitHub credentials configured successfully
 ```
 
 ## Related Commands

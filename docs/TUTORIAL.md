@@ -459,12 +459,12 @@ ivaldi whereami
 
 ## What Makes Ivaldi Revolutionary
 
-### 🎯 **Human-Centered Design**
+### TARGET **Human-Centered Design**
 - **Memorable names** instead of cryptic hashes
 - **Workshop metaphor** that makes intuitive sense
 - **Natural language** for all references and operations
 
-### 🚀 **Zero Work Loss**
+### ROCKET **Zero Work Loss**
 - **Automatic preservation** during timeline switches
 - **Mathematical impossibility** of losing work
 - **Smart restoration** when returning to timelines
@@ -474,12 +474,12 @@ ivaldi whereami
 - **Pattern detection** for commit types
 - **Intelligent suggestions** for next steps
 
-### 🎨 **Rich Visual Interface**
+### ART **Rich Visual Interface**
 - **Colored output** with clear indicators
 - **Helpful error messages** with actionable solutions
 - **Progress feedback** for all operations
 
-### 🔧 **Intuitive Operations**
+### WRENCH **Intuitive Operations**
 - **One-command exclusion** for files
 - **Flexible removal** with multiple options
 - **Smart portal management** with automatic upstream

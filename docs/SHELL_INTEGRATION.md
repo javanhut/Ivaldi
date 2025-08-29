@@ -22,9 +22,28 @@ With shell integration, your prompt will show Ivaldi timeline information:
 ➜  ~
 ```
 
-## Quick Setup (Oh My Zsh)
+## Quick Setup
 
-**For Oh My Zsh users, this is the fastest way:**
+### Ghostty Terminal (Recommended)
+
+**For Ghostty terminal users:**
+
+```bash
+# Navigate to your Ivaldi directory
+cd /path/to/Ivaldi
+
+# Run the Ghostty-specific setup script
+./scripts/ghostty-setup.sh
+
+# Restart your terminal or reload your config
+source ~/.bashrc  # or source ~/.zshrc
+```
+
+**BOOK For detailed Ghostty configuration, see: [docs/GHOSTTY_SETUP.md](GHOSTTY_SETUP.md)**
+
+### Oh My Zsh (Other Terminals)
+
+**For Oh My Zsh users:**
 
 ```bash
 # Navigate to your Ivaldi directory
@@ -38,10 +57,10 @@ source ~/.zshrc
 ```
 
 This will:
-- ✅ Install the Ivaldi Oh My Zsh plugin
-- ✅ Switch to the enhanced robbyrussell theme (shows both Git and Ivaldi)
-- ✅ Add convenient aliases (`irename`, `igather`, `iseal`, etc.)
-- ✅ Backup your current `.zshrc`
+- CHECKMARK Install the Ivaldi Oh My Zsh plugin
+- CHECKMARK Switch to the enhanced robbyrussell theme (shows both Git and Ivaldi)
+- CHECKMARK Add convenient aliases (`irename`, `igather`, `iseal`, etc.)
+- CHECKMARK Backup your current `.zshrc`
 
 ## Manual Installation
 
@@ -75,6 +94,16 @@ This will:
 
 ### General Bash/Zsh (Non-Oh My Zsh)
 
+#### Ghostty Terminal Setup
+**Recommended for Ghostty users:**
+
+```bash
+# Run the automated setup
+./scripts/ghostty-setup.sh
+```
+
+#### Manual Configuration
+
 1. **Source the prompt script:**
    ```bash
    # Add to ~/.bashrc or ~/.zshrc
@@ -86,7 +115,7 @@ This will:
    # Add timeline info to your prompt
    PS1="${PS1%\$ }\$(ivaldi_timeline_prompt)\$ "
    
-   # Or with colors
+   # Or with Ghostty-optimized colors
    PS1="\[\033[0;32m\]\u@\h\[\033[0m\]:\[\033[0;34m\]\w\[\033[0;35m\]\$(ivaldi_timeline_prompt)\[\033[0m\]\$ "
    ```
 
@@ -98,7 +127,7 @@ This will:
    # Add timeline info to your prompt  
    PROMPT="${PROMPT%% }%{\$(ivaldi_timeline_prompt_zsh)%} "
    
-   # Or with colors
+   # Or with Ghostty-optimized colors
    PROMPT='%F{green}%n@%m%f:%F{blue}%~%f%F{magenta}$(ivaldi_timeline_prompt_zsh)%f$ '
    ```
 

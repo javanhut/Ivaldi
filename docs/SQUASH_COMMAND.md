@@ -48,20 +48,20 @@ ivaldi squash --count 3 "Consolidated last 3 commits"
 
 # Squash all commits into one
 ivaldi squash --all "feat: implement user authentication system"
-→ ✅ Successfully created clean commit: d6de547d
+→ CHECKMARK Successfully created clean commit: d6de547d
 → Timeline now has 1 commit instead of 4
 
 # Force push to update GitHub
 ivaldi squash --all "feat: implement user authentication system" --force-push
-→ ✅ Successfully created clean commit: d6de547d
-→ ✅ Successfully squashed commits and updated origin!
+→ CHECKMARK Successfully created clean commit: d6de547d
+→ CHECKMARK Successfully squashed commits and updated origin!
 ```
 
 ### Example 2: Squash Recent Commits Only
 ```bash
 # Squash only the last 3 commits
 ivaldi squash --count 3 "fix: resolve validation issues"
-→ ✅ Squashed 3 commits into: bright-river-42
+→ CHECKMARK Squashed 3 commits into: bright-river-42
 ```
 
 ### Example 3: Preview Squash Operation
@@ -138,9 +138,9 @@ Before squashing, Ivaldi automatically creates a backup:
 Ensures operation is safe:
 ```bash
 → Validating squash operation...
-→ ✅ No uncommitted changes detected
-→ ✅ All commits are local (safe to squash)
-→ ✅ GitHub credentials validated
+→ CHECKMARK No uncommitted changes detected
+→ CHECKMARK All commits are local (safe to squash)
+→ CHECKMARK GitHub credentials validated
 ```
 
 ### Confirmation for Force Push

@@ -43,7 +43,7 @@ For GitHub repositories, uses REST API directly:
 ```bash
 → Using GitHub API for repository: user/repo
 → Authenticating with stored credentials...
-→ ✅ Connected to GitHub API
+→ CHECKMARK Connected to GitHub API
 ```
 
 ### 3. Batch Operations
@@ -52,7 +52,7 @@ Uploads multiple files atomically:
 → Uploading 15 files in parallel...
 → Creating GitHub tree with 15 items...
 → Creating single commit with all changes...
-→ ✅ Successfully uploaded 15 files in single commit: a1b2c3d4
+→ CHECKMARK Successfully uploaded 15 files in single commit: a1b2c3d4
 ```
 
 ## Command Options
@@ -78,9 +78,9 @@ ivaldi portal add origin https://github.com/myusername/myproject.git
 
 # Initial sync
 ivaldi sync origin
-→ ✅ Repository is empty, uploading all files...
-→ ✅ Uploading 23 files in parallel...
-→ ✅ Successfully uploaded 23 files in single commit: d4e5f6g7
+→ CHECKMARK Repository is empty, uploading all files...
+→ CHECKMARK Uploading 23 files in parallel...
+→ CHECKMARK Successfully uploaded 23 files in single commit: d4e5f6g7
 ```
 
 ### Example 2: Ongoing Development Sync
@@ -92,8 +92,8 @@ ivaldi seal "Add new feature"
 
 # Sync to GitHub
 ivaldi sync origin
-→ ✅ Uploading 1 new file...
-→ ✅ Successfully synced changes to GitHub
+→ CHECKMARK Uploading 1 new file...
+→ CHECKMARK Successfully synced changes to GitHub
 ```
 
 ### Example 3: Sync with Ignore Files
@@ -108,9 +108,9 @@ EOF
 
 # Sync respects ignore patterns
 ivaldi sync origin
-→ ✅ Processing 50 files...
-→ ✅ Skipped 23 ignored files
-→ ✅ Uploaded 27 source files
+→ CHECKMARK Processing 50 files...
+→ CHECKMARK Skipped 23 ignored files
+→ CHECKMARK Uploaded 27 source files
 ```
 
 ## Ignore File Support
@@ -153,7 +153,7 @@ Groups files into single GitHub API call:
 → Creating tree with 50 items...
 → Creating single commit...
 → Updating branch reference...
-→ ✅ Uploaded 50 files in 2.3 seconds
+→ CHECKMARK Uploaded 50 files in 2.3 seconds
 ```
 
 ### Parallel Processing
@@ -170,7 +170,7 @@ Only uploads changed files:
 → Comparing local vs remote state...
 → Found 3 modified files, 2 new files
 → Uploading 5 changed files...
-→ ✅ Sync completed (45 files unchanged)
+→ CHECKMARK Sync completed (45 files unchanged)
 ```
 
 ## Conflict Resolution
@@ -181,7 +181,7 @@ Uses Ivaldi's native fuse system:
 → Detected divergent branches
 → Creating temporary timeline for remote changes...
 → Using automatic fuse strategy...
-→ ✅ Successfully merged divergent changes
+→ CHECKMARK Successfully merged divergent changes
 ```
 
 ### Merge Strategies
@@ -193,9 +193,9 @@ Uses Ivaldi's native fuse system:
 Override conflicts when needed:
 ```bash
 ivaldi sync origin --force
-→ ⚠️  Force sync will override remote changes
+→ WARNING  Force sync will override remote changes
 → Continue? (y/N): y
-→ ✅ Force sync completed
+→ CHECKMARK Force sync completed
 ```
 
 ## GitHub Integration Details
@@ -206,7 +206,7 @@ Uses Personal Access Tokens:
 → Authenticating with GitHub...
 → Token: ghp_****...****
 → User: myusername
-→ ✅ Authentication successful
+→ CHECKMARK Authentication successful
 ```
 
 ### API Endpoints Used

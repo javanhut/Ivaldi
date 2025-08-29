@@ -119,13 +119,13 @@ func (cm *ConfigManager) InteractiveSetup() error {
 
 	// Try to detect existing git credentials
 	if gitToken, gitErr := cm.LoadGitCredentials(); gitErr == nil && gitToken != "" {
-		fmt.Println("🔍 Found GitHub token in git credentials!")
+		fmt.Println("Found GitHub token in git credentials!")
 		fmt.Printf("Use detected token? (y/N): ")
 		if input, _ := reader.ReadString('\n'); strings.ToLower(strings.TrimSpace(input)) == "y" {
 			creds.GitHubToken = gitToken
-			fmt.Println("✅ Using git credentials")
+			fmt.Println("Using git credentials")
 		} else {
-			fmt.Println("📝 Manual token entry:")
+			fmt.Println("Manual token entry:")
 			fmt.Println("GitHub Personal Access Token:")
 			fmt.Println("  1. Go to https://github.com/settings/tokens")
 			fmt.Println("  2. Generate a new token with 'repo' permissions")
@@ -160,10 +160,10 @@ func (cm *ConfigManager) InteractiveSetup() error {
 	if creds.GitHubToken != "" {
 		fmt.Print("Validating GitHub token... ")
 		if err := cm.validateGitHubToken(creds.GitHubToken); err != nil {
-			fmt.Printf("❌ Invalid: %v\n", err)
+			fmt.Printf("INVALID: %v\n", err)
 			return fmt.Errorf("GitHub token validation failed: %v", err)
 		}
-		fmt.Println("✅ Valid")
+		fmt.Println("Valid")
 	}
 
 	// GitLab token (optional)
@@ -181,10 +181,10 @@ func (cm *ConfigManager) InteractiveSetup() error {
 	if creds.GitLabToken != "" {
 		fmt.Print("Validating GitLab token... ")
 		if err := cm.validateGitLabToken(creds.GitLabToken); err != nil {
-			fmt.Printf("❌ Invalid: %v\n", err)
+			fmt.Printf("INVALID: %v\n", err)
 			return fmt.Errorf("GitLab token validation failed: %v", err)
 		}
-		fmt.Println("✅ Valid")
+		fmt.Println("Valid")
 	}
 
 	// Save credentials
@@ -193,7 +193,7 @@ func (cm *ConfigManager) InteractiveSetup() error {
 	}
 
 	fmt.Println()
-	fmt.Println("✅ Configuration saved successfully!")
+	fmt.Println("Configuration saved successfully!")
 	fmt.Printf("Credentials stored in: %s\n", cm.configPath)
 	fmt.Println("You can now use 'ivaldi upload' to push to remote repositories")
 

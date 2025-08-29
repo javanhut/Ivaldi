@@ -5,11 +5,11 @@
 
 set -e
 
-echo "🔧 Setting up Ivaldi timeline prompt for Oh My Zsh..."
+echo " Setting up Ivaldi timeline prompt for Oh My Zsh..."
 
 # Check if Oh My Zsh is installed
 if [[ ! -d "$HOME/.oh-my-zsh" ]]; then
-    echo "❌ Oh My Zsh not found. Please install it first."
+    echo "ERROR: Oh My Zsh not found. Please install it first."
     exit 1
 fi
 
@@ -20,19 +20,19 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "📁 Creating plugin directory..."
+echo " Creating plugin directory..."
 PLUGIN_DIR="$ZSH_CUSTOM/plugins/ivaldi"
 mkdir -p "$PLUGIN_DIR"
 
-echo "📋 Copying plugin files..."
+echo "COPY: Copying plugin files..."
 cp "$SCRIPT_DIR/oh-my-zsh-plugin/ivaldi.plugin.zsh" "$PLUGIN_DIR/"
 
-echo "🎨 Copying theme..."
+echo " Copying theme..."
 THEME_DIR="$ZSH_CUSTOM/themes"
 mkdir -p "$THEME_DIR"
 cp "$SCRIPT_DIR/oh-my-zsh-plugin/robbyrussell-ivaldi.zsh-theme" "$THEME_DIR/"
 
-echo "⚙️  Updating ~/.zshrc..."
+echo "CONFIG:  Updating ~/.zshrc..."
 ZSHRC="$HOME/.zshrc"
 
 # Backup .zshrc
@@ -61,14 +61,14 @@ else
 fi
 
 echo ""
-echo "✅ Setup complete!"
+echo " Setup complete!"
 echo ""
 echo "Your prompt will now show:"
 echo "  ➜  project git:(main) ivaldi:(timeline-name)"
 echo ""
-echo "🔄 Restart your terminal or run: source ~/.zshrc"
+echo " Restart your terminal or run: source ~/.zshrc"
 echo ""
-echo "🎯 Available aliases:"
+echo " Available aliases:"
 echo "  iva → ivaldi"
 echo "  igather → ivaldi gather"
 echo "  iseal → ivaldi seal"

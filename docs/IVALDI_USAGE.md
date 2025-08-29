@@ -35,7 +35,7 @@ make build
 ./build/ivaldi config
 → Enter GitHub username: your-username
 → Enter GitHub token: ghp_xxxxxxxxxxxx
-→ ✅ GitHub credentials configured successfully
+→ CHECKMARK GitHub credentials configured successfully
 ```
 
 ### 6. Add GitHub Portal
@@ -47,8 +47,8 @@ make build
 ```bash
 # Native sync (no git commands used)
 ./build/ivaldi sync origin
-→ ✅ Uploading 15 files in parallel...
-→ ✅ Successfully uploaded 15 files in single commit
+→ CHECKMARK Uploading 15 files in parallel...
+→ CHECKMARK Successfully uploaded 15 files in single commit
 ```
 
 ## Common Commands
@@ -149,8 +149,8 @@ EOF
 
 # Sync respects ignore patterns
 ./build/ivaldi sync origin
-→ ✅ Skipped 23 ignored files
-→ ✅ Uploaded 12 source files
+→ CHECKMARK Skipped 23 ignored files
+→ CHECKMARK Uploaded 12 source files
 ```
 
 ### Built-in Ignore Patterns
@@ -167,11 +167,11 @@ Ivaldi automatically ignores:
 ```bash
 # Squash multiple commits into one
 ./build/ivaldi squash --all "Clean commit message"
-→ ✅ Successfully created clean commit: d6de547d
+→ CHECKMARK Successfully created clean commit: d6de547d
 
 # Squash with force push to rewrite history
 ./build/ivaldi squash --all "Clean implementation" --force-push
-→ ✅ Successfully squashed commits and updated origin!
+→ CHECKMARK Successfully squashed commits and updated origin!
 ```
 
 ### Force Push with History Rewriting

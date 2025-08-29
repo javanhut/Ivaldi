@@ -4,7 +4,7 @@
 
 ## ✨ New Features
 
-### 🔄 Timeline Rename Functionality
+### REFRESH Timeline Rename Functionality
 **Easy timeline renaming with remote overwrite support**
 
 - **Command**: `ivaldi rename <old> --to <new>` or `ivaldi timeline rename <old> --to <new>`
@@ -21,7 +21,7 @@
   - When uploading, creates new remote branch with new name
   - Perfect for GitHub's master→main migration
 
-### 🐚 Shell Integration & Prompt Support
+### SHELL Shell Integration & Prompt Support
 **Timeline information in your shell prompt like Git branches**
 
 - **Quick Setup**: Run `./scripts/quick-setup.sh` for Oh My Zsh
@@ -42,9 +42,9 @@
   - Mirror for preserving development history
   - Download for clean slate without historical baggage
 
-## 🔧 Enhanced Features
+## WRENCH Enhanced Features
 
-### 📋 Oh My Zsh Plugin Aliases
+###  Oh My Zsh Plugin Aliases
 **Convenient shortcuts for common operations**
 
 | Alias | Command | Purpose |
@@ -58,7 +58,7 @@
 | `imirror` | `ivaldi mirror` | Mirror with history |
 | `idownload` | `ivaldi download` | Download files only |
 
-### 🎨 Enhanced Help and Documentation
+### ART Enhanced Help and Documentation
 **Improved command help and comprehensive guides**
 
 - Updated main help text with clear command descriptions
@@ -67,7 +67,7 @@
 - Updated README with latest features
 - Complete command reference documentation
 
-### ⚙️ Installation Improvements
+###  Installation Improvements
 **Better installation experience with shell integration**
 
 - `make install` now includes shell prompt scripts
@@ -75,7 +75,7 @@
 - Quick setup script for Oh My Zsh users
 - Comprehensive installation documentation
 
-## 🔄 Updated Commands
+## REFRESH Updated Commands
 
 ### Timeline Commands
 ```bash
@@ -99,7 +99,7 @@ ivaldi download <url> [dest]        # Download files only
 ivaldi forge <name>                  # Create new repository
 ```
 
-## 🚀 Installation & Setup
+## ROCKET Installation & Setup
 
 ### Quick Installation
 ```bash
@@ -142,7 +142,7 @@ source scripts/ivaldi-prompt.sh
 - **[oh-my-zsh-plugin/](../scripts/oh-my-zsh-plugin/)** - Complete plugin with theme
 - **[INSTALL_PROMPT.md](../scripts/INSTALL_PROMPT.md)** - General shell setup guide
 
-## 🔍 Migration Guide
+## MAGNIFY Migration Guide
 
 ### From Previous Ivaldi Versions
 ```bash
@@ -170,15 +170,15 @@ ivaldi upload
 # You can delete it manually when ready
 ```
 
-## 🎯 What's Next
+## TARGET What's Next
 
 These updates make Ivaldi more user-friendly and integrate better with modern development workflows:
 
-- ✅ **Easy timeline renaming** for better branch management
-- ✅ **Visual feedback** in shell prompts
-- ✅ **Convenient aliases** for faster workflows  
-- ✅ **Clear command distinctions** between mirror and download
-- ✅ **Better documentation** and setup experience
+- CHECKMARK **Easy timeline renaming** for better branch management
+- CHECKMARK **Visual feedback** in shell prompts
+- CHECKMARK **Convenient aliases** for faster workflows  
+- CHECKMARK **Clear command distinctions** between mirror and download
+- CHECKMARK **Better documentation** and setup experience
 
 ## 🤝 Feedback
 
