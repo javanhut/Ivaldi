@@ -198,6 +198,31 @@ Ivaldi uses GitHub's Git Data API for fast batch uploads:
 - Atomic commits (all files uploaded together)
 - Parallel processing for large repositories
 
+### Empty Repository Support
+Ivaldi fully supports uploading to empty GitHub repositories:
+- **Automatic detection** of empty repositories during upload
+- **Special handling** for initial commits using GitHub's blob creation API
+- **Repository validation** before upload to ensure accessibility
+- **Clear progress** indicators for empty repository uploads
+
+Example for empty repository:
+```bash
+# Create a new empty repository on GitHub first, then:
+ivaldi forge
+ivaldi gather .
+ivaldi seal -m "Initial commit"
+ivaldi portal add origin https://github.com/username/new-repo.git
+ivaldi upload origin
+
+# Output will show:
+# ├─ Getting remote state... Creating new branch: main
+# ├─ Creating tree for empty repository...
+# ├─ Creating 38 blobs for empty repository... Done
+# ├─ Creating tree object... Done
+# ├─ Creating commit... Done
+# └─ Setting branch: main... Done
+```
+
 ## Notes
 
 - **Git-independent**: Ivaldi does not use git commands underneath

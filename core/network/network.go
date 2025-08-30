@@ -726,6 +726,11 @@ func (nm *NetworkManager) uploadToGitHub(portalURL, timeline string, seals []*ob
 		return fmt.Errorf("invalid timeline name '%s': %v", timeline, err)
 	}
 
+	// Validate repository access before attempting upload
+	if err := nm.validateRepositoryAccess(owner, repo); err != nil {
+		return fmt.Errorf("repository validation failed: %v", err)
+	}
+
 	fmt.Printf("Uploading to GitHub repo: %s/%s (timeline: %s)\n", owner, repo, timeline)
 
 	// Get files that have changed and need to be uploaded
@@ -1096,13 +1101,26 @@ func (nm *NetworkManager) uploadFilesBatchWithProgress(owner, repo, timeline str
 	fmt.Println("Done")
 
 	// Step 3: Create tree (batch operation)
-	fmt.Print("├─ Creating tree object... ")
-	treeSHA, err := nm.createTree(owner, repo, treeData)
-	if err != nil {
-		fmt.Println("Failed")
-		return fmt.Errorf("failed to create tree: %v", err)
+	var treeSHA string
+
+	if currentSHA == "" {
+		// Empty repository - use special handling with blob creation first
+		fmt.Print("├─ Creating tree for empty repository... ")
+		treeSHA, err = nm.createTreeForEmptyRepo(owner, repo, files)
+		if err != nil {
+			fmt.Println("Failed")
+			return fmt.Errorf("failed to create tree for empty repository: %v", err)
+		}
+	} else {
+		// Existing repository - use standard tree creation
+		fmt.Print("├─ Creating tree object... ")
+		treeSHA, err = nm.createTree(owner, repo, treeData)
+		if err != nil {
+			fmt.Println("Failed")
+			return fmt.Errorf("failed to create tree: %v", err)
+		}
+		fmt.Println("Done")
 	}
-	fmt.Println("Done")
 
 	// Step 4: Create commit
 	fmt.Print("├─ Creating commit... ")
@@ -1636,6 +1654,9 @@ func (nm *NetworkManager) createTree(owner, repo string, treeData []byte) (strin
 
 	if resp.StatusCode != 201 {
 		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == 409 && strings.Contains(string(body), "Git Repository is empty") {
+			return "", fmt.Errorf("empty repository detected - use empty repository handling: %s", string(body))
+		}
 		return "", fmt.Errorf("failed to create tree: %s - %s", resp.Status, string(body))
 	}
 
@@ -1648,6 +1669,103 @@ func (nm *NetworkManager) createTree(owner, repo string, treeData []byte) (strin
 	}
 
 	return tree.SHA, nil
+}
+
+// createBlob creates a blob object via GitHub API for empty repository support
+func (nm *NetworkManager) createBlob(owner, repo string, content []byte) (string, error) {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/git/blobs", owner, repo)
+
+	blobData := map[string]interface{}{
+		"content":  base64.StdEncoding.EncodeToString(content),
+		"encoding": "base64",
+	}
+
+	jsonData, err := json.Marshal(blobData)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", err
+	}
+
+	// Add authentication
+	token, err := nm.getGitHubToken()
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("Authorization", "token "+token)
+	req.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := nm.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 201 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("failed to create blob: %s - %s", resp.Status, string(body))
+	}
+
+	var blob struct {
+		SHA string `json:"sha"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&blob); err != nil {
+		return "", err
+	}
+
+	return blob.SHA, nil
+}
+
+// createTreeForEmptyRepo creates a tree for empty repositories by first creating blobs
+func (nm *NetworkManager) createTreeForEmptyRepo(owner, repo string, files []FileToUpload) (string, error) {
+	if len(files) == 0 {
+		return "", fmt.Errorf("no files to upload")
+	}
+
+	fmt.Printf("├─ Creating %d blobs for empty repository... ", len(files))
+
+	// Create tree items with blob SHAs instead of content
+	treeItems := make([]GitHubTreeItem, 0, len(files))
+
+	for i, file := range files {
+		// Create blob for this file
+		blobSHA, err := nm.createBlob(owner, repo, file.Content)
+		if err != nil {
+			fmt.Println("Failed")
+			return "", fmt.Errorf("failed to create blob for %s: %v", file.Path, err)
+		}
+
+		// Add to tree with blob SHA reference
+		treeItems = append(treeItems, GitHubTreeItem{
+			Path: file.Path,
+			Mode: "100644",
+			Type: "blob",
+			SHA:  blobSHA,
+		})
+
+		// Progress indicator for large uploads
+		if i > 0 && i%10 == 0 {
+			fmt.Printf("\n├─ Created %d/%d blobs... ", i, len(files))
+		}
+	}
+
+	fmt.Println("Done")
+
+	// Now create tree with blob references
+	tree := GitHubTree{Tree: treeItems}
+	treeData, err := json.Marshal(tree)
+	if err != nil {
+		return "", fmt.Errorf("failed to prepare tree data: %v", err)
+	}
+
+	// Use standard tree creation now that we have blobs
+	return nm.createTree(owner, repo, treeData)
 }
 
 // createCommit creates a commit object via GitHub API
@@ -1795,6 +1913,45 @@ func (nm *NetworkManager) createReference(owner, repo, ref, sha string) error {
 	}
 
 	return nil
+}
+
+// validateRepositoryAccess checks if repository exists and is accessible
+func (nm *NetworkManager) validateRepositoryAccess(owner, repo string) error {
+	url := fmt.Sprintf("https://api.github.com/repos/%s/%s", owner, repo)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create request: %v", err)
+	}
+
+	// Add authentication
+	token, err := nm.getGitHubToken()
+	if err != nil {
+		return fmt.Errorf("failed to get GitHub token: %v", err)
+	}
+
+	req.Header.Set("Authorization", "token "+token)
+	req.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
+
+	resp, err := nm.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to access repository: %v", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case 200:
+		return nil // Repository exists and is accessible
+	case 401:
+		return fmt.Errorf("authentication failed - check your GitHub token")
+	case 403:
+		return fmt.Errorf("access forbidden - check repository permissions")
+	case 404:
+		return fmt.Errorf("repository %s/%s not found or not accessible", owner, repo)
+	default:
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("repository validation failed (%s): %s", resp.Status, string(body))
+	}
 }
 
 // GitHubCommitInfo represents commit information from GitHub API
