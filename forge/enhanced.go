@@ -756,3 +756,35 @@ func (er *EnhancedRepository) References() *references.ReferenceManager {
 func (er *EnhancedRepository) Position() *position.Manager {
 	return er.position
 }
+
+// Butterfly Timeline Methods - Wrappers for the embedded repository
+
+// CreateButterflyTimeline creates a new butterfly variant
+func (er *EnhancedRepository) CreateButterflyTimeline(identifier string) error {
+	return er.Repository.CreateButterflyTimeline(identifier)
+}
+
+// SwitchButterflyTimeline switches to a butterfly variant with auto-shelving
+func (er *EnhancedRepository) SwitchButterflyTimeline(identifier string) error {
+	return er.Repository.SwitchButterflyTimeline(identifier)
+}
+
+// ListButterflyTimelines returns information about all butterfly variants
+func (er *EnhancedRepository) ListButterflyTimelines() []timeline.ButterflyInfo {
+	return er.Repository.ListButterflyTimelines()
+}
+
+// DeleteButterflyVariant deletes a butterfly variant with safety checks
+func (er *EnhancedRepository) DeleteButterflyVariant(identifier string, force bool) error {
+	return er.Repository.DeleteButterflyVariant(identifier, force)
+}
+
+// GetCurrentButterflyInfo returns information about the current butterfly state
+func (er *EnhancedRepository) GetCurrentButterflyInfo() (string, string, bool) {
+	return er.Repository.GetCurrentButterflyInfo()
+}
+
+// GetUploadHistory returns upload history for a timeline
+func (er *EnhancedRepository) GetUploadHistory(timelineName string) (*timeline.VariantUploadTracking, error) {
+	return er.Repository.getUploadHistory(timelineName)
+}

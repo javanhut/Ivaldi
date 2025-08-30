@@ -28,6 +28,7 @@ Start here if you're new to Ivaldi:
 - **[Squash Command](SQUASH_COMMAND.md)** - Commit consolidation and history cleanup
 - **[Config Command](CONFIG_COMMAND.md)** - Credential management and setup
 - **[Ignore Files](IVALDIIGNORE.md)** - File pattern management with .ivaldiignore
+- **[Butterfly Feature](BUTTERFLY_FEATURE.md)** - Timeline variants for experimentation
 
 ### Development & Examples
 

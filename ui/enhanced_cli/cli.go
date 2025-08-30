@@ -165,6 +165,7 @@ func (ec *EnhancedCLI) addEnhancedCommands(rootCmd *cobra.Command) {
 	rootCmd.AddCommand(ec.createRemoveCommand())
 	rootCmd.AddCommand(ec.createSealCommand())
 	rootCmd.AddCommand(ec.createTimelineCommand())
+	rootCmd.AddCommand(ec.createButterflyCommand())
 	rootCmd.AddCommand(ec.createRenameCommand())
 	rootCmd.AddCommand(ec.createJumpCommand())
 	rootCmd.AddCommand(ec.createShelfCommand())
@@ -678,6 +679,352 @@ Examples:
 			}
 
 			ec.output.Success(fmt.Sprintf("Jumped to: %s", reference))
+
+			return nil
+		},
+	}
+}
+
+// Create butterfly command (manage variants)
+func (ec *EnhancedCLI) createButterflyCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "butterfly",
+		Aliases: []string{"bf", "variant"},
+		Short:   "Manage butterfly sub-timelines (variants)",
+		Long: `Create and manage divergent variations of timelines.
+
+Butterfly timelines (also called variants) allow you to experiment with 
+different approaches on the same logical timeline. Each variant maintains 
+its own state while sharing the same base timeline.
+
+COMMAND ALIASES:
+  butterfly, bf, variant          # All refer to the same functionality
+
+WORKFLOW ALIASES:
+  create, new                     # Create new variants
+  list, ls, show                  # List existing variants  
+  delete, del, rm, remove         # Delete variants
+  switch, sw, to                  # Switch between variants
+
+Examples:
+  ivaldi variant                  # Create auto-numbered variant
+  ivaldi bf new_feature           # Create named variant
+  ivaldi butterfly list           # List all variants
+  ivaldi variant 1                # Switch to variant 1
+  ivaldi bf delete old_test       # Delete variant
+  ivaldi timeline source          # Return to base timeline`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if ec.currentRepo == nil {
+				return fmt.Errorf("not in repository")
+			}
+
+			// If no args, create auto-numbered variant
+			if len(args) == 0 {
+				currentTimeline := ec.currentRepo.GetCurrentTimeline()
+				baseTimeline := ec.currentRepo.Timeline().GetBaseTimeline(currentTimeline)
+				nextID := ec.currentRepo.Timeline().GetNextButterflyID(baseTimeline)
+				identifier := fmt.Sprintf("%d", nextID)
+
+				if err := ec.currentRepo.CreateButterflyTimeline(identifier); err != nil {
+					ec.output.Error("Failed to create butterfly variant", []string{
+						"Check that base timeline exists",
+						"Try with a different identifier",
+					})
+					return err
+				}
+
+				if err := ec.currentRepo.SwitchButterflyTimeline(identifier); err != nil {
+					ec.output.Error("Created variant but failed to switch", []string{
+						"Variant created successfully but switch failed",
+						"Use: bf " + identifier,
+					})
+					return err
+				}
+
+				variantName := fmt.Sprintf("%s:diverged:%s", baseTimeline, identifier)
+				ec.output.Success(fmt.Sprintf("Created and switched to butterfly variant: %s", variantName))
+				return nil
+			}
+
+			// If one arg, either switch to existing variant or create named variant
+			identifier := args[0]
+
+			// Try to switch first (in case it exists)
+			if err := ec.currentRepo.SwitchButterflyTimeline(identifier); err == nil {
+				currentTimeline := ec.currentRepo.GetCurrentTimeline()
+				ec.output.Success(fmt.Sprintf("Switched to butterfly variant: %s", currentTimeline))
+				return nil
+			}
+
+			// If switch failed, try to create new named variant
+			if err := ec.currentRepo.CreateButterflyTimeline(identifier); err != nil {
+				ec.output.Error("Failed to create or switch to butterfly variant", []string{
+					"Variant might not exist, or creation failed",
+					"Use: bf list (to see available variants)",
+					"Check that identifier is valid",
+				})
+				return err
+			}
+
+			if err := ec.currentRepo.SwitchButterflyTimeline(identifier); err != nil {
+				ec.output.Error("Created variant but failed to switch", []string{
+					"Variant created successfully but switch failed",
+					"Use: bf " + identifier,
+				})
+				return err
+			}
+
+			currentTimeline := ec.currentRepo.GetCurrentTimeline()
+			ec.output.Success(fmt.Sprintf("Created and switched to butterfly variant: %s", currentTimeline))
+			return nil
+		},
+	}
+
+	// Add subcommands
+	cmd.AddCommand(ec.createButterflyCreateCommand())
+	cmd.AddCommand(ec.createButterflyListCommand())
+	cmd.AddCommand(ec.createButterflyDeleteCommand())
+	cmd.AddCommand(ec.createButterflyUploadStatusCommand())
+
+	return cmd
+}
+
+// Butterfly subcommands
+func (ec *EnhancedCLI) createButterflyCreateCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:     "create [identifier]",
+		Aliases: []string{"new", "make"},
+		Short:   "Create new butterfly variant",
+		Long: `Create a new butterfly sub-timeline (variant).
+
+Without an identifier, creates an auto-numbered variant.
+With an identifier, creates a named variant.
+
+Examples:
+  ivaldi bf create             # Auto-numbered (e.g., :diverged:1)
+  ivaldi bf new experiment     # Named variant (:diverged:experiment)
+  ivaldi variant make feature  # Alternative syntax`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if ec.currentRepo == nil {
+				return fmt.Errorf("not in repository")
+			}
+
+			var identifier string
+			if len(args) == 0 {
+				// Auto-numbered variant
+				currentTimeline := ec.currentRepo.GetCurrentTimeline()
+				baseTimeline := ec.currentRepo.Timeline().GetBaseTimeline(currentTimeline)
+				nextID := ec.currentRepo.Timeline().GetNextButterflyID(baseTimeline)
+				identifier = fmt.Sprintf("%d", nextID)
+			} else {
+				identifier = args[0]
+			}
+
+			if err := ec.currentRepo.CreateButterflyTimeline(identifier); err != nil {
+				ec.output.Error("Failed to create butterfly variant", []string{
+					"Check that base timeline exists",
+					"Variant might already exist",
+					"Try with a different identifier",
+				})
+				return err
+			}
+
+			currentTimeline := ec.currentRepo.GetCurrentTimeline()
+			baseTimeline := ec.currentRepo.Timeline().GetBaseTimeline(currentTimeline)
+			variantName := fmt.Sprintf("%s:diverged:%s", baseTimeline, identifier)
+			ec.output.Success(fmt.Sprintf("Created butterfly variant: %s", variantName))
+			return nil
+		},
+	}
+}
+
+func (ec *EnhancedCLI) createButterflyListCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:     "list",
+		Aliases: []string{"ls", "show"},
+		Short:   "List butterfly variants for current timeline",
+		Long: `List all butterfly variants for the current base timeline.
+
+Shows both the base timeline and all its butterfly variants,
+indicating which one is currently active.
+
+Examples:
+  ivaldi bf list                   # List variants
+  ivaldi variant ls                # Using variant alias
+  ivaldi butterfly show            # Using show alias`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if ec.currentRepo == nil {
+				return fmt.Errorf("not in repository")
+			}
+
+			variants := ec.currentRepo.ListButterflyTimelines()
+			if len(variants) == 0 {
+				ec.output.Info("No butterfly variants found")
+				return nil
+			}
+
+			currentTimeline := ec.currentRepo.GetCurrentTimeline()
+			baseTimeline := ec.currentRepo.Timeline().GetBaseTimeline(currentTimeline)
+
+			ec.output.Info(fmt.Sprintf("Base timeline: %s", baseTimeline))
+			ec.output.Info("")
+			ec.output.Info("Variants:")
+
+			for _, variant := range variants {
+				marker := " "
+				if variant.FullName == currentTimeline {
+					marker = "*"
+				}
+
+				if variant.Identifier == "" {
+					// This is the base timeline
+					ec.output.Info(fmt.Sprintf("  %s %s (base)", marker, variant.FullName))
+				} else {
+					ec.output.Info(fmt.Sprintf("  %s %s", marker, variant.FullName))
+				}
+			}
+
+			return nil
+		},
+	}
+}
+
+func (ec *EnhancedCLI) createButterflyDeleteCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "delete <identifier>",
+		Aliases: []string{"del", "rm", "remove"},
+		Short:   "Delete a butterfly variant",
+		Long: `Delete a butterfly variant and all associated state.
+
+This will remove:
+- Timeline state and history  
+- Workspace state
+- Auto-shelved changes
+- Upload tracking information
+
+Use with caution - this cannot be undone.
+
+Examples:
+  ivaldi bf delete 1               # Delete variant 1
+  ivaldi variant rm experiment     # Delete named variant
+  ivaldi butterfly remove old --force  # Force delete`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if ec.currentRepo == nil {
+				return fmt.Errorf("not in repository")
+			}
+
+			identifier := args[0]
+			force, _ := cmd.Flags().GetBool("force")
+
+			if err := ec.currentRepo.DeleteButterflyVariant(identifier, force); err != nil {
+				ec.output.Error("Failed to delete butterfly variant", []string{
+					"Check that variant exists",
+					"Cannot delete active variant - switch first",
+					"Use --force to override safety checks",
+				})
+				return err
+			}
+
+			ec.output.Success(fmt.Sprintf("Deleted butterfly variant: %s", identifier))
+			return nil
+		},
+	}
+
+	cmd.Flags().Bool("force", false, "Force delete even with uncommitted changes")
+	return cmd
+}
+
+func (ec *EnhancedCLI) createButterflyUploadStatusCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:     "upload-status [identifier]",
+		Aliases: []string{"uploads", "up-status"},
+		Short:   "Show upload status for variants",
+		Long: `Show upload status for butterfly variants.
+
+Without arguments, shows upload status for all variants.
+With identifier, shows detailed status for specific variant.
+
+Examples:
+  ivaldi bf upload-status          # Show all variants
+  ivaldi variant uploads 1         # Show status for variant 1`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if ec.currentRepo == nil {
+				return fmt.Errorf("not in repository")
+			}
+
+			if len(args) == 0 {
+				// Show status for all variants
+				variants := ec.currentRepo.ListButterflyTimelines()
+				ec.output.Info("Upload status for all variants:")
+				ec.output.Info("")
+
+				for _, variant := range variants {
+					tracking, err := ec.currentRepo.GetUploadHistory(variant.FullName)
+					if err != nil {
+						ec.output.Info(fmt.Sprintf("  %s: Error loading upload status", variant.FullName))
+						continue
+					}
+
+					if tracking.LastUpload == nil {
+						ec.output.Info(fmt.Sprintf("  %s: Never uploaded", variant.FullName))
+					} else {
+						status := "uploaded"
+						if !tracking.LastUpload.Success {
+							status = "upload failed"
+						}
+						timeStr := tracking.LastUpload.Timestamp.Format("2006-01-02 15:04")
+						ec.output.Info(fmt.Sprintf("  %s: %s %s to %s", variant.FullName, status, timeStr, tracking.LastUpload.Portal))
+					}
+				}
+			} else {
+				// Show detailed status for specific variant
+				identifier := args[0]
+				currentTimeline := ec.currentRepo.GetCurrentTimeline()
+				baseTimeline := ec.currentRepo.Timeline().GetBaseTimeline(currentTimeline)
+				variantName := fmt.Sprintf("%s:diverged:%s", baseTimeline, identifier)
+
+				tracking, err := ec.currentRepo.GetUploadHistory(variantName)
+				if err != nil {
+					ec.output.Error("Failed to load upload status", []string{
+						"Check that variant exists",
+						"Upload tracking data might be corrupted",
+					})
+					return err
+				}
+
+				ec.output.Info(fmt.Sprintf("Upload status for variant '%s':", identifier))
+				ec.output.Info("")
+
+				if tracking.LastUpload == nil {
+					ec.output.Info("  Never uploaded")
+				} else {
+					ec.output.Info(fmt.Sprintf("  Last Upload: %s", tracking.LastUpload.Timestamp.Format("2006-01-02 15:04:05")))
+					ec.output.Info(fmt.Sprintf("  Portal: %s", tracking.LastUpload.Portal))
+					ec.output.Info(fmt.Sprintf("  Success: %t", tracking.LastUpload.Success))
+					ec.output.Info(fmt.Sprintf("  Seal: %s", tracking.LastUpload.SealName))
+					if !tracking.LastUpload.Success {
+						ec.output.Info(fmt.Sprintf("  Error: %s", tracking.LastUpload.ErrorMessage))
+					}
+				}
+
+				if len(tracking.UploadHistory) > 1 {
+					ec.output.Info("")
+					ec.output.Info("Recent Upload History:")
+					for i := len(tracking.UploadHistory) - 2; i >= 0 && i >= len(tracking.UploadHistory)-6; i-- {
+						record := tracking.UploadHistory[i]
+						status := "✓"
+						if !record.Success {
+							status = "✗"
+						}
+						timeStr := record.Timestamp.Format("2006-01-02 15:04")
+						ec.output.Info(fmt.Sprintf("  %s %s to %s (%s)", status, timeStr, record.Portal, record.SealName))
+					}
+				}
+			}
 
 			return nil
 		},

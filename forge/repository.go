@@ -2028,8 +2028,37 @@ func (r *Repository) CreateBranchAndMigrate(newBranch, fromBranch string) error 
 }
 
 func (r *Repository) UploadToPortal(portalName, branch string) error {
+	currentTimeline := r.timeline.Current()
+	currentCommit := r.position.Current().Hash
+
+	// Record upload attempt start
+	startTime := time.Now()
+
 	// Simple upload - just push with upstream
-	return r.PushToBranch(portalName, branch, true)
+	err := r.PushToBranch(portalName, branch, true)
+
+	// Record upload result
+	record := timeline.UploadRecord{
+		Timeline:   currentTimeline,
+		CommitHash: currentCommit,
+		SealName:   r.getCurrentSealName(),
+		Portal:     portalName,
+		Timestamp:  startTime,
+		Success:    err == nil,
+		Author:     r.getCurrentAuthor(),
+	}
+
+	if err != nil {
+		record.ErrorMessage = err.Error()
+	}
+
+	// Record the upload attempt
+	if trackingErr := r.recordUpload(record); trackingErr != nil {
+		// Don't fail the upload if tracking fails, just warn
+		fmt.Printf("Warning: Failed to record upload: %v\n", trackingErr)
+	}
+
+	return err
 }
 
 func (r *Repository) RenameBranchOnPortal(portalName, oldBranch, newBranch string) error {
@@ -3039,4 +3068,365 @@ func (r *Repository) ensureP2PManager() error {
 
 	// Initialize P2P manager to reconnect to running P2P
 	return r.initializeP2PManager()
+}
+
+// Butterfly Timeline Methods
+
+// CreateButterflyTimeline creates a new butterfly variant from the current timeline
+func (r *Repository) CreateButterflyTimeline(identifier string) error {
+	currentTimeline := r.timeline.Current()
+	baseTimeline := timeline.GetBaseTimeline(currentTimeline)
+
+	// Create the butterfly timeline
+	if err := r.timeline.CreateButterflyTimeline(baseTimeline, identifier); err != nil {
+		return err
+	}
+
+	butterflyTimelineName := timeline.BuildButterflyTimelineName(baseTimeline, identifier)
+
+	// Save current timeline state before creating butterfly variant
+	if err := r.saveTimelineState(currentTimeline); err != nil {
+		return fmt.Errorf("failed to save current timeline state: %v", err)
+	}
+
+	// Save current workspace state
+	if err := r.workspace.SaveState(currentTimeline); err != nil {
+		return fmt.Errorf("failed to save current workspace state: %v", err)
+	}
+
+	// Copy workspace state to new butterfly timeline
+	if err := r.copyWorkspaceState(currentTimeline, butterflyTimelineName); err != nil {
+		return fmt.Errorf("failed to copy workspace state to butterfly timeline: %v", err)
+	}
+
+	// Copy timeline state to butterfly variant
+	if err := r.saveTimelineState(butterflyTimelineName); err != nil {
+		return fmt.Errorf("failed to save butterfly timeline state: %v", err)
+	}
+
+	return nil
+}
+
+// SwitchButterflyTimeline switches to a butterfly variant with auto-shelving
+func (r *Repository) SwitchButterflyTimeline(identifier string) error {
+	currentTimeline := r.timeline.Current()
+	baseTimeline := timeline.GetBaseTimeline(currentTimeline)
+	targetTimeline := timeline.BuildButterflyTimelineName(baseTimeline, identifier)
+
+	// Check if target timeline exists
+	if !r.timeline.Exists(targetTimeline) {
+		return fmt.Errorf("butterfly variant '%s' does not exist", identifier)
+	}
+
+	// Auto-shelve uncommitted changes
+	if r.workspace.HasUncommittedChanges() {
+		if err := r.autoShelveChanges(currentTimeline, "variant-switch"); err != nil {
+			return fmt.Errorf("failed to auto-shelve changes: %v", err)
+		}
+		fmt.Printf("Auto-shelved uncommitted changes from %s\n", r.getButterflyDisplayName(currentTimeline))
+	}
+
+	// Switch timeline using existing functionality
+	if err := r.SwitchTimeline(targetTimeline); err != nil {
+		return err
+	}
+
+	// Auto-restore shelved changes for target timeline
+	if err := r.autoRestoreShelvedChanges(targetTimeline); err != nil {
+		fmt.Printf("Warning: Could not restore shelved changes: %v\n", err)
+	}
+
+	return nil
+}
+
+// ListButterflyTimelines returns information about all butterfly variants for current base timeline
+func (r *Repository) ListButterflyTimelines() []timeline.ButterflyInfo {
+	currentTimeline := r.timeline.Current()
+	baseTimeline := timeline.GetBaseTimeline(currentTimeline)
+
+	variants := r.timeline.GetButterflyVariants(baseTimeline)
+
+	// Add base timeline to the list
+	if baseInfo, exists := r.timeline.Get(baseTimeline); exists {
+		baseVariant := timeline.ButterflyInfo{
+			Identifier:   "", // Empty for base timeline
+			FullName:     baseTimeline,
+			BaseTimeline: baseTimeline,
+			CreatedAt:    baseInfo.CreatedAt,
+			LastModified: baseInfo.UpdatedAt,
+			HasShelved:   false,
+		}
+		variants = append([]timeline.ButterflyInfo{baseVariant}, variants...)
+	}
+
+	return variants
+}
+
+// DeleteButterflyVariant deletes a butterfly variant with safety checks
+func (r *Repository) DeleteButterflyVariant(identifier string, force bool) error {
+	currentTimeline := r.timeline.Current()
+	baseTimeline := timeline.GetBaseTimeline(currentTimeline)
+	targetTimeline := timeline.BuildButterflyTimelineName(baseTimeline, identifier)
+
+	// Safety checks
+	if !r.timeline.Exists(targetTimeline) {
+		return fmt.Errorf("butterfly variant '%s' does not exist", identifier)
+	}
+
+	if currentTimeline == targetTimeline {
+		return fmt.Errorf("cannot delete currently active variant, switch to another variant first")
+	}
+
+	// Check for uncommitted changes unless forced
+	if !force {
+		if r.hasUncommittedChangesInVariant(targetTimeline) {
+			return fmt.Errorf("variant has uncommitted changes, use --force to delete anyway or switch and commit first")
+		}
+	}
+
+	// Delete all variant data
+	return r.deleteVariantData(targetTimeline)
+}
+
+// GetCurrentButterflyInfo returns information about the current butterfly state
+func (r *Repository) GetCurrentButterflyInfo() (string, string, bool) {
+	currentTimeline := r.timeline.Current()
+	if timeline.IsButterflyTimeline(currentTimeline) {
+		baseTimeline := timeline.GetBaseTimeline(currentTimeline)
+		identifier := timeline.GetButterflyIdentifier(currentTimeline)
+		return baseTimeline, identifier, true
+	}
+	return currentTimeline, "", false
+}
+
+// Helper methods for butterfly functionality
+
+// getButterflyDisplayName returns a user-friendly display name for a timeline
+func (r *Repository) getButterflyDisplayName(timelineName string) string {
+	if timeline.IsButterflyTimeline(timelineName) {
+		baseTimeline := timeline.GetBaseTimeline(timelineName)
+		identifier := timeline.GetButterflyIdentifier(timelineName)
+		return fmt.Sprintf("%s (variant: %s)", baseTimeline, identifier)
+	}
+	return timelineName
+}
+
+// autoShelveChanges saves uncommitted changes to a shelve for later restoration
+func (r *Repository) autoShelveChanges(timelineName, reason string) error {
+	shelveDir := filepath.Join(r.root, ".ivaldi", "shelves", timelineName)
+	if err := os.MkdirAll(shelveDir, 0755); err != nil {
+		return err
+	}
+
+	shelveTime := time.Now()
+	shelveID := fmt.Sprintf("auto-shelve-%d", shelveTime.Unix())
+
+	// Create shelve data structure
+	shelve := timeline.AutoShelve{
+		ID:             shelveID,
+		Timeline:       timelineName,
+		Reason:         reason,
+		Timestamp:      shelveTime,
+		WorkingChanges: make(map[string]interface{}),
+		AnvilFiles:     make(map[string]interface{}),
+		Position:       r.position.Current().Hash,
+		AutoCreated:    true,
+	}
+
+	// Convert workspace data to generic map for JSON serialization
+	for path, fileState := range r.workspace.Files {
+		if fileState.Status != workspace.StatusUnmodified {
+			shelve.WorkingChanges[path] = fileState
+		}
+	}
+
+	for path, fileState := range r.workspace.AnvilFiles {
+		shelve.AnvilFiles[path] = fileState
+	}
+
+	// Save shelve
+	shelveFile := filepath.Join(shelveDir, shelveID+".json")
+	data, err := json.MarshalIndent(shelve, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(shelveFile, data, 0644)
+}
+
+// autoRestoreShelvedChanges restores the most recent auto-shelved changes
+func (r *Repository) autoRestoreShelvedChanges(timelineName string) error {
+	shelveDir := filepath.Join(r.root, ".ivaldi", "shelves", timelineName)
+
+	// Find most recent auto-shelve
+	latestShelve := r.findLatestAutoShelve(shelveDir)
+	if latestShelve == "" {
+		return nil // No shelved changes to restore
+	}
+
+	// Load shelve
+	data, err := os.ReadFile(latestShelve)
+	if err != nil {
+		return err
+	}
+
+	var shelve timeline.AutoShelve
+	if err := json.Unmarshal(data, &shelve); err != nil {
+		return err
+	}
+
+	fmt.Printf("Restored auto-shelved changes from %s\n", shelve.Timestamp.Format("2006-01-02 15:04:05"))
+
+	// Remove the shelve file after successful restoration
+	os.Remove(latestShelve)
+
+	return nil
+}
+
+// findLatestAutoShelve finds the most recent auto-shelve file
+func (r *Repository) findLatestAutoShelve(shelveDir string) string {
+	entries, err := os.ReadDir(shelveDir)
+	if err != nil {
+		return ""
+	}
+
+	var latestFile string
+	var latestTime time.Time
+
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "auto-shelve-") && strings.HasSuffix(entry.Name(), ".json") {
+			filePath := filepath.Join(shelveDir, entry.Name())
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+
+			if info.ModTime().After(latestTime) {
+				latestTime = info.ModTime()
+				latestFile = filePath
+			}
+		}
+	}
+
+	return latestFile
+}
+
+// hasUncommittedChangesInVariant checks if a variant has uncommitted changes
+func (r *Repository) hasUncommittedChangesInVariant(timelineName string) bool {
+	// Load workspace state for the timeline
+	tmpWorkspace := workspace.New(r.root, r.workspace.Store)
+	if err := tmpWorkspace.LoadState(timelineName); err != nil {
+		return false
+	}
+
+	return tmpWorkspace.HasUncommittedChanges()
+}
+
+// deleteVariantData removes all data associated with a butterfly variant
+func (r *Repository) deleteVariantData(timelineName string) error {
+	// Delete timeline from manager
+	if err := r.timeline.Delete(timelineName); err != nil {
+		return err
+	}
+
+	// Delete workspace state
+	workspaceDir := filepath.Join(r.root, ".ivaldi", "workspace", timelineName)
+	if err := os.RemoveAll(workspaceDir); err != nil {
+		return err
+	}
+
+	// Delete timeline state
+	timelineState := filepath.Join(r.root, ".ivaldi", "timeline_states", timelineName+".json")
+	os.Remove(timelineState) // Ignore error if doesn't exist
+
+	// Delete shelved changes
+	shelveDir := filepath.Join(r.root, ".ivaldi", "shelves", timelineName)
+	if err := os.RemoveAll(shelveDir); err != nil {
+		return err
+	}
+
+	// Delete upload tracking
+	uploadTrackingFile := filepath.Join(r.root, ".ivaldi", "upload_tracking", timelineName+".json")
+	os.Remove(uploadTrackingFile) // Ignore error if doesn't exist
+
+	return nil
+}
+
+// Helper methods for upload tracking
+
+// getCurrentSealName returns the memorable name of the current seal
+func (r *Repository) getCurrentSealName() string {
+	currentPos := r.position.Current()
+	if name, exists := r.position.GetMemorableName(currentPos.Hash); exists {
+		return name
+	}
+	return "unknown"
+}
+
+// getCurrentAuthor returns the current user information
+func (r *Repository) getCurrentAuthor() string {
+	// For now, return a default. In the future, this could read from config
+	return "Developer"
+}
+
+// recordUpload stores upload tracking information
+func (r *Repository) recordUpload(record timeline.UploadRecord) error {
+	trackingFile := filepath.Join(r.root, ".ivaldi", "upload_tracking", record.Timeline+".json")
+
+	var tracking timeline.VariantUploadTracking
+	if data, err := os.ReadFile(trackingFile); err == nil {
+		json.Unmarshal(data, &tracking)
+	} else {
+		tracking = timeline.VariantUploadTracking{
+			Timeline:      record.Timeline,
+			UploadHistory: []timeline.UploadRecord{},
+			CreatedAt:     time.Now(),
+		}
+	}
+
+	// Update tracking
+	tracking.LastUpload = &record
+	tracking.UploadHistory = append(tracking.UploadHistory, record)
+	tracking.LastModified = time.Now()
+
+	// Keep only last 50 upload records
+	if len(tracking.UploadHistory) > 50 {
+		tracking.UploadHistory = tracking.UploadHistory[len(tracking.UploadHistory)-50:]
+	}
+
+	// Save tracking
+	if err := os.MkdirAll(filepath.Dir(trackingFile), 0755); err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(tracking, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(trackingFile, data, 0644)
+}
+
+// getUploadHistory returns upload history for a timeline
+func (r *Repository) getUploadHistory(timelineName string) (*timeline.VariantUploadTracking, error) {
+	trackingFile := filepath.Join(r.root, ".ivaldi", "upload_tracking", timelineName+".json")
+
+	data, err := os.ReadFile(trackingFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &timeline.VariantUploadTracking{
+				Timeline:      timelineName,
+				UploadHistory: []timeline.UploadRecord{},
+				CreatedAt:     time.Now(),
+			}, nil
+		}
+		return nil, err
+	}
+
+	var tracking timeline.VariantUploadTracking
+	if err := json.Unmarshal(data, &tracking); err != nil {
+		return nil, err
+	}
+
+	return &tracking, nil
 }

@@ -6,6 +6,18 @@ All notable changes to Ivaldi will be documented in this file.
 
 ### Added
 
+#### Butterfly Timeline Variants System 🦋
+- Complete butterfly sub-timeline system for safe experimentation
+- Create variants with `ivaldi bf`, `ivaldi butterfly`, or `ivaldi variant`
+- Auto-numbered variants (`:diverged:1`, `:diverged:2`) and named variants (`:diverged:jwt_approach`)
+- Automatic work shelving when switching between variants - never lose progress
+- Independent state management per variant (workspace, commits, uploads)
+- Upload tracking per variant with detailed history (`ivaldi bf upload-status`)
+- Safe variant deletion with confirmation prompts (`ivaldi bf delete <name>`)
+- Multiple command aliases for natural usage patterns
+- Complete integration with existing timeline commands (`ivaldi timeline source`)
+- Comprehensive test suite ensuring reliability
+
 #### Concurrent Sync Performance (8x Faster)
 - Implemented worker pool pattern with 8 concurrent workers for file downloads
 - Added `ConcurrentDownloader` struct for parallel download operations

@@ -189,6 +189,31 @@ Would perform these changes:
    Changes: All commits from feature will be squashed
 ```
 
+### 9. Butterfly Timeline Variants System
+**Status: COMPLETE & TESTED**
+- **File**: `core/timeline/butterfly.go`
+- **Working Features**:
+  - Create timeline variants for experimentation (`:diverged:` suffix)
+  - Auto-numbered variants (1, 2, 3) and named variants (jwt_approach, oauth_flow)
+  - Automatic work shelving when switching between variants
+  - Independent state management for each variant
+  - Upload tracking per variant with history
+  - Safe variant deletion with confirmation prompts
+  - Multiple command aliases (`butterfly`, `bf`, `variant`)
+
+**LIVE DEMO WORKING:**
+```bash
+$ ivaldi bf jwt_approach
+Created and switched to butterfly variant: feature:diverged:jwt_approach
+$ ivaldi bf list
+Base timeline: feature
+Variants:
+  feature                        (base)
+* feature:diverged:jwt_approach  (active)
+$ ivaldi bf upload-status  
+  feature:diverged:jwt_approach: uploaded 5 minutes ago to origin
+```
+
 ### 9. Enhanced Portal System with Branch Management
 **Status: COMPLETE & TESTED**
 - **Files**: `forge/repository.go`, `ui/enhanced_cli/cli.go`

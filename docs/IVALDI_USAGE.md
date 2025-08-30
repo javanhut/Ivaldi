@@ -105,6 +105,15 @@ make build
 ./build/ivaldi fuse feature-xyz --dry-run          # Preview merge
 ./build/ivaldi fuse feature-xyz --strategy=squash  # Squash commits
 ./build/ivaldi fuse feature-xyz --delete-source    # Delete source timeline after merge
+
+# Butterfly variants (experimental sub-timelines)
+./build/ivaldi butterfly                           # Create auto-numbered variant
+./build/ivaldi bf jwt_approach                     # Create named variant (using alias)
+./build/ivaldi variant oauth_flow                  # Create variant (alternative alias)
+./build/ivaldi bf list                             # List all variants
+./build/ivaldi bf 1                                # Switch to variant 1
+./build/ivaldi variant delete old_test             # Delete variant
+./build/ivaldi bf upload-status                    # Show upload status for variants
 ```
 
 ## Full Workflow Example

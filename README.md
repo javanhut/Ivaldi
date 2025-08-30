@@ -25,6 +25,7 @@ Ivaldi is a modern version control system designed around how developers actuall
 - **Shell Integration**: Timeline info in your prompt just like Git branches
 - **Easy Renaming**: Rename timelines with automatic remote handling
 - **Seamless GitHub**: Direct API integration without git dependency
+- **Timeline Variants**: Experiment with butterfly sub-timelines for safe exploration
 - **Intuitive Commands**: Workshop metaphors that make sense
 
 ## Quick Start
