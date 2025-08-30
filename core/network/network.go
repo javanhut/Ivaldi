@@ -1104,13 +1104,32 @@ func (nm *NetworkManager) uploadFilesBatchWithProgress(owner, repo, timeline str
 	var treeSHA string
 
 	if currentSHA == "" {
-		// Empty repository - use special handling with blob creation first
-		fmt.Print("├─ Creating tree for empty repository... ")
-		treeSHA, err = nm.createTreeForEmptyRepo(owner, repo, files)
+		// Empty repository - need to create initial file first using Contents API
+		fmt.Print("├─ Initializing empty repository... ")
+		if err := nm.initializeEmptyRepository(owner, repo); err != nil {
+			fmt.Println("Failed")
+			return fmt.Errorf("failed to initialize empty repository: %v", err)
+		}
+		fmt.Println("Done")
+
+		// Now get the SHA of the initial commit
+		currentSHA, err = nm.getCurrentCommitSHA(owner, repo, timeline)
+		if err != nil {
+			// Try main branch if timeline doesn't exist yet
+			currentSHA, err = nm.getCurrentCommitSHA(owner, repo, "main")
+			if err != nil {
+				return fmt.Errorf("failed to get initial commit SHA after initialization: %v", err)
+			}
+		}
+
+		// Now we can use standard tree creation
+		fmt.Print("├─ Creating tree object... ")
+		treeSHA, err = nm.createTree(owner, repo, treeData)
 		if err != nil {
 			fmt.Println("Failed")
-			return fmt.Errorf("failed to create tree for empty repository: %v", err)
+			return fmt.Errorf("failed to create tree: %v", err)
 		}
+		fmt.Println("Done")
 	} else {
 		// Existing repository - use standard tree creation
 		fmt.Print("├─ Creating tree object... ")
@@ -1129,8 +1148,16 @@ func (nm *NetworkManager) uploadFilesBatchWithProgress(owner, repo, timeline str
 		parents = []string{currentSHA}
 	}
 
+	// For repositories we just initialized, update the commit message to reflect actual content
+	commitMessage := seal.Message
+	if strings.Contains(seal.Message, "Initial commit") || seal.Message == "" {
+		commitMessage = fmt.Sprintf("%s\n\nSealed as: %s", seal.Message, seal.Name)
+	} else {
+		commitMessage = fmt.Sprintf("%s\n\nSealed as: %s", seal.Message, seal.Name)
+	}
+
 	commit := GitHubCommit{
-		Message: fmt.Sprintf("%s\n\nSealed as: %s", seal.Message, seal.Name),
+		Message: commitMessage,
 		Tree:    treeSHA,
 		Parents: parents,
 	}
@@ -1722,50 +1749,60 @@ func (nm *NetworkManager) createBlob(owner, repo string, content []byte) (string
 	return blob.SHA, nil
 }
 
-// createTreeForEmptyRepo creates a tree for empty repositories by first creating blobs
-func (nm *NetworkManager) createTreeForEmptyRepo(owner, repo string, files []FileToUpload) (string, error) {
-	if len(files) == 0 {
-		return "", fmt.Errorf("no files to upload")
+// initializeEmptyRepository creates an initial commit in an empty repository using the Contents API
+func (nm *NetworkManager) initializeEmptyRepository(owner, repo string) error {
+	// Create a minimal README.md file to initialize the repository
+	// This uses the Contents API which works on empty repositories
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/contents/README.md", owner, repo)
+
+	content := []byte("# Repository initialized by Ivaldi\n\nThis repository was initialized by Ivaldi version control system.\n")
+	encodedContent := base64.StdEncoding.EncodeToString(content)
+
+	requestBody := map[string]interface{}{
+		"message": "Initial commit by Ivaldi",
+		"content": encodedContent,
+		"branch":  "main",
 	}
 
-	fmt.Printf("├─ Creating %d blobs for empty repository... ", len(files))
-
-	// Create tree items with blob SHAs instead of content
-	treeItems := make([]GitHubTreeItem, 0, len(files))
-
-	for i, file := range files {
-		// Create blob for this file
-		blobSHA, err := nm.createBlob(owner, repo, file.Content)
-		if err != nil {
-			fmt.Println("Failed")
-			return "", fmt.Errorf("failed to create blob for %s: %v", file.Path, err)
-		}
-
-		// Add to tree with blob SHA reference
-		treeItems = append(treeItems, GitHubTreeItem{
-			Path: file.Path,
-			Mode: "100644",
-			Type: "blob",
-			SHA:  blobSHA,
-		})
-
-		// Progress indicator for large uploads
-		if i > 0 && i%10 == 0 {
-			fmt.Printf("\n├─ Created %d/%d blobs... ", i, len(files))
-		}
-	}
-
-	fmt.Println("Done")
-
-	// Now create tree with blob references
-	tree := GitHubTree{Tree: treeItems}
-	treeData, err := json.Marshal(tree)
+	jsonData, err := json.Marshal(requestBody)
 	if err != nil {
-		return "", fmt.Errorf("failed to prepare tree data: %v", err)
+		return fmt.Errorf("failed to marshal request: %v", err)
 	}
 
-	// Use standard tree creation now that we have blobs
-	return nm.createTree(owner, repo, treeData)
+	req, err := http.NewRequest("PUT", apiURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %v", err)
+	}
+
+	// Add authentication
+	token, err := nm.getGitHubToken()
+	if err != nil {
+		return fmt.Errorf("failed to get GitHub token: %v", err)
+	}
+
+	req.Header.Set("Authorization", "token "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Ivaldi-VCS/1.0")
+
+	resp, err := nm.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 201 && resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to initialize repository: %s - %s", resp.Status, string(body))
+	}
+
+	return nil
+}
+
+// createTreeForEmptyRepo is now deprecated but kept for compatibility
+func (nm *NetworkManager) createTreeForEmptyRepo(owner, repo string, files []FileToUpload) (string, error) {
+	// This function is no longer used but kept for backward compatibility
+	// The new approach uses initializeEmptyRepository instead
+	return "", fmt.Errorf("deprecated: use initializeEmptyRepository instead")
 }
 
 // createCommit creates a commit object via GitHub API
