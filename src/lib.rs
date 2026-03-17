@@ -22,5 +22,8 @@ pub mod store;
 pub mod repo;
 pub mod github;
 pub mod sync;
+pub mod color;
+pub mod logging;
+pub mod progress;
 pub mod tui;
 pub mod cli;

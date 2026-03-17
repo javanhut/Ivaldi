@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::process;
 
 use crate::cas::FileCas;
+use crate::color;
 use crate::config::{self, Config};
 use crate::forge;
 use crate::fuse::Strategy;
@@ -91,6 +92,9 @@ fn cmd_forge(quiet: bool) -> Result<(), String> {
         } else {
             println!("Initialized empty Ivaldi repository in {}", result.ivaldi_dir.display());
             println!("Created timeline: {}", result.default_timeline);
+            if result.git_imported > 0 {
+                println!("Imported {} Git branch(es) as timelines", result.git_imported);
+            }
         }
     }
     Ok(())
@@ -169,7 +173,7 @@ fn cmd_status() -> Result<(), String> {
     let repo = open_repo()?;
     let timeline = repo.current_timeline().unwrap_or_else(|_| "detached".into());
 
-    println!("Timeline: {}", timeline);
+    println!("Timeline: {}", color::timeline(&timeline));
 
     // Get last seal tree hash for comparison
     let last_tree = repo.get_timeline_head(&timeline)
@@ -187,7 +191,7 @@ fn cmd_status() -> Result<(), String> {
         if let Some(leaf) = repo.get_leaf(head_idx).map_err(|e| e.to_string())? {
             let hash = leaf.hash();
             let name = seal::generate_seal_name(hash);
-            println!("Last seal: {} ({})", name, hash.short8());
+            println!("Last seal: {} ({})", color::seal_name(&name), color::hash(&hash.short8()));
         }
     }
 
@@ -203,18 +207,18 @@ fn cmd_status() -> Result<(), String> {
 
     if !staged.is_empty() {
         println!("\nStaged changes:");
-        for f in &staged { println!("  staged: {}", f.path); }
+        for f in &staged { println!("  {}: {}", color::status_label("staged"), f.path); }
     }
     if !modified.is_empty() {
         println!("\nUnstaged changes:");
-        for f in &modified { println!("  modified: {}", f.path); }
+        for f in &modified { println!("  {}: {}", color::status_label("modified"), f.path); }
     }
     if !deleted.is_empty() {
-        for f in &deleted { println!("  deleted: {}", f.path); }
+        for f in &deleted { println!("  {}: {}", color::status_label("deleted"), f.path); }
     }
     if !untracked.is_empty() {
         println!("\nUntracked files:");
-        for f in &untracked { println!("  {}", f.path); }
+        for f in &untracked { println!("  {}", color::dim(&f.path)); }
     }
     Ok(())
 }
@@ -278,11 +282,11 @@ fn cmd_log(args: LogArgs) -> Result<(), String> {
 
     for entry in entries {
         if args.oneline {
-            println!("{} {} {}", entry.short_hash, entry.seal_name, entry.message);
+            println!("{} {} {}", color::hash(&entry.short_hash), color::seal_name(&entry.seal_name), entry.message);
         } else {
-            println!("Seal: {} ({})", entry.seal_name, entry.short_hash);
-            println!("Timeline: {}", entry.timeline);
-            println!("Author: {}", entry.author);
+            println!("Seal: {} ({})", color::seal_name(&entry.seal_name), color::hash(&entry.short_hash));
+            println!("Timeline: {}", color::timeline(&entry.timeline));
+            println!("Author: {}", color::author(&entry.author));
             println!("Date: {}", entry.time_unix);
             println!();
             println!("    {}", entry.message);

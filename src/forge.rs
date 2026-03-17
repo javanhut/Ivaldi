@@ -32,6 +32,8 @@ pub struct ForgeResult {
     pub default_timeline: String,
     /// Whether this was a new initialization or already existed.
     pub already_existed: bool,
+    /// Number of Git branches imported (0 if no .git/).
+    pub git_imported: usize,
 }
 
 /// Initialize a new Ivaldi repository in the given directory.
@@ -46,6 +48,7 @@ pub fn forge(work_dir: &Path) -> Result<ForgeResult, ForgeError> {
             ivaldi_dir,
             default_timeline: "main".to_string(),
             already_existed: true,
+            git_imported: 0,
         });
     }
 
@@ -81,11 +84,51 @@ pub fn forge(work_dir: &Path) -> Result<ForgeResult, ForgeError> {
         .save(&ivaldi_dir.join("config"))
         .map_err(|e| ForgeError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
 
+    // Detect and import from existing .git/ if present
+    let git_imported = detect_and_import_git(work_dir, &ivaldi_dir);
+
     Ok(ForgeResult {
         ivaldi_dir,
         default_timeline: "main".to_string(),
         already_existed: false,
+        git_imported,
     })
+}
+
+/// Detect a .git/ directory and import basic refs info.
+/// Returns number of branches found, or 0 if no .git/.
+fn detect_and_import_git(work_dir: &Path, ivaldi_dir: &Path) -> usize {
+    let git_dir = work_dir.join(".git");
+    if !git_dir.exists() {
+        return 0;
+    }
+
+    let mut imported = 0;
+
+    // Import HEAD
+    if let Ok(head_content) = fs::read_to_string(git_dir.join("HEAD")) {
+        let head = head_content.trim();
+        if let Some(ref_path) = head.strip_prefix("ref: refs/heads/") {
+            // Write Ivaldi HEAD pointing to same branch
+            let _ = fs::write(ivaldi_dir.join("HEAD"), format!("ref: refs/heads/{}\n", ref_path));
+        }
+    }
+
+    // Import branch names from .git/refs/heads/
+    let git_heads = git_dir.join("refs").join("heads");
+    if let Ok(entries) = fs::read_dir(&git_heads) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let ivaldi_ref = ivaldi_dir.join("refs/heads").join(&name);
+                // Create empty ref file (will be populated on first commit)
+                let _ = fs::write(&ivaldi_ref, "");
+                imported += 1;
+            }
+        }
+    }
+
+    imported
 }
 
 /// Read the current HEAD reference.

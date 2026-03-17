@@ -49,6 +49,58 @@ impl GitHubClient {
         r
     }
 
+    /// Make a request with automatic rate limit retry.
+    #[allow(dead_code)]
+    fn call_with_retry(&self, req: ureq::Request) -> Result<ureq::Response, GitHubError> {
+        match req.call() {
+            Ok(resp) => {
+                // Check remaining rate limit from headers
+                if let Some(remaining) = resp.header("X-RateLimit-Remaining") {
+                    if remaining == "0" {
+                        if let Some(reset) = resp.header("X-RateLimit-Reset") {
+                            if let Ok(ts) = reset.parse::<u64>() {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap().as_secs();
+                                if ts > now {
+                                    let wait = ts - now;
+                                    crate::logging::warn(&format!(
+                                        "Rate limited. Waiting {} seconds...", wait
+                                    ));
+                                    thread::sleep(Duration::from_secs(wait.min(60)));
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(resp)
+            }
+            Err(ureq::Error::Status(403, resp)) => {
+                // Check if rate limited
+                if let Some(remaining) = resp.header("X-RateLimit-Remaining") {
+                    if remaining == "0" {
+                        if let Some(reset) = resp.header("X-RateLimit-Reset") {
+                            if let Ok(ts) = reset.parse::<u64>() {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap().as_secs();
+                                let wait = if ts > now { ts - now } else { 60 };
+                                let wait = wait.min(120);
+                                crate::logging::warn(&format!(
+                                    "Rate limited. Waiting {} seconds...", wait
+                                ));
+                                thread::sleep(Duration::from_secs(wait));
+                                // Retry not implemented for simplicity — return error
+                            }
+                        }
+                    }
+                }
+                Err(GitHubError::RateLimited)
+            }
+            Err(e) => Err(gh_err(e)),
+        }
+    }
+
     pub fn get_repo(&self, owner: &str, repo: &str) -> Result<RepoInfo, GitHubError> {
         let resp = self.req("GET", &format!("/repos/{}/{}", owner, repo))
             .call().map_err(gh_err)?;

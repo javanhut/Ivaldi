@@ -82,23 +82,19 @@ pub fn download(
 
     let blob_entries: Vec<_> = tree.tree.iter().filter(|e| e.entry_type == "blob").collect();
     let total = blob_entries.len();
+    let pb = crate::progress::file_bar(total as u64, "Downloading");
 
-    for (i, entry) in blob_entries.iter().enumerate() {
-        if (i + 1) % 10 == 0 || i + 1 == total {
-            eprint!("\rDownloading files: {}/{}", i + 1, total);
-        }
+    for entry in &blob_entries {
+        pb.inc(1);
 
         match client.download_file(owner, repo_name, &entry.path, &branch_info.commit.sha) {
             Ok(content) => {
-                // Store in CAS
                 let (blob_hash, _) = store
                     .put_blob(&content)
                     .map_err(|e| SyncError::Other(e.to_string()))?;
 
-                // Map SHA1 → BLAKE3
                 hash_mapping.insert(&entry.sha, blob_hash);
 
-                // Write file to working directory
                 let file_path = target_dir.join(&entry.path);
                 if let Some(parent) = file_path.parent() {
                     fs::create_dir_all(parent).ok();
@@ -109,11 +105,11 @@ pub fn download(
                 file_count += 1;
             }
             Err(e) => {
-                eprintln!("\nWarning: failed to download {}: {}", entry.path, e);
+                crate::logging::warn(&format!("failed to download {}: {}", entry.path, e));
             }
         }
     }
-    eprintln!(); // newline after progress
+    pb.finish_with_message(format!("{} files downloaded", file_count));
 
     // Save hash mapping
     hash_mapping.save().map_err(|e| SyncError::Other(e.to_string()))?;
@@ -189,16 +185,12 @@ pub fn upload(
     collect_tree_files(&store, head_leaf.tree_root, "", &mut files)
         .map_err(|e| SyncError::Other(e.to_string()))?;
 
-    eprintln!("Uploading {} files to {}/{}...", files.len(), owner, repo_name);
-
-    // Create blobs on GitHub
     let mut tree_entries = Vec::new();
     let total = files.len();
+    let pb = crate::progress::file_bar(total as u64, "Uploading");
 
-    for (i, (path, blob_hash)) in files.iter().enumerate() {
-        if (i + 1) % 5 == 0 || i + 1 == total {
-            eprint!("\rUploading blobs: {}/{}", i + 1, total);
-        }
+    for (path, blob_hash) in &files {
+        pb.inc(1);
 
         let (_, content) = store
             .load_blob(*blob_hash)
@@ -215,7 +207,7 @@ pub fn upload(
             sha,
         });
     }
-    eprintln!();
+    pb.finish_with_message(format!("{} blobs uploaded", total));
 
     // Create tree
     let tree_sha = client
