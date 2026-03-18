@@ -45,6 +45,7 @@ pub fn run_command(cli: Cli) {
             Commands::Scout(args) => cmd_scout(args),
             Commands::Harvest(args) => cmd_harvest(args, cli.quiet),
             Commands::Sync(args) => cmd_sync(args, cli.quiet),
+            Commands::Tui => cmd_tui(),
         };
         if let Err(e) = result {
             eprintln!("Error: {}", e);
@@ -1313,6 +1314,11 @@ fn parse_repo_arg(arg: &str) -> Result<(String, String), String> {
         }
     }
     Err(format!("invalid repository format: '{}'. Expected: owner/repo", arg))
+}
+
+fn cmd_tui() -> Result<(), String> {
+    let ctx = find_repo()?;
+    crate::tui::app::run(&ctx.work_dir, &ctx.ivaldi_dir)
 }
 
 #[cfg(test)]

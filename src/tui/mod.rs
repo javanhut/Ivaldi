@@ -4,10 +4,17 @@
 //! - `travel` — browse history, diverge or overwrite
 //! - `shift` — select commit range to squash
 //! - `resolver` — per-file conflict resolution during fuse
+//! - `app` — tabbed dashboard with status, log, diff, timelines, remote, fuse
 
 pub mod travel;
 pub mod shift;
 pub mod resolver;
+pub mod app;
+pub mod theme;
+pub mod types;
+pub mod input;
+pub mod components;
+pub mod views;
 
 use std::io;
 use crossterm::{

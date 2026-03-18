@@ -94,6 +94,9 @@ pub enum Commands {
 
     /// Sync current timeline with remote (delta only)
     Sync(SyncArgs),
+
+    /// Open interactive TUI dashboard
+    Tui,
 }
 
 // ---------------------------------------------------------------------------
@@ -647,5 +650,11 @@ mod tests {
             }
             _ => panic!("expected Diff"),
         }
+    }
+
+    #[test]
+    fn parse_tui_command() {
+        let cli = Cli::try_parse_from(["ivaldi", "tui"]).unwrap();
+        assert!(matches!(cli.command.unwrap(), Commands::Tui));
     }
 }
