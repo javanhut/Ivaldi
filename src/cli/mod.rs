@@ -29,9 +29,11 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Initialize a new Ivaldi repository
+    #[command(alias = "init")]
     Forge,
 
     /// Stage files for the next seal
+    #[command(alias = "add")]
     Gather(GatherArgs),
 
     /// Create a sealed commit from staged files
@@ -153,9 +155,9 @@ pub struct DiffArgs {
     #[arg(long)]
     pub stat: bool,
 
-    /// Seal name or hash prefix to compare against
-    #[arg()]
-    pub target: Option<String>,
+    /// Timeline names, seal names, or hash prefixes to compare
+    #[arg(num_args = 0..=2)]
+    pub targets: Vec<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -570,5 +572,80 @@ mod tests {
         let cli = Cli::try_parse_from(["ivaldi", "-vv", "-q", "status"]).unwrap();
         assert_eq!(cli.verbose, 2);
         assert!(cli.quiet);
+    }
+
+    #[test]
+    fn parse_forge_init_alias() {
+        let cli = Cli::try_parse_from(["ivaldi", "init"]).unwrap();
+        assert!(matches!(cli.command.unwrap(), Commands::Forge));
+    }
+
+    #[test]
+    fn parse_gather_add_alias() {
+        let cli = Cli::try_parse_from(["ivaldi", "add", "file.txt"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Gather(args) => {
+                assert_eq!(args.files, vec!["file.txt"]);
+            }
+            _ => panic!("expected Gather"),
+        }
+    }
+
+    #[test]
+    fn parse_diff_no_targets() {
+        let cli = Cli::try_parse_from(["ivaldi", "diff"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Diff(args) => {
+                assert!(args.targets.is_empty());
+                assert!(!args.staged);
+                assert!(!args.stat);
+            }
+            _ => panic!("expected Diff"),
+        }
+    }
+
+    #[test]
+    fn parse_diff_one_target() {
+        let cli = Cli::try_parse_from(["ivaldi", "diff", "crimson-forge"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Diff(args) => {
+                assert_eq!(args.targets, vec!["crimson-forge"]);
+            }
+            _ => panic!("expected Diff"),
+        }
+    }
+
+    #[test]
+    fn parse_diff_two_targets() {
+        let cli = Cli::try_parse_from(["ivaldi", "diff", "main", "feature"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Diff(args) => {
+                assert_eq!(args.targets, vec!["main", "feature"]);
+            }
+            _ => panic!("expected Diff"),
+        }
+    }
+
+    #[test]
+    fn parse_diff_staged_flag() {
+        let cli = Cli::try_parse_from(["ivaldi", "diff", "--staged"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Diff(args) => {
+                assert!(args.staged);
+                assert!(args.targets.is_empty());
+            }
+            _ => panic!("expected Diff"),
+        }
+    }
+
+    #[test]
+    fn parse_diff_stat_flag() {
+        let cli = Cli::try_parse_from(["ivaldi", "diff", "--stat"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Diff(args) => {
+                assert!(args.stat);
+            }
+            _ => panic!("expected Diff"),
+        }
     }
 }

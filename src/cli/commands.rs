@@ -250,26 +250,33 @@ fn cmd_status() -> Result<(), String> {
     let untracked: Vec<_> = status.iter().filter(|f| f.state == FileState::Untracked).collect();
     let deleted: Vec<_> = status.iter().filter(|f| f.state == FileState::Deleted).collect();
 
-    if staged.is_empty() && modified.is_empty() && untracked.is_empty() && deleted.is_empty() {
+    let has_changes = !modified.is_empty() || !untracked.is_empty() || !deleted.is_empty();
+
+    if !has_changes && staged.is_empty() {
         println!("\nWorking directory: clean");
         return Ok(());
     }
 
+    if has_changes {
+        println!("\nChanges:");
+        for f in &untracked {
+            println!("  {} {:<30} (added)", color::bold_green("++"), f.path);
+        }
+        for f in &modified {
+            println!("  {} {:<30} (modified)", color::bold_yellow("~~"), f.path);
+        }
+        for f in &deleted {
+            println!("  {} {:<30} (deleted)", color::bold_red("--"), f.path);
+        }
+    }
+
     if !staged.is_empty() {
-        println!("\nStaged changes:");
-        for f in &staged { println!("  {}: {}", color::status_label("staged"), f.path); }
+        println!("\nStaged:");
+        for f in &staged {
+            println!("  {} {:<30} (staged)", color::bold_green("++"), f.path);
+        }
     }
-    if !modified.is_empty() {
-        println!("\nUnstaged changes:");
-        for f in &modified { println!("  {}: {}", color::status_label("modified"), f.path); }
-    }
-    if !deleted.is_empty() {
-        for f in &deleted { println!("  {}: {}", color::status_label("deleted"), f.path); }
-    }
-    if !untracked.is_empty() {
-        println!("\nUntracked files:");
-        for f in &untracked { println!("  {}", color::dim(&f.path)); }
-    }
+
     Ok(())
 }
 
@@ -351,63 +358,133 @@ fn cmd_diff(args: DiffArgs) -> Result<(), String> {
     let ctx = find_repo()?;
     let timeline = repo.current_timeline().unwrap_or_else(|_| "main".into());
 
-    if let Some(target) = &args.target {
-        match repo.resolve_seal(target).map_err(|e| e.to_string())? {
-            Some((_, leaf)) => {
-                let hash = leaf.hash();
-                println!("Comparing against seal: {} ({})", seal::generate_seal_name(hash), hash.short8());
-                println!("  Message: {}", leaf.message);
-            }
-            None => return Err(format!("seal or hash not found: {}", target)),
-        }
-    } else if args.staged {
-        let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
-        let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
-        if ws.staging.is_empty() {
-            println!("No staged changes.");
-        } else {
-            println!("Staged changes:");
-            for (path, _) in ws.staging.staged_files() {
-                println!("  new/modified: {}", path);
-            }
-        }
-    } else {
-        // Show working directory changes vs last seal
-        let last_tree = repo.get_timeline_head(&timeline).map_err(|e| e.to_string())?
-            .and_then(|idx| repo.get_leaf(idx).ok().flatten())
-            .map(|l| l.tree_root);
+    match args.targets.len() {
+        2 => {
+            // Timeline-to-timeline or seal-to-seal diff
+            let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
+            let store = crate::fsmerkle::FsStore::new(&cas);
 
-        let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
-        let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
-        let ignore_cache = ignore::load_pattern_cache(&ctx.work_dir);
-        let status = ws.status(last_tree, &ignore_cache).map_err(|e| e.to_string())?;
+            let (label_a, tree_a) = resolve_tree(&repo, &args.targets[0])?;
+            let (label_b, tree_b) = resolve_tree(&repo, &args.targets[1])?;
 
-        let changes: Vec<_> = status.iter().filter(|f| f.state != FileState::Unmodified).collect();
+            println!("Diff: {} -> {}", label_a, label_b);
 
-        if changes.is_empty() {
-            println!("No changes.");
-        } else if args.stat {
-            // --stat mode: summary counts
-            let modified = changes.iter().filter(|f| f.state == FileState::Modified).count();
-            let added = changes.iter().filter(|f| f.state == FileState::Untracked).count();
-            let deleted = changes.iter().filter(|f| f.state == FileState::Deleted).count();
-            let staged = changes.iter().filter(|f| f.state == FileState::Staged).count();
-            println!("{} file(s) changed: {} modified, {} added, {} deleted, {} staged",
-                changes.len(), modified, added, deleted, staged);
-        } else {
-            for f in &changes {
-                let label = match f.state {
-                    FileState::Modified => "modified",
-                    FileState::Untracked => "added",
-                    FileState::Deleted => "deleted",
-                    FileState::Staged => "staged",
-                    _ => "unknown",
-                };
-                println!("  {}: {}", label, f.path);
+            let changes = crate::fsmerkle::diff_trees(tree_a, tree_b, &store)
+                .map_err(|e| format!("diff failed: {}", e))?;
+
+            if changes.is_empty() {
+                println!("\n  No differences.");
+            } else {
+                println!();
+                let mut added = 0usize;
+                let mut modified = 0usize;
+                let mut deleted = 0usize;
+                for c in &changes {
+                    let (marker, marker_fn): (&str, fn(&str) -> String) = match c.kind {
+                        crate::fsmerkle::ChangeKind::Added => { added += 1; ("++", color::bold_green) }
+                        crate::fsmerkle::ChangeKind::Deleted => { deleted += 1; ("--", color::bold_red) }
+                        crate::fsmerkle::ChangeKind::Modified | crate::fsmerkle::ChangeKind::TypeChange => {
+                            modified += 1; ("~~", color::bold_yellow)
+                        }
+                    };
+                    println!("  {} {}", marker_fn(marker), c.path);
+                }
+                println!("\n{} change(s): {} added, {} modified, {} deleted",
+                    changes.len(), added, modified, deleted);
             }
         }
+        1 => {
+            // Single target: resolve as seal and show info, or working dir vs that seal
+            let target = &args.targets[0];
+            match repo.resolve_seal(target).map_err(|e| e.to_string())? {
+                Some((_, leaf)) => {
+                    let hash = leaf.hash();
+                    println!("Comparing against seal: {} ({})", seal::generate_seal_name(hash), hash.short8());
+                    println!("  Message: {}", leaf.message);
+                }
+                None => {
+                    // Try as timeline name
+                    if repo.get_timeline_head(target).map_err(|e| e.to_string())?.is_some() {
+                        return Err(format!(
+                            "'{}' is a timeline. Use two targets for timeline diff: ivaldi diff <a> <b>",
+                            target
+                        ));
+                    }
+                    return Err(format!("seal or hash not found: {}", target));
+                }
+            }
+        }
+        0 => {
+            if args.staged {
+                let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
+                let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
+                if ws.staging.is_empty() {
+                    println!("No staged changes.");
+                } else {
+                    println!("Staged changes:");
+                    for (path, _) in ws.staging.staged_files() {
+                        println!("  {} {}", color::bold_green("++"), path);
+                    }
+                }
+            } else {
+                // Working directory changes vs last seal
+                let last_tree = repo.get_timeline_head(&timeline).map_err(|e| e.to_string())?
+                    .and_then(|idx| repo.get_leaf(idx).ok().flatten())
+                    .map(|l| l.tree_root);
+
+                let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
+                let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
+                let ignore_cache = ignore::load_pattern_cache(&ctx.work_dir);
+                let status = ws.status(last_tree, &ignore_cache).map_err(|e| e.to_string())?;
+
+                let changes: Vec<_> = status.iter().filter(|f| f.state != FileState::Unmodified).collect();
+
+                if changes.is_empty() {
+                    println!("No changes.");
+                } else if args.stat {
+                    let mod_count = changes.iter().filter(|f| f.state == FileState::Modified).count();
+                    let add_count = changes.iter().filter(|f| f.state == FileState::Untracked).count();
+                    let del_count = changes.iter().filter(|f| f.state == FileState::Deleted).count();
+                    let stg_count = changes.iter().filter(|f| f.state == FileState::Staged).count();
+                    println!("{} file(s) changed: {} modified, {} added, {} deleted, {} staged",
+                        changes.len(), mod_count, add_count, del_count, stg_count);
+                } else {
+                    for f in &changes {
+                        let (marker, marker_fn): (&str, fn(&str) -> String) = match f.state {
+                            FileState::Modified => ("~~", color::bold_yellow),
+                            FileState::Untracked => ("++", color::bold_green),
+                            FileState::Deleted => ("--", color::bold_red),
+                            FileState::Staged => ("++", color::bold_green),
+                            _ => ("??", color::dim),
+                        };
+                        println!("  {} {}", marker_fn(marker), f.path);
+                    }
+                }
+            }
+        }
+        _ => return Err("too many arguments. Usage: ivaldi diff [<target1> [<target2>]]".into()),
     }
     Ok(())
+}
+
+/// Resolve a diff target to a (label, tree_hash) pair.
+/// Tries timeline name first, then seal name/hash prefix.
+fn resolve_tree(repo: &Repo, target: &str) -> Result<(String, crate::hash::B3Hash), String> {
+    // Try as timeline name first
+    if let Some(head_idx) = repo.get_timeline_head(target).map_err(|e| e.to_string())? {
+        if let Some(leaf) = repo.get_leaf(head_idx).map_err(|e| e.to_string())? {
+            return Ok((format!("timeline:{}", target), leaf.tree_root));
+        }
+    }
+
+    // Try as seal name / hash prefix
+    if let Some((_, leaf)) = repo.resolve_seal(target).map_err(|e| e.to_string())? {
+        let hash = leaf.hash();
+        let name = seal::generate_seal_name(hash);
+        return Ok((format!("seal:{}", name), leaf.tree_root));
+    }
+
+    Err(format!("could not resolve '{}' as timeline or seal", target))
 }
 
 fn cmd_reset(args: ResetArgs, quiet: bool) -> Result<(), String> {
@@ -1204,6 +1281,29 @@ fn cmd_sync(args: SyncArgs, quiet: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Format a change marker for display.
+/// Returns (marker, color_fn) for the given ChangeKind.
+pub(crate) fn change_marker(kind: crate::fsmerkle::ChangeKind) -> (&'static str, fn(&str) -> String) {
+    match kind {
+        crate::fsmerkle::ChangeKind::Added => ("++", color::bold_green),
+        crate::fsmerkle::ChangeKind::Deleted => ("--", color::bold_red),
+        crate::fsmerkle::ChangeKind::Modified | crate::fsmerkle::ChangeKind::TypeChange => {
+            ("~~", color::bold_yellow)
+        }
+    }
+}
+
+/// Format a file state marker for display.
+pub(crate) fn state_marker(state: FileState) -> (&'static str, fn(&str) -> String) {
+    match state {
+        FileState::Modified => ("~~", color::bold_yellow),
+        FileState::Untracked => ("++", color::bold_green),
+        FileState::Deleted => ("--", color::bold_red),
+        FileState::Staged => ("++", color::bold_green),
+        _ => ("??", color::dim),
+    }
+}
+
 // Helper: parse "owner/repo" from CLI arg
 fn parse_repo_arg(arg: &str) -> Result<(String, String), String> {
     // Handle "owner/repo" format
@@ -1213,4 +1313,100 @@ fn parse_repo_arg(arg: &str) -> Result<(String, String), String> {
         }
     }
     Err(format!("invalid repository format: '{}'. Expected: owner/repo", arg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fsmerkle::ChangeKind;
+    use crate::workspace::FileState;
+
+    #[test]
+    fn status_markers_added() {
+        let (marker, _) = state_marker(FileState::Untracked);
+        assert_eq!(marker, "++");
+    }
+
+    #[test]
+    fn status_markers_modified() {
+        let (marker, _) = state_marker(FileState::Modified);
+        assert_eq!(marker, "~~");
+    }
+
+    #[test]
+    fn status_markers_deleted() {
+        let (marker, _) = state_marker(FileState::Deleted);
+        assert_eq!(marker, "--");
+    }
+
+    #[test]
+    fn status_markers_staged() {
+        let (marker, _) = state_marker(FileState::Staged);
+        assert_eq!(marker, "++");
+    }
+
+    #[test]
+    fn change_marker_added() {
+        let (marker, _) = change_marker(ChangeKind::Added);
+        assert_eq!(marker, "++");
+    }
+
+    #[test]
+    fn change_marker_deleted() {
+        let (marker, _) = change_marker(ChangeKind::Deleted);
+        assert_eq!(marker, "--");
+    }
+
+    #[test]
+    fn change_marker_modified() {
+        let (marker, _) = change_marker(ChangeKind::Modified);
+        assert_eq!(marker, "~~");
+    }
+
+    #[test]
+    fn change_marker_typechange() {
+        let (marker, _) = change_marker(ChangeKind::TypeChange);
+        assert_eq!(marker, "~~");
+    }
+
+    #[test]
+    fn diff_two_trees_with_markers() {
+        use crate::cas::MemoryCas;
+        use crate::fsmerkle::{self, FsStore};
+        use std::collections::BTreeMap;
+
+        let cas = MemoryCas::new();
+        let store = FsStore::new(&cas);
+
+        let mut files_a = BTreeMap::new();
+        files_a.insert("kept.txt".into(), b"same".to_vec());
+        files_a.insert("changed.txt".into(), b"old content".to_vec());
+        files_a.insert("removed.txt".into(), b"gone".to_vec());
+        let tree_a = store.build_tree_from_map(&files_a).unwrap();
+
+        let mut files_b = BTreeMap::new();
+        files_b.insert("kept.txt".into(), b"same".to_vec());
+        files_b.insert("changed.txt".into(), b"new content".to_vec());
+        files_b.insert("added.txt".into(), b"fresh".to_vec());
+        let tree_b = store.build_tree_from_map(&files_b).unwrap();
+
+        let changes = fsmerkle::diff_trees(tree_a, tree_b, &store).unwrap();
+        assert_eq!(changes.len(), 3);
+
+        let mut added = 0;
+        let mut modified = 0;
+        let mut deleted = 0;
+        for c in &changes {
+            let (marker, _) = change_marker(c.kind);
+            match marker {
+                "++" => added += 1,
+                "~~" => modified += 1,
+                "--" => deleted += 1,
+                _ => panic!("unexpected marker"),
+            }
+        }
+        assert_eq!(added, 1);
+        assert_eq!(modified, 1);
+        assert_eq!(deleted, 1);
+    }
 }
