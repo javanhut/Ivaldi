@@ -93,6 +93,13 @@ impl HashMapping {
         self.blake3_to_sha1.get(&blake3).map(|s| s.as_str())
     }
 
+    /// Remove a mapping by SHA1 key.
+    pub fn remove_sha1(&mut self, sha1: &str) {
+        if let Some(blake3) = self.sha1_to_blake3.remove(sha1) {
+            self.blake3_to_sha1.remove(&blake3);
+        }
+    }
+
     /// Number of mappings.
     pub fn len(&self) -> usize {
         self.sha1_to_blake3.len()

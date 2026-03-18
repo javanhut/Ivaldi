@@ -287,8 +287,6 @@ pub fn upload(
             .map_err(SyncError::GitHub)?;
     }
 
-    eprintln!("Uploaded to {}/{} (branch: {})", owner, repo_name, branch_name);
-
     Ok(UploadResult {
         files_uploaded: total,
         commit_sha,
@@ -669,7 +667,7 @@ pub fn sync_timeline(
     let branch = branches.iter().find(|b| b.name == timeline)
         .ok_or_else(|| SyncError::Other(format!("remote branch '{}' not found", timeline)))?;
 
-    let hash_mapping = HashMapping::new(&repo.ivaldi_dir);
+    let mut hash_mapping = HashMapping::new(&repo.ivaldi_dir);
 
     // Fetch remote commits
     let remote_commits = client.list_commits(owner, repo_name, timeline, 0)
@@ -682,15 +680,51 @@ pub fn sync_timeline(
         });
     }
 
-    // Find common ancestor: walk remote commits newest→oldest, check hash mapping
+    // Get local head BEFORE import so we can constrain ancestor search
+    let local_head_idx = repo.get_timeline_head(timeline)
+        .map_err(|e| SyncError::Other(e.to_string()))?;
+
+    // Build set of leaf indices reachable from local timeline head.
+    // This prevents matching commits from OTHER timelines that happen to
+    // be in the hash_mapping (e.g. after uploading a feature branch whose
+    // commits later appear on main via a merge).
+    let local_reachable: BTreeSet<u64> = {
+        let mut reachable = BTreeSet::new();
+        if let Some(head) = local_head_idx {
+            let mut cur = Some(head);
+            while let Some(idx) = cur {
+                reachable.insert(idx);
+                if let Ok(Some(leaf)) = repo.get_leaf(idx) {
+                    // Follow both prev_idx and merge parents
+                    for &midx in &leaf.merge_idxs {
+                        // Shallow: just add direct merge parents
+                        reachable.insert(midx);
+                    }
+                    cur = if leaf.has_parent() { Some(leaf.prev_idx) } else { None };
+                } else {
+                    break;
+                }
+            }
+        }
+        reachable
+    };
+
+    // Find common ancestor: walk remote commits newest→oldest, check hash mapping.
+    // Only accept leaves that are reachable from the local timeline head.
     let mut common_ancestor_sha: Option<String> = None;
     let mut common_ancestor_idx: Option<u64> = None;
+    // Track commits with stale mappings so we skip them on re-search
+    let mut stale_shas: BTreeSet<String> = BTreeSet::new();
+
     for commit in &remote_commits {
+        if stale_shas.contains(&commit.sha) {
+            continue;
+        }
         if let Some(b3) = hash_mapping.get_blake3(&commit.sha) {
             // Find leaf index with this hash
             for idx in 0..repo.commit_count() {
                 if let Ok(Some(leaf)) = repo.get_leaf(idx) {
-                    if leaf.hash() == b3 {
+                    if leaf.hash() == b3 && local_reachable.contains(&idx) {
                         common_ancestor_sha = Some(commit.sha.clone());
                         common_ancestor_idx = Some(idx);
                         break;
@@ -703,16 +737,73 @@ pub fn sync_timeline(
         }
     }
 
+    // Stale-mapping detection: when the common ancestor IS the remote tip
+    // (i.e., sync would say "up to date"), verify that the local tree
+    // actually matches the remote tree.  A mismatch means a previous buggy
+    // sync created a wrong fuse commit and mapped the remote tip to it.
+    if common_ancestor_sha.as_ref() == Some(&remote_commits[0].sha) {
+        if let Some(ca_idx) = common_ancestor_idx {
+            let remote_tip_tree_sha = &remote_commits[0].commit.tree.sha;
+            let remote_tree = client
+                .get_tree(owner, repo_name, remote_tip_tree_sha)
+                .map_err(SyncError::GitHub)?;
+            let remote_paths: BTreeSet<&str> = remote_tree
+                .tree
+                .iter()
+                .filter(|e| e.entry_type == "blob")
+                .map(|e| e.path.as_str())
+                .collect();
+
+            let verify_cas = FileCas::new(repo.ivaldi_dir.join("objects"))
+                .map_err(|e| SyncError::Other(e.to_string()))?;
+            let verify_store = FsStore::new(&verify_cas);
+            let local_files = get_tree_files(repo, &verify_store, ca_idx)?;
+            let local_paths: BTreeSet<&str> =
+                local_files.keys().map(|s| s.as_str()).collect();
+
+            if remote_paths != local_paths {
+                // Stale mapping: remove it and re-search for the real ancestor
+                let stale_sha = remote_commits[0].sha.clone();
+                hash_mapping.remove_sha1(&stale_sha);
+                hash_mapping
+                    .save()
+                    .map_err(|e| SyncError::Other(e.to_string()))?;
+                stale_shas.insert(stale_sha);
+                common_ancestor_sha = None;
+                common_ancestor_idx = None;
+
+                for commit in &remote_commits {
+                    if stale_shas.contains(&commit.sha) {
+                        continue;
+                    }
+                    if let Some(b3) = hash_mapping.get_blake3(&commit.sha) {
+                        for idx in 0..repo.commit_count() {
+                            if let Ok(Some(leaf)) = repo.get_leaf(idx) {
+                                if leaf.hash() == b3
+                                    && local_reachable.contains(&idx)
+                                {
+                                    common_ancestor_sha =
+                                        Some(commit.sha.clone());
+                                    common_ancestor_idx = Some(idx);
+                                    break;
+                                }
+                            }
+                        }
+                        if common_ancestor_idx.is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Count new remote commits (those before the common ancestor in the list)
     let new_remote_count = if let Some(ref ca_sha) = common_ancestor_sha {
         remote_commits.iter().take_while(|c| c.sha != *ca_sha).count()
     } else {
         remote_commits.len()
     };
-
-    // Count new local commits after common ancestor
-    let local_head_idx = repo.get_timeline_head(timeline)
-        .map_err(|e| SyncError::Other(e.to_string()))?;
     let new_local_count = match (local_head_idx, common_ancestor_idx) {
         (Some(head), Some(ancestor)) => {
             // Walk from head back to ancestor, counting steps
@@ -1714,6 +1805,67 @@ mod tests {
         checkout_tree_to_workspace(&repo, &store, "main").unwrap();
         assert!(!dir.path().join("sub/deep.txt").exists());
         assert!(!dir.path().join("sub").exists(), "empty sub/ dir should be cleaned up");
+    }
+
+    #[test]
+    fn compute_delta_ignores_cross_timeline_ancestors() {
+        // Regression: when a feature branch was uploaded and later merged on
+        // GitHub, sync_timeline would pick the feature branch commit as the
+        // common ancestor.  Because that leaf lives on a different local
+        // timeline, the divergence detector would over-count local commits,
+        // falsely triggering a fuse that deleted the merged files.
+        //
+        // The fix constrains the common-ancestor search to leaves reachable
+        // from the LOCAL timeline's head.
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let mut repo = Repo::open(dir.path()).unwrap();
+
+        // Commit on main (simulates the initial synced state)
+        let main_tree = B3Hash::digest(b"main-tree");
+        repo.commit(main_tree, "author", "initial main").unwrap();
+        let main_head = repo.get_timeline_head("main").unwrap().unwrap();
+
+        // Create a feature timeline with a different commit
+        let feat_tree = B3Hash::digest(b"feat-tree");
+        let mut feat_leaf = Leaf::new(feat_tree, "feature", "author", 2000, "feat work");
+        feat_leaf.prev_idx = crate::leaf::NO_PARENT;
+        let feat_result = repo.commit_raw(feat_leaf, "feature").unwrap();
+
+        // Map both to fake GitHub SHAs (simulating upload of both)
+        let mut mapping = HashMapping::new(&repo.ivaldi_dir);
+        let main_sha = "aaaa111122223333444455556666777788889999";
+        let feat_sha = "bbbb111122223333444455556666777788889999";
+        let main_leaf = repo.get_leaf(main_head).unwrap().unwrap();
+        mapping.insert(main_sha, main_leaf.hash());
+        let feat_leaf_stored = repo.get_leaf(feat_result.index).unwrap().unwrap();
+        mapping.insert(feat_sha, feat_leaf_stored.hash());
+
+        // Build local_reachable from main's head
+        let local_reachable: BTreeSet<u64> = {
+            let mut reachable = BTreeSet::new();
+            let mut cur = Some(main_head);
+            while let Some(idx) = cur {
+                reachable.insert(idx);
+                if let Ok(Some(leaf)) = repo.get_leaf(idx) {
+                    cur = if leaf.has_parent() { Some(leaf.prev_idx) } else { None };
+                } else {
+                    break;
+                }
+            }
+            reachable
+        };
+
+        // Feature leaf should NOT be in main's reachable set
+        assert!(
+            !local_reachable.contains(&feat_result.index),
+            "feature commit must not be reachable from main"
+        );
+        // Main leaf SHOULD be reachable
+        assert!(
+            local_reachable.contains(&main_head),
+            "main head must be in its own reachable set"
+        );
     }
 
     #[test]
