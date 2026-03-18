@@ -177,7 +177,8 @@ pub struct TimelineArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum TimelineCommands {
-    /// Create a new timeline
+    /// Create a new timeline and switch to it
+    #[command(alias = "cr")]
     Create(TimelineCreateArgs),
 
     /// Switch to a different timeline
@@ -191,6 +192,10 @@ pub enum TimelineCommands {
     /// Remove a timeline
     #[command(alias = "rm")]
     Remove(TimelineRemoveArgs),
+
+    /// Rename the current timeline
+    #[command(alias = "rn")]
+    Rename(TimelineRenameArgs),
 
     /// Manage butterfly (experimental) timelines
     #[command(alias = "bf")]
@@ -215,6 +220,12 @@ pub struct TimelineSwitchArgs {
 pub struct TimelineRemoveArgs {
     /// Timeline to remove
     pub name: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct TimelineRenameArgs {
+    /// New name for the current timeline
+    pub new_name: String,
 }
 
 #[derive(clap::Args, Debug)]
@@ -460,4 +471,104 @@ pub struct HarvestArgs {
 pub struct SyncArgs {
     /// Timeline to sync (defaults to current)
     pub timeline: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parse_timeline_create() {
+        let cli = Cli::try_parse_from(["ivaldi", "timeline", "create", "feature"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Timeline(args) => match args.command {
+                TimelineCommands::Create(c) => {
+                    assert_eq!(c.name, "feature");
+                    assert!(c.from.is_none());
+                }
+                _ => panic!("expected Create"),
+            },
+            _ => panic!("expected Timeline"),
+        }
+    }
+
+    #[test]
+    fn parse_timeline_create_from() {
+        let cli = Cli::try_parse_from(["ivaldi", "tl", "create", "hotfix", "main"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Timeline(args) => match args.command {
+                TimelineCommands::Create(c) => {
+                    assert_eq!(c.name, "hotfix");
+                    assert_eq!(c.from.as_deref(), Some("main"));
+                }
+                _ => panic!("expected Create"),
+            },
+            _ => panic!("expected Timeline"),
+        }
+    }
+
+    #[test]
+    fn parse_timeline_cr_alias() {
+        // "cr" should work as alias for "create"
+        let cli = Cli::try_parse_from(["ivaldi", "tl", "cr", "experiment"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Timeline(args) => match args.command {
+                TimelineCommands::Create(c) => {
+                    assert_eq!(c.name, "experiment");
+                }
+                _ => panic!("expected Create via cr alias"),
+            },
+            _ => panic!("expected Timeline"),
+        }
+    }
+
+    #[test]
+    fn parse_timeline_sw_alias() {
+        let cli = Cli::try_parse_from(["ivaldi", "tl", "sw", "main"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Timeline(args) => match args.command {
+                TimelineCommands::Switch(s) => assert_eq!(s.name, "main"),
+                _ => panic!("expected Switch"),
+            },
+            _ => panic!("expected Timeline"),
+        }
+    }
+
+    #[test]
+    fn parse_wai_alias() {
+        let cli = Cli::try_parse_from(["ivaldi", "wai"]).unwrap();
+        assert!(matches!(cli.command.unwrap(), Commands::Whereami));
+    }
+
+    #[test]
+    fn parse_timeline_rename() {
+        let cli = Cli::try_parse_from(["ivaldi", "tl", "rename", "new-name"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Timeline(args) => match args.command {
+                TimelineCommands::Rename(r) => assert_eq!(r.new_name, "new-name"),
+                _ => panic!("expected Rename"),
+            },
+            _ => panic!("expected Timeline"),
+        }
+    }
+
+    #[test]
+    fn parse_timeline_rn_alias() {
+        let cli = Cli::try_parse_from(["ivaldi", "tl", "rn", "new-name"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Timeline(args) => match args.command {
+                TimelineCommands::Rename(r) => assert_eq!(r.new_name, "new-name"),
+                _ => panic!("expected Rename via rn alias"),
+            },
+            _ => panic!("expected Timeline"),
+        }
+    }
+
+    #[test]
+    fn parse_global_flags() {
+        let cli = Cli::try_parse_from(["ivaldi", "-vv", "-q", "status"]).unwrap();
+        assert_eq!(cli.verbose, 2);
+        assert!(cli.quiet);
+    }
 }

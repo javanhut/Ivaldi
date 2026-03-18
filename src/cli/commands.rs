@@ -405,11 +405,13 @@ fn cmd_timeline(args: TimelineArgs, quiet: bool) -> Result<(), String> {
             let repo = open_repo()?;
             repo.create_timeline(&create_args.name, create_args.from.as_deref())
                 .map_err(|e| e.to_string())?;
+            repo.switch_timeline(&create_args.name).map_err(|e| e.to_string())?;
             if !quiet {
-                println!("Created timeline: {}", create_args.name);
+                println!("Created timeline: {}", color::timeline(&create_args.name));
                 if let Some(from) = &create_args.from {
                     println!("  from: {}", from);
                 }
+                println!("Switched to timeline: {}", color::timeline(&create_args.name));
             }
             Ok(())
         }
@@ -484,6 +486,15 @@ fn cmd_timeline(args: TimelineArgs, quiet: bool) -> Result<(), String> {
             let repo = open_repo()?;
             repo.remove_timeline(&remove_args.name).map_err(|e| e.to_string())?;
             if !quiet { println!("Removed timeline: {}", remove_args.name); }
+            Ok(())
+        }
+        TimelineCommands::Rename(rename_args) => {
+            let repo = open_repo()?;
+            let current = repo.current_timeline().map_err(|e| e.to_string())?;
+            repo.rename_timeline(&current, &rename_args.new_name).map_err(|e| e.to_string())?;
+            if !quiet {
+                println!("Renamed timeline: {} → {}", color::dim(&current), color::timeline(&rename_args.new_name));
+            }
             Ok(())
         }
         TimelineCommands::Butterfly(bf_args) => {

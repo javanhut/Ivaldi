@@ -222,6 +222,44 @@ impl Repo {
         Ok(())
     }
 
+    /// Rename a timeline. If it's the current timeline, HEAD is updated too.
+    pub fn rename_timeline(&self, old_name: &str, new_name: &str) -> Result<(), RepoError> {
+        if old_name == new_name {
+            return Ok(());
+        }
+
+        // Check new name doesn't already exist
+        if self.store.get_timeline_head(new_name).map_err(RepoError::Store)?.is_some() {
+            return Err(RepoError::Other(format!("timeline '{}' already exists", new_name)));
+        }
+
+        // Copy head to new name
+        let head_idx = self.store.get_timeline_head(old_name).map_err(RepoError::Store)?
+            .ok_or_else(|| RepoError::Other(format!("timeline '{}' not found", old_name)))?;
+        self.store.set_timeline_head(new_name, head_idx).map_err(RepoError::Store)?;
+
+        // Remove old name
+        self.store.remove_timeline_head(old_name).map_err(RepoError::Store)?;
+
+        // Update ref files
+        let old_ref = self.ivaldi_dir.join("refs/heads").join(old_name);
+        let new_ref = self.ivaldi_dir.join("refs/heads").join(new_name);
+        if old_ref.exists() {
+            let _ = std::fs::rename(&old_ref, &new_ref);
+        } else {
+            let _ = std::fs::write(&new_ref, "");
+        }
+
+        // Update HEAD if this was the current timeline
+        let current = self.current_timeline()?;
+        if current == old_name {
+            forge::write_head(&self.ivaldi_dir, &HeadRef::Timeline(new_name.to_string()))
+                .map_err(|e| RepoError::Other(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+
     /// Walk commit history from a timeline head backwards.
     pub fn walk_history(&self, timeline: &str) -> Result<Vec<HistoryEntry>, RepoError> {
         let head_idx = match self.get_timeline_head(timeline)? {
@@ -713,6 +751,143 @@ mod tests {
 
         let result = repo.remove_timeline("main");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn create_timeline_auto_switch() {
+        // Simulates the CLI behavior: create + switch in sequence
+        let (_dir, mut repo) = setup_repo();
+        repo.commit(B3Hash::digest(b"t"), "A", "init").unwrap();
+
+        // Before: on main
+        assert_eq!(repo.current_timeline().unwrap(), "main");
+
+        // Create and switch (as the CLI does)
+        repo.create_timeline("feature", None).unwrap();
+        repo.switch_timeline("feature").unwrap();
+
+        // After: on feature
+        assert_eq!(repo.current_timeline().unwrap(), "feature");
+
+        // Feature should have same head as main
+        assert_eq!(
+            repo.get_timeline_head("feature").unwrap(),
+            repo.get_timeline_head("main").unwrap()
+        );
+
+        // Commits on feature should not affect main
+        repo.commit(B3Hash::digest(b"feat"), "A", "Feature work").unwrap();
+        assert_ne!(
+            repo.get_timeline_head("feature").unwrap(),
+            repo.get_timeline_head("main").unwrap()
+        );
+    }
+
+    #[test]
+    fn create_timeline_from_source_and_switch() {
+        let (_dir, mut repo) = setup_repo();
+        repo.commit(B3Hash::digest(b"t1"), "A", "main commit 1").unwrap();
+        repo.commit(B3Hash::digest(b"t2"), "A", "main commit 2").unwrap();
+
+        // Create from main (which has 2 commits) and switch
+        repo.create_timeline("hotfix", Some("main")).unwrap();
+        repo.switch_timeline("hotfix").unwrap();
+
+        assert_eq!(repo.current_timeline().unwrap(), "hotfix");
+        // Hotfix head should match main's head
+        assert_eq!(repo.get_timeline_head("hotfix").unwrap(), Some(1));
+
+        // Commit on hotfix
+        repo.commit(B3Hash::digest(b"fix"), "A", "hotfix").unwrap();
+        assert_eq!(repo.get_timeline_head("hotfix").unwrap(), Some(2));
+        // Main unchanged
+        assert_eq!(repo.get_timeline_head("main").unwrap(), Some(1));
+    }
+
+    #[test]
+    fn create_timeline_persists_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        forge::forge(dir.path()).unwrap();
+
+        let mut cfg = Config::new();
+        cfg.set("user.name", "T");
+        cfg.set("user.email", "t@t");
+        cfg.save(&dir.path().join(".ivaldi/config")).unwrap();
+
+        // Session 1: create timeline and switch
+        {
+            let mut repo = Repo::open(dir.path()).unwrap();
+            repo.commit(B3Hash::digest(b"t"), "A", "init").unwrap();
+            repo.create_timeline("feature", None).unwrap();
+            repo.switch_timeline("feature").unwrap();
+            assert_eq!(repo.current_timeline().unwrap(), "feature");
+        }
+
+        // Session 2: verify persistence
+        {
+            let repo = Repo::open(dir.path()).unwrap();
+            assert_eq!(repo.current_timeline().unwrap(), "feature");
+            assert!(repo.get_timeline_head("feature").unwrap().is_some());
+            assert!(repo.get_timeline_head("main").unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn rename_current_timeline() {
+        let (_dir, mut repo) = setup_repo();
+        repo.commit(B3Hash::digest(b"t"), "A", "init").unwrap();
+
+        assert_eq!(repo.current_timeline().unwrap(), "main");
+        let head_before = repo.get_timeline_head("main").unwrap();
+
+        repo.rename_timeline("main", "primary").unwrap();
+
+        // HEAD should now point to "primary"
+        assert_eq!(repo.current_timeline().unwrap(), "primary");
+        // Same head index
+        assert_eq!(repo.get_timeline_head("primary").unwrap(), head_before);
+        // Old name gone
+        assert!(repo.get_timeline_head("main").unwrap().is_none());
+    }
+
+    #[test]
+    fn rename_non_current_timeline() {
+        let (_dir, mut repo) = setup_repo();
+        repo.commit(B3Hash::digest(b"t"), "A", "init").unwrap();
+        repo.create_timeline("feature", None).unwrap();
+
+        repo.rename_timeline("feature", "feat-auth").unwrap();
+
+        // Current unchanged
+        assert_eq!(repo.current_timeline().unwrap(), "main");
+        // New name exists, old gone
+        assert!(repo.get_timeline_head("feat-auth").unwrap().is_some());
+        assert!(repo.get_timeline_head("feature").unwrap().is_none());
+    }
+
+    #[test]
+    fn rename_to_existing_name_fails() {
+        let (_dir, mut repo) = setup_repo();
+        repo.commit(B3Hash::digest(b"t"), "A", "init").unwrap();
+        repo.create_timeline("feature", None).unwrap();
+
+        let result = repo.rename_timeline("main", "feature");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rename_nonexistent_fails() {
+        let (_dir, repo) = setup_repo();
+        let result = repo.rename_timeline("nope", "something");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rename_same_name_is_noop() {
+        let (_dir, mut repo) = setup_repo();
+        repo.commit(B3Hash::digest(b"t"), "A", "init").unwrap();
+        repo.rename_timeline("main", "main").unwrap(); // should not error
+        assert_eq!(repo.current_timeline().unwrap(), "main");
     }
 
     #[test]

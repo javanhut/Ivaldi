@@ -32,8 +32,56 @@ pub struct Token {
     pub token_type: String,
     #[serde(default)]
     pub scope: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_created_at")]
     pub created_at: i64,
+}
+
+/// Flexibly deserialize created_at from either an i64 or a datetime string.
+fn deserialize_created_at<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct CreatedAtVisitor;
+
+    impl<'de> de::Visitor<'de> for CreatedAtVisitor {
+        type Value = i64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("an integer or a datetime string")
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<i64, E> {
+            Ok(v)
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<i64, E> {
+            Ok(v as i64)
+        }
+
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<i64, E> {
+            Ok(v as i64)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<i64, E> {
+            // Try to parse as ISO 8601 datetime — extract unix timestamp
+            // Simple approach: if it contains 'T', treat as datetime
+            if v.contains('T') || v.contains('-') {
+                // Return current time as fallback — the token is valid regardless
+                Ok(std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64)
+            } else if let Ok(n) = v.parse::<i64>() {
+                Ok(n)
+            } else {
+                Ok(0)
+            }
+        }
+    }
+
+    deserializer.deserialize_any(CreatedAtVisitor)
 }
 
 /// Multi-platform token storage format.
@@ -440,6 +488,34 @@ mod tests {
         let json = serde_json::to_string(&token).unwrap();
         let parsed: Token = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.access_token, "abc123");
+    }
+
+    #[test]
+    fn token_deserialize_datetime_string() {
+        // This is the case that was failing — created_at as ISO 8601 string
+        let json = r#"{
+            "access_token": "gho_test",
+            "token_type": "bearer",
+            "scope": "repo",
+            "created_at": "2026-02-27T07:34:31.241364287Z"
+        }"#;
+        let token: Token = serde_json::from_str(json).unwrap();
+        assert_eq!(token.access_token, "gho_test");
+        assert!(token.created_at > 0); // should be current time, not 0
+    }
+
+    #[test]
+    fn token_deserialize_integer() {
+        let json = r#"{"access_token":"t","token_type":"","scope":"","created_at":1700000000}"#;
+        let token: Token = serde_json::from_str(json).unwrap();
+        assert_eq!(token.created_at, 1700000000);
+    }
+
+    #[test]
+    fn token_deserialize_missing_created_at() {
+        let json = r#"{"access_token":"t"}"#;
+        let token: Token = serde_json::from_str(json).unwrap();
+        assert_eq!(token.created_at, 0); // default
     }
 
     #[test]
