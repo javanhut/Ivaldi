@@ -198,10 +198,61 @@ impl<'a> Workspace<'a> {
 
     /// Gather (stage) files for the next seal.
     /// Reads file content, stores in CAS, and adds to staging area.
-    pub fn gather(&mut self, paths: &[&str]) -> Result<Vec<String>, WorkspaceError> {
+    ///
+    /// Dotfiles require explicit confirmation via the `DotfileAllowlist`.
+    /// Unconfirmed dotfiles are returned in `GatherResult::needs_confirmation`
+    /// rather than being staged. Security-blocked files (`.env`, `.venv`)
+    /// are always rejected with an error.
+    pub fn gather(
+        &mut self,
+        paths: &[&str],
+        allowlist: &DotfileAllowlist,
+    ) -> Result<GatherResult, WorkspaceError> {
         let mut gathered = Vec::new();
+        let mut needs_confirmation = Vec::new();
 
         for &path in paths {
+            // Hard block: security-pattern files can never be staged
+            if crate::ignore::is_security_blocked(path) {
+                return Err(WorkspaceError::SecurityBlocked(path.to_string()));
+            }
+
+            let full_path = self.work_dir.join(path);
+            if !full_path.exists() {
+                continue;
+            }
+
+            // Dotfiles need explicit confirmation unless already allowed
+            let basename = path.rsplit('/').next().unwrap_or(path);
+            if basename.starts_with('.') && basename != ".ivaldiignore" && !allowlist.is_allowed(path) {
+                needs_confirmation.push(path.to_string());
+                continue;
+            }
+
+            let content = fs::read(&full_path).map_err(WorkspaceError::Io)?;
+            let canonical = BlobNode::canonical_bytes(&content);
+            let hash = B3Hash::digest(&canonical);
+            self.cas.put(hash, &canonical).map_err(WorkspaceError::Cas)?;
+
+            self.staging.stage(path, hash);
+            gathered.push(path.to_string());
+        }
+
+        Ok(GatherResult {
+            gathered,
+            needs_confirmation,
+        })
+    }
+
+    /// Stage specific files unconditionally (used after user confirms dotfiles).
+    /// Still rejects security-blocked files.
+    pub fn gather_confirmed(&mut self, paths: &[&str]) -> Result<Vec<String>, WorkspaceError> {
+        let mut gathered = Vec::new();
+        for &path in paths {
+            if crate::ignore::is_security_blocked(path) {
+                return Err(WorkspaceError::SecurityBlocked(path.to_string()));
+            }
+
             let full_path = self.work_dir.join(path);
             if !full_path.exists() {
                 continue;
@@ -215,15 +266,18 @@ impl<'a> Workspace<'a> {
             self.staging.stage(path, hash);
             gathered.push(path.to_string());
         }
-
         Ok(gathered)
     }
 
     /// Gather all files in the workspace (respecting ignore patterns).
+    /// Dotfiles are auto-excluded by the ignore cache during scan,
+    /// so no confirmation is needed here.
     pub fn gather_all(&mut self, ignore: &PatternCache) -> Result<Vec<String>, WorkspaceError> {
         let files = self.scan(ignore)?;
-        let refs: Vec<&str> = files.iter().map(|s| s.as_str()).collect();
-        self.gather(&refs)
+        // scan() already excludes dotfiles via is_ignored(), so no allowlist needed
+        let allowlist = DotfileAllowlist::load(&self.ivaldi_dir);
+        let result = self.gather(&files.iter().map(|s| s.as_str()).collect::<Vec<_>>(), &allowlist)?;
+        Ok(result.gathered)
     }
 
     /// Build a tree from currently staged files and return the root hash.
@@ -383,6 +437,51 @@ impl<'a> Workspace<'a> {
     }
 }
 
+/// Result of a gather operation, separating successfully gathered files
+/// from dotfiles that require explicit user confirmation.
+#[derive(Debug, Clone)]
+pub struct GatherResult {
+    /// Files that were successfully staged.
+    pub gathered: Vec<String>,
+    /// Dotfiles that need explicit user confirmation before staging.
+    pub needs_confirmation: Vec<String>,
+}
+
+/// Manages the persistent allowlist of dotfiles the user has explicitly
+/// confirmed for staging. Stored in `.ivaldi/dotfile-allowlist`.
+pub struct DotfileAllowlist {
+    allowed: BTreeSet<String>,
+    path: PathBuf,
+}
+
+impl DotfileAllowlist {
+    pub fn load(ivaldi_dir: &Path) -> Self {
+        let path = ivaldi_dir.join("dotfile-allowlist");
+        let allowed = match fs::read_to_string(&path) {
+            Ok(content) => content
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect(),
+            Err(_) => BTreeSet::new(),
+        };
+        Self { allowed, path }
+    }
+
+    pub fn is_allowed(&self, path: &str) -> bool {
+        self.allowed.contains(path)
+    }
+
+    pub fn allow(&mut self, path: &str) {
+        self.allowed.insert(path.to_string());
+    }
+
+    pub fn save(&self) -> Result<(), std::io::Error> {
+        let content: String = self.allowed.iter().map(|s| format!("{}\n", s)).collect();
+        fs::write(&self.path, content)
+    }
+}
+
 /// Workspace errors.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceError {
@@ -392,6 +491,8 @@ pub enum WorkspaceError {
     Cas(#[from] CasError),
     #[error("filesystem merkle error: {0}")]
     FsMerkle(#[from] fsmerkle::FsMerkleError),
+    #[error("security blocked: {0} matches a protected pattern and cannot be staged")]
+    SecurityBlocked(String),
 }
 
 #[cfg(test)]
@@ -404,6 +505,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".ivaldi")).unwrap();
         (dir, MemoryCas::new())
+    }
+
+    fn empty_allowlist(dir: &tempfile::TempDir) -> DotfileAllowlist {
+        DotfileAllowlist::load(&dir.path().join(".ivaldi"))
     }
 
     #[test]
@@ -497,10 +602,12 @@ mod tests {
         let (dir, cas) = setup_workspace();
         fs::write(dir.path().join("file.txt"), "hello").unwrap();
 
+        let allowlist = empty_allowlist(&dir);
         let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
-        let gathered = ws.gather(&["file.txt"]).unwrap();
+        let result = ws.gather(&["file.txt"], &allowlist).unwrap();
 
-        assert_eq!(gathered, vec!["file.txt"]);
+        assert_eq!(result.gathered, vec!["file.txt"]);
+        assert!(result.needs_confirmation.is_empty());
         assert!(ws.staging.is_staged("file.txt"));
         assert_eq!(cas.len(), 1); // Content stored in CAS
     }
@@ -526,8 +633,9 @@ mod tests {
         fs::create_dir_all(dir.path().join("src")).unwrap();
         fs::write(dir.path().join("src/main.rs"), "fn main()").unwrap();
 
+        let allowlist = empty_allowlist(&dir);
         let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
-        ws.gather(&["file.txt", "src/main.rs"]).unwrap();
+        ws.gather(&["file.txt", "src/main.rs"], &allowlist).unwrap();
 
         let tree_hash = ws.build_staged_tree().unwrap();
         assert_ne!(tree_hash, B3Hash::ZERO);
@@ -613,8 +721,9 @@ mod tests {
         let (dir, cas) = setup_workspace();
 
         fs::write(dir.path().join("file.txt"), "content").unwrap();
+        let allowlist = empty_allowlist(&dir);
         let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
-        ws.gather(&["file.txt"]).unwrap();
+        ws.gather(&["file.txt"], &allowlist).unwrap();
 
         let ignore = PatternCache::new(&[]);
         let status = ws.status(None, &ignore).unwrap();
@@ -670,6 +779,119 @@ mod tests {
             fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
             "fn main() {}"
         );
+    }
+
+    #[test]
+    fn gather_rejects_env_file() {
+        let (dir, cas) = setup_workspace();
+        fs::write(dir.path().join(".env"), "SECRET=abc").unwrap();
+
+        let allowlist = empty_allowlist(&dir);
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        let result = ws.gather(&[".env"], &allowlist);
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, WorkspaceError::SecurityBlocked(_)),
+            "expected SecurityBlocked, got: {err}"
+        );
+    }
+
+    #[test]
+    fn gather_rejects_env_even_if_allowlisted() {
+        let (dir, cas) = setup_workspace();
+        fs::write(dir.path().join(".env"), "SECRET=abc").unwrap();
+
+        let mut allowlist = empty_allowlist(&dir);
+        allowlist.allow(".env"); // try to force-allow it
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        let result = ws.gather(&[".env"], &allowlist);
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), WorkspaceError::SecurityBlocked(_)));
+    }
+
+    #[test]
+    fn gather_dotfile_needs_confirmation_without_allowlist() {
+        let (dir, cas) = setup_workspace();
+        fs::write(dir.path().join(".prettierrc"), "{}").unwrap();
+
+        let allowlist = empty_allowlist(&dir);
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        let result = ws.gather(&[".prettierrc"], &allowlist).unwrap();
+
+        assert!(result.gathered.is_empty());
+        assert_eq!(result.needs_confirmation, vec![".prettierrc"]);
+        assert!(!ws.staging.is_staged(".prettierrc"));
+    }
+
+    #[test]
+    fn gather_allows_dotfile_with_allowlist() {
+        let (dir, cas) = setup_workspace();
+        fs::write(dir.path().join(".prettierrc"), "{}").unwrap();
+
+        let mut allowlist = empty_allowlist(&dir);
+        allowlist.allow(".prettierrc");
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        let result = ws.gather(&[".prettierrc"], &allowlist).unwrap();
+
+        assert_eq!(result.gathered, vec![".prettierrc"]);
+        assert!(result.needs_confirmation.is_empty());
+        assert!(ws.staging.is_staged(".prettierrc"));
+    }
+
+    #[test]
+    fn gather_confirmed_stages_dotfile() {
+        let (dir, cas) = setup_workspace();
+        fs::write(dir.path().join(".prettierrc"), "{}").unwrap();
+
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        let gathered = ws.gather_confirmed(&[".prettierrc"]).unwrap();
+        assert_eq!(gathered, vec![".prettierrc"]);
+        assert!(ws.staging.is_staged(".prettierrc"));
+    }
+
+    #[test]
+    fn gather_confirmed_still_rejects_env() {
+        let (dir, cas) = setup_workspace();
+        fs::write(dir.path().join(".env"), "SECRET=abc").unwrap();
+
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        let result = ws.gather_confirmed(&[".env"]);
+        assert!(matches!(result.unwrap_err(), WorkspaceError::SecurityBlocked(_)));
+    }
+
+    #[test]
+    fn dotfile_allowlist_persistence() {
+        let (dir, _cas) = setup_workspace();
+        let ivaldi_dir = dir.path().join(".ivaldi");
+
+        let mut allowlist = DotfileAllowlist::load(&ivaldi_dir);
+        assert!(!allowlist.is_allowed(".prettierrc"));
+
+        allowlist.allow(".prettierrc");
+        allowlist.allow(".editorconfig");
+        allowlist.save().unwrap();
+
+        // Reload from disk
+        let reloaded = DotfileAllowlist::load(&ivaldi_dir);
+        assert!(reloaded.is_allowed(".prettierrc"));
+        assert!(reloaded.is_allowed(".editorconfig"));
+        assert!(!reloaded.is_allowed(".npmrc"));
+    }
+
+    #[test]
+    fn gather_all_skips_dotfiles() {
+        let (dir, cas) = setup_workspace();
+        fs::write(dir.path().join(".npmrc"), "registry=...").unwrap();
+        fs::write(dir.path().join("foo.txt"), "hello").unwrap();
+
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        let ignore = PatternCache::new(&[]);
+        let gathered = ws.gather_all(&ignore).unwrap();
+
+        assert_eq!(gathered, vec!["foo.txt"]);
     }
 
     #[test]

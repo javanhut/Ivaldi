@@ -3,7 +3,7 @@
 //! Bridges Ivaldi's internal BLAKE3-based storage with GitHub's SHA1-based
 //! Git objects. SHA1 is used ONLY for API communication — never internally.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -11,6 +11,7 @@ use crate::cas::{Cas, FileCas};
 use crate::fsmerkle::FsStore;
 use crate::github::{GitHubClient, GitHubError, TreeEntryCreate};
 use crate::hash::B3Hash;
+use crate::ignore;
 use crate::leaf::Leaf;
 use crate::remote::HashMapping;
 use crate::repo::Repo;
@@ -71,35 +72,16 @@ pub fn download(
 
     let import = import_full_history(client, &mut repo, owner, repo_name, default_branch, 0)?;
 
-    // Checkout tip tree files to workspace
-    let file_count = if let Some(head_idx) = repo
+    // Checkout tip tree files to workspace (reuses shared checkout logic)
+    let cas = FileCas::new(ivaldi_dir.join("objects"))
+        .map_err(|e| SyncError::Other(e.to_string()))?;
+    let store = FsStore::new(&cas);
+    let file_count = if repo
         .get_timeline_head(default_branch)
         .map_err(|e| SyncError::Other(e.to_string()))?
+        .is_some()
     {
-        let head_leaf = repo
-            .get_leaf(head_idx)
-            .map_err(|e| SyncError::Other(e.to_string()))?
-            .ok_or_else(|| SyncError::Other("corrupt head leaf after import".into()))?;
-
-        let cas = FileCas::new(ivaldi_dir.join("objects"))
-            .map_err(|e| SyncError::Other(e.to_string()))?;
-        let store = FsStore::new(&cas);
-        let mut files = BTreeMap::new();
-        collect_tree_files(&store, head_leaf.tree_root, "", &mut files)
-            .map_err(|e| SyncError::Other(e.to_string()))?;
-
-        for (path, blob_hash) in &files {
-            let (_, content) = store
-                .load_blob(*blob_hash)
-                .map_err(|e| SyncError::Other(e.to_string()))?;
-            let file_path = target_dir.join(path);
-            if let Some(parent) = file_path.parent() {
-                fs::create_dir_all(parent).ok();
-            }
-            fs::write(&file_path, &content)
-                .map_err(|e| SyncError::Other(e.to_string()))?;
-        }
-        files.len()
+        checkout_tree_to_workspace(&repo, &store, default_branch)?
     } else {
         0
     };
@@ -127,6 +109,15 @@ fn upload_blobs_parallel(
     owner: &str,
     repo_name: &str,
 ) -> Result<Vec<TreeEntryCreate>, SyncError> {
+    // Defense-in-depth: reject security-blocked files before upload
+    for (path, _) in files {
+        if crate::ignore::is_security_blocked(path) {
+            return Err(SyncError::Other(
+                format!("refusing to upload security-blocked file: {}", path),
+            ));
+        }
+    }
+
     // Partition files into already-mapped (skip) and need-upload
     let mut tree_entries = Vec::new();
     let mut to_upload: Vec<(String, B3Hash)> = Vec::new();
@@ -959,11 +950,16 @@ fn compute_file_changes(
 }
 
 /// Checkout the tip tree of a timeline to the workspace directory.
+///
+/// Writes all files from the target tree, deletes workspace files that are
+/// no longer in the tree (respecting `.ivaldiignore`), and cleans up empty
+/// parent directories left behind.  Returns the number of files in the
+/// target tree.
 fn checkout_tree_to_workspace(
     repo: &Repo,
     store: &FsStore<'_>,
     timeline: &str,
-) -> Result<(), SyncError> {
+) -> Result<usize, SyncError> {
     let head_idx = repo.get_timeline_head(timeline)
         .map_err(|e| SyncError::Other(e.to_string()))?
         .ok_or_else(|| SyncError::Other("no head to checkout".into()))?;
@@ -976,18 +972,110 @@ fn checkout_tree_to_workspace(
     collect_tree_files(store, head_leaf.tree_root, "", &mut files)
         .map_err(|e| SyncError::Other(e.to_string()))?;
 
+    // Write / update files from the target tree
     for (path, blob_hash) in &files {
         let (_, content) = store.load_blob(*blob_hash)
             .map_err(|e| SyncError::Other(e.to_string()))?;
         let file_path = repo.work_dir.join(path);
-        if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent).ok();
+
+        let should_write = if file_path.exists() {
+            let existing = fs::read(&file_path)
+                .map_err(|e| SyncError::Other(e.to_string()))?;
+            existing != content
+        } else {
+            true
+        };
+
+        if should_write {
+            if let Some(parent) = file_path.parent() {
+                fs::create_dir_all(parent).ok();
+            }
+            fs::write(&file_path, &content)
+                .map_err(|e| SyncError::Other(e.to_string()))?;
         }
-        fs::write(&file_path, &content)
-            .map_err(|e| SyncError::Other(e.to_string()))?;
     }
 
-    Ok(())
+    // Delete workspace files that are no longer in the target tree
+    let ignore_cache = ignore::load_pattern_cache(&repo.work_dir);
+    let current_files = scan_workspace_files(&repo.work_dir, "", &ignore_cache);
+    let target_set: BTreeSet<&str> = files.keys().map(|s| s.as_str()).collect();
+
+    for path in &current_files {
+        if !target_set.contains(path.as_str()) {
+            let full_path = repo.work_dir.join(path);
+            let _ = fs::remove_file(&full_path);
+            // Clean up empty parent directories
+            let mut dir = full_path.parent();
+            while let Some(d) = dir {
+                if d == repo.work_dir {
+                    break;
+                }
+                if fs::read_dir(d).map(|mut r| r.next().is_none()).unwrap_or(false) {
+                    let _ = fs::remove_dir(d);
+                    dir = d.parent();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    let count = files.len();
+    Ok(count)
+}
+
+/// Recursively scan workspace files, respecting ignore patterns and
+/// skipping the `.ivaldi/` directory.  Returns sorted relative paths.
+fn scan_workspace_files(
+    root: &Path,
+    prefix: &str,
+    ignore_cache: &ignore::PatternCache,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    scan_workspace_dir(root, root, prefix, ignore_cache, &mut out);
+    out.sort();
+    out
+}
+
+fn scan_workspace_dir(
+    root: &Path,
+    dir: &Path,
+    prefix: &str,
+    ignore_cache: &ignore::PatternCache,
+    out: &mut Vec<String>,
+) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let rel = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{}", prefix, name)
+        };
+
+        // Skip .ivaldi directory
+        if rel == ".ivaldi" || rel.starts_with(".ivaldi/") {
+            continue;
+        }
+
+        if ignore_cache.is_ignored(&rel) {
+            continue;
+        }
+
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        if ft.is_dir() {
+            scan_workspace_dir(root, &entry.path(), &rel, ignore_cache, out);
+        } else if ft.is_file() {
+            out.push(rel);
+        }
+    }
 }
 
 /// Resolve the GitHub parent SHA(s) for a new commit.
@@ -1483,5 +1571,187 @@ mod tests {
         // merge chain: other→A (mapped) → found, but A is already in parents
         assert_eq!(parents.len(), 1, "both chains converge on A");
         assert_eq!(parents[0], a_sha);
+    }
+
+    // -- checkout_tree_to_workspace regression tests --
+
+    /// Helper: build a tree in the CAS from a map of path→content, commit it,
+    /// and return the repo + CAS for checkout testing.
+    fn setup_checkout_repo(
+        dir: &Path,
+        files: &BTreeMap<String, Vec<u8>>,
+    ) -> (Repo, FileCas) {
+        crate::forge::forge(dir).unwrap();
+        let mut repo = Repo::open(dir).unwrap();
+        let ivaldi_dir = dir.join(".ivaldi");
+        let cas = FileCas::new(ivaldi_dir.join("objects")).unwrap();
+        let store = FsStore::new(&cas);
+        let tree_hash = store.build_tree_from_map(files).unwrap();
+        repo.commit(tree_hash, "test-author", "test commit").unwrap();
+        (repo, cas)
+    }
+
+    #[test]
+    fn checkout_writes_new_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = BTreeMap::new();
+        files.insert("a.txt".into(), b"hello a".to_vec());
+        files.insert("b.txt".into(), b"hello b".to_vec());
+        let (repo, cas) = setup_checkout_repo(dir.path(), &files);
+        let store = FsStore::new(&cas);
+
+        let count = checkout_tree_to_workspace(&repo, &store, "main").unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "hello a");
+        assert_eq!(fs::read_to_string(dir.path().join("b.txt")).unwrap(), "hello b");
+    }
+
+    #[test]
+    fn checkout_deletes_removed_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Initial commit with A, B, C
+        let mut files = BTreeMap::new();
+        files.insert("a.txt".into(), b"aaa".to_vec());
+        files.insert("b.txt".into(), b"bbb".to_vec());
+        files.insert("c.txt".into(), b"ccc".to_vec());
+        let (mut repo, cas) = setup_checkout_repo(dir.path(), &files);
+        let store = FsStore::new(&cas);
+
+        // Checkout first commit — all three files present
+        checkout_tree_to_workspace(&repo, &store, "main").unwrap();
+        assert!(dir.path().join("c.txt").exists());
+
+        // Second commit with only A, B (C removed)
+        let mut files2 = BTreeMap::new();
+        files2.insert("a.txt".into(), b"aaa".to_vec());
+        files2.insert("b.txt".into(), b"bbb".to_vec());
+        let tree2 = store.build_tree_from_map(&files2).unwrap();
+        repo.commit(tree2, "test-author", "remove c").unwrap();
+
+        // Checkout second commit — C should be deleted
+        let count = checkout_tree_to_workspace(&repo, &store, "main").unwrap();
+        assert_eq!(count, 2);
+        assert!(dir.path().join("a.txt").exists());
+        assert!(dir.path().join("b.txt").exists());
+        assert!(!dir.path().join("c.txt").exists(), "c.txt should be deleted");
+    }
+
+    #[test]
+    fn checkout_handles_modified_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Initial commit
+        let mut files = BTreeMap::new();
+        files.insert("doc.txt".into(), b"version 1".to_vec());
+        let (mut repo, cas) = setup_checkout_repo(dir.path(), &files);
+        let store = FsStore::new(&cas);
+        checkout_tree_to_workspace(&repo, &store, "main").unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join("doc.txt")).unwrap(), "version 1");
+
+        // Second commit with modified content
+        let mut files2 = BTreeMap::new();
+        files2.insert("doc.txt".into(), b"version 2".to_vec());
+        let tree2 = store.build_tree_from_map(&files2).unwrap();
+        repo.commit(tree2, "test-author", "update doc").unwrap();
+
+        checkout_tree_to_workspace(&repo, &store, "main").unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join("doc.txt")).unwrap(), "version 2");
+    }
+
+    #[test]
+    fn checkout_preserves_ignored_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create .ivaldiignore before forging so it's present
+        let ignore_path = dir.path().join(".ivaldiignore");
+        fs::write(&ignore_path, "secret.key\n").unwrap();
+
+        // Initial commit with one tracked file
+        let mut files = BTreeMap::new();
+        files.insert("a.txt".into(), b"tracked".to_vec());
+        let (repo, cas) = setup_checkout_repo(dir.path(), &files);
+        let store = FsStore::new(&cas);
+
+        // Place an ignored file in the workspace
+        fs::write(dir.path().join("secret.key"), "private data").unwrap();
+
+        // Re-write .ivaldiignore (forge may overwrite)
+        fs::write(&ignore_path, "secret.key\n").unwrap();
+
+        checkout_tree_to_workspace(&repo, &store, "main").unwrap();
+
+        // Ignored file should still be there
+        assert!(
+            dir.path().join("secret.key").exists(),
+            "ignored file should not be deleted by checkout"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("secret.key")).unwrap(),
+            "private data"
+        );
+    }
+
+    #[test]
+    fn checkout_cleans_empty_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Commit with a file in a subdirectory
+        let mut files = BTreeMap::new();
+        files.insert("a.txt".into(), b"root file".to_vec());
+        files.insert("sub/deep.txt".into(), b"deep file".to_vec());
+        let (mut repo, cas) = setup_checkout_repo(dir.path(), &files);
+        let store = FsStore::new(&cas);
+        checkout_tree_to_workspace(&repo, &store, "main").unwrap();
+        assert!(dir.path().join("sub/deep.txt").exists());
+
+        // Second commit without the subdirectory file
+        let mut files2 = BTreeMap::new();
+        files2.insert("a.txt".into(), b"root file".to_vec());
+        let tree2 = store.build_tree_from_map(&files2).unwrap();
+        repo.commit(tree2, "test-author", "remove sub/deep.txt").unwrap();
+
+        checkout_tree_to_workspace(&repo, &store, "main").unwrap();
+        assert!(!dir.path().join("sub/deep.txt").exists());
+        assert!(!dir.path().join("sub").exists(), "empty sub/ dir should be cleaned up");
+    }
+
+    #[test]
+    fn upload_rejects_security_blocked_files() {
+        use crate::cas::MemoryCas;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ivaldi_dir = dir.path().join(".ivaldi");
+        std::fs::create_dir_all(&ivaldi_dir).unwrap();
+
+        let cas = MemoryCas::new();
+        let store = FsStore::new(&cas);
+
+        // Build a file map containing a .env file
+        let mut files = BTreeMap::new();
+        let content = b"SECRET=abc";
+        let canonical = crate::fsmerkle::BlobNode::canonical_bytes(content);
+        let hash = B3Hash::digest(&canonical);
+        cas.put(hash, &canonical).unwrap();
+        files.insert(".env".to_string(), hash);
+
+        let client = GitHubClient::new();
+        let mut mapping = HashMapping::new(&ivaldi_dir);
+
+        let result = upload_blobs_parallel(
+            &client,
+            &store,
+            &files,
+            &mut mapping,
+            "owner",
+            "repo",
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("security-blocked"),
+            "expected security-blocked error, got: {err}"
+        );
     }
 }

@@ -3,6 +3,7 @@
 //! Each function handles one CLI command, wiring user input to the core modules.
 //! Commands that need persistent state use `Repo`; others use lightweight helpers.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process;
 
@@ -102,34 +103,70 @@ fn cmd_forge(quiet: bool) -> Result<(), String> {
 }
 
 fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
+    use crate::workspace::DotfileAllowlist;
+
     let ctx = find_repo()?;
     let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
     let mut ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
     let ignore_cache = ignore::load_pattern_cache(&ctx.work_dir);
+    let mut allowlist = DotfileAllowlist::load(&ctx.ivaldi_dir);
 
-    let gathered = if args.files.is_empty() || args.files == ["."] {
-        ws.gather_all(&ignore_cache).map_err(|e| e.to_string())?
+    let mut all_gathered: Vec<String>;
+
+    if args.files.is_empty() || args.files == ["."] {
+        // gather_all auto-excludes dotfiles via scan, no confirmation needed
+        all_gathered = ws.gather_all(&ignore_cache).map_err(|e| e.to_string())?;
     } else {
         let refs: Vec<&str> = args.files.iter().map(|s| s.as_str()).collect();
-        ws.gather(&refs).map_err(|e| e.to_string())?
-    };
+        let result = ws.gather(&refs, &allowlist).map_err(|e| e.to_string())?;
+        all_gathered = result.gathered;
 
-    // Warn about sensitive/hidden files unless --allow-all
-    if !args.allow_all && !quiet {
-        for file in &gathered {
-            let basename = file.rsplit('/').next().unwrap_or(file);
-            if basename.starts_with('.') && basename != ".ivaldiignore" {
-                eprintln!("WARNING: Staging hidden file: {}", file);
-                eprintln!("  Consider adding to .ivaldiignore or use --allow-all to suppress");
+        // Handle dotfiles that need confirmation
+        if !result.needs_confirmation.is_empty() {
+            if args.allow_all {
+                // --allow-all pre-approves all dotfiles (except security-blocked)
+                let confirmed_refs: Vec<&str> =
+                    result.needs_confirmation.iter().map(|s| s.as_str()).collect();
+                let extra = ws.gather_confirmed(&confirmed_refs).map_err(|e| e.to_string())?;
+                for path in &extra {
+                    allowlist.allow(path);
+                }
+                all_gathered.extend(extra);
+            } else {
+                // Prompt for each dotfile individually
+                for dotfile in &result.needs_confirmation {
+                    eprint!("WARNING: '{}' is a hidden (dot) file — stage it? [y/N]: ", dotfile);
+                    std::io::stderr().flush().map_err(|e| e.to_string())?;
+
+                    let mut input = String::new();
+                    std::io::stdin()
+                        .read_line(&mut input)
+                        .map_err(|e| e.to_string())?;
+
+                    if input.trim().eq_ignore_ascii_case("y") {
+                        let extra = ws
+                            .gather_confirmed(&[dotfile.as_str()])
+                            .map_err(|e| e.to_string())?;
+                        allowlist.allow(dotfile);
+                        all_gathered.extend(extra);
+                    } else {
+                        eprintln!("  skipped: {}", dotfile);
+                    }
+                }
             }
+
+            // Persist allowlist so confirmed dotfiles don't prompt again
+            allowlist.save().map_err(|e| e.to_string())?;
         }
     }
 
     ws.save().map_err(|e| e.to_string())?;
 
     if !quiet {
-        for file in &gathered { println!("  gathered: {}", file); }
-        println!("{} file(s) staged", gathered.len());
+        for file in &all_gathered {
+            println!("  gathered: {}", file);
+        }
+        println!("{} file(s) staged", all_gathered.len());
     }
     Ok(())
 }
@@ -1030,8 +1067,8 @@ fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
         .ok_or("no portal configured. Run 'ivaldi portal add owner/repo'.")?;
 
     if args.force {
-        println!("WARNING: Force push will OVERWRITE remote history!");
-        println!("Type 'force push' to confirm:");
+        print!("WARNING: Force push will OVERWRITE remote history! Type 'force push' to confirm: ");
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).map_err(|e| e.to_string())?;
         if input.trim() != "force push" {

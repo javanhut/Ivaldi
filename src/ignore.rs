@@ -89,6 +89,11 @@ impl PatternCache {
             return false;
         }
 
+        // Auto-exclude dotfiles (basename starts with '.')
+        if basename.starts_with('.') {
+            return true;
+        }
+
         // Literal match (full path or basename)
         for pattern in &self.literal_patterns {
             if path == pattern || basename == pattern {
@@ -204,6 +209,27 @@ pub fn load_pattern_cache(work_dir: &Path) -> PatternCache {
     let mut all: Vec<String> = DEFAULT_PATTERNS.iter().map(|s| s.to_string()).collect();
     all.extend(user_patterns);
     PatternCache::from_strings(&all)
+}
+
+/// Check if a path matches a security-blocked pattern (`.env`, `.env.*`, `.venv`).
+/// This is a standalone check usable without a `PatternCache` instance.
+pub fn is_security_blocked(path: &str) -> bool {
+    let basename = path_basename(path);
+    for &sec_pattern in SECURITY_PATTERNS {
+        if sec_pattern.contains('*') || sec_pattern.contains('?') {
+            if glob_match(sec_pattern, basename) {
+                return true;
+            }
+        } else if sec_pattern.ends_with('/') {
+            let dir = sec_pattern.trim_end_matches('/');
+            if path == dir || path.starts_with(&format!("{}/", dir)) || basename == dir {
+                return true;
+            }
+        } else if basename == sec_pattern || path == sec_pattern {
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -429,6 +455,38 @@ mod tests {
         assert!(cache.is_ignored("file3.txt"));
         assert!(cache.is_ignored("file9.txt"));
         assert!(!cache.is_ignored("fileA.txt"));
+    }
+
+    #[test]
+    fn dotfiles_auto_excluded() {
+        let cache = PatternCache::new(&[]);
+        assert!(cache.is_ignored(".npmrc"));
+        assert!(cache.is_ignored(".prettierrc"));
+        assert!(cache.is_ignored(".gitignore"));
+        assert!(cache.is_ignored("src/.hidden"));
+        assert!(!cache.is_ignored("visible.txt"));
+    }
+
+    #[test]
+    fn ivaldiignore_not_excluded() {
+        let cache = PatternCache::new(&[]);
+        assert!(!cache.is_ignored(".ivaldiignore"));
+    }
+
+    #[test]
+    fn security_blocked_standalone() {
+        assert!(is_security_blocked(".env"));
+        assert!(is_security_blocked(".env.local"));
+        assert!(is_security_blocked(".env.production"));
+        assert!(is_security_blocked(".venv"));
+        assert!(is_security_blocked("subdir/.env"));
+    }
+
+    #[test]
+    fn security_blocked_non_env() {
+        assert!(!is_security_blocked(".prettierrc"));
+        assert!(!is_security_blocked(".npmrc"));
+        assert!(!is_security_blocked("README.md"));
     }
 
     #[test]
