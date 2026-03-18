@@ -270,14 +270,78 @@ impl<'a> Workspace<'a> {
     }
 
     /// Gather all files in the workspace (respecting ignore patterns).
-    /// Dotfiles are auto-excluded by the ignore cache during scan,
-    /// so no confirmation is needed here.
-    pub fn gather_all(&mut self, ignore: &PatternCache) -> Result<Vec<String>, WorkspaceError> {
+    /// Dotfiles are auto-excluded by the ignore cache during scan.
+    /// Returns a `GatherResult` with skipped dotfiles in `needs_confirmation`
+    /// so the caller can report them to the user.
+    pub fn gather_all(&mut self, ignore: &PatternCache) -> Result<GatherResult, WorkspaceError> {
         let files = self.scan(ignore)?;
         // scan() already excludes dotfiles via is_ignored(), so no allowlist needed
         let allowlist = DotfileAllowlist::load(&self.ivaldi_dir);
         let result = self.gather(&files.iter().map(|s| s.as_str()).collect::<Vec<_>>(), &allowlist)?;
-        Ok(result.gathered)
+
+        // Discover dotfiles that were skipped so the caller can report them
+        let skipped = self.find_dotfiles(ignore)?;
+
+        Ok(GatherResult {
+            gathered: result.gathered,
+            needs_confirmation: skipped,
+        })
+    }
+
+    /// Walk the workspace and return dotfile paths that exist on disk but were
+    /// excluded from `scan()`. Skips `.ivaldi/`, `.ivaldiignore`, security-blocked
+    /// files, and ignored directories.
+    pub fn find_dotfiles(&self, ignore: &PatternCache) -> Result<Vec<String>, WorkspaceError> {
+        let mut dotfiles = Vec::new();
+        self.find_dotfiles_in(&self.work_dir, "", ignore, &mut dotfiles)?;
+        dotfiles.sort();
+        Ok(dotfiles)
+    }
+
+    fn find_dotfiles_in(
+        &self,
+        dir: &Path,
+        prefix: &str,
+        ignore: &PatternCache,
+        dotfiles: &mut Vec<String>,
+    ) -> Result<(), WorkspaceError> {
+        let entries = fs::read_dir(dir).map_err(WorkspaceError::Io)?;
+
+        for entry in entries {
+            let entry = entry.map_err(WorkspaceError::Io)?;
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            let rel_path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{}/{}", prefix, name)
+            };
+
+            // Skip .ivaldi directory
+            if rel_path == ".ivaldi" || rel_path.starts_with(".ivaldi/") {
+                continue;
+            }
+
+            let file_type = entry.file_type().map_err(WorkspaceError::Io)?;
+
+            if file_type.is_dir() {
+                if ignore.is_dir_ignored(&rel_path) {
+                    continue;
+                }
+                self.find_dotfiles_in(&entry.path(), &rel_path, ignore, dotfiles)?;
+            } else if file_type.is_file() {
+                let basename = name.as_str();
+                // Only collect dotfiles that aren't .ivaldiignore and aren't security-blocked
+                if basename.starts_with('.')
+                    && basename != ".ivaldiignore"
+                    && !crate::ignore::is_security_blocked(&rel_path)
+                {
+                    dotfiles.push(rel_path);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Build a tree from currently staged files and return the root hash.
@@ -620,9 +684,10 @@ mod tests {
 
         let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
         let ignore = PatternCache::new(&[]);
-        let gathered = ws.gather_all(&ignore).unwrap();
+        let result = ws.gather_all(&ignore).unwrap();
 
-        assert_eq!(gathered.len(), 2);
+        assert_eq!(result.gathered.len(), 2);
+        assert!(result.needs_confirmation.is_empty());
         assert_eq!(ws.staging.len(), 2);
     }
 
@@ -889,9 +954,59 @@ mod tests {
 
         let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
         let ignore = PatternCache::new(&[]);
-        let gathered = ws.gather_all(&ignore).unwrap();
+        let result = ws.gather_all(&ignore).unwrap();
 
-        assert_eq!(gathered, vec!["foo.txt"]);
+        assert_eq!(result.gathered, vec!["foo.txt"]);
+    }
+
+    #[test]
+    fn gather_all_reports_skipped_dotfiles() {
+        let (dir, cas) = setup_workspace();
+        fs::write(dir.path().join(".npmrc"), "registry=...").unwrap();
+        fs::write(dir.path().join("foo.txt"), "hello").unwrap();
+
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        let ignore = PatternCache::new(&[]);
+        let result = ws.gather_all(&ignore).unwrap();
+
+        assert_eq!(result.gathered, vec!["foo.txt"]);
+        assert_eq!(result.needs_confirmation, vec![".npmrc"]);
+    }
+
+    #[test]
+    fn gather_all_skips_env_from_report() {
+        let (dir, cas) = setup_workspace();
+        fs::write(dir.path().join(".env"), "SECRET=abc").unwrap();
+        fs::write(dir.path().join(".npmrc"), "registry=...").unwrap();
+        fs::write(dir.path().join("foo.txt"), "hello").unwrap();
+
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        let ignore = PatternCache::new(&[]);
+        let result = ws.gather_all(&ignore).unwrap();
+
+        assert_eq!(result.gathered, vec!["foo.txt"]);
+        // .env should NOT appear — it's security-blocked, not just a dotfile
+        assert_eq!(result.needs_confirmation, vec![".npmrc"]);
+        assert!(!result.needs_confirmation.contains(&".env".to_string()));
+    }
+
+    #[test]
+    fn find_dotfiles_discovers_hidden_files() {
+        let (dir, cas) = setup_workspace();
+        fs::write(dir.path().join(".prettierrc"), "{}").unwrap();
+        fs::write(dir.path().join(".editorconfig"), "[*]").unwrap();
+        fs::write(dir.path().join("normal.txt"), "hi").unwrap();
+        // .ivaldiignore should NOT be reported
+        fs::write(dir.path().join(".ivaldiignore"), "*.log").unwrap();
+
+        let ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        let ignore = PatternCache::new(&[]);
+        let dotfiles = ws.find_dotfiles(&ignore).unwrap();
+
+        assert!(dotfiles.contains(&".prettierrc".to_string()));
+        assert!(dotfiles.contains(&".editorconfig".to_string()));
+        assert!(!dotfiles.contains(&"normal.txt".to_string()));
+        assert!(!dotfiles.contains(&".ivaldiignore".to_string()));
     }
 
     #[test]

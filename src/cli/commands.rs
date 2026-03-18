@@ -114,8 +114,20 @@ fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
     let mut all_gathered: Vec<String>;
 
     if args.files.is_empty() || args.files == ["."] {
-        // gather_all auto-excludes dotfiles via scan, no confirmation needed
-        all_gathered = ws.gather_all(&ignore_cache).map_err(|e| e.to_string())?;
+        let result = ws.gather_all(&ignore_cache).map_err(|e| e.to_string())?;
+        all_gathered = result.gathered;
+
+        // Report skipped dotfiles so the user knows they were found but excluded
+        if !quiet && !result.needs_confirmation.is_empty() {
+            eprintln!(
+                "Skipped {} hidden (dot) file(s):",
+                result.needs_confirmation.len()
+            );
+            for dotfile in &result.needs_confirmation {
+                eprintln!("  {}", dotfile);
+            }
+            eprintln!("  Use 'ivaldi gather <file>' to stage specific dotfiles");
+        }
     } else {
         let refs: Vec<&str> = args.files.iter().map(|s| s.as_str()).collect();
         let result = ws.gather(&refs, &allowlist).map_err(|e| e.to_string())?;
