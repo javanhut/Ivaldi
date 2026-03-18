@@ -361,6 +361,146 @@ fn collect_tree_files(
     Ok(())
 }
 
+/// Result of a sync (delta update) operation.
+#[derive(Debug)]
+pub struct SyncResult {
+    pub added: Vec<String>,
+    pub modified: Vec<String>,
+    pub deleted: Vec<String>,
+    pub no_changes: bool,
+}
+
+/// Sync — incremental delta update of a local timeline from remote.
+/// Downloads only changed files compared to local state.
+pub fn sync_timeline(
+    client: &GitHubClient,
+    repo: &mut Repo,
+    owner: &str,
+    repo_name: &str,
+    timeline: &str,
+) -> Result<SyncResult, SyncError> {
+    // Get remote tree
+    let branches = client.list_branches(owner, repo_name).map_err(SyncError::GitHub)?;
+    let branch = branches.iter().find(|b| b.name == timeline)
+        .ok_or_else(|| SyncError::Other(format!("remote branch '{}' not found", timeline)))?;
+
+    let remote_tree = client.get_tree(owner, repo_name, &branch.commit.sha)
+        .map_err(SyncError::GitHub)?;
+
+    // Build remote file set: path → sha1
+    let remote_files: BTreeMap<String, String> = remote_tree.tree.iter()
+        .filter(|e| e.entry_type == "blob")
+        .map(|e| (e.path.clone(), e.sha.clone()))
+        .collect();
+
+    // Build local file set from last commit tree
+    let cas = FileCas::new(repo.ivaldi_dir.join("objects"))
+        .map_err(|e| SyncError::Other(e.to_string()))?;
+    let store = FsStore::new(&cas);
+
+    let mut local_files: BTreeMap<String, B3Hash> = BTreeMap::new();
+    if let Ok(Some(head_idx)) = repo.get_timeline_head(timeline) {
+        if let Ok(Some(leaf)) = repo.get_leaf(head_idx) {
+            let _ = collect_tree_files(&store, leaf.tree_root, "", &mut local_files);
+        }
+    }
+
+    // Compute delta
+    let mut added = Vec::new();
+    let mut modified = Vec::new();
+    let mut deleted = Vec::new();
+
+    // Check for existing local files by building a hash mapping
+    let hash_mapping = crate::remote::HashMapping::new(&repo.ivaldi_dir);
+
+    // Files in remote but not local, or changed
+    for (path, remote_sha) in &remote_files {
+        let is_new = !local_files.contains_key(path);
+        let is_modified = if !is_new {
+            // Check if the remote SHA maps to a different BLAKE3 than what we have locally
+            match hash_mapping.get_blake3(remote_sha) {
+                Some(b3) => local_files.get(path) != Some(&b3),
+                None => true, // Unknown mapping = assume changed
+            }
+        } else {
+            false
+        };
+
+        if is_new || is_modified {
+            if is_new { added.push(path.clone()); } else { modified.push(path.clone()); }
+        }
+    }
+
+    // Files in local but not remote
+    for path in local_files.keys() {
+        if !remote_files.contains_key(path) {
+            deleted.push(path.clone());
+        }
+    }
+
+    if added.is_empty() && modified.is_empty() && deleted.is_empty() {
+        return Ok(SyncResult { added, modified, deleted, no_changes: true });
+    }
+
+    // Download added/modified files
+    let download_paths: Vec<String> = added.iter().chain(modified.iter()).cloned().collect();
+    let pb = crate::progress::file_bar(download_paths.len() as u64, "Syncing");
+
+    let mut hash_mapping = crate::remote::HashMapping::new(&repo.ivaldi_dir);
+
+    for path in &download_paths {
+        pb.inc(1);
+        match client.download_file(owner, repo_name, path, &branch.commit.sha) {
+            Ok(content) => {
+                let (blob_hash, _) = store.put_blob(&content)
+                    .map_err(|e| SyncError::Other(e.to_string()))?;
+
+                if let Some(remote_sha) = remote_files.get(path) {
+                    hash_mapping.insert(remote_sha, blob_hash);
+                }
+
+                // Write to workspace
+                let file_path = repo.work_dir.join(path);
+                if let Some(parent) = file_path.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
+                std::fs::write(&file_path, &content).ok();
+            }
+            Err(e) => {
+                crate::logging::warn(&format!("failed to sync {}: {}", path, e));
+            }
+        }
+    }
+    pb.finish_with_message("Sync complete");
+
+    // Delete removed files from workspace
+    for path in &deleted {
+        let file_path = repo.work_dir.join(path);
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    hash_mapping.save().map_err(|e| SyncError::Other(e.to_string()))?;
+
+    // Create commit for the synced state
+    let ignore_cache = crate::ignore::load_pattern_cache(&repo.work_dir);
+    let mut ws = crate::workspace::Workspace::new(&cas, &repo.work_dir, &repo.ivaldi_dir);
+    ws.gather_all(&ignore_cache).map_err(|e| SyncError::Other(e.to_string()))?;
+
+    if !ws.staging.is_empty() {
+        let tree_hash = ws.build_staged_tree().map_err(|e| SyncError::Other(e.to_string()))?;
+        let msg = format!("Synced from {}/{} (branch: {})", owner, repo_name, timeline);
+        repo.commit(tree_hash, "ivaldi-sync", &msg).map_err(|e| SyncError::Other(e.to_string()))?;
+        ws.staging.clear();
+        ws.save().map_err(|e| SyncError::Other(e.to_string()))?;
+    }
+
+    added.sort();
+    modified.sort();
+    deleted.sort();
+
+    Ok(SyncResult { added, modified, deleted, no_changes: false })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
     #[error("GitHub error: {0}")]

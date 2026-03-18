@@ -89,6 +89,9 @@ pub enum Commands {
 
     /// Download specific remote timelines
     Harvest(HarvestArgs),
+
+    /// Sync current timeline with remote (delta only)
+    Sync(SyncArgs),
 }
 
 // ---------------------------------------------------------------------------
@@ -451,4 +454,10 @@ pub struct HarvestArgs {
     /// Update existing timelines and download new ones
     #[arg(long)]
     pub update: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SyncArgs {
+    /// Timeline to sync (defaults to current)
+    pub timeline: Option<String>,
 }

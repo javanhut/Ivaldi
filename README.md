@@ -46,6 +46,7 @@ ivaldi upload                      # Push to GitHub
 ivaldi download owner/repo         # Clone a repository
 ivaldi scout                       # List remote branches
 ivaldi harvest feature-branch      # Fetch specific branch
+ivaldi sync                        # Pull remote changes (delta only)
 ```
 
 ## Command Reference
@@ -73,6 +74,7 @@ ivaldi harvest feature-branch      # Fetch specific branch
 | `upload` | | Push to remote |
 | `scout` | | Discover remote branches |
 | `harvest` | | Fetch specific branches |
+| `sync` | | Pull remote changes (delta only) |
 
 ## Ivaldi vs Git
 

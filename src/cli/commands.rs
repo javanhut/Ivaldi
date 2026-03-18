@@ -43,6 +43,7 @@ pub fn run_command(cli: Cli) {
             Commands::Upload(args) => cmd_upload(args, cli.quiet),
             Commands::Scout(args) => cmd_scout(args),
             Commands::Harvest(args) => cmd_harvest(args, cli.quiet),
+            Commands::Sync(args) => cmd_sync(args, cli.quiet),
         };
         if let Err(e) = result {
             eprintln!("Error: {}", e);
@@ -780,7 +781,9 @@ fn cmd_config(args: ConfigArgs) -> Result<(), String> {
     let cfg = config::load_config(&ctx.ivaldi_dir);
 
     if args.list {
-        for (key, value) in cfg.list() { println!("{}={}", key, value); }
+        for (key, value) in cfg.list() {
+            println!("{}={}", color::dim(key), value);
+        }
         return Ok(());
     }
     if let Some(key) = &args.get {
@@ -798,8 +801,69 @@ fn cmd_config(args: ConfigArgs) -> Result<(), String> {
         println!("{}={}", key, value);
         return Ok(());
     }
-    for (key, value) in cfg.list() { println!("{}={}", key, value); }
+
+    // No flags — interactive mode
+    interactive_config(&ctx.ivaldi_dir)?;
     Ok(())
+}
+
+fn interactive_config(ivaldi_dir: &std::path::Path) -> Result<(), String> {
+    let mut cfg = Config::load(&ivaldi_dir.join("config")).unwrap_or_else(|_| Config::new());
+
+    println!("{}", color::bold("Ivaldi Configuration"));
+    println!("{}\n", color::dim("Press Enter to keep current value, or type a new one."));
+
+    // user.name
+    let current_name = cfg.get("user.name").unwrap_or("").to_string();
+    let name = prompt_with_default("user.name", &current_name)?;
+    if !name.is_empty() { cfg.set("user.name", &name); }
+
+    // user.email
+    let current_email = cfg.get("user.email").unwrap_or("").to_string();
+    let email = prompt_with_default("user.email", &current_email)?;
+    if !email.is_empty() { cfg.set("user.email", &email); }
+
+    // color.ui
+    let current_color = cfg.get("color.ui").unwrap_or("true").to_string();
+    let color_ui = prompt_with_default("color.ui", &current_color)?;
+    if !color_ui.is_empty() { cfg.set("color.ui", &color_ui); }
+
+    // core.autoshelf
+    let current_shelf = cfg.get("core.autoshelf").unwrap_or("true").to_string();
+    let autoshelf = prompt_with_default("core.autoshelf", &current_shelf)?;
+    if !autoshelf.is_empty() { cfg.set("core.autoshelf", &autoshelf); }
+
+    cfg.save(&ivaldi_dir.join("config"))
+        .map_err(|e| e.to_string())?;
+
+    println!("\n{} Configuration saved.", color::green("✓"));
+
+    if let Some(author) = cfg.author() {
+        println!("Author: {}", color::author(&author));
+    }
+
+    Ok(())
+}
+
+fn prompt_with_default(key: &str, default: &str) -> Result<String, String> {
+    use std::io::Write;
+
+    if default.is_empty() {
+        print!("  {} = ", color::cyan(key));
+    } else {
+        print!("  {} [{}] = ", color::cyan(key), color::dim(default));
+    }
+    std::io::stdout().flush().map_err(|e| e.to_string())?;
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).map_err(|e| e.to_string())?;
+    let input = input.trim();
+
+    if input.is_empty() {
+        Ok(default.to_string())
+    } else {
+        Ok(input.to_string())
+    }
 }
 
 fn cmd_exclude(args: ExcludeArgs, quiet: bool) -> Result<(), String> {
@@ -1030,6 +1094,47 @@ fn cmd_harvest(args: HarvestArgs, quiet: bool) -> Result<(), String> {
             println!("Harvested timeline: {}", name);
         }
     }
+    Ok(())
+}
+
+fn cmd_sync(args: SyncArgs, quiet: bool) -> Result<(), String> {
+    use crate::github::GitHubClient;
+    use crate::sync;
+
+    let mut repo = open_repo()?;
+    let client = GitHubClient::new();
+    let portal_mgr = PortalManager::new(&repo.ivaldi_dir);
+    let portal = portal_mgr
+        .get_default()
+        .map_err(|e| e.to_string())?
+        .ok_or("no portal configured. Run 'ivaldi portal add owner/repo'.")?;
+
+    let timeline = args.timeline
+        .unwrap_or_else(|| repo.current_timeline().unwrap_or_else(|_| "main".into()));
+
+    if !quiet {
+        println!("Syncing timeline '{}' with {}/{}...\n",
+            color::timeline(&timeline), portal.owner, portal.repo);
+    }
+
+    let result = sync::sync_timeline(&client, &mut repo, &portal.owner, &portal.repo, &timeline)
+        .map_err(|e| e.to_string())?;
+
+    if result.no_changes {
+        println!("{} Timeline '{}' is already up to date", color::green("✓"), color::bold(&timeline));
+        return Ok(());
+    }
+
+    for f in &result.added { println!("{} {}", color::green("++"), f); }
+    for f in &result.modified { println!("{} {}", color::green("++"), f); }
+    for f in &result.deleted { println!("{} {}", color::red("--"), f); }
+
+    let total = result.added.len() + result.modified.len() + result.deleted.len();
+    println!("\n{} Synced {} file(s) from remote", color::green("✓"), total);
+    if !result.added.is_empty() { println!("  Added: {}", color::green(&result.added.len().to_string())); }
+    if !result.modified.is_empty() { println!("  Modified: {}", color::blue(&result.modified.len().to_string())); }
+    if !result.deleted.is_empty() { println!("  Deleted: {}", color::red(&result.deleted.len().to_string())); }
+
     Ok(())
 }
 
