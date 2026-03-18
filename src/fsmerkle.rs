@@ -270,6 +270,79 @@ impl<'a> FsStore<'a> {
         self.build_recursive(files, "")
     }
 
+    /// Build a filesystem tree from a map of paths to blob hashes (blobs already in CAS).
+    ///
+    /// Unlike `build_tree_from_map`, this does NOT store blobs — it assumes they
+    /// are already present in the CAS. Used by auto-fuse to construct merged trees
+    /// without re-reading file content.
+    pub fn build_tree_from_hash_map(
+        &self,
+        files: &BTreeMap<String, B3Hash>,
+    ) -> Result<B3Hash, FsMerkleError> {
+        if files.is_empty() {
+            return self.put_tree(Vec::new());
+        }
+        self.build_hash_recursive(files, "")
+    }
+
+    fn build_hash_recursive(
+        &self,
+        files: &BTreeMap<String, B3Hash>,
+        prefix: &str,
+    ) -> Result<B3Hash, FsMerkleError> {
+        let mut entries: BTreeMap<String, Entry> = BTreeMap::new();
+        let mut subdirs: BTreeMap<String, BTreeMap<String, B3Hash>> = BTreeMap::new();
+
+        for (path, hash) in files {
+            let rel_path = if prefix.is_empty() {
+                path.clone()
+            } else if let Some(stripped) = path.strip_prefix(&format!("{}/", prefix)) {
+                stripped.to_string()
+            } else {
+                continue;
+            };
+
+            if let Some(slash_pos) = rel_path.find('/') {
+                let dir_name = &rel_path[..slash_pos];
+                subdirs
+                    .entry(dir_name.to_string())
+                    .or_default()
+                    .insert(path.clone(), *hash);
+            } else {
+                entries.insert(
+                    rel_path.clone(),
+                    Entry {
+                        name: rel_path,
+                        mode: MODE_FILE,
+                        kind: NodeKind::Blob,
+                        hash: *hash,
+                    },
+                );
+            }
+        }
+
+        for (dir_name, sub_files) in &subdirs {
+            let sub_prefix = if prefix.is_empty() {
+                dir_name.clone()
+            } else {
+                format!("{}/{}", prefix, dir_name)
+            };
+            let sub_hash = self.build_hash_recursive(sub_files, &sub_prefix)?;
+            entries.insert(
+                dir_name.clone(),
+                Entry {
+                    name: dir_name.clone(),
+                    mode: MODE_DIR,
+                    kind: NodeKind::Tree,
+                    hash: sub_hash,
+                },
+            );
+        }
+
+        let entry_vec: Vec<Entry> = entries.into_values().collect();
+        self.put_tree(entry_vec)
+    }
+
     fn build_recursive(
         &self,
         files: &BTreeMap<String, Vec<u8>>,
@@ -922,5 +995,82 @@ mod tests {
         let changes = diff_trees(empty, root, &store).unwrap();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].kind, ChangeKind::Added);
+    }
+
+    #[test]
+    fn build_tree_from_hash_map_flat() {
+        let cas = MemoryCas::new();
+        let store = FsStore::new(&cas);
+
+        // Pre-store blobs
+        let (h1, _) = store.put_blob(b"file one").unwrap();
+        let (h2, _) = store.put_blob(b"file two").unwrap();
+
+        let mut hash_files = BTreeMap::new();
+        hash_files.insert("a.txt".into(), h1);
+        hash_files.insert("b.txt".into(), h2);
+
+        let root = store.build_tree_from_hash_map(&hash_files).unwrap();
+        let tree = store.load_tree(root).unwrap();
+        assert_eq!(tree.entries.len(), 2);
+        assert_eq!(tree.entries[0].name, "a.txt");
+        assert_eq!(tree.entries[0].hash, h1);
+        assert_eq!(tree.entries[1].name, "b.txt");
+        assert_eq!(tree.entries[1].hash, h2);
+    }
+
+    #[test]
+    fn build_tree_from_hash_map_nested() {
+        let cas = MemoryCas::new();
+        let store = FsStore::new(&cas);
+
+        let (h1, _) = store.put_blob(b"readme").unwrap();
+        let (h2, _) = store.put_blob(b"main code").unwrap();
+        let (h3, _) = store.put_blob(b"lib code").unwrap();
+
+        let mut hash_files = BTreeMap::new();
+        hash_files.insert("README.md".into(), h1);
+        hash_files.insert("src/main.rs".into(), h2);
+        hash_files.insert("src/lib.rs".into(), h3);
+
+        let root = store.build_tree_from_hash_map(&hash_files).unwrap();
+        let tree = store.load_tree(root).unwrap();
+        assert_eq!(tree.entries.len(), 2); // README.md + src/
+        assert_eq!(tree.entries[0].name, "README.md");
+        assert_eq!(tree.entries[1].name, "src");
+        assert_eq!(tree.entries[1].kind, NodeKind::Tree);
+
+        // Check src/ subtree
+        let src_tree = store.load_tree(tree.entries[1].hash).unwrap();
+        assert_eq!(src_tree.entries.len(), 2);
+        assert_eq!(src_tree.entries[0].name, "lib.rs");
+        assert_eq!(src_tree.entries[1].name, "main.rs");
+    }
+
+    #[test]
+    fn build_tree_from_hash_map_matches_content_map() {
+        // Verify that build_tree_from_hash_map produces the same tree as
+        // build_tree_from_map when given matching inputs
+        let cas = MemoryCas::new();
+        let store = FsStore::new(&cas);
+
+        let mut content_files = BTreeMap::new();
+        content_files.insert("a.txt".into(), b"hello".to_vec());
+        content_files.insert("dir/b.txt".into(), b"world".to_vec());
+
+        let root_content = store.build_tree_from_map(&content_files).unwrap();
+
+        // Now build the same tree using hash map
+        let (ha, _) = store.put_blob(b"hello").unwrap();
+        let (hb, _) = store.put_blob(b"world").unwrap();
+
+        let mut hash_files = BTreeMap::new();
+        hash_files.insert("a.txt".into(), ha);
+        hash_files.insert("dir/b.txt".into(), hb);
+
+        let root_hash = store.build_tree_from_hash_map(&hash_files).unwrap();
+
+        // Both should produce the same root hash
+        assert_eq!(root_content, root_hash);
     }
 }

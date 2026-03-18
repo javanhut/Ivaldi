@@ -627,18 +627,24 @@ fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
     let result = FuseEngine::fuse(&base_files, &ours_files, &theirs_files, strategy);
 
     if result.success {
-        // Build merged tree and commit
-        let mut file_map = BTreeMap::new();
-        for (path, hash) in &result.merged_files {
-            let (_, content) = store.load_blob(*hash).map_err(|e| e.to_string())?;
-            file_map.insert(path.clone(), content);
-        }
-        let merged_tree = store.build_tree_from_map(&file_map).map_err(|e| e.to_string())?;
+        // Build merged tree (blobs already in CAS, just build tree structure)
+        let merged_tree = store.build_tree_from_hash_map(&result.merged_files)
+            .map_err(|e| e.to_string())?;
 
         let cfg = repo.config();
         let author = cfg.author().unwrap_or_else(|| "ivaldi".into());
         let message = format!("Fuse {} into {}", source, target);
-        let commit_result = repo.commit(merged_tree, &author, &message).map_err(|e| e.to_string())?;
+
+        // Build a raw leaf so we can record the source head as a merge parent.
+        // This preserves merge topology for GitHub uploads.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut fuse_leaf = crate::leaf::Leaf::new(merged_tree, &target, &author, now, &message);
+        fuse_leaf.prev_idx = target_head;
+        fuse_leaf.merge_idxs = vec![source_head];
+        let commit_result = repo.commit_raw(fuse_leaf, &target).map_err(|e| e.to_string())?;
 
         if !quiet {
             println!("[OK] Merge completed successfully!");

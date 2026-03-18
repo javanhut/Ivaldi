@@ -130,6 +130,50 @@ impl Repo {
         })
     }
 
+    /// Create a raw commit (seal) with a pre-built Leaf on a specific timeline.
+    ///
+    /// Unlike `commit()`, this does NOT read the current timeline, timestamp, or
+    /// auto-set `prev_idx`. The caller is responsible for setting all Leaf fields.
+    /// Used for history import where commit metadata comes from an external source.
+    pub fn commit_raw(&mut self, leaf: Leaf, timeline: &str) -> Result<CommitResult, RepoError> {
+        // Compute hash and seal name
+        let leaf_hash = leaf.hash();
+        let seal_name = seal::generate_seal_name(leaf_hash);
+
+        // Persist leaf canonical bytes
+        let canonical = leaf.canonical_bytes();
+        let idx = self.mmr.size();
+        self.store
+            .put_leaf(idx, &canonical)
+            .map_err(RepoError::Store)?;
+
+        // Append to in-memory MMR
+        let (leaf_idx, root) = self.mmr.append_leaf(leaf);
+
+        // Update timeline head
+        self.store
+            .set_timeline_head(timeline, leaf_idx)
+            .map_err(RepoError::Store)?;
+
+        // Store seal name mapping
+        self.store
+            .put_seal_name(&seal_name, leaf_hash)
+            .map_err(RepoError::Store)?;
+
+        // Store MMR size
+        self.store
+            .set_meta("mmr.size", &self.mmr.size().to_string())
+            .map_err(RepoError::Store)?;
+
+        Ok(CommitResult {
+            index: leaf_idx,
+            hash: leaf_hash,
+            seal_name,
+            root,
+            timeline: timeline.to_string(),
+        })
+    }
+
     /// Get a leaf by index.
     pub fn get_leaf(&self, idx: u64) -> Result<Option<Leaf>, RepoError> {
         match self.store.get_leaf(idx).map_err(RepoError::Store)? {
@@ -950,5 +994,75 @@ mod tests {
             assert_eq!(feat_hist[0].message, "Feature");
             assert_eq!(feat_hist[1].message, "Base");
         }
+    }
+
+    #[test]
+    fn commit_raw_preserves_custom_timestamp() {
+        let (_dir, mut repo) = setup_repo();
+        let tree = B3Hash::digest(b"raw tree");
+        let custom_time: i64 = 1600000000;
+
+        let leaf = Leaf::new(tree, "main", "Imported <imp@test>", custom_time, "Historical commit");
+        let result = repo.commit_raw(leaf, "main").unwrap();
+
+        let stored = repo.get_leaf(result.index).unwrap().unwrap();
+        assert_eq!(stored.time_unix, custom_time);
+        assert_eq!(stored.author, "Imported <imp@test>");
+        assert_eq!(stored.message, "Historical commit");
+        assert_eq!(stored.timeline_id, "main");
+    }
+
+    #[test]
+    fn commit_raw_with_merge_idxs() {
+        let (_dir, mut repo) = setup_repo();
+
+        // Create two parent commits
+        let r0 = repo.commit(B3Hash::digest(b"t0"), "A", "Parent 0").unwrap();
+        let r1 = repo.commit(B3Hash::digest(b"t1"), "A", "Parent 1").unwrap();
+
+        // Create a raw merge commit referencing both parents
+        let mut merge_leaf = Leaf::new(
+            B3Hash::digest(b"merged tree"),
+            "main",
+            "Merger <m@test>",
+            1700000000,
+            "Merge commit",
+        );
+        merge_leaf.prev_idx = r1.index;
+        merge_leaf.merge_idxs = vec![r0.index];
+
+        let result = repo.commit_raw(merge_leaf, "main").unwrap();
+
+        let stored = repo.get_leaf(result.index).unwrap().unwrap();
+        assert!(stored.is_merge());
+        assert_eq!(stored.prev_idx, r1.index);
+        assert_eq!(stored.merge_idxs, vec![r0.index]);
+
+        // Roundtrip: canonical bytes → parse → same merge_idxs
+        let bytes = stored.canonical_bytes();
+        let parsed = crate::leaf::parse_leaf(&bytes).unwrap();
+        assert_eq!(parsed.merge_idxs, vec![r0.index]);
+    }
+
+    #[test]
+    fn commit_raw_sequential_ordering() {
+        let (_dir, mut repo) = setup_repo();
+
+        let leaf0 = Leaf::new(B3Hash::digest(b"t0"), "main", "A", 1000, "First");
+        let r0 = repo.commit_raw(leaf0, "main").unwrap();
+
+        let mut leaf1 = Leaf::new(B3Hash::digest(b"t1"), "main", "A", 2000, "Second");
+        leaf1.prev_idx = r0.index;
+        let r1 = repo.commit_raw(leaf1, "main").unwrap();
+
+        assert_eq!(r0.index, 0);
+        assert_eq!(r1.index, 1);
+        assert_eq!(repo.commit_count(), 2);
+
+        // Walk history should show correct chain
+        let history = repo.walk_history("main").unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].message, "Second");
+        assert_eq!(history[1].message, "First");
     }
 }
