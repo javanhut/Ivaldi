@@ -63,6 +63,7 @@ pub fn forge(work_dir: &Path) -> Result<ForgeResult, ForgeError> {
         "shelves",         // Auto-shelving
         "butterflies",     // Butterfly metadata
         "stage",           // Staging area
+        "reviews",         // Local code reviews
     ];
 
     for dir in &dirs {

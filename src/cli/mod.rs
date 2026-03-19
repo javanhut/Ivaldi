@@ -95,6 +95,10 @@ pub enum Commands {
     /// Sync current timeline with remote (delta only)
     Sync(SyncArgs),
 
+    /// Local code review system
+    #[command(alias = "rv")]
+    Review(ReviewArgs),
+
     /// Open interactive TUI dashboard
     Tui,
 }
@@ -478,6 +482,161 @@ pub struct SyncArgs {
     pub timeline: Option<String>,
 }
 
+#[derive(clap::Args, Debug)]
+pub struct ReviewArgs {
+    #[command(subcommand)]
+    pub command: ReviewCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ReviewCommands {
+    /// Create a new review
+    #[command(alias = "cr")]
+    Create(ReviewCreateArgs),
+
+    /// List reviews
+    #[command(alias = "ls")]
+    List(ReviewListArgs),
+
+    /// Show review details
+    Show(ReviewShowArgs),
+
+    /// Show diff for a review
+    Diff(ReviewDiffArgs),
+
+    /// Add a comment to a review
+    Comment(ReviewCommentArgs),
+
+    /// Approve a review
+    Approve(ReviewApproveArgs),
+
+    /// Request changes on a review
+    RequestChanges(ReviewRequestChangesArgs),
+
+    /// Merge an approved review
+    Merge(ReviewMergeArgs),
+
+    /// Close a review without merging
+    Close(ReviewCloseArgs),
+
+    /// Reopen a closed review
+    Reopen(ReviewReopenArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ReviewCreateArgs {
+    /// Source timeline
+    #[arg(long)]
+    pub source: String,
+
+    /// Target timeline
+    #[arg(long, default_value = "main")]
+    pub target: String,
+
+    /// Review title
+    #[arg(long)]
+    pub title: String,
+
+    /// Review description
+    #[arg(long, default_value = "")]
+    pub description: String,
+
+    /// Fuse strategy (auto, ours, theirs, union, base)
+    #[arg(long, default_value = "auto")]
+    pub strategy: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ReviewListArgs {
+    /// Filter by status
+    #[arg(long)]
+    pub status: Option<String>,
+
+    /// Show all reviews (including merged/closed)
+    #[arg(long)]
+    pub all: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ReviewShowArgs {
+    /// Review ID
+    pub id: u64,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ReviewDiffArgs {
+    /// Review ID
+    pub id: u64,
+
+    /// Show summary statistics only
+    #[arg(long)]
+    pub stat: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ReviewCommentArgs {
+    /// Review ID
+    pub id: u64,
+
+    /// File to comment on
+    #[arg(long)]
+    pub file: String,
+
+    /// Line number (omit for file-level comment)
+    #[arg(long)]
+    pub line: Option<u64>,
+
+    /// Comment body
+    #[arg(long)]
+    pub body: String,
+
+    /// Reply to a specific comment ID
+    #[arg(long)]
+    pub reply_to: Option<u64>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ReviewApproveArgs {
+    /// Review ID
+    pub id: u64,
+
+    /// Optional approval message
+    #[arg(long, default_value = "")]
+    pub body: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ReviewRequestChangesArgs {
+    /// Review ID
+    pub id: u64,
+
+    /// Reason for requesting changes
+    #[arg(long)]
+    pub body: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ReviewMergeArgs {
+    /// Review ID
+    pub id: u64,
+
+    /// Override fuse strategy
+    #[arg(long)]
+    pub strategy: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ReviewCloseArgs {
+    /// Review ID
+    pub id: u64,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ReviewReopenArgs {
+    /// Review ID
+    pub id: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,5 +815,202 @@ mod tests {
     fn parse_tui_command() {
         let cli = Cli::try_parse_from(["ivaldi", "tui"]).unwrap();
         assert!(matches!(cli.command.unwrap(), Commands::Tui));
+    }
+
+    // ---- Review command parsing ----
+
+    #[test]
+    fn parse_review_create() {
+        let cli = Cli::try_parse_from([
+            "ivaldi", "review", "create",
+            "--source", "feature",
+            "--target", "main",
+            "--title", "Add login",
+        ]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Review(args) => match args.command {
+                ReviewCommands::Create(c) => {
+                    assert_eq!(c.source, "feature");
+                    assert_eq!(c.target, "main");
+                    assert_eq!(c.title, "Add login");
+                    assert_eq!(c.strategy, "auto");
+                }
+                _ => panic!("expected Create"),
+            },
+            _ => panic!("expected Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_rv_alias() {
+        let cli = Cli::try_parse_from([
+            "ivaldi", "rv", "create",
+            "--source", "feature",
+            "--title", "Test",
+        ]).unwrap();
+        assert!(matches!(cli.command.unwrap(), Commands::Review(_)));
+    }
+
+    #[test]
+    fn parse_review_list() {
+        let cli = Cli::try_parse_from(["ivaldi", "review", "list"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Review(args) => match args.command {
+                ReviewCommands::List(l) => {
+                    assert!(l.status.is_none());
+                    assert!(!l.all);
+                }
+                _ => panic!("expected List"),
+            },
+            _ => panic!("expected Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_list_with_status() {
+        let cli = Cli::try_parse_from(["ivaldi", "review", "list", "--status", "open"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Review(args) => match args.command {
+                ReviewCommands::List(l) => {
+                    assert_eq!(l.status.as_deref(), Some("open"));
+                }
+                _ => panic!("expected List"),
+            },
+            _ => panic!("expected Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_show() {
+        let cli = Cli::try_parse_from(["ivaldi", "review", "show", "42"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Review(args) => match args.command {
+                ReviewCommands::Show(s) => assert_eq!(s.id, 42),
+                _ => panic!("expected Show"),
+            },
+            _ => panic!("expected Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_diff() {
+        let cli = Cli::try_parse_from(["ivaldi", "review", "diff", "1", "--stat"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Review(args) => match args.command {
+                ReviewCommands::Diff(d) => {
+                    assert_eq!(d.id, 1);
+                    assert!(d.stat);
+                }
+                _ => panic!("expected Diff"),
+            },
+            _ => panic!("expected Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_comment() {
+        let cli = Cli::try_parse_from([
+            "ivaldi", "review", "comment", "1",
+            "--file", "src/main.rs",
+            "--line", "42",
+            "--body", "Fix this",
+        ]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Review(args) => match args.command {
+                ReviewCommands::Comment(c) => {
+                    assert_eq!(c.id, 1);
+                    assert_eq!(c.file, "src/main.rs");
+                    assert_eq!(c.line, Some(42));
+                    assert_eq!(c.body, "Fix this");
+                }
+                _ => panic!("expected Comment"),
+            },
+            _ => panic!("expected Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_approve() {
+        let cli = Cli::try_parse_from(["ivaldi", "review", "approve", "3"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Review(args) => match args.command {
+                ReviewCommands::Approve(a) => assert_eq!(a.id, 3),
+                _ => panic!("expected Approve"),
+            },
+            _ => panic!("expected Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_request_changes() {
+        let cli = Cli::try_parse_from([
+            "ivaldi", "review", "request-changes", "1",
+            "--body", "Needs work",
+        ]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Review(args) => match args.command {
+                ReviewCommands::RequestChanges(rc) => {
+                    assert_eq!(rc.id, 1);
+                    assert_eq!(rc.body, "Needs work");
+                }
+                _ => panic!("expected RequestChanges"),
+            },
+            _ => panic!("expected Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_merge() {
+        let cli = Cli::try_parse_from(["ivaldi", "review", "merge", "5"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Review(args) => match args.command {
+                ReviewCommands::Merge(m) => {
+                    assert_eq!(m.id, 5);
+                    assert!(m.strategy.is_none());
+                }
+                _ => panic!("expected Merge"),
+            },
+            _ => panic!("expected Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_merge_with_strategy() {
+        let cli = Cli::try_parse_from([
+            "ivaldi", "review", "merge", "5", "--strategy", "theirs",
+        ]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Review(args) => match args.command {
+                ReviewCommands::Merge(m) => {
+                    assert_eq!(m.strategy.as_deref(), Some("theirs"));
+                }
+                _ => panic!("expected Merge"),
+            },
+            _ => panic!("expected Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_close() {
+        let cli = Cli::try_parse_from(["ivaldi", "review", "close", "2"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Review(args) => match args.command {
+                ReviewCommands::Close(c) => assert_eq!(c.id, 2),
+                _ => panic!("expected Close"),
+            },
+            _ => panic!("expected Review"),
+        }
+    }
+
+    #[test]
+    fn parse_review_reopen() {
+        let cli = Cli::try_parse_from(["ivaldi", "review", "reopen", "2"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Review(args) => match args.command {
+                ReviewCommands::Reopen(r) => assert_eq!(r.id, 2),
+                _ => panic!("expected Reopen"),
+            },
+            _ => panic!("expected Review"),
+        }
     }
 }

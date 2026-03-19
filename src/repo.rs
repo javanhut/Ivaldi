@@ -482,6 +482,73 @@ impl Repo {
         self.ivaldi_dir.join("MERGE_STATE").exists()
     }
 
+    // -- Review persistence --
+
+    /// Path to the reviews directory.
+    pub fn reviews_dir(&self) -> std::path::PathBuf {
+        self.ivaldi_dir.join("reviews")
+    }
+
+    /// Get the next review ID and increment the counter.
+    pub fn next_review_id(&self) -> Result<u64, RepoError> {
+        let current = self
+            .store
+            .get_meta("review.next_id")
+            .map_err(RepoError::Store)?
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1);
+        self.store
+            .set_meta("review.next_id", &(current + 1).to_string())
+            .map_err(RepoError::Store)?;
+        Ok(current)
+    }
+
+    /// Save a review to its JSON file.
+    pub fn save_review(&self, review: &crate::review::Review) -> Result<(), RepoError> {
+        let dir = self.reviews_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| RepoError::Other(e.to_string()))?;
+        let path = dir.join(format!("{}.json", review.id));
+        let data = serde_json::to_string_pretty(review)
+            .map_err(|e| RepoError::Other(e.to_string()))?;
+        std::fs::write(&path, data).map_err(|e| RepoError::Other(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load a review by ID.
+    pub fn load_review(&self, id: u64) -> Result<Option<crate::review::Review>, RepoError> {
+        let path = self.reviews_dir().join(format!("{}.json", id));
+        match std::fs::read_to_string(&path) {
+            Ok(data) => {
+                let review = serde_json::from_str(&data)
+                    .map_err(|e| RepoError::Other(e.to_string()))?;
+                Ok(Some(review))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(RepoError::Other(e.to_string())),
+        }
+    }
+
+    /// List all reviews.
+    pub fn list_reviews(&self) -> Result<Vec<crate::review::Review>, RepoError> {
+        let dir = self.reviews_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut reviews = Vec::new();
+        let entries = std::fs::read_dir(&dir).map_err(|e| RepoError::Other(e.to_string()))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "json") {
+                let data =
+                    std::fs::read_to_string(&path).map_err(|e| RepoError::Other(e.to_string()))?;
+                let review: crate::review::Review =
+                    serde_json::from_str(&data).map_err(|e| RepoError::Other(e.to_string()))?;
+                reviews.push(review);
+            }
+        }
+        Ok(reviews)
+    }
+
     // -- Butterfly sync --
 
     /// Sync butterfly up: merge butterfly changes into parent timeline.

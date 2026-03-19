@@ -20,6 +20,7 @@ use crate::tui::views::fuse::FuseView;
 use crate::tui::views::log::LogView;
 use crate::tui::views::remote::RemoteView;
 use crate::tui::views::status::StatusView;
+use crate::tui::views::review::ReviewView;
 use crate::tui::views::timeline::TimelineView;
 
 /// Run the TUI dashboard.
@@ -51,6 +52,7 @@ struct App {
     timeline_view: TimelineView,
     remote_view: RemoteView,
     fuse_view: FuseView,
+    review_view: ReviewView,
 }
 
 impl App {
@@ -70,6 +72,7 @@ impl App {
             timeline_view: TimelineView::new(),
             remote_view: RemoteView::new(),
             fuse_view: FuseView::new(),
+            review_view: ReviewView::new(),
         }
     }
 
@@ -81,6 +84,7 @@ impl App {
             TabId::Timelines => &self.timeline_view,
             TabId::Remote => &self.remote_view,
             TabId::Fuse => &self.fuse_view,
+            TabId::Review => &self.review_view,
         }
     }
 
@@ -92,6 +96,7 @@ impl App {
             TabId::Timelines => self.timeline_view.load_data(&self.ctx),
             TabId::Remote => self.remote_view.load_data(&self.ctx),
             TabId::Fuse => self.fuse_view.load_data(&self.ctx),
+            TabId::Review => self.review_view.load_data(&self.ctx),
         }
         self.refresh_status();
     }
@@ -155,6 +160,7 @@ impl App {
                             KeyCode::Char('4') => self.switch_tab(TabId::Timelines),
                             KeyCode::Char('5') => self.switch_tab(TabId::Remote),
                             KeyCode::Char('6') => self.switch_tab(TabId::Fuse),
+                            KeyCode::Char('7') => self.switch_tab(TabId::Review),
                             KeyCode::Tab => {
                                 let next = (self.active_tab.index() + 1) % TabId::ALL.len();
                                 if let Some(tab) = TabId::from_index(next) {
@@ -205,6 +211,9 @@ impl App {
                         }
                         TabId::Remote => self.remote_view.handle_event(&key, &mut self.ctx),
                         TabId::Fuse => self.fuse_view.handle_event(&key, &mut self.ctx),
+                        TabId::Review => {
+                            self.review_view.handle_event(&key, &mut self.ctx)
+                        }
                     };
 
                     self.handle_action(action);

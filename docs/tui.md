@@ -64,10 +64,62 @@ Per-file conflict resolution during fuse operations.
 3. Keep BOTH (concatenate)
 4. Skip this file
 
+## Dashboard Tabs (`ivaldi tui`)
+
+The TUI dashboard has 7 tabs, switchable with number keys or Tab/Shift+Tab:
+
+| Key | Tab | View |
+|-----|-----|------|
+| 1 | Status | Repository status overview |
+| 2 | Log | Commit history |
+| 3 | Diff | Change comparison |
+| 4 | Timelines | Timeline management |
+| 5 | Remote | Remote operations |
+| 6 | Fuse | Merge timelines |
+| 7 | Review | Local code review |
+
+### Review Tab (`tui/views/review.rs`)
+
+Local code review management with three sub-modes:
+
+**List Mode** — Browse all reviews with status icons.
+
+| Key | Action |
+|-----|--------|
+| j/k | Navigate up/down |
+| Enter | Open review detail |
+| r | Refresh list |
+
+**Detail Mode** — View a single review with comments and verdicts.
+
+| Key | Action |
+|-----|--------|
+| j/k | Scroll up/down |
+| d | View diff between source/target |
+| C | Add comment (opens dialog) |
+| a | Approve review |
+| x | Request changes |
+| m | Merge (requires approval, asks for confirmation) |
+| q | Close review (asks for confirmation) |
+| Esc | Back to list |
+
+**Diff Mode** — File-level changes between source and target timelines.
+
+| Key | Action |
+|-----|--------|
+| j/k | Scroll up/down |
+| g/G | Jump to top/bottom |
+| Esc | Back to detail |
+
 ## Architecture
 
 ```
 tui/mod.rs       — Terminal init/restore helpers
+tui/app.rs       — Dashboard app loop, tab dispatch
+tui/types.rs     — TabId, Action, AppContext
+tui/theme.rs     — Color themes
+tui/views/       — Tab view implementations (status, log, diff, timeline, remote, fuse, review)
+tui/components/  — Reusable widgets (tab_bar, status_bar, file_list, diff_view, dialog)
 tui/travel.rs    — History browser
 tui/shift.rs     — Squash range selector
 tui/resolver.rs  — Conflict resolver

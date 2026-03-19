@@ -6,6 +6,7 @@ pub mod diff;
 pub mod timeline;
 pub mod remote;
 pub mod fuse;
+pub mod review;
 pub mod help;
 
 use crossterm::event::KeyEvent;

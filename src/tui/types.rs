@@ -13,16 +13,18 @@ pub enum TabId {
     Timelines,
     Remote,
     Fuse,
+    Review,
 }
 
 impl TabId {
-    pub const ALL: [TabId; 6] = [
+    pub const ALL: [TabId; 7] = [
         TabId::Status,
         TabId::Log,
         TabId::Diff,
         TabId::Timelines,
         TabId::Remote,
         TabId::Fuse,
+        TabId::Review,
     ];
 
     pub fn label(self) -> &'static str {
@@ -33,6 +35,7 @@ impl TabId {
             TabId::Timelines => "Timelines",
             TabId::Remote => "Remote",
             TabId::Fuse => "Fuse",
+            TabId::Review => "Review",
         }
     }
 
@@ -44,6 +47,7 @@ impl TabId {
             TabId::Timelines => 3,
             TabId::Remote => 4,
             TabId::Fuse => 5,
+            TabId::Review => 6,
         }
     }
 
@@ -55,6 +59,7 @@ impl TabId {
             3 => Some(TabId::Timelines),
             4 => Some(TabId::Remote),
             5 => Some(TabId::Fuse),
+            6 => Some(TabId::Review),
             _ => None,
         }
     }
@@ -109,7 +114,7 @@ mod tests {
 
     #[test]
     fn tab_id_from_index_out_of_range() {
-        assert_eq!(TabId::from_index(6), None);
+        assert_eq!(TabId::from_index(7), None);
         assert_eq!(TabId::from_index(99), None);
     }
 

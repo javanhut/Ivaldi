@@ -20,6 +20,7 @@ pub mod auth;
 pub mod remote;
 pub mod store;
 pub mod repo;
+pub mod review;
 pub mod github;
 pub mod sync;
 pub mod color;

@@ -27,6 +27,7 @@ Command-line interface for Ivaldi VCS, built with `clap`.
 | `upload` | | Push (transport pending) |
 | `scout` | | Discover remotes (transport pending) |
 | `harvest` | | Fetch branches (transport pending) |
+| `review create/list/show/diff/comment/approve/request-changes/merge/close/reopen` | `rv` | Local code review system |
 
 ## Global Flags
 
