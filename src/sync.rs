@@ -9,7 +9,7 @@ use std::path::Path;
 
 use crate::cas::{Cas, FileCas};
 use crate::fsmerkle::FsStore;
-use crate::github::{GitHubClient, GitHubError, TreeEntryCreate};
+use crate::github::{GitHubClient, GitHubError, TreeEntryCreate, TreeResponse};
 use crate::hash::B3Hash;
 use crate::ignore;
 use crate::leaf::Leaf;
@@ -511,6 +511,133 @@ fn import_full_history_into(
         fs::write(&ref_path, "").ok();
     }
 
+    // Identify unskipped commits (those not already mapped)
+    let unskipped: Vec<usize> = commits.iter().enumerate()
+        .filter(|(_, c)| hash_mapping.get_blake3(&c.sha).is_none())
+        .map(|(i, _)| i)
+        .collect();
+
+    // Collect unique tree SHAs from unskipped commits
+    let unique_tree_shas: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        unskipped.iter()
+            .map(|&i| commits[i].commit.tree.sha.clone())
+            .filter(|sha| seen.insert(sha.clone()))
+            .collect()
+    };
+
+    // --- Phase 2: Parallel tree pre-fetch ---
+    let prefetched_trees: HashMap<String, TreeResponse> = if !unique_tree_shas.is_empty() {
+        let pb_trees = crate::progress::file_bar(unique_tree_shas.len() as u64, "Fetching trees");
+        let results: Vec<(String, Result<TreeResponse, GitHubError>)> = std::thread::scope(|s| {
+            let chunk_size = (unique_tree_shas.len() / 8).max(1);
+            let mut handles = Vec::new();
+            for chunk in unique_tree_shas.chunks(chunk_size) {
+                let pb_trees = &pb_trees;
+                let handle = s.spawn(move || {
+                    let mut results = Vec::new();
+                    for sha in chunk {
+                        let r = client.get_tree(owner, repo_name, sha);
+                        pb_trees.inc(1);
+                        results.push((sha.clone(), r));
+                    }
+                    results
+                });
+                handles.push(handle);
+            }
+            handles.into_iter()
+                .flat_map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
+        pb_trees.finish_with_message(format!("{} trees fetched", unique_tree_shas.len()));
+
+        let mut map = HashMap::new();
+        for (sha, result) in results {
+            match result {
+                Ok(tree) => { map.insert(sha, tree); }
+                Err(e) => {
+                    crate::logging::warn(&format!("failed to pre-fetch tree {}: {}", sha, e));
+                }
+            }
+        }
+        map
+    } else {
+        HashMap::new()
+    };
+
+    // --- Phase 3: Global blob batch download ---
+    // Collect all unique blobs from pre-fetched trees that we don't already have
+    let mut blobs_to_download: Vec<(String, String, String)> = Vec::new(); // (path, sha1, commit_sha)
+    let mut seen_blob_shas: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for &idx in &unskipped {
+        let commit = &commits[idx];
+        let tree_sha = &commit.commit.tree.sha;
+        if let Some(tree) = prefetched_trees.get(tree_sha) {
+            for entry in &tree.tree {
+                if entry.entry_type == "blob"
+                    && hash_mapping.get_blake3(&entry.sha).is_none()
+                    && seen_blob_shas.insert(entry.sha.clone())
+                {
+                    blobs_to_download.push((
+                        entry.path.clone(),
+                        entry.sha.clone(),
+                        commit.sha.clone(),
+                    ));
+                }
+            }
+        }
+    }
+
+    if !blobs_to_download.is_empty() {
+        let pb_blobs = crate::progress::file_bar(blobs_to_download.len() as u64, "Downloading blobs");
+        let blob_results: Vec<Result<(String, String, Vec<u8>), String>> = std::thread::scope(|s| {
+            let chunk_size = (blobs_to_download.len() / 8).max(1);
+            let mut handles = Vec::new();
+            for chunk in blobs_to_download.chunks(chunk_size) {
+                let pb_blobs = &pb_blobs;
+                let handle = s.spawn(move || {
+                    let mut results = Vec::new();
+                    for (path, sha1, commit_sha) in chunk {
+                        match client.download_file(owner, repo_name, path, commit_sha) {
+                            Ok(content) => {
+                                pb_blobs.inc(1);
+                                results.push(Ok((path.clone(), sha1.clone(), content)));
+                            }
+                            Err(e) => {
+                                pb_blobs.inc(1);
+                                results.push(Err(format!("failed to download {}: {}", path, e)));
+                            }
+                        }
+                    }
+                    results
+                });
+                handles.push(handle);
+            }
+            handles.into_iter()
+                .flat_map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
+        pb_blobs.finish_with_message(format!("{} blobs downloaded", blobs_to_download.len()));
+
+        // Store in CAS and update hash_mapping (serial — CAS is not Sync)
+        for result in blob_results {
+            match result {
+                Ok((_, sha1, content)) => {
+                    let (b3_hash, _) = store
+                        .put_blob(&content)
+                        .map_err(|e| SyncError::Other(e.to_string()))?;
+                    hash_mapping.insert(&sha1, b3_hash);
+                    blobs_downloaded += 1;
+                }
+                Err(msg) => {
+                    crate::logging::warn(&msg);
+                }
+            }
+        }
+    }
+
+    // --- Phase 4: Commit loop using build_tree_from_hash_map ---
     let total = commits.len();
     let pb = crate::progress::file_bar(total as u64, "Importing commits");
 
@@ -520,7 +647,6 @@ fn import_full_history_into(
         // Skip if already mapped
         if hash_mapping.get_blake3(&commit.sha).is_some() {
             // Still populate sha_to_idx from existing data for parent resolution
-            // We need to find the existing leaf index by walking
             if let Some(b3) = hash_mapping.get_blake3(&commit.sha) {
                 // Search for leaf with this hash
                 for idx in 0..repo.commit_count() {
@@ -536,48 +662,31 @@ fn import_full_history_into(
             continue;
         }
 
-        // Fetch tree (with caching)
+        // Build tree using hash-based approach (Phase 4 optimization)
         let tree_sha = &commit.commit.tree.sha;
         let ivaldi_tree_hash = if let Some(&cached) = tree_cache.get(tree_sha) {
             cached
         } else {
-            let tree = client
-                .get_tree(owner, repo_name, tree_sha)
-                .map_err(SyncError::GitHub)?;
+            // Look up pre-fetched tree, fall back to live fetch
+            let tree = match prefetched_trees.get(tree_sha) {
+                Some(t) => t.clone(),
+                None => client.get_tree(owner, repo_name, tree_sha).map_err(SyncError::GitHub)?,
+            };
 
-            // Download blobs and build file map
-            let mut file_map: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-            let blob_entries: Vec<_> = tree.tree.iter().filter(|e| e.entry_type == "blob").collect();
-
-            for entry in &blob_entries {
-                // Check if we already have this blob via hash mapping
-                if let Some(b3) = hash_mapping.get_blake3(&entry.sha) {
-                    if cas.has(b3).unwrap_or(false) {
-                        // Load from CAS instead of re-downloading
-                        if let Ok((_, content)) = store.load_blob(b3) {
-                            file_map.insert(entry.path.clone(), content);
-                            continue;
-                        }
+            // Build hash map from tree entries — pure HashMap lookups, zero disk I/O
+            let mut hash_file_map: BTreeMap<String, B3Hash> = BTreeMap::new();
+            for entry in &tree.tree {
+                if entry.entry_type == "blob" {
+                    if let Some(b3) = hash_mapping.get_blake3(&entry.sha) {
+                        hash_file_map.insert(entry.path.clone(), b3);
                     }
-                }
-
-                match client.download_file(owner, repo_name, &entry.path, &commit.sha) {
-                    Ok(content) => {
-                        let (blob_hash, _) = store
-                            .put_blob(&content)
-                            .map_err(|e| SyncError::Other(e.to_string()))?;
-                        hash_mapping.insert(&entry.sha, blob_hash);
-                        blobs_downloaded += 1;
-                        file_map.insert(entry.path.clone(), content);
-                    }
-                    Err(e) => {
-                        crate::logging::warn(&format!("failed to download {}: {}", entry.path, e));
-                    }
+                    // else: blob wasn't downloaded (error during batch) — skip
                 }
             }
 
+            // Build Merkle tree from hashes only — NO blob content reads
             let tree_hash = store
-                .build_tree_from_map(&file_map)
+                .build_tree_from_hash_map(&hash_file_map)
                 .map_err(|e| SyncError::Other(e.to_string()))?;
             tree_cache.insert(tree_sha.clone(), tree_hash);
             tree_hash

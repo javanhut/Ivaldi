@@ -18,16 +18,24 @@ const ACCEPT: &str = "application/vnd.github.v3+json";
 
 pub struct GitHubClient {
     token: Option<String>,
+    agent: ureq::Agent,
+}
+
+fn make_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(30))
+        .timeout_read(std::time::Duration::from_secs(60))
+        .build()
 }
 
 impl GitHubClient {
     pub fn new() -> Self {
         let token = auth::resolve_auth(Platform::GitHub).map(|m| m.token);
-        Self { token }
+        Self { token, agent: make_agent() }
     }
 
     pub fn with_token(token: impl Into<String>) -> Self {
-        Self { token: Some(token.into()) }
+        Self { token: Some(token.into()), agent: make_agent() }
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -40,7 +48,7 @@ impl GitHubClient {
         } else {
             format!("{}{}", GITHUB_API, path)
         };
-        let mut r = ureq::request(method, &url)
+        let mut r = self.agent.request(method, &url)
             .set("Accept", ACCEPT)
             .set("User-Agent", "ivaldi-vcs/0.1.0");
         if let Some(ref t) = self.token {
@@ -254,9 +262,9 @@ pub struct TreeRef { pub sha: String }
 #[derive(Debug, Deserialize)]
 pub struct ParentRef { pub sha: String }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TreeResponse { pub sha: String, pub tree: Vec<TreeEntry>, #[serde(default)] pub truncated: bool }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TreeEntry { pub path: String, pub mode: String, #[serde(rename = "type")] pub entry_type: String, #[serde(default)] pub size: Option<u64>, pub sha: String }
 
 #[derive(Debug, Serialize)]
