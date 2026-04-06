@@ -1,13 +1,13 @@
 //! Tab view trait and implementations.
 
-pub mod status;
-pub mod log;
 pub mod diff;
-pub mod timeline;
-pub mod remote;
 pub mod fuse;
-pub mod review;
 pub mod help;
+pub mod log;
+pub mod remote;
+pub mod review;
+pub mod status;
+pub mod timeline;
 
 use crossterm::event::KeyEvent;
 use ratatui::prelude::*;

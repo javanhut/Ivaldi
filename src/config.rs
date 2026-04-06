@@ -153,9 +153,7 @@ pub fn load_config(ivaldi_dir: &Path) -> Config {
 
 /// Get home directory path.
 fn dirs_path() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(PathBuf::from)
+    std::env::var("HOME").ok().map(PathBuf::from)
 }
 
 #[derive(Debug, thiserror::Error)]

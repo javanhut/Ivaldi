@@ -32,7 +32,9 @@ pub fn scan_all_objects(objects_dir: &Path) -> Result<Vec<(B3Hash, PathBuf, u64)
             continue;
         }
         let shard_name = shard_entry.file_name().to_string_lossy().to_string();
-        if shard_name.len() != 2 { continue; }
+        if shard_name.len() != 2 {
+            continue;
+        }
 
         let shard_entries = fs::read_dir(shard_entry.path()).map_err(GcError::Io)?;
         for obj_entry in shard_entries.flatten() {

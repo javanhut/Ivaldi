@@ -54,16 +54,16 @@ pub fn forge(work_dir: &Path) -> Result<ForgeResult, ForgeError> {
 
     // Create directory structure
     let dirs = [
-        "",                // .ivaldi/
-        "objects",         // CAS
-        "refs",            // References root
-        "refs/heads",      // Timeline heads
-        "refs/remotes",    // Remote refs
-        "refs/seals",      // Seal name mappings
-        "shelves",         // Auto-shelving
-        "butterflies",     // Butterfly metadata
-        "stage",           // Staging area
-        "reviews",         // Local code reviews
+        "",             // .ivaldi/
+        "objects",      // CAS
+        "refs",         // References root
+        "refs/heads",   // Timeline heads
+        "refs/remotes", // Remote refs
+        "refs/seals",   // Seal name mappings
+        "shelves",      // Auto-shelving
+        "butterflies",  // Butterfly metadata
+        "stage",        // Staging area
+        "reviews",      // Local code reviews
     ];
 
     for dir in &dirs {
@@ -81,9 +81,12 @@ pub fn forge(work_dir: &Path) -> Result<ForgeResult, ForgeError> {
 
     // Create default config
     let config = Config::new();
-    config
-        .save(&ivaldi_dir.join("config"))
-        .map_err(|e| ForgeError::Io(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())))?;
+    config.save(&ivaldi_dir.join("config")).map_err(|e| {
+        ForgeError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e.to_string(),
+        ))
+    })?;
 
     // Detect and import from existing .git/ if present
     let git_imported = detect_and_import_git(work_dir, &ivaldi_dir);
@@ -111,7 +114,10 @@ fn detect_and_import_git(work_dir: &Path, ivaldi_dir: &Path) -> usize {
         let head = head_content.trim();
         if let Some(ref_path) = head.strip_prefix("ref: refs/heads/") {
             // Write Ivaldi HEAD pointing to same branch
-            let _ = fs::write(ivaldi_dir.join("HEAD"), format!("ref: refs/heads/{}\n", ref_path));
+            let _ = fs::write(
+                ivaldi_dir.join("HEAD"),
+                format!("ref: refs/heads/{}\n", ref_path),
+            );
         }
     }
 

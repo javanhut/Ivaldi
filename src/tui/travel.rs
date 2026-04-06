@@ -18,7 +18,10 @@ use crate::repo::HistoryEntry;
 #[derive(Debug, Clone)]
 pub enum TravelAction {
     /// Create a new timeline from this seal.
-    Diverge { seal_index: u64, new_timeline: String },
+    Diverge {
+        seal_index: u64,
+        new_timeline: String,
+    },
     /// Reset current timeline to this seal.
     Overwrite { seal_index: u64 },
     /// User cancelled.
@@ -38,11 +41,14 @@ impl TravelState {
         match &self.search {
             Some(q) => {
                 let q = q.to_lowercase();
-                self.entries.iter().filter(|e| {
-                    e.message.to_lowercase().contains(&q)
-                        || e.author.to_lowercase().contains(&q)
-                        || e.seal_name.to_lowercase().contains(&q)
-                }).collect()
+                self.entries
+                    .iter()
+                    .filter(|e| {
+                        e.message.to_lowercase().contains(&q)
+                            || e.author.to_lowercase().contains(&q)
+                            || e.seal_name.to_lowercase().contains(&q)
+                    })
+                    .collect()
             }
             None => self.entries.iter().collect(),
         }
@@ -77,26 +83,39 @@ pub fn run_travel(
         terminal.draw(|frame| draw_travel(frame, &state))?;
 
         if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press { continue; }
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break TravelAction::Cancel,
                 KeyCode::Up => {
-                    if state.cursor > 0 { state.cursor -= 1; }
+                    if state.cursor > 0 {
+                        state.cursor -= 1;
+                    }
                     adjust_offset(&mut state, frame_height());
                 }
                 KeyCode::Down => {
-                    if state.cursor + 1 < state.total() { state.cursor += 1; }
+                    if state.cursor + 1 < state.total() {
+                        state.cursor += 1;
+                    }
                     adjust_offset(&mut state, frame_height());
                 }
-                KeyCode::Home => { state.cursor = 0; state.offset = 0; }
+                KeyCode::Home => {
+                    state.cursor = 0;
+                    state.offset = 0;
+                }
                 KeyCode::End => {
                     let total = state.total();
-                    if total > 0 { state.cursor = total - 1; }
+                    if total > 0 {
+                        state.cursor = total - 1;
+                    }
                     adjust_offset(&mut state, frame_height());
                 }
                 KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                     let n = (c as usize) - ('0' as usize);
-                    if n <= state.total() { state.cursor = n - 1; }
+                    if n <= state.total() {
+                        state.cursor = n - 1;
+                    }
                     adjust_offset(&mut state, frame_height());
                 }
                 KeyCode::Enter => {
@@ -116,7 +135,9 @@ pub fn run_travel(
     Ok(result)
 }
 
-fn frame_height() -> usize { 10 } // approximate visible items
+fn frame_height() -> usize {
+    10
+} // approximate visible items
 
 fn adjust_offset(state: &mut TravelState, visible: usize) {
     if state.cursor < state.offset {
@@ -133,8 +154,16 @@ fn draw_travel(frame: &mut Frame, state: &TravelState) {
 
     // Header
     let header_area = Rect { height: 3, ..area };
-    let list_area = Rect { y: 3, height: area.height.saturating_sub(6), ..area };
-    let footer_area = Rect { y: area.height.saturating_sub(3), height: 3, ..area };
+    let list_area = Rect {
+        y: 3,
+        height: area.height.saturating_sub(6),
+        ..area
+    };
+    let footer_area = Rect {
+        y: area.height.saturating_sub(3),
+        height: 3,
+        ..area
+    };
 
     let visible = list_area.height as usize;
 
@@ -150,7 +179,9 @@ fn draw_travel(frame: &mut Frame, state: &TravelState) {
     frame.render_widget(header, header_area);
 
     // Entry list
-    let items: Vec<ListItem> = filtered.iter().enumerate()
+    let items: Vec<ListItem> = filtered
+        .iter()
+        .enumerate()
         .skip(state.offset)
         .take(visible)
         .map(|(i, entry)| {
@@ -158,9 +189,14 @@ fn draw_travel(frame: &mut Frame, state: &TravelState) {
             let head = if i == 0 { " [HEAD]" } else { "" };
             let text = format!(
                 "{} {}. {} ({}){}\n     {}\n     {} • {}",
-                marker, i + 1, entry.seal_name, entry.short_hash, head,
+                marker,
+                i + 1,
+                entry.seal_name,
+                entry.short_hash,
+                head,
                 entry.message,
-                entry.author, entry.time_unix,
+                entry.author,
+                entry.time_unix,
             );
             ListItem::new(text)
         })
@@ -200,7 +236,10 @@ fn prompt_travel_action(seal_index: u64) -> std::io::Result<TravelAction> {
             if name.is_empty() {
                 Ok(TravelAction::Cancel)
             } else {
-                Ok(TravelAction::Diverge { seal_index, new_timeline: name })
+                Ok(TravelAction::Diverge {
+                    seal_index,
+                    new_timeline: name,
+                })
             }
         }
         "2" => {

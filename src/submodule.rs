@@ -113,17 +113,23 @@ impl SubmoduleManager {
             for line in content.lines() {
                 let parts: Vec<&str> = line.splitn(4, '\t').collect();
                 if parts.len() >= 3 {
-                    modules.insert(parts[0].to_string(), Submodule {
-                        name: parts[0].to_string(),
-                        path: parts[1].to_string(),
-                        url: parts[2].to_string(),
-                        branch: parts.get(3).map(|s| s.to_string()),
-                    });
+                    modules.insert(
+                        parts[0].to_string(),
+                        Submodule {
+                            name: parts[0].to_string(),
+                            path: parts[1].to_string(),
+                            url: parts[2].to_string(),
+                            branch: parts.get(3).map(|s| s.to_string()),
+                        },
+                    );
                 }
             }
         }
 
-        Self { modules, ivaldi_dir: ivaldi_dir.to_path_buf() }
+        Self {
+            modules,
+            ivaldi_dir: ivaldi_dir.to_path_buf(),
+        }
     }
 
     pub fn add(&mut self, module: Submodule) {
@@ -159,7 +165,9 @@ mod tests {
     #[test]
     fn parse_gitmodules_file() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join(".gitmodules"), r#"
+        fs::write(
+            dir.path().join(".gitmodules"),
+            r#"
 [submodule "lib/crypto"]
     path = lib/crypto
     url = https://github.com/example/crypto.git
@@ -168,7 +176,9 @@ mod tests {
 [submodule "vendor/tools"]
     path = vendor/tools
     url = https://github.com/example/tools.git
-"#).unwrap();
+"#,
+        )
+        .unwrap();
 
         let modules = parse_gitmodules(dir.path());
         assert_eq!(modules.len(), 2);

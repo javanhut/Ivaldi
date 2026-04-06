@@ -6,7 +6,9 @@ use ratatui::widgets::Paragraph;
 
 use crate::cas::Cas;
 use crate::ignore;
-use crate::tui::components::diff_view::{compute_line_diff, DiffLine, DiffLineKind, DiffViewWidget};
+use crate::tui::components::diff_view::{
+    DiffLine, DiffLineKind, DiffViewWidget, compute_line_diff,
+};
 use crate::tui::theme::Theme;
 use crate::tui::types::{Action, AppContext};
 use crate::tui::views::TabView;
@@ -72,11 +74,12 @@ impl TabView for DiffTabView {
 
     fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if self.diff_view.lines.is_empty() {
-            let mode = if self.show_staged { "staged" } else { "working" };
-            let msg = Paragraph::new(Span::styled(
-                format!("No {} changes", mode),
-                theme.dim,
-            ));
+            let mode = if self.show_staged {
+                "staged"
+            } else {
+                "working"
+            };
+            let msg = Paragraph::new(Span::styled(format!("No {} changes", mode), theme.dim));
             frame.render_widget(msg, area);
         } else {
             self.diff_view.render(frame, area, theme);
@@ -90,9 +93,16 @@ impl TabView for DiffTabView {
                 width: area.width,
                 height: 1,
             };
-            let mode = if self.show_staged { "staged" } else { "working" };
+            let mode = if self.show_staged {
+                "staged"
+            } else {
+                "working"
+            };
             let help = Paragraph::new(Span::styled(
-                format!(" j/k:scroll n/p:file s:toggle({}) g/G:top/bottom r:refresh", mode),
+                format!(
+                    " j/k:scroll n/p:file s:toggle({}) g/G:top/bottom r:refresh",
+                    mode
+                ),
                 theme.dim,
             ));
             frame.render_widget(help, help_area);
@@ -108,9 +118,15 @@ impl TabView for DiffTabView {
             .repo
             .walk_history(&timeline)
             .ok()
-            .and_then(|h| h.first().map(|e| {
-                ctx.repo.get_leaf(e.index).ok().flatten().map(|l| l.tree_root)
-            }))
+            .and_then(|h| {
+                h.first().map(|e| {
+                    ctx.repo
+                        .get_leaf(e.index)
+                        .ok()
+                        .flatten()
+                        .map(|l| l.tree_root)
+                })
+            })
             .flatten();
 
         let files = ws.status(last_tree, &ignore).unwrap_or_default();
@@ -121,7 +137,10 @@ impl TabView for DiffTabView {
             let dominated = if self.show_staged {
                 matches!(file.state, FileState::Staged)
             } else {
-                matches!(file.state, FileState::Modified | FileState::Untracked | FileState::Deleted)
+                matches!(
+                    file.state,
+                    FileState::Modified | FileState::Untracked | FileState::Deleted
+                )
             };
 
             if !dominated {

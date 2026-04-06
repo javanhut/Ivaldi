@@ -109,10 +109,7 @@ impl ButterflyManager {
 
     /// Get children of a timeline (butterflies that branch from it).
     pub fn get_children(&self, name: &str) -> Vec<String> {
-        self.children
-            .get(name)
-            .cloned()
-            .unwrap_or_default()
+        self.children.get(name).cloned().unwrap_or_default()
     }
 
     /// Get the divergence hash for a butterfly.
@@ -308,10 +305,8 @@ mod tests {
     fn delete_without_cascade_orphans_children() {
         let mut mgr = ButterflyManager::new();
         mgr.create("parent-bf", "main", B3Hash::ZERO, 0).unwrap();
-        mgr.create("child-a", "parent-bf", B3Hash::ZERO, 0)
-            .unwrap();
-        mgr.create("child-b", "parent-bf", B3Hash::ZERO, 0)
-            .unwrap();
+        mgr.create("child-a", "parent-bf", B3Hash::ZERO, 0).unwrap();
+        mgr.create("child-b", "parent-bf", B3Hash::ZERO, 0).unwrap();
 
         let deleted = mgr.delete("parent-bf", false).unwrap();
         assert_eq!(deleted, vec!["parent-bf"]);
@@ -331,8 +326,7 @@ mod tests {
     fn delete_with_cascade() {
         let mut mgr = ButterflyManager::new();
         mgr.create("parent-bf", "main", B3Hash::ZERO, 0).unwrap();
-        mgr.create("child-a", "parent-bf", B3Hash::ZERO, 0)
-            .unwrap();
+        mgr.create("child-a", "parent-bf", B3Hash::ZERO, 0).unwrap();
         mgr.create("grandchild", "child-a", B3Hash::ZERO, 0)
             .unwrap();
 

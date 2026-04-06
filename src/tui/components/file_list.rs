@@ -123,12 +123,10 @@ impl FileListWidget {
             })
             .collect();
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                format!(" {} ({}) ", title, self.items.len()),
-                theme.title,
-            ));
+        let block = Block::default().borders(Borders::ALL).title(Span::styled(
+            format!(" {} ({}) ", title, self.items.len()),
+            theme.title,
+        ));
 
         let list = List::new(items).block(block);
         frame.render_widget(list, area);

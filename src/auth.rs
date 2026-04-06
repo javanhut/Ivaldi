@@ -101,8 +101,7 @@ pub struct TokenStore {
 impl TokenStore {
     /// Create a token store at the default location (`~/.config/ivaldi/auth.json`).
     pub fn new() -> Result<Self, AuthError> {
-        let home = std::env::var("HOME")
-            .map_err(|_| AuthError::NoHome)?;
+        let home = std::env::var("HOME").map_err(|_| AuthError::NoHome)?;
         let config_dir = PathBuf::from(home).join(".config").join("ivaldi");
         fs::create_dir_all(&config_dir).map_err(AuthError::Io)?;
 
@@ -209,7 +208,10 @@ pub fn resolve_auth(platform: Platform) -> Option<AuthMethod> {
                 };
                 return Some(AuthMethod {
                     name: "ivaldi".to_string(),
-                    description: format!("Authenticated via 'ivaldi auth login --{}'", platform_name),
+                    description: format!(
+                        "Authenticated via 'ivaldi auth login --{}'",
+                        platform_name
+                    ),
                     token: token.access_token,
                 });
             }
@@ -312,8 +314,7 @@ fn read_gh_cli_token() -> Option<String> {
 }
 
 fn read_glab_cli_token() -> Option<String> {
-    let content =
-        fs::read_to_string(home_dir()?.join(".config/glab-cli/config.yml")).ok()?;
+    let content = fs::read_to_string(home_dir()?.join(".config/glab-cli/config.yml")).ok()?;
     let lines: Vec<&str> = content.lines().collect();
     for (i, line) in lines.iter().enumerate() {
         if line.contains("token:") && i > 0 && lines[i - 1].contains("gitlab.com") {

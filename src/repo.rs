@@ -33,9 +33,8 @@ impl Repo {
         }
 
         let store = Store::open(&ivaldi_dir.join("store.db")).map_err(RepoError::Store)?;
-        let cas = FileCas::new(ivaldi_dir.join("objects")).map_err(|e| {
-            RepoError::Other(format!("failed to open CAS: {}", e))
-        })?;
+        let cas = FileCas::new(ivaldi_dir.join("objects"))
+            .map_err(|e| RepoError::Other(format!("failed to open CAS: {}", e)))?;
 
         // Rebuild in-memory MMR from persisted leaves
         let mut mmr = Mmr::new();
@@ -59,11 +58,13 @@ impl Repo {
 
     /// Get the current HEAD timeline name.
     pub fn current_timeline(&self) -> Result<String, RepoError> {
-        let head = forge::read_head(&self.ivaldi_dir)
-            .map_err(|e| RepoError::Other(e.to_string()))?;
+        let head =
+            forge::read_head(&self.ivaldi_dir).map_err(|e| RepoError::Other(e.to_string()))?;
         match head {
             HeadRef::Timeline(name) => Ok(name),
-            HeadRef::Detached(hash) => Err(RepoError::Other(format!("HEAD is detached at {}", hash))),
+            HeadRef::Detached(hash) => {
+                Err(RepoError::Other(format!("HEAD is detached at {}", hash)))
+            }
         }
     }
 
@@ -197,14 +198,18 @@ impl Repo {
     }
 
     /// Create a new timeline forking from the current one (or a named source).
-    pub fn create_timeline(
-        &self,
-        name: &str,
-        source: Option<&str>,
-    ) -> Result<(), RepoError> {
+    pub fn create_timeline(&self, name: &str, source: Option<&str>) -> Result<(), RepoError> {
         // Check if already exists
-        if self.store.get_timeline_head(name).map_err(RepoError::Store)?.is_some() {
-            return Err(RepoError::Other(format!("timeline '{}' already exists", name)));
+        if self
+            .store
+            .get_timeline_head(name)
+            .map_err(RepoError::Store)?
+            .is_some()
+        {
+            return Err(RepoError::Other(format!(
+                "timeline '{}' already exists",
+                name
+            )));
         }
 
         let source_name = match source {
@@ -236,7 +241,12 @@ impl Repo {
     /// Switch to a different timeline (updates HEAD).
     pub fn switch_timeline(&self, name: &str) -> Result<(), RepoError> {
         // Verify timeline exists
-        if self.store.get_timeline_head(name).map_err(RepoError::Store)?.is_none() {
+        if self
+            .store
+            .get_timeline_head(name)
+            .map_err(RepoError::Store)?
+            .is_none()
+        {
             // Check if ref file exists even without a head (newly created, no commits)
             let ref_path = self.ivaldi_dir.join("refs/heads").join(name);
             if !ref_path.exists() {
@@ -273,17 +283,32 @@ impl Repo {
         }
 
         // Check new name doesn't already exist
-        if self.store.get_timeline_head(new_name).map_err(RepoError::Store)?.is_some() {
-            return Err(RepoError::Other(format!("timeline '{}' already exists", new_name)));
+        if self
+            .store
+            .get_timeline_head(new_name)
+            .map_err(RepoError::Store)?
+            .is_some()
+        {
+            return Err(RepoError::Other(format!(
+                "timeline '{}' already exists",
+                new_name
+            )));
         }
 
         // Copy head to new name
-        let head_idx = self.store.get_timeline_head(old_name).map_err(RepoError::Store)?
+        let head_idx = self
+            .store
+            .get_timeline_head(old_name)
+            .map_err(RepoError::Store)?
             .ok_or_else(|| RepoError::Other(format!("timeline '{}' not found", old_name)))?;
-        self.store.set_timeline_head(new_name, head_idx).map_err(RepoError::Store)?;
+        self.store
+            .set_timeline_head(new_name, head_idx)
+            .map_err(RepoError::Store)?;
 
         // Remove old name
-        self.store.remove_timeline_head(old_name).map_err(RepoError::Store)?;
+        self.store
+            .remove_timeline_head(old_name)
+            .map_err(RepoError::Store)?;
 
         // Update ref files
         let old_ref = self.ivaldi_dir.join("refs/heads").join(old_name);
@@ -345,7 +370,9 @@ impl Repo {
 
     /// Get the seal name for a hash.
     pub fn get_seal_name(&self, hash: B3Hash) -> Result<Option<String>, RepoError> {
-        self.store.get_seal_name_by_hash(hash).map_err(RepoError::Store)
+        self.store
+            .get_seal_name_by_hash(hash)
+            .map_err(RepoError::Store)
     }
 
     /// Resolve a seal name or hash prefix to a leaf index.
@@ -447,8 +474,8 @@ impl Repo {
     /// Save a merge-in-progress state.
     pub fn save_merge_state(&self, state: &MergeState) -> Result<(), RepoError> {
         let path = self.ivaldi_dir.join("MERGE_STATE");
-        let data = serde_json::to_string_pretty(state)
-            .map_err(|e| RepoError::Other(e.to_string()))?;
+        let data =
+            serde_json::to_string_pretty(state).map_err(|e| RepoError::Other(e.to_string()))?;
         std::fs::write(&path, data).map_err(|e| RepoError::Other(e.to_string()))?;
         Ok(())
     }
@@ -458,8 +485,8 @@ impl Repo {
         let path = self.ivaldi_dir.join("MERGE_STATE");
         match std::fs::read_to_string(&path) {
             Ok(data) => {
-                let state = serde_json::from_str(&data)
-                    .map_err(|e| RepoError::Other(e.to_string()))?;
+                let state =
+                    serde_json::from_str(&data).map_err(|e| RepoError::Other(e.to_string()))?;
                 Ok(Some(state))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -508,8 +535,8 @@ impl Repo {
         let dir = self.reviews_dir();
         std::fs::create_dir_all(&dir).map_err(|e| RepoError::Other(e.to_string()))?;
         let path = dir.join(format!("{}.json", review.id));
-        let data = serde_json::to_string_pretty(review)
-            .map_err(|e| RepoError::Other(e.to_string()))?;
+        let data =
+            serde_json::to_string_pretty(review).map_err(|e| RepoError::Other(e.to_string()))?;
         std::fs::write(&path, data).map_err(|e| RepoError::Other(e.to_string()))?;
         Ok(())
     }
@@ -519,8 +546,8 @@ impl Repo {
         let path = self.reviews_dir().join(format!("{}.json", id));
         match std::fs::read_to_string(&path) {
             Ok(data) => {
-                let review = serde_json::from_str(&data)
-                    .map_err(|e| RepoError::Other(e.to_string()))?;
+                let review =
+                    serde_json::from_str(&data).map_err(|e| RepoError::Other(e.to_string()))?;
                 Ok(Some(review))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -553,18 +580,19 @@ impl Repo {
 
     /// Sync butterfly up: merge butterfly changes into parent timeline.
     /// Uses the fuse engine with auto strategy (fast-forward preferred).
-    pub fn butterfly_sync_up(
-        &mut self,
-        butterfly_name: &str,
-    ) -> Result<CommitResult, RepoError> {
+    pub fn butterfly_sync_up(&mut self, butterfly_name: &str) -> Result<CommitResult, RepoError> {
         // Get butterfly and parent head trees
-        let bf_head = self.get_timeline_head(butterfly_name)?
-            .ok_or_else(|| RepoError::Other(format!("butterfly '{}' has no commits", butterfly_name)))?;
-        let bf_leaf = self.get_leaf(bf_head)?
+        let bf_head = self.get_timeline_head(butterfly_name)?.ok_or_else(|| {
+            RepoError::Other(format!("butterfly '{}' has no commits", butterfly_name))
+        })?;
+        let bf_leaf = self
+            .get_leaf(bf_head)?
             .ok_or_else(|| RepoError::Other("corrupt butterfly head".into()))?;
 
         // Find parent name from store metadata
-        let parent_data = self.store.get_butterfly(butterfly_name)
+        let parent_data = self
+            .store
+            .get_butterfly(butterfly_name)
             .map_err(RepoError::Store)?
             .ok_or_else(|| RepoError::Other(format!("'{}' is not a butterfly", butterfly_name)))?;
         let parent_name: String = serde_json::from_slice::<serde_json::Value>(&parent_data)
@@ -577,7 +605,10 @@ impl Repo {
         // Use butterfly's tree as the merge result (fast-forward)
         let tree_root = bf_leaf.tree_root;
         let author = bf_leaf.author.clone();
-        let message = format!("Merged butterfly '{}' into '{}'", butterfly_name, parent_name);
+        let message = format!(
+            "Merged butterfly '{}' into '{}'",
+            butterfly_name, parent_name
+        );
 
         // Switch to parent and commit
         let prev_current = self.current_timeline()?;
@@ -592,11 +623,10 @@ impl Repo {
     }
 
     /// Sync butterfly down: merge parent changes into butterfly.
-    pub fn butterfly_sync_down(
-        &mut self,
-        butterfly_name: &str,
-    ) -> Result<CommitResult, RepoError> {
-        let parent_data = self.store.get_butterfly(butterfly_name)
+    pub fn butterfly_sync_down(&mut self, butterfly_name: &str) -> Result<CommitResult, RepoError> {
+        let parent_data = self
+            .store
+            .get_butterfly(butterfly_name)
             .map_err(RepoError::Store)?
             .ok_or_else(|| RepoError::Other(format!("'{}' is not a butterfly", butterfly_name)))?;
         let parent_name: String = serde_json::from_slice::<serde_json::Value>(&parent_data)
@@ -606,15 +636,20 @@ impl Repo {
             .ok_or_else(|| RepoError::Other("corrupt butterfly metadata".into()))?
             .to_string();
 
-        let parent_head = self.get_timeline_head(&parent_name)?
+        let parent_head = self
+            .get_timeline_head(&parent_name)?
             .ok_or_else(|| RepoError::Other(format!("parent '{}' has no commits", parent_name)))?;
-        let parent_leaf = self.get_leaf(parent_head)?
+        let parent_leaf = self
+            .get_leaf(parent_head)?
             .ok_or_else(|| RepoError::Other("corrupt parent head".into()))?;
 
         // Use parent's tree as the merge result (fast-forward down)
         let tree_root = parent_leaf.tree_root;
         let author = parent_leaf.author.clone();
-        let message = format!("Synced from parent '{}' into '{}'", parent_name, butterfly_name);
+        let message = format!(
+            "Synced from parent '{}' into '{}'",
+            parent_name, butterfly_name
+        );
 
         let prev_current = self.current_timeline()?;
         self.switch_timeline(butterfly_name)?;
@@ -640,7 +675,9 @@ impl Repo {
             "is_orphaned": false,
         });
         let bytes = serde_json::to_vec(&data).map_err(|e| RepoError::Other(e.to_string()))?;
-        self.store.put_butterfly(name, &bytes).map_err(RepoError::Store)?;
+        self.store
+            .put_butterfly(name, &bytes)
+            .map_err(RepoError::Store)?;
         Ok(())
     }
 }
@@ -692,7 +729,9 @@ mod tests {
         let (_dir, mut repo) = setup_repo();
         let tree = B3Hash::digest(b"tree root 1");
 
-        let result = repo.commit(tree, "Alice <a@b.com>", "First commit").unwrap();
+        let result = repo
+            .commit(tree, "Alice <a@b.com>", "First commit")
+            .unwrap();
 
         assert_eq!(result.index, 0);
         assert_eq!(result.timeline, "main");
@@ -825,7 +864,8 @@ mod tests {
         assert_eq!(repo.current_timeline().unwrap(), "feature");
 
         // Commit on feature
-        repo.commit(B3Hash::digest(b"t2"), "A", "Feature work").unwrap();
+        repo.commit(B3Hash::digest(b"t2"), "A", "Feature work")
+            .unwrap();
         assert_eq!(repo.get_timeline_head("feature").unwrap(), Some(1));
         // Main still at 0
         assert_eq!(repo.get_timeline_head("main").unwrap(), Some(0));
@@ -887,7 +927,8 @@ mod tests {
         );
 
         // Commits on feature should not affect main
-        repo.commit(B3Hash::digest(b"feat"), "A", "Feature work").unwrap();
+        repo.commit(B3Hash::digest(b"feat"), "A", "Feature work")
+            .unwrap();
         assert_ne!(
             repo.get_timeline_head("feature").unwrap(),
             repo.get_timeline_head("main").unwrap()
@@ -897,8 +938,10 @@ mod tests {
     #[test]
     fn create_timeline_from_source_and_switch() {
         let (_dir, mut repo) = setup_repo();
-        repo.commit(B3Hash::digest(b"t1"), "A", "main commit 1").unwrap();
-        repo.commit(B3Hash::digest(b"t2"), "A", "main commit 2").unwrap();
+        repo.commit(B3Hash::digest(b"t1"), "A", "main commit 1")
+            .unwrap();
+        repo.commit(B3Hash::digest(b"t2"), "A", "main commit 2")
+            .unwrap();
 
         // Create from main (which has 2 commits) and switch
         repo.create_timeline("hotfix", Some("main")).unwrap();
@@ -1040,7 +1083,8 @@ mod tests {
             repo.commit(B3Hash::digest(b"base"), "A", "Base").unwrap();
             repo.create_timeline("feature", None).unwrap();
             repo.switch_timeline("feature").unwrap();
-            repo.commit(B3Hash::digest(b"feat"), "A", "Feature").unwrap();
+            repo.commit(B3Hash::digest(b"feat"), "A", "Feature")
+                .unwrap();
             repo.switch_timeline("main").unwrap();
             repo.commit(B3Hash::digest(b"main2"), "A", "Main2").unwrap();
         }
@@ -1069,7 +1113,13 @@ mod tests {
         let tree = B3Hash::digest(b"raw tree");
         let custom_time: i64 = 1600000000;
 
-        let leaf = Leaf::new(tree, "main", "Imported <imp@test>", custom_time, "Historical commit");
+        let leaf = Leaf::new(
+            tree,
+            "main",
+            "Imported <imp@test>",
+            custom_time,
+            "Historical commit",
+        );
         let result = repo.commit_raw(leaf, "main").unwrap();
 
         let stored = repo.get_leaf(result.index).unwrap().unwrap();

@@ -83,7 +83,9 @@ mod tests {
     #[test]
     fn create_commit_bar() {
         let pb = commit_bar(10);
-        for _ in 0..10 { pb.inc(1); }
+        for _ in 0..10 {
+            pb.inc(1);
+        }
         pb.finish();
     }
 }

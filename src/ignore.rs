@@ -17,21 +17,10 @@ use std::fs;
 use std::path::Path;
 
 /// Built-in ignore patterns always applied.
-pub const DEFAULT_PATTERNS: &[&str] = &[
-    ".git/",
-    ".svn/",
-    ".hg/",
-    ".fossil/",
-    ".claude/",
-];
+pub const DEFAULT_PATTERNS: &[&str] = &[".git/", ".svn/", ".hg/", ".fossil/", ".claude/"];
 
 /// Auto-excluded files for security (always ignored regardless of .ivaldiignore).
-pub const SECURITY_PATTERNS: &[&str] = &[
-    ".env",
-    ".env.*",
-    ".venv",
-    ".venv/",
-];
+pub const SECURITY_PATTERNS: &[&str] = &[".env", ".env.*", ".venv", ".venv/"];
 
 /// Pre-compiled pattern cache for fast matching.
 pub struct PatternCache {
@@ -424,11 +413,7 @@ mod tests {
     fn load_patterns_from_file() {
         let dir = tempfile::tempdir().unwrap();
         let ignore_path = dir.path().join(".ivaldiignore");
-        fs::write(
-            &ignore_path,
-            "# Comment\n\n*.log\nbuild/\nnode_modules/\n",
-        )
-        .unwrap();
+        fs::write(&ignore_path, "# Comment\n\n*.log\nbuild/\nnode_modules/\n").unwrap();
 
         let patterns = load_patterns(dir.path());
         assert_eq!(patterns, vec!["*.log", "build/", "node_modules/"]);
@@ -491,13 +476,8 @@ mod tests {
 
     #[test]
     fn combined_patterns() {
-        let cache = PatternCache::new(&[
-            "*.log",
-            "build/",
-            "node_modules/",
-            ".DS_Store",
-            "**/*.bak",
-        ]);
+        let cache =
+            PatternCache::new(&["*.log", "build/", "node_modules/", ".DS_Store", "**/*.bak"]);
         assert!(cache.is_ignored("error.log"));
         assert!(cache.is_ignored("build/output.js"));
         assert!(cache.is_ignored("node_modules/express/index.js"));

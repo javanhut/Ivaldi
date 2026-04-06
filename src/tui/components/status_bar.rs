@@ -21,7 +21,11 @@ impl StatusBar {
         if area.height >= 2 {
             let msg_area = Rect { height: 1, ..area };
             if let Some((msg, is_error)) = message {
-                let style = if *is_error { theme.error } else { theme.success };
+                let style = if *is_error {
+                    theme.error
+                } else {
+                    theme.success
+                };
                 let para = Paragraph::new(Span::styled(msg.as_str(), style));
                 frame.render_widget(para, msg_area);
             }
@@ -53,16 +57,10 @@ impl StatusBar {
         }
 
         if data.staged > 0 {
-            spans.push(Span::styled(
-                format!("{}S ", data.staged),
-                theme.staged,
-            ));
+            spans.push(Span::styled(format!("{}S ", data.staged), theme.staged));
         }
         if data.modified > 0 {
-            spans.push(Span::styled(
-                format!("{}M ", data.modified),
-                theme.modified,
-            ));
+            spans.push(Span::styled(format!("{}M ", data.modified), theme.modified));
         }
         if data.untracked > 0 {
             spans.push(Span::styled(
@@ -71,10 +69,7 @@ impl StatusBar {
             ));
         }
         if data.deleted > 0 {
-            spans.push(Span::styled(
-                format!("{}D ", data.deleted),
-                theme.deleted,
-            ));
+            spans.push(Span::styled(format!("{}D ", data.deleted), theme.deleted));
         }
 
         let line = Line::from(spans);

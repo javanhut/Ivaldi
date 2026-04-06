@@ -67,11 +67,7 @@ impl DiffViewWidget {
     }
 
     pub fn next_file(&mut self) {
-        if let Some(&boundary) = self
-            .file_boundaries
-            .iter()
-            .find(|&&b| b > self.offset)
-        {
+        if let Some(&boundary) = self.file_boundaries.iter().find(|&&b| b > self.offset) {
             self.offset = boundary;
         }
     }
@@ -117,20 +113,13 @@ impl DiffViewWidget {
         let scroll_info = if self.lines.is_empty() {
             String::from("empty")
         } else {
-            format!(
-                "{}/{}",
-                self.offset + 1,
-                self.lines.len()
-            )
+            format!("{}/{}", self.offset + 1, self.lines.len())
         };
 
         let block = Block::default()
             .borders(Borders::ALL)
             .title(Span::styled(" Diff ", theme.title))
-            .title_bottom(Span::styled(
-                format!(" {} ", scroll_info),
-                theme.dim,
-            ));
+            .title_bottom(Span::styled(format!(" {} ", scroll_info), theme.dim));
 
         let para = Paragraph::new(text_lines).block(block);
         frame.render_widget(para, area);
@@ -217,7 +206,10 @@ mod tests {
     #[test]
     fn compute_diff_addition() {
         let lines = compute_line_diff("a", "a\nb", "test.txt");
-        let adds: Vec<_> = lines.iter().filter(|l| l.kind == DiffLineKind::Add).collect();
+        let adds: Vec<_> = lines
+            .iter()
+            .filter(|l| l.kind == DiffLineKind::Add)
+            .collect();
         assert_eq!(adds.len(), 1);
         assert!(adds[0].text.contains('b'));
     }

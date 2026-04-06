@@ -12,7 +12,9 @@ pub use commands::run_command;
 #[derive(Parser, Debug)]
 #[command(name = "ivaldi", version = "0.1.0")]
 #[command(about = "Ivaldi is a Version Control System")]
-#[command(long_about = "Ivaldi is a VCS used to control repositories that can replace Git in your normal workflow")]
+#[command(
+    long_about = "Ivaldi is a VCS used to control repositories that can replace Git in your normal workflow"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -131,9 +133,7 @@ pub struct SealArgs {
 
 impl SealArgs {
     pub fn get_message(&self) -> Option<&str> {
-        self.message
-            .as_deref()
-            .or(self.m.as_deref())
+        self.message.as_deref().or(self.m.as_deref())
     }
 }
 
@@ -822,11 +822,17 @@ mod tests {
     #[test]
     fn parse_review_create() {
         let cli = Cli::try_parse_from([
-            "ivaldi", "review", "create",
-            "--source", "feature",
-            "--target", "main",
-            "--title", "Add login",
-        ]).unwrap();
+            "ivaldi",
+            "review",
+            "create",
+            "--source",
+            "feature",
+            "--target",
+            "main",
+            "--title",
+            "Add login",
+        ])
+        .unwrap();
         match cli.command.unwrap() {
             Commands::Review(args) => match args.command {
                 ReviewCommands::Create(c) => {
@@ -844,10 +850,9 @@ mod tests {
     #[test]
     fn parse_review_rv_alias() {
         let cli = Cli::try_parse_from([
-            "ivaldi", "rv", "create",
-            "--source", "feature",
-            "--title", "Test",
-        ]).unwrap();
+            "ivaldi", "rv", "create", "--source", "feature", "--title", "Test",
+        ])
+        .unwrap();
         assert!(matches!(cli.command.unwrap(), Commands::Review(_)));
     }
 
@@ -910,11 +915,18 @@ mod tests {
     #[test]
     fn parse_review_comment() {
         let cli = Cli::try_parse_from([
-            "ivaldi", "review", "comment", "1",
-            "--file", "src/main.rs",
-            "--line", "42",
-            "--body", "Fix this",
-        ]).unwrap();
+            "ivaldi",
+            "review",
+            "comment",
+            "1",
+            "--file",
+            "src/main.rs",
+            "--line",
+            "42",
+            "--body",
+            "Fix this",
+        ])
+        .unwrap();
         match cli.command.unwrap() {
             Commands::Review(args) => match args.command {
                 ReviewCommands::Comment(c) => {
@@ -944,9 +956,14 @@ mod tests {
     #[test]
     fn parse_review_request_changes() {
         let cli = Cli::try_parse_from([
-            "ivaldi", "review", "request-changes", "1",
-            "--body", "Needs work",
-        ]).unwrap();
+            "ivaldi",
+            "review",
+            "request-changes",
+            "1",
+            "--body",
+            "Needs work",
+        ])
+        .unwrap();
         match cli.command.unwrap() {
             Commands::Review(args) => match args.command {
                 ReviewCommands::RequestChanges(rc) => {
@@ -976,9 +993,8 @@ mod tests {
 
     #[test]
     fn parse_review_merge_with_strategy() {
-        let cli = Cli::try_parse_from([
-            "ivaldi", "review", "merge", "5", "--strategy", "theirs",
-        ]).unwrap();
+        let cli = Cli::try_parse_from(["ivaldi", "review", "merge", "5", "--strategy", "theirs"])
+            .unwrap();
         match cli.command.unwrap() {
             Commands::Review(args) => match args.command {
                 ReviewCommands::Merge(m) => {

@@ -75,7 +75,9 @@ impl FuseView {
         if result.success {
             // Apply merged files
             let config = crate::config::load_config(&ctx.ivaldi_dir);
-            let author = config.author().unwrap_or_else(|| "unknown <unknown>".into());
+            let author = config
+                .author()
+                .unwrap_or_else(|| "unknown <unknown>".into());
             let msg = format!("Fuse {} into {}", source_name, current);
 
             // Build tree from merged file hashes and commit
@@ -115,11 +117,13 @@ impl FuseView {
     }
 
     fn get_head_tree(&self, ctx: &AppContext, timeline: &str) -> Option<crate::hash::B3Hash> {
-        ctx.repo
-            .walk_history(timeline)
-            .ok()?
-            .first()
-            .and_then(|e| ctx.repo.get_leaf(e.index).ok().flatten().map(|l| l.tree_root))
+        ctx.repo.walk_history(timeline).ok()?.first().and_then(|e| {
+            ctx.repo
+                .get_leaf(e.index)
+                .ok()
+                .flatten()
+                .map(|l| l.tree_root)
+        })
     }
 
     fn load_tree_map(
@@ -216,10 +220,7 @@ impl TabView for FuseView {
                 ..area
             };
             let banner = Paragraph::new(vec![
-                Line::from(Span::styled(
-                    "MERGE IN PROGRESS",
-                    theme.warning,
-                )),
+                Line::from(Span::styled("MERGE IN PROGRESS", theme.warning)),
                 Line::from(Span::styled(
                     format!("Conflicts: {}", self.merge_conflicts.join(", ")),
                     theme.error,
@@ -242,10 +243,7 @@ impl TabView for FuseView {
         };
         let strategy_text = Paragraph::new(Line::from(vec![
             Span::styled("Strategy: ", theme.dim),
-            Span::styled(
-                format!("{}", self.current_strategy()),
-                theme.brand,
-            ),
+            Span::styled(format!("{}", self.current_strategy()), theme.brand),
             Span::styled("  (press 's' to cycle)", theme.dim),
         ]));
         frame.render_widget(strategy_text, strategy_area);
@@ -264,10 +262,7 @@ impl TabView for FuseView {
         };
 
         if self.timelines.is_empty() {
-            let msg = Paragraph::new(Span::styled(
-                "No other timelines to fuse",
-                theme.dim,
-            ));
+            let msg = Paragraph::new(Span::styled("No other timelines to fuse", theme.dim));
             frame.render_widget(msg, list_area);
         } else {
             let items: Vec<ListItem> = self
@@ -302,10 +297,7 @@ impl TabView for FuseView {
                 width: area.width.saturating_sub(4),
                 height: 1,
             };
-            let msg = Paragraph::new(Span::styled(
-                "Abort merge? y:yes any:cancel",
-                theme.warning,
-            ));
+            let msg = Paragraph::new(Span::styled("Abort merge? y:yes any:cancel", theme.warning));
             frame.render_widget(msg, msg_area);
         }
 

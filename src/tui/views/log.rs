@@ -107,7 +107,8 @@ impl TabView for LogView {
             // In full mode each entry takes 3 lines
             let entries_per_page = inner_height / 3;
             if self.cursor >= self.offset + entries_per_page {
-                self.cursor.saturating_sub(entries_per_page.saturating_sub(1))
+                self.cursor
+                    .saturating_sub(entries_per_page.saturating_sub(1))
             } else {
                 self.offset
             }
@@ -125,11 +126,7 @@ impl TabView for LogView {
                     let merge_flag = if entry.is_merge { " M" } else { "" };
                     let text = format!(
                         "{} {} {} {}{}",
-                        marker,
-                        &entry.short_hash,
-                        entry.seal_name,
-                        entry.message,
-                        merge_flag,
+                        marker, &entry.short_hash, entry.seal_name, entry.message, merge_flag,
                     );
                     let style = if i == self.cursor {
                         theme.cursor
@@ -141,12 +138,15 @@ impl TabView for LogView {
                 .collect();
 
             let mode = if self.all_timelines { "all" } else { "current" };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    format!(" Log ({}) [{}/{}] ", mode, self.cursor + 1, self.entries.len()),
-                    theme.title,
-                ));
+            let block = Block::default().borders(Borders::ALL).title(Span::styled(
+                format!(
+                    " Log ({}) [{}/{}] ",
+                    mode,
+                    self.cursor + 1,
+                    self.entries.len()
+                ),
+                theme.title,
+            ));
 
             let list = List::new(items).block(block);
             frame.render_widget(list, area);
@@ -167,7 +167,11 @@ impl TabView for LogView {
                 let merge_flag = if entry.is_merge { " [merge]" } else { "" };
 
                 // Line 1: seal name + hash
-                let name_style = if is_current { theme.cursor } else { theme.brand };
+                let name_style = if is_current {
+                    theme.cursor
+                } else {
+                    theme.brand
+                };
                 lines.push(Line::from(vec![
                     Span::styled(format!("{} ", marker), name_style),
                     Span::styled(&entry.seal_name, name_style),
@@ -176,7 +180,9 @@ impl TabView for LogView {
 
                 // Line 2: message
                 let msg_style = if is_current {
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -194,12 +200,15 @@ impl TabView for LogView {
             }
 
             let mode = if self.all_timelines { "all" } else { "current" };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    format!(" Log ({}) [{}/{}] ", mode, self.cursor + 1, self.entries.len()),
-                    theme.title,
-                ));
+            let block = Block::default().borders(Borders::ALL).title(Span::styled(
+                format!(
+                    " Log ({}) [{}/{}] ",
+                    mode,
+                    self.cursor + 1,
+                    self.entries.len()
+                ),
+                theme.title,
+            ));
 
             let para = Paragraph::new(lines).block(block);
             frame.render_widget(para, area);

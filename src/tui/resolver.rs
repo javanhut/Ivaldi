@@ -69,19 +69,33 @@ pub fn run_resolver(conflicts: Vec<ConflictItem>) -> std::io::Result<ResolverRes
         terminal.draw(|frame| draw_resolver(frame, &state))?;
 
         if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press { continue; }
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break ResolverResult::Aborted,
                 KeyCode::Up => {
-                    if state.cursor > 0 { state.cursor -= 1; }
+                    if state.cursor > 0 {
+                        state.cursor -= 1;
+                    }
                 }
                 KeyCode::Down => {
-                    if state.cursor + 1 < CHOICES.len() { state.cursor += 1; }
+                    if state.cursor + 1 < CHOICES.len() {
+                        state.cursor += 1;
+                    }
                 }
-                KeyCode::Char('1') => { resolve_current(&mut state, Resolution::Ours); }
-                KeyCode::Char('2') => { resolve_current(&mut state, Resolution::Theirs); }
-                KeyCode::Char('3') => { resolve_current(&mut state, Resolution::Both); }
-                KeyCode::Char('4') => { resolve_current(&mut state, Resolution::Skip); }
+                KeyCode::Char('1') => {
+                    resolve_current(&mut state, Resolution::Ours);
+                }
+                KeyCode::Char('2') => {
+                    resolve_current(&mut state, Resolution::Theirs);
+                }
+                KeyCode::Char('3') => {
+                    resolve_current(&mut state, Resolution::Both);
+                }
+                KeyCode::Char('4') => {
+                    resolve_current(&mut state, Resolution::Skip);
+                }
                 KeyCode::Char('a') => break ResolverResult::Aborted,
                 KeyCode::Enter => {
                     let choice = CHOICES[state.cursor].1;
@@ -92,7 +106,9 @@ pub fn run_resolver(conflicts: Vec<ConflictItem>) -> std::io::Result<ResolverRes
 
             // Check if all resolved
             if state.resolutions.iter().all(|r| r.is_some()) {
-                let resolved: Vec<(String, Resolution)> = state.conflicts.iter()
+                let resolved: Vec<(String, Resolution)> = state
+                    .conflicts
+                    .iter()
                     .zip(state.resolutions.iter())
                     .filter_map(|(c, r)| r.map(|res| (c.path.clone(), res)))
                     .collect();
@@ -122,9 +138,21 @@ fn draw_resolver(frame: &mut Frame, state: &ResolverState) {
     let area = frame.area();
 
     let header_area = Rect { height: 3, ..area };
-    let conflict_area = Rect { y: 3, height: 4, ..area };
-    let choices_area = Rect { y: 7, height: area.height.saturating_sub(10), ..area };
-    let footer_area = Rect { y: area.height.saturating_sub(3), height: 3, ..area };
+    let conflict_area = Rect {
+        y: 3,
+        height: 4,
+        ..area
+    };
+    let choices_area = Rect {
+        y: 7,
+        height: area.height.saturating_sub(10),
+        ..area
+    };
+    let footer_area = Rect {
+        y: area.height.saturating_sub(3),
+        height: 3,
+        ..area
+    };
 
     let resolved_count = state.resolutions.iter().filter(|r| r.is_some()).count();
     let total = state.conflicts.len();
@@ -147,13 +175,18 @@ fn draw_resolver(frame: &mut Frame, state: &ResolverState) {
 
     let conflict_text = Paragraph::new(format!(
         " Conflict {} of {}: {}{}\n {}",
-        state.current + 1, total, conflict.path, status,
+        state.current + 1,
+        total,
+        conflict.path,
+        status,
         conflict.description,
     ))
     .block(Block::bordered());
     frame.render_widget(conflict_text, conflict_area);
 
-    let items: Vec<ListItem> = CHOICES.iter().enumerate()
+    let items: Vec<ListItem> = CHOICES
+        .iter()
+        .enumerate()
         .map(|(i, (label, _))| {
             let marker = if i == state.cursor { "→" } else { " " };
             ListItem::new(format!("{} [{}] {}", marker, i + 1, label))

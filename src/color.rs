@@ -52,26 +52,58 @@ fn wrap(code: &str, text: &str) -> String {
     }
 }
 
-pub fn bold(text: &str) -> String { wrap(BOLD, text) }
-pub fn dim(text: &str) -> String { wrap(DIM, text) }
-pub fn red(text: &str) -> String { wrap(RED, text) }
-pub fn green(text: &str) -> String { wrap(GREEN, text) }
-pub fn yellow(text: &str) -> String { wrap(YELLOW, text) }
-pub fn blue(text: &str) -> String { wrap(BLUE, text) }
-pub fn magenta(text: &str) -> String { wrap(MAGENTA, text) }
-pub fn cyan(text: &str) -> String { wrap(CYAN, text) }
+pub fn bold(text: &str) -> String {
+    wrap(BOLD, text)
+}
+pub fn dim(text: &str) -> String {
+    wrap(DIM, text)
+}
+pub fn red(text: &str) -> String {
+    wrap(RED, text)
+}
+pub fn green(text: &str) -> String {
+    wrap(GREEN, text)
+}
+pub fn yellow(text: &str) -> String {
+    wrap(YELLOW, text)
+}
+pub fn blue(text: &str) -> String {
+    wrap(BLUE, text)
+}
+pub fn magenta(text: &str) -> String {
+    wrap(MAGENTA, text)
+}
+pub fn cyan(text: &str) -> String {
+    wrap(CYAN, text)
+}
 
 pub fn bold_green(text: &str) -> String {
-    if is_enabled() { format!("{}{}{}{}", BOLD, GREEN, text, RESET) } else { text.to_string() }
+    if is_enabled() {
+        format!("{}{}{}{}", BOLD, GREEN, text, RESET)
+    } else {
+        text.to_string()
+    }
 }
 pub fn bold_red(text: &str) -> String {
-    if is_enabled() { format!("{}{}{}{}", BOLD, RED, text, RESET) } else { text.to_string() }
+    if is_enabled() {
+        format!("{}{}{}{}", BOLD, RED, text, RESET)
+    } else {
+        text.to_string()
+    }
 }
 pub fn bold_yellow(text: &str) -> String {
-    if is_enabled() { format!("{}{}{}{}", BOLD, YELLOW, text, RESET) } else { text.to_string() }
+    if is_enabled() {
+        format!("{}{}{}{}", BOLD, YELLOW, text, RESET)
+    } else {
+        text.to_string()
+    }
 }
 pub fn bold_cyan(text: &str) -> String {
-    if is_enabled() { format!("{}{}{}{}", BOLD, CYAN, text, RESET) } else { text.to_string() }
+    if is_enabled() {
+        format!("{}{}{}{}", BOLD, CYAN, text, RESET)
+    } else {
+        text.to_string()
+    }
 }
 
 /// Format a file state for status display.
@@ -88,16 +120,24 @@ pub fn status_label(state: &str) -> String {
 }
 
 /// Format a seal name with color.
-pub fn seal_name(name: &str) -> String { bold_cyan(name) }
+pub fn seal_name(name: &str) -> String {
+    bold_cyan(name)
+}
 
 /// Format a hash with color.
-pub fn hash(h: &str) -> String { yellow(h) }
+pub fn hash(h: &str) -> String {
+    yellow(h)
+}
 
 /// Format a timeline name.
-pub fn timeline(name: &str) -> String { bold_green(name) }
+pub fn timeline(name: &str) -> String {
+    bold_green(name)
+}
 
 /// Format an author.
-pub fn author(name: &str) -> String { blue(name) }
+pub fn author(name: &str) -> String {
+    blue(name)
+}
 
 #[cfg(test)]
 mod tests {

@@ -420,14 +420,7 @@ mod tests {
         let mut commits = get_last_n(&mgr, "main", 3).unwrap();
         commits.reverse();
 
-        let result = squash(
-            &mut mgr,
-            "main",
-            &commits,
-            "All squashed",
-            "Author",
-        )
-        .unwrap();
+        let result = squash(&mut mgr, "main", &commits, "All squashed", "Author").unwrap();
 
         assert_eq!(result.squashed_count, 3);
 

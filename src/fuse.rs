@@ -251,7 +251,6 @@ fn merge_file_auto(
                 MergeDecision::Conflict // Both changed differently
             }
         }
-
     }
 }
 
@@ -459,7 +458,7 @@ mod tests {
         let ours = files(&[
             ("keep.txt", "keep"),
             ("modify.txt", "base"), // unchanged
-            // delete.txt removed
+                                    // delete.txt removed
         ]);
         let theirs = files(&[
             ("keep.txt", "keep"),

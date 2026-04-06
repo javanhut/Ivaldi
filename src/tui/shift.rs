@@ -56,14 +56,20 @@ pub fn run_shift(entries: Vec<HistoryEntry>) -> std::io::Result<ShiftAction> {
         terminal.draw(|frame| draw_shift(frame, &state))?;
 
         if let Event::Key(key) = event::read()? {
-            if key.kind != KeyEventKind::Press { continue; }
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break ShiftAction::Cancel,
                 KeyCode::Up => {
-                    if state.cursor > 0 { state.cursor -= 1; }
+                    if state.cursor > 0 {
+                        state.cursor -= 1;
+                    }
                 }
                 KeyCode::Down => {
-                    if state.cursor + 1 < state.entries.len() { state.cursor += 1; }
+                    if state.cursor + 1 < state.entries.len() {
+                        state.cursor += 1;
+                    }
                 }
                 KeyCode::Enter => {
                     match state.phase {
@@ -95,18 +101,19 @@ pub fn run_shift(entries: Vec<HistoryEntry>) -> std::io::Result<ShiftAction> {
                             println!("\n✓ Range selected: {} commits will be squashed\n", count);
                             println!("📋 Review commits to squash:\n");
                             for i in (newest..=oldest).rev() {
-                                println!("[✓] {} - {}", state.entries[i].short_hash, state.entries[i].message);
+                                println!(
+                                    "[✓] {} - {}",
+                                    state.entries[i].short_hash, state.entries[i].message
+                                );
                             }
 
                             // Generate suggested message
-                            let suggested: Vec<&str> = (newest..=oldest).rev()
+                            let suggested: Vec<&str> = (newest..=oldest)
+                                .rev()
                                 .map(|i| state.entries[i].message.as_str())
                                 .collect();
-                            let suggested_msg = format!(
-                                "Squashed {} commits:\n\n{}",
-                                count,
-                                suggested.join("\n")
-                            );
+                            let suggested_msg =
+                                format!("Squashed {} commits:\n\n{}", count, suggested.join("\n"));
 
                             println!("\nSuggested commit message:\n{}\n", suggested_msg);
                             print!("Enter new commit message (or press Enter to use suggested): ");
@@ -121,7 +128,9 @@ pub fn run_shift(entries: Vec<HistoryEntry>) -> std::io::Result<ShiftAction> {
                                 input.trim().to_string()
                             };
 
-                            print!("\n⚠ WARNING: This will rewrite commit history!\nConfirm squash? (yes/no): ");
+                            print!(
+                                "\n⚠ WARNING: This will rewrite commit history!\nConfirm squash? (yes/no): "
+                            );
                             std::io::stdout().flush()?;
                             let mut confirm = String::new();
                             std::io::stdin().read_line(&mut confirm)?;
@@ -152,30 +161,52 @@ fn draw_shift(frame: &mut Frame, state: &ShiftState) {
     let area = frame.area();
 
     let header_area = Rect { height: 3, ..area };
-    let list_area = Rect { y: 3, height: area.height.saturating_sub(6), ..area };
-    let footer_area = Rect { y: area.height.saturating_sub(3), height: 3, ..area };
+    let list_area = Rect {
+        y: 3,
+        height: area.height.saturating_sub(6),
+        ..area
+    };
+    let footer_area = Rect {
+        y: area.height.saturating_sub(3),
+        height: 3,
+        ..area
+    };
 
     let phase_text = match state.phase {
         Phase::SelectStart => "⏱ Select START of commit range (oldest)",
         Phase::SelectEnd => "⏱ Select END of commit range (newest)",
     };
 
-    let header = Paragraph::new(phase_text)
-        .block(Block::bordered().title(" Shift "));
+    let header = Paragraph::new(phase_text).block(Block::bordered().title(" Shift "));
     frame.render_widget(header, header_area);
 
     let visible = list_area.height as usize;
-    let offset = if state.cursor >= visible { state.cursor - visible + 1 } else { 0 };
+    let offset = if state.cursor >= visible {
+        state.cursor - visible + 1
+    } else {
+        0
+    };
 
-    let items: Vec<ListItem> = state.entries.iter().enumerate()
+    let items: Vec<ListItem> = state
+        .entries
+        .iter()
+        .enumerate()
         .skip(offset)
         .take(visible)
         .map(|(i, entry)| {
             let marker = if i == state.cursor { "→" } else { " " };
-            let start_mark = if state.start == Some(i) { " [START]" } else { "" };
+            let start_mark = if state.start == Some(i) {
+                " [START]"
+            } else {
+                ""
+            };
             let text = format!(
                 "{} {}. {} ({}){}\n     {}",
-                marker, i + 1, entry.seal_name, entry.short_hash, start_mark,
+                marker,
+                i + 1,
+                entry.seal_name,
+                entry.short_hash,
+                start_mark,
                 entry.message,
             );
             ListItem::new(text)
@@ -185,7 +216,6 @@ fn draw_shift(frame: &mut Frame, state: &ShiftState) {
     let list = List::new(items).block(Block::bordered());
     frame.render_widget(list, list_area);
 
-    let footer = Paragraph::new(" ↑/↓ navigate • Enter select • q quit")
-        .block(Block::bordered());
+    let footer = Paragraph::new(" ↑/↓ navigate • Enter select • q quit").block(Block::bordered());
     frame.render_widget(footer, footer_area);
 }

@@ -55,8 +55,10 @@ impl RemoteView {
                     match result {
                         BgResult::ScoutDone(Ok(branches)) => {
                             self.remote_timelines = branches;
-                            self.status_message =
-                                Some((format!("Found {} remote timelines", self.remote_timelines.len()), false));
+                            self.status_message = Some((
+                                format!("Found {} remote timelines", self.remote_timelines.len()),
+                                false,
+                            ));
                         }
                         BgResult::ScoutDone(Err(e)) => {
                             self.status_message = Some((format!("Scout failed: {}", e), true));
@@ -312,10 +314,7 @@ impl TabView for RemoteView {
 
     fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         // Portal info at top
-        let portal_area = Rect {
-            height: 2,
-            ..area
-        };
+        let portal_area = Rect { height: 2, ..area };
         let portal_text = match &self.portal_info {
             Some(p) => format!("Portal: {}", p),
             None => "No portal configured (press 'p' to add)".into(),
@@ -378,12 +377,10 @@ impl TabView for RemoteView {
                 })
                 .collect();
 
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title(Span::styled(
-                    format!(" Remote Timelines ({}) ", self.remote_timelines.len()),
-                    theme.title,
-                ));
+            let block = Block::default().borders(Borders::ALL).title(Span::styled(
+                format!(" Remote Timelines ({}) ", self.remote_timelines.len()),
+                theme.title,
+            ));
 
             let list = List::new(items).block(block);
             frame.render_widget(list, list_area);
@@ -410,11 +407,7 @@ impl TabView for RemoteView {
 
     fn load_data(&mut self, ctx: &AppContext) {
         let pm = PortalManager::new(&ctx.ivaldi_dir);
-        self.portal_info = pm
-            .get_default()
-            .ok()
-            .flatten()
-            .map(|p| p.to_string_repr());
+        self.portal_info = pm.get_default().ok().flatten().map(|p| p.to_string_repr());
     }
 
     fn short_help(&self) -> &str {

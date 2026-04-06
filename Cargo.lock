@@ -645,6 +645,7 @@ dependencies = [
  "blake3",
  "clap",
  "crossterm",
+ "flate2",
  "hex",
  "indicatif",
  "ratatui",

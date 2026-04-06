@@ -126,7 +126,14 @@ impl ReviewView {
                         return Action::Consumed;
                     }
                     if let Some(ref review) = self.selected_review {
-                        match review::add_comment(&ctx.repo, review.id, "(general)", None, &body, None) {
+                        match review::add_comment(
+                            &ctx.repo,
+                            review.id,
+                            "(general)",
+                            None,
+                            &body,
+                            None,
+                        ) {
                             Ok(updated) => {
                                 self.selected_review = Some(updated);
                                 Action::Success("Comment added".into())
@@ -330,12 +337,10 @@ impl ReviewView {
             })
             .collect();
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                format!(" Reviews ({}) ", self.reviews.len()),
-                theme.title,
-            ));
+        let block = Block::default().borders(Borders::ALL).title(Span::styled(
+            format!(" Reviews ({}) ", self.reviews.len()),
+            theme.title,
+        ));
 
         let list = List::new(items).block(block);
         frame.render_widget(list, area);
@@ -466,10 +471,7 @@ impl ReviewView {
             }
         }
 
-        let visible_lines: Vec<Line> = lines
-            .into_iter()
-            .skip(self.detail_scroll)
-            .collect();
+        let visible_lines: Vec<Line> = lines.into_iter().skip(self.detail_scroll).collect();
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -594,8 +596,8 @@ impl TabView for ReviewView {
     }
 
     fn load_data(&mut self, ctx: &AppContext) {
-        self.reviews = review::list_reviews(&ctx.repo, &ReviewFilter::default())
-            .unwrap_or_default();
+        self.reviews =
+            review::list_reviews(&ctx.repo, &ReviewFilter::default()).unwrap_or_default();
         if self.cursor >= self.reviews.len() && !self.reviews.is_empty() {
             self.cursor = self.reviews.len() - 1;
         }

@@ -7,13 +7,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
-use crate::cas::{Cas, FileCas};
+use crate::cas::FileCas;
 use crate::fsmerkle::FsStore;
+use crate::git_remote::{self, SmartHttpClient};
 use crate::github::{GitHubClient, GitHubError, TreeEntryCreate, TreeResponse};
 use crate::hash::B3Hash;
 use crate::ignore;
 use crate::leaf::Leaf;
-use crate::remote::HashMapping;
+use crate::remote::{HashMapping, RemoteBranch};
 use crate::repo::Repo;
 
 /// Result of a download (clone) operation.
@@ -32,6 +33,21 @@ pub struct UploadResult {
     pub branch: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteTimelineState {
+    NotDownloaded,
+    UpToDate,
+    OutOfSync,
+    LocalOnly,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteTimelineInfo {
+    pub name: String,
+    pub remote_sha: String,
+    pub state: RemoteTimelineState,
+}
+
 /// Download a repository from GitHub into a local Ivaldi repo.
 pub fn download(
     client: &GitHubClient,
@@ -40,62 +56,81 @@ pub fn download(
     target_dir: &Path,
     branch: Option<&str>,
 ) -> Result<DownloadResult, SyncError> {
-    if !client.is_authenticated() {
-        // Try unauthenticated for public repos
+    if target_dir.exists()
+        && target_dir
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false)
+    {
+        return Err(SyncError::Other(format!(
+            "directory '{}' already exists and is not empty",
+            target_dir.display()
+        )));
     }
+    let created_target = ensure_download_target(target_dir)?;
 
     eprintln!("Downloading {}/{}...", owner, repo_name);
+    let result = (|| -> Result<DownloadResult, SyncError> {
+        let remote = SmartHttpClient::new(client.token())
+            .fetch_repo(owner, repo_name, branch)
+            .map_err(|e| SyncError::Other(e.to_string()))?;
 
-    // Get repo info
-    let repo_info = client
-        .get_repo(owner, repo_name)
-        .map_err(SyncError::GitHub)?;
-    let default_branch = branch.unwrap_or(&repo_info.default_branch);
+        crate::forge::forge(target_dir).map_err(|e| SyncError::Other(e.to_string()))?;
+        let ivaldi_dir = target_dir.join(".ivaldi");
 
-    // Initialize Ivaldi repo at target
-    crate::forge::forge(target_dir).map_err(|e| SyncError::Other(e.to_string()))?;
+        let portal_mgr = crate::portal::PortalManager::new(&ivaldi_dir);
+        let portal = crate::portal::Portal::parse(&format!("{}/{}", owner, repo_name)).unwrap();
+        let _ = portal_mgr.add(&portal);
 
-    let ivaldi_dir = target_dir.join(".ivaldi");
+        let mut cfg = crate::config::Config::new();
+        cfg.set("portal.default", &format!("{}/{}", owner, repo_name));
+        cfg.save(&ivaldi_dir.join("config")).ok();
 
-    // Configure portal
-    let portal_mgr = crate::portal::PortalManager::new(&ivaldi_dir);
-    let portal = crate::portal::Portal::parse(&format!("{}/{}", owner, repo_name)).unwrap();
-    let _ = portal_mgr.add(&portal);
+        let mut repo = Repo::open(target_dir).map_err(|e| SyncError::Other(e.to_string()))?;
+        let import = git_remote::import_fetch_result(&mut repo, &remote)
+            .map_err(|e| SyncError::Other(e.to_string()))?;
 
-    // Set up config
-    let mut cfg = crate::config::Config::new();
-    cfg.set("portal.default", &format!("{}/{}", owner, repo_name));
-    cfg.save(&ivaldi_dir.join("config")).ok();
+        let cas = FileCas::new(ivaldi_dir.join("objects"))
+            .map_err(|e| SyncError::Other(e.to_string()))?;
+        let store = FsStore::new(&cas);
+        let file_count = if repo
+            .get_timeline_head(&remote.branch)
+            .map_err(|e| SyncError::Other(e.to_string()))?
+            .is_some()
+        {
+            checkout_tree_to_workspace(&repo, &store, &remote.branch)?
+        } else {
+            0
+        };
 
-    // Import full commit history
-    let mut repo = Repo::open(target_dir).map_err(|e| SyncError::Other(e.to_string()))?;
+        eprintln!(
+            "Downloaded {} files, imported {} commits from {}/{}",
+            file_count, import.commits_imported, owner, repo_name
+        );
 
-    let import = import_full_history(client, &mut repo, owner, repo_name, default_branch, 0)?;
+        Ok(DownloadResult {
+            files_downloaded: file_count,
+            commits_imported: import.commits_imported,
+            timelines_created: vec![remote.branch],
+        })
+    })();
 
-    // Checkout tip tree files to workspace (reuses shared checkout logic)
-    let cas = FileCas::new(ivaldi_dir.join("objects"))
-        .map_err(|e| SyncError::Other(e.to_string()))?;
-    let store = FsStore::new(&cas);
-    let file_count = if repo
-        .get_timeline_head(default_branch)
-        .map_err(|e| SyncError::Other(e.to_string()))?
-        .is_some()
-    {
-        checkout_tree_to_workspace(&repo, &store, default_branch)?
-    } else {
-        0
-    };
+    if result.is_err() && created_target {
+        cleanup_failed_download_target(target_dir);
+    }
+    result
+}
 
-    eprintln!(
-        "Downloaded {} files, imported {} commits from {}/{}",
-        file_count, import.commits_imported, owner, repo_name
-    );
+fn ensure_download_target(target_dir: &Path) -> Result<bool, SyncError> {
+    if target_dir.exists() {
+        return Ok(false);
+    }
+    fs::create_dir_all(target_dir).map_err(|e| SyncError::Other(e.to_string()))?;
+    Ok(true)
+}
 
-    Ok(DownloadResult {
-        files_downloaded: file_count,
-        commits_imported: import.commits_imported,
-        timelines_created: vec![default_branch.to_string()],
-    })
+fn cleanup_failed_download_target(target_dir: &Path) {
+    let _ = fs::remove_dir_all(target_dir);
 }
 
 /// Upload blobs in parallel, skipping those already mapped.
@@ -112,9 +147,10 @@ fn upload_blobs_parallel(
     // Defense-in-depth: reject security-blocked files before upload
     for (path, _) in files {
         if crate::ignore::is_security_blocked(path) {
-            return Err(SyncError::Other(
-                format!("refusing to upload security-blocked file: {}", path),
-            ));
+            return Err(SyncError::Other(format!(
+                "refusing to upload security-blocked file: {}",
+                path
+            )));
         }
     }
 
@@ -148,7 +184,8 @@ fn upload_blobs_parallel(
     // Pre-load all blob content (CAS is not Sync, so load before spawning threads)
     let mut upload_items: Vec<(String, B3Hash, Vec<u8>)> = Vec::new();
     for (path, blob_hash) in &to_upload {
-        let (_, content) = store.load_blob(*blob_hash)
+        let (_, content) = store
+            .load_blob(*blob_hash)
             .map_err(|e| SyncError::Other(e.to_string()))?;
         upload_items.push((path.clone(), *blob_hash, content));
     }
@@ -177,7 +214,8 @@ fn upload_blobs_parallel(
             handles.push(handle);
         }
 
-        handles.into_iter()
+        handles
+            .into_iter()
             .flat_map(|h| h.join().unwrap_or_default())
             .collect()
     });
@@ -210,7 +248,9 @@ pub fn upload(
         return Err(SyncError::GitHub(GitHubError::AuthRequired));
     }
 
-    let timeline = repo.current_timeline().map_err(|e| SyncError::Other(e.to_string()))?;
+    let timeline = repo
+        .current_timeline()
+        .map_err(|e| SyncError::Other(e.to_string()))?;
     let branch_name = branch.unwrap_or(&timeline);
 
     // Get head leaf
@@ -236,9 +276,8 @@ pub fn upload(
     let mut hash_mapping = HashMapping::new(&repo.ivaldi_dir);
     let total = files.len();
 
-    let tree_entries = upload_blobs_parallel(
-        client, &store, &files, &mut hash_mapping, owner, repo_name,
-    )?;
+    let tree_entries =
+        upload_blobs_parallel(client, &store, &files, &mut hash_mapping, owner, repo_name)?;
 
     // Create tree
     let tree_sha = client
@@ -300,11 +339,30 @@ pub fn scout(
     owner: &str,
     repo_name: &str,
 ) -> Result<Vec<String>, SyncError> {
-    let branches = client
+    SmartHttpClient::new(client.token())
         .list_branches(owner, repo_name)
-        .map_err(SyncError::GitHub)?;
+        .map_err(|e| SyncError::Other(e.to_string()))
+}
 
-    Ok(branches.into_iter().map(|b| b.name).collect())
+pub fn scout_with_status(
+    client: &GitHubClient,
+    repo: &Repo,
+    owner: &str,
+    repo_name: &str,
+) -> Result<Vec<RemoteTimelineInfo>, SyncError> {
+    let branches = SmartHttpClient::new(client.token())
+        .list_branch_refs(owner, repo_name)
+        .map_err(|e| SyncError::Other(e.to_string()))?;
+    let mapping = HashMapping::new(&repo.ivaldi_dir);
+
+    Ok(branches
+        .into_iter()
+        .map(|branch| RemoteTimelineInfo {
+            name: branch.name.clone(),
+            remote_sha: branch.sha1.clone(),
+            state: timeline_sync_state(repo, &mapping, &branch),
+        })
+        .collect())
 }
 
 /// Harvest — download specific branches with full history.
@@ -315,24 +373,34 @@ pub fn harvest(
     repo_name: &str,
     timeline_names: &[String],
 ) -> Result<Vec<String>, SyncError> {
-    // Verify all requested branches exist on remote
-    let branches = client
-        .list_branches(owner, repo_name)
-        .map_err(SyncError::GitHub)?;
+    let branches = SmartHttpClient::new(client.token())
+        .list_branch_refs(owner, repo_name)
+        .map_err(|e| SyncError::Other(e.to_string()))?;
+    let mapping = HashMapping::new(&repo.ivaldi_dir);
 
     let mut harvested = Vec::new();
 
     for target_name in timeline_names {
-        let _branch = branches
+        let branch = branches
             .iter()
-            .find(|b| b.name == *target_name)
+            .find(|b| &b.name == target_name)
             .ok_or_else(|| {
                 SyncError::Other(format!("remote timeline '{}' not found", target_name))
             })?;
 
         eprintln!("Harvesting timeline '{}'...", target_name);
+        match timeline_sync_state(repo, &mapping, branch) {
+            RemoteTimelineState::NotDownloaded => eprintln!("  Local state: not downloaded"),
+            RemoteTimelineState::UpToDate => eprintln!("  Local state: up to date"),
+            RemoteTimelineState::OutOfSync => eprintln!("  Local state: out of sync"),
+            RemoteTimelineState::LocalOnly => eprintln!("  Local state: local only"),
+        }
 
-        let import = import_full_history(client, repo, owner, repo_name, target_name, 0)?;
+        let fetch = SmartHttpClient::new(client.token())
+            .fetch_repo(owner, repo_name, Some(target_name))
+            .map_err(|e| SyncError::Other(e.to_string()))?;
+        let import = git_remote::import_fetch_result(repo, &fetch)
+            .map_err(|e| SyncError::Other(e.to_string()))?;
         eprintln!(
             "  {} commits imported, {} skipped",
             import.commits_imported, import.commits_skipped
@@ -342,6 +410,25 @@ pub fn harvest(
     }
 
     Ok(harvested)
+}
+
+fn timeline_sync_state(
+    repo: &Repo,
+    mapping: &HashMapping,
+    branch: &RemoteBranch,
+) -> RemoteTimelineState {
+    let Ok(Some(head_idx)) = repo.get_timeline_head(&branch.name) else {
+        return RemoteTimelineState::NotDownloaded;
+    };
+    let Ok(Some(head_leaf)) = repo.get_leaf(head_idx) else {
+        return RemoteTimelineState::LocalOnly;
+    };
+
+    match mapping.get_sha1(head_leaf.hash()) {
+        Some(sha) if sha == branch.sha1 => RemoteTimelineState::UpToDate,
+        Some(_) => RemoteTimelineState::OutOfSync,
+        None => RemoteTimelineState::LocalOnly,
+    }
 }
 
 // Helper to collect files from tree
@@ -434,7 +521,20 @@ pub fn parse_iso8601_to_unix(s: &str) -> Option<i64> {
     for y in 1970..year {
         days += if is_leap_year(y) { 366 } else { 365 };
     }
-    let month_days = [31, if is_leap_year(year) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let month_days = [
+        31,
+        if is_leap_year(year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     for m in 0..(month - 1) as usize {
         if m < 12 {
             days += month_days[m] as i64;
@@ -502,7 +602,11 @@ fn import_full_history_into(
     let mut blobs_downloaded = 0usize;
 
     // Ensure timeline exists
-    if repo.get_timeline_head(local_timeline).map_err(|e| SyncError::Other(e.to_string()))?.is_none() {
+    if repo
+        .get_timeline_head(local_timeline)
+        .map_err(|e| SyncError::Other(e.to_string()))?
+        .is_none()
+    {
         // Create timeline ref directory/file but no head yet
         let ref_path = repo.ivaldi_dir.join("refs/heads").join(local_timeline);
         if let Some(parent) = ref_path.parent() {
@@ -512,7 +616,9 @@ fn import_full_history_into(
     }
 
     // Identify unskipped commits (those not already mapped)
-    let unskipped: Vec<usize> = commits.iter().enumerate()
+    let unskipped: Vec<usize> = commits
+        .iter()
+        .enumerate()
         .filter(|(_, c)| hash_mapping.get_blake3(&c.sha).is_none())
         .map(|(i, _)| i)
         .collect();
@@ -520,7 +626,8 @@ fn import_full_history_into(
     // Collect unique tree SHAs from unskipped commits
     let unique_tree_shas: Vec<String> = {
         let mut seen = std::collections::HashSet::new();
-        unskipped.iter()
+        unskipped
+            .iter()
             .map(|&i| commits[i].commit.tree.sha.clone())
             .filter(|sha| seen.insert(sha.clone()))
             .collect()
@@ -545,7 +652,8 @@ fn import_full_history_into(
                 });
                 handles.push(handle);
             }
-            handles.into_iter()
+            handles
+                .into_iter()
                 .flat_map(|h| h.join().unwrap_or_default())
                 .collect()
         });
@@ -554,7 +662,9 @@ fn import_full_history_into(
         let mut map = HashMap::new();
         for (sha, result) in results {
             match result {
-                Ok(tree) => { map.insert(sha, tree); }
+                Ok(tree) => {
+                    map.insert(sha, tree);
+                }
                 Err(e) => {
                     crate::logging::warn(&format!("failed to pre-fetch tree {}: {}", sha, e));
                 }
@@ -590,34 +700,38 @@ fn import_full_history_into(
     }
 
     if !blobs_to_download.is_empty() {
-        let pb_blobs = crate::progress::file_bar(blobs_to_download.len() as u64, "Downloading blobs");
-        let blob_results: Vec<Result<(String, String, Vec<u8>), String>> = std::thread::scope(|s| {
-            let chunk_size = (blobs_to_download.len() / 8).max(1);
-            let mut handles = Vec::new();
-            for chunk in blobs_to_download.chunks(chunk_size) {
-                let pb_blobs = &pb_blobs;
-                let handle = s.spawn(move || {
-                    let mut results = Vec::new();
-                    for (path, sha1, commit_sha) in chunk {
-                        match client.download_file(owner, repo_name, path, commit_sha) {
-                            Ok(content) => {
-                                pb_blobs.inc(1);
-                                results.push(Ok((path.clone(), sha1.clone(), content)));
-                            }
-                            Err(e) => {
-                                pb_blobs.inc(1);
-                                results.push(Err(format!("failed to download {}: {}", path, e)));
+        let pb_blobs =
+            crate::progress::file_bar(blobs_to_download.len() as u64, "Downloading blobs");
+        let blob_results: Vec<Result<(String, String, Vec<u8>), String>> =
+            std::thread::scope(|s| {
+                let chunk_size = (blobs_to_download.len() / 8).max(1);
+                let mut handles = Vec::new();
+                for chunk in blobs_to_download.chunks(chunk_size) {
+                    let pb_blobs = &pb_blobs;
+                    let handle = s.spawn(move || {
+                        let mut results = Vec::new();
+                        for (path, sha1, commit_sha) in chunk {
+                            match client.download_file(owner, repo_name, path, commit_sha) {
+                                Ok(content) => {
+                                    pb_blobs.inc(1);
+                                    results.push(Ok((path.clone(), sha1.clone(), content)));
+                                }
+                                Err(e) => {
+                                    pb_blobs.inc(1);
+                                    results
+                                        .push(Err(format!("failed to download {}: {}", path, e)));
+                                }
                             }
                         }
-                    }
-                    results
-                });
-                handles.push(handle);
-            }
-            handles.into_iter()
-                .flat_map(|h| h.join().unwrap_or_default())
-                .collect()
-        });
+                        results
+                    });
+                    handles.push(handle);
+                }
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap_or_default())
+                    .collect()
+            });
         pb_blobs.finish_with_message(format!("{} blobs downloaded", blobs_to_download.len()));
 
         // Store in CAS and update hash_mapping (serial — CAS is not Sync)
@@ -670,7 +784,9 @@ fn import_full_history_into(
             // Look up pre-fetched tree, fall back to live fetch
             let tree = match prefetched_trees.get(tree_sha) {
                 Some(t) => t.clone(),
-                None => client.get_tree(owner, repo_name, tree_sha).map_err(SyncError::GitHub)?,
+                None => client
+                    .get_tree(owner, repo_name, tree_sha)
+                    .map_err(SyncError::GitHub)?,
             };
 
             // Build hash map from tree entries — pure HashMap lookups, zero disk I/O
@@ -693,7 +809,10 @@ fn import_full_history_into(
         };
 
         // Parse author and timestamp
-        let author = format!("{} <{}>", commit.commit.author.name, commit.commit.author.email);
+        let author = format!(
+            "{} <{}>",
+            commit.commit.author.name, commit.commit.author.email
+        );
         let time_unix = commit
             .commit
             .author
@@ -720,7 +839,13 @@ fn import_full_history_into(
             .collect();
 
         // Build leaf
-        let mut leaf = Leaf::new(ivaldi_tree_hash, local_timeline, &author, time_unix, &commit.commit.message);
+        let mut leaf = Leaf::new(
+            ivaldi_tree_hash,
+            local_timeline,
+            &author,
+            time_unix,
+            &commit.commit.message,
+        );
         leaf.prev_idx = prev_idx;
         leaf.merge_idxs = merge_idxs;
 
@@ -734,10 +859,15 @@ fn import_full_history_into(
         sha_to_idx.insert(commit.sha.clone(), result.index);
         commits_imported += 1;
     }
-    pb.finish_with_message(format!("{} commits imported, {} skipped", commits_imported, commits_skipped));
+    pb.finish_with_message(format!(
+        "{} commits imported, {} skipped",
+        commits_imported, commits_skipped
+    ));
 
     // Save hash mapping
-    hash_mapping.save().map_err(|e| SyncError::Other(e.to_string()))?;
+    hash_mapping
+        .save()
+        .map_err(|e| SyncError::Other(e.to_string()))?;
 
     Ok(ImportResult {
         commits_imported,
@@ -772,25 +902,36 @@ pub fn sync_timeline(
     repo_name: &str,
     timeline: &str,
 ) -> Result<SyncResult, SyncError> {
-    let branches = client.list_branches(owner, repo_name).map_err(SyncError::GitHub)?;
-    let branch = branches.iter().find(|b| b.name == timeline)
+    let branches = client
+        .list_branches(owner, repo_name)
+        .map_err(SyncError::GitHub)?;
+    let branch = branches
+        .iter()
+        .find(|b| b.name == timeline)
         .ok_or_else(|| SyncError::Other(format!("remote branch '{}' not found", timeline)))?;
 
     let mut hash_mapping = HashMapping::new(&repo.ivaldi_dir);
 
     // Fetch remote commits
-    let remote_commits = client.list_commits(owner, repo_name, timeline, 0)
+    let remote_commits = client
+        .list_commits(owner, repo_name, timeline, 0)
         .map_err(SyncError::GitHub)?;
 
     if remote_commits.is_empty() {
         return Ok(SyncResult {
-            added: vec![], modified: vec![], deleted: vec![], no_changes: true,
-            was_fast_forward: false, was_fused: false, conflicts: vec![],
+            added: vec![],
+            modified: vec![],
+            deleted: vec![],
+            no_changes: true,
+            was_fast_forward: false,
+            was_fused: false,
+            conflicts: vec![],
         });
     }
 
     // Get local head BEFORE import so we can constrain ancestor search
-    let local_head_idx = repo.get_timeline_head(timeline)
+    let local_head_idx = repo
+        .get_timeline_head(timeline)
         .map_err(|e| SyncError::Other(e.to_string()))?;
 
     // Build set of leaf indices reachable from local timeline head.
@@ -809,7 +950,11 @@ pub fn sync_timeline(
                         // Shallow: just add direct merge parents
                         reachable.insert(midx);
                     }
-                    cur = if leaf.has_parent() { Some(leaf.prev_idx) } else { None };
+                    cur = if leaf.has_parent() {
+                        Some(leaf.prev_idx)
+                    } else {
+                        None
+                    };
                 } else {
                     break;
                 }
@@ -867,8 +1012,7 @@ pub fn sync_timeline(
                 .map_err(|e| SyncError::Other(e.to_string()))?;
             let verify_store = FsStore::new(&verify_cas);
             let local_files = get_tree_files(repo, &verify_store, ca_idx)?;
-            let local_paths: BTreeSet<&str> =
-                local_files.keys().map(|s| s.as_str()).collect();
+            let local_paths: BTreeSet<&str> = local_files.keys().map(|s| s.as_str()).collect();
 
             if remote_paths != local_paths {
                 // Stale mapping: remove it and re-search for the real ancestor
@@ -888,11 +1032,8 @@ pub fn sync_timeline(
                     if let Some(b3) = hash_mapping.get_blake3(&commit.sha) {
                         for idx in 0..repo.commit_count() {
                             if let Ok(Some(leaf)) = repo.get_leaf(idx) {
-                                if leaf.hash() == b3
-                                    && local_reachable.contains(&idx)
-                                {
-                                    common_ancestor_sha =
-                                        Some(commit.sha.clone());
+                                if leaf.hash() == b3 && local_reachable.contains(&idx) {
+                                    common_ancestor_sha = Some(commit.sha.clone());
                                     common_ancestor_idx = Some(idx);
                                     break;
                                 }
@@ -909,7 +1050,10 @@ pub fn sync_timeline(
 
     // Count new remote commits (those before the common ancestor in the list)
     let new_remote_count = if let Some(ref ca_sha) = common_ancestor_sha {
-        remote_commits.iter().take_while(|c| c.sha != *ca_sha).count()
+        remote_commits
+            .iter()
+            .take_while(|c| c.sha != *ca_sha)
+            .count()
     } else {
         remote_commits.len()
     };
@@ -919,10 +1063,16 @@ pub fn sync_timeline(
             let mut count = 0u64;
             let mut cur = Some(head);
             while let Some(idx) = cur {
-                if idx == ancestor { break; }
+                if idx == ancestor {
+                    break;
+                }
                 if let Ok(Some(leaf)) = repo.get_leaf(idx) {
                     count += 1;
-                    cur = if leaf.has_parent() { Some(leaf.prev_idx) } else { None };
+                    cur = if leaf.has_parent() {
+                        Some(leaf.prev_idx)
+                    } else {
+                        None
+                    };
                 } else {
                     break;
                 }
@@ -931,7 +1081,8 @@ pub fn sync_timeline(
         }
         (Some(_), None) => {
             // No common ancestor: all local commits are "new"
-            let history = repo.walk_history(timeline)
+            let history = repo
+                .walk_history(timeline)
                 .map_err(|e| SyncError::Other(e.to_string()))?;
             history.len() as u64
         }
@@ -940,8 +1091,13 @@ pub fn sync_timeline(
 
     if new_remote_count == 0 {
         return Ok(SyncResult {
-            added: vec![], modified: vec![], deleted: vec![], no_changes: true,
-            was_fast_forward: false, was_fused: false, conflicts: vec![],
+            added: vec![],
+            modified: vec![],
+            deleted: vec![],
+            no_changes: true,
+            was_fast_forward: false,
+            was_fused: false,
+            conflicts: vec![],
         });
     }
 
@@ -957,14 +1113,20 @@ pub fn sync_timeline(
             .map_err(|e| SyncError::Other(e.to_string()))?;
         let store = FsStore::new(&cas);
 
-        let (added, modified, deleted) = compute_workspace_delta(repo, &store, timeline, common_ancestor_idx)?;
+        let (added, modified, deleted) =
+            compute_workspace_delta(repo, &store, timeline, common_ancestor_idx)?;
 
         // Update workspace files
         checkout_tree_to_workspace(repo, &store, timeline)?;
 
         return Ok(SyncResult {
-            added, modified, deleted, no_changes: false,
-            was_fast_forward: true, was_fused: false, conflicts: vec![],
+            added,
+            modified,
+            deleted,
+            no_changes: false,
+            was_fast_forward: true,
+            was_fused: false,
+            conflicts: vec![],
         });
     }
 
@@ -979,12 +1141,14 @@ pub fn sync_timeline(
             fs::create_dir_all(parent).ok();
         }
         fs::write(&ref_path, "").ok();
-        repo.store.set_timeline_head(&temp_timeline, ancestor_idx)
+        repo.store
+            .set_timeline_head(&temp_timeline, ancestor_idx)
             .map_err(|e| SyncError::Other(format!("store: {}", e)))?;
     }
 
     // Import remote history into temp timeline (fetch from real remote branch)
-    let _import = import_full_history_into(client, repo, owner, repo_name, timeline, &temp_timeline, 0)?;
+    let _import =
+        import_full_history_into(client, repo, owner, repo_name, timeline, &temp_timeline, 0)?;
 
     // Get file sets for three-way merge
     let cas = FileCas::new(repo.ivaldi_dir.join("objects"))
@@ -1003,7 +1167,8 @@ pub fn sync_timeline(
         BTreeMap::new()
     };
 
-    let their_head_idx = repo.get_timeline_head(&temp_timeline)
+    let their_head_idx = repo
+        .get_timeline_head(&temp_timeline)
         .map_err(|e| SyncError::Other(e.to_string()))?;
     let their_files = if let Some(idx) = their_head_idx {
         get_tree_files(repo, &store, idx)?
@@ -1012,11 +1177,17 @@ pub fn sync_timeline(
     };
 
     // Auto-fuse
-    let fuse_result = crate::fuse::FuseEngine::fuse(&base_files, &our_files, &their_files, crate::fuse::Strategy::Auto);
+    let fuse_result = crate::fuse::FuseEngine::fuse(
+        &base_files,
+        &our_files,
+        &their_files,
+        crate::fuse::Strategy::Auto,
+    );
 
     if fuse_result.success {
         // Build merged tree
-        let merged_tree = store.build_tree_from_hash_map(&fuse_result.merged_files)
+        let merged_tree = store
+            .build_tree_from_hash_map(&fuse_result.merged_files)
             .map_err(|e| SyncError::Other(e.to_string()))?;
 
         // Create fuse commit
@@ -1031,7 +1202,10 @@ pub fn sync_timeline(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs() as i64,
-            &format!("Fused sync from {}/{} (branch: {})", owner, repo_name, timeline),
+            &format!(
+                "Fused sync from {}/{} (branch: {})",
+                owner, repo_name, timeline
+            ),
         );
         fuse_leaf.prev_idx = our_head;
         if their_head != crate::leaf::NO_PARENT {
@@ -1046,24 +1220,44 @@ pub fn sync_timeline(
 
         // Map remote tip SHA
         let mut hash_mapping = HashMapping::new(&repo.ivaldi_dir);
-        hash_mapping.insert(&branch.commit.sha, repo.get_leaf(
-            repo.get_timeline_head(timeline).map_err(|e| SyncError::Other(e.to_string()))?.unwrap()
-        ).map_err(|e| SyncError::Other(e.to_string()))?.unwrap().hash());
-        hash_mapping.save().map_err(|e| SyncError::Other(e.to_string()))?;
+        hash_mapping.insert(
+            &branch.commit.sha,
+            repo.get_leaf(
+                repo.get_timeline_head(timeline)
+                    .map_err(|e| SyncError::Other(e.to_string()))?
+                    .unwrap(),
+            )
+            .map_err(|e| SyncError::Other(e.to_string()))?
+            .unwrap()
+            .hash(),
+        );
+        hash_mapping
+            .save()
+            .map_err(|e| SyncError::Other(e.to_string()))?;
 
         // Clean up temp timeline
         let _ = repo.store.remove_timeline_head(&temp_timeline);
         let _ = fs::remove_file(repo.ivaldi_dir.join("refs/heads").join(&temp_timeline));
 
-        let (added, modified, deleted) = compute_file_changes(&base_files, &fuse_result.merged_files);
+        let (added, modified, deleted) =
+            compute_file_changes(&base_files, &fuse_result.merged_files);
 
         Ok(SyncResult {
-            added, modified, deleted, no_changes: false,
-            was_fast_forward: false, was_fused: true, conflicts: vec![],
+            added,
+            modified,
+            deleted,
+            no_changes: false,
+            was_fast_forward: false,
+            was_fused: true,
+            conflicts: vec![],
         })
     } else {
         // Conflicts — save merge state, report
-        let conflicts: Vec<String> = fuse_result.conflicts.iter().map(|c| c.path.clone()).collect();
+        let conflicts: Vec<String> = fuse_result
+            .conflicts
+            .iter()
+            .map(|c| c.path.clone())
+            .collect();
 
         let merge_state = crate::repo::MergeState {
             source_timeline: temp_timeline.clone(),
@@ -1075,8 +1269,13 @@ pub fn sync_timeline(
             .map_err(|e| SyncError::Other(e.to_string()))?;
 
         Ok(SyncResult {
-            added: vec![], modified: vec![], deleted: vec![], no_changes: false,
-            was_fast_forward: false, was_fused: false, conflicts,
+            added: vec![],
+            modified: vec![],
+            deleted: vec![],
+            no_changes: false,
+            was_fast_forward: false,
+            was_fused: false,
+            conflicts,
         })
     }
 }
@@ -1087,7 +1286,8 @@ fn get_tree_files(
     store: &FsStore<'_>,
     leaf_idx: u64,
 ) -> Result<BTreeMap<String, B3Hash>, SyncError> {
-    let leaf = repo.get_leaf(leaf_idx)
+    let leaf = repo
+        .get_leaf(leaf_idx)
         .map_err(|e| SyncError::Other(e.to_string()))?
         .ok_or_else(|| SyncError::Other(format!("leaf {} not found", leaf_idx)))?;
 
@@ -1110,7 +1310,8 @@ fn compute_workspace_delta(
         BTreeMap::new()
     };
 
-    let new_head = repo.get_timeline_head(timeline)
+    let new_head = repo
+        .get_timeline_head(timeline)
         .map_err(|e| SyncError::Other(e.to_string()))?;
     let new_files = if let Some(idx) = new_head {
         get_tree_files(repo, store, idx)?
@@ -1160,11 +1361,13 @@ fn checkout_tree_to_workspace(
     store: &FsStore<'_>,
     timeline: &str,
 ) -> Result<usize, SyncError> {
-    let head_idx = repo.get_timeline_head(timeline)
+    let head_idx = repo
+        .get_timeline_head(timeline)
         .map_err(|e| SyncError::Other(e.to_string()))?
         .ok_or_else(|| SyncError::Other("no head to checkout".into()))?;
 
-    let head_leaf = repo.get_leaf(head_idx)
+    let head_leaf = repo
+        .get_leaf(head_idx)
         .map_err(|e| SyncError::Other(e.to_string()))?
         .ok_or_else(|| SyncError::Other("corrupt head leaf".into()))?;
 
@@ -1174,13 +1377,13 @@ fn checkout_tree_to_workspace(
 
     // Write / update files from the target tree
     for (path, blob_hash) in &files {
-        let (_, content) = store.load_blob(*blob_hash)
+        let (_, content) = store
+            .load_blob(*blob_hash)
             .map_err(|e| SyncError::Other(e.to_string()))?;
         let file_path = repo.work_dir.join(path);
 
         let should_write = if file_path.exists() {
-            let existing = fs::read(&file_path)
-                .map_err(|e| SyncError::Other(e.to_string()))?;
+            let existing = fs::read(&file_path).map_err(|e| SyncError::Other(e.to_string()))?;
             existing != content
         } else {
             true
@@ -1190,8 +1393,7 @@ fn checkout_tree_to_workspace(
             if let Some(parent) = file_path.parent() {
                 fs::create_dir_all(parent).ok();
             }
-            fs::write(&file_path, &content)
-                .map_err(|e| SyncError::Other(e.to_string()))?;
+            fs::write(&file_path, &content).map_err(|e| SyncError::Other(e.to_string()))?;
         }
     }
 
@@ -1210,7 +1412,10 @@ fn checkout_tree_to_workspace(
                 if d == repo.work_dir {
                     break;
                 }
-                if fs::read_dir(d).map(|mut r| r.next().is_none()).unwrap_or(false) {
+                if fs::read_dir(d)
+                    .map(|mut r| r.next().is_none())
+                    .unwrap_or(false)
+                {
                     let _ = fs::remove_dir(d);
                     dir = d.parent();
                 } else {
@@ -1358,9 +1563,7 @@ fn resolve_github_parent(
     }
 
     if parents.is_empty() && head_leaf.has_parent() {
-        eprintln!(
-            "Warning: no GitHub SHA1 mapping found in ancestor chain — creating root commit",
-        );
+        eprintln!("Warning: no GitHub SHA1 mapping found in ancestor chain — creating root commit",);
     }
 
     parents
@@ -1377,8 +1580,10 @@ pub enum SyncError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cas::Cas;
     use crate::hash::B3Hash;
     use crate::leaf::Leaf;
+    use std::fs;
 
     // -- ISO 8601 parsing tests --
 
@@ -1393,6 +1598,42 @@ mod tests {
         let ts = parse_iso8601_to_unix("2024-01-15T10:30:00+05:30").unwrap();
         // 10:30 at +05:30 = 05:00 UTC → 1705314600 - 5*3600 - 30*60
         assert_eq!(ts, 1705294800);
+    }
+
+    #[test]
+    fn ensure_download_target_creates_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("clone-target");
+        assert!(!target.exists());
+
+        let created = ensure_download_target(&target).unwrap();
+
+        assert!(created);
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn ensure_download_target_keeps_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("existing");
+        fs::create_dir_all(&target).unwrap();
+
+        let created = ensure_download_target(&target).unwrap();
+
+        assert!(!created);
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn cleanup_failed_download_target_removes_directory_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("partial");
+        fs::create_dir_all(target.join(".ivaldi")).unwrap();
+        fs::write(target.join(".ivaldi").join("config"), "partial").unwrap();
+
+        cleanup_failed_download_target(&target);
+
+        assert!(!target.exists());
     }
 
     #[test]
@@ -1530,8 +1771,10 @@ mod tests {
         let mut repo = Repo::open(work_dir).unwrap();
 
         // Two commits on main
-        repo.commit(B3Hash::digest(b"t1"), "author", "first").unwrap();
-        repo.commit(B3Hash::digest(b"t2"), "author", "second").unwrap();
+        repo.commit(B3Hash::digest(b"t1"), "author", "first")
+            .unwrap();
+        repo.commit(B3Hash::digest(b"t2"), "author", "second")
+            .unwrap();
 
         let head_idx = repo.get_timeline_head("main").unwrap().unwrap();
         let head_leaf = repo.get_leaf(head_idx).unwrap().unwrap();
@@ -1541,7 +1784,10 @@ mod tests {
         let mapping = HashMapping::new(&repo.ivaldi_dir);
 
         let parents = resolve_github_parent(&repo, &head_leaf, &mapping, None, false);
-        assert!(parents.is_empty(), "should be root commit when parent not mapped");
+        assert!(
+            parents.is_empty(),
+            "should be root commit when parent not mapped"
+        );
     }
 
     #[test]
@@ -1552,7 +1798,8 @@ mod tests {
         crate::forge::forge(work_dir).unwrap();
         let mut repo = Repo::open(work_dir).unwrap();
 
-        repo.commit(B3Hash::digest(b"tree"), "author", "initial").unwrap();
+        repo.commit(B3Hash::digest(b"tree"), "author", "initial")
+            .unwrap();
 
         let head_idx = repo.get_timeline_head("main").unwrap().unwrap();
         let head_leaf = repo.get_leaf(head_idx).unwrap().unwrap();
@@ -1572,8 +1819,10 @@ mod tests {
         crate::forge::forge(work_dir).unwrap();
         let mut repo = Repo::open(work_dir).unwrap();
 
-        repo.commit(B3Hash::digest(b"t1"), "author", "first").unwrap();
-        repo.commit(B3Hash::digest(b"t2"), "author", "second").unwrap();
+        repo.commit(B3Hash::digest(b"t1"), "author", "first")
+            .unwrap();
+        repo.commit(B3Hash::digest(b"t2"), "author", "second")
+            .unwrap();
 
         let head_idx = repo.get_timeline_head("main").unwrap().unwrap();
         let head_leaf = repo.get_leaf(head_idx).unwrap().unwrap();
@@ -1583,13 +1832,8 @@ mod tests {
         mapping.insert("mapped_parent_sha", parent_leaf.hash());
 
         // Existing branch SHA should win over the mapping
-        let parents = resolve_github_parent(
-            &repo,
-            &head_leaf,
-            &mapping,
-            Some("branch_tip_sha"),
-            false,
-        );
+        let parents =
+            resolve_github_parent(&repo, &head_leaf, &mapping, Some("branch_tip_sha"), false);
         assert_eq!(parents, vec!["branch_tip_sha"]);
     }
 
@@ -1601,8 +1845,10 @@ mod tests {
         crate::forge::forge(work_dir).unwrap();
         let mut repo = Repo::open(work_dir).unwrap();
 
-        repo.commit(B3Hash::digest(b"t1"), "author", "first").unwrap();
-        repo.commit(B3Hash::digest(b"t2"), "author", "second").unwrap();
+        repo.commit(B3Hash::digest(b"t1"), "author", "first")
+            .unwrap();
+        repo.commit(B3Hash::digest(b"t2"), "author", "second")
+            .unwrap();
 
         let head_idx = repo.get_timeline_head("main").unwrap().unwrap();
         let head_leaf = repo.get_leaf(head_idx).unwrap().unwrap();
@@ -1619,8 +1865,11 @@ mod tests {
             Some("old_broken_tip_sha"),
             true,
         );
-        assert_eq!(parents, vec!["mapped_parent_sha"],
-            "force should skip existing branch tip and use mapped parent");
+        assert_eq!(
+            parents,
+            vec!["mapped_parent_sha"],
+            "force should skip existing branch tip and use mapped parent"
+        );
     }
 
     #[test]
@@ -1632,12 +1881,14 @@ mod tests {
         let mut repo = Repo::open(work_dir).unwrap();
 
         // Create parent (simulates synced main)
-        repo.commit(B3Hash::digest(b"main-tree"), "author", "synced main").unwrap();
+        repo.commit(B3Hash::digest(b"main-tree"), "author", "synced main")
+            .unwrap();
         let main_head = repo.get_timeline_head("main").unwrap().unwrap();
         let main_leaf = repo.get_leaf(main_head).unwrap().unwrap();
 
         // Create child on top (simulates feature after fuse)
-        repo.commit(B3Hash::digest(b"feature-tree"), "author", "feature work").unwrap();
+        repo.commit(B3Hash::digest(b"feature-tree"), "author", "feature work")
+            .unwrap();
         let feature_head = repo.get_timeline_head("main").unwrap().unwrap();
         let feature_leaf = repo.get_leaf(feature_head).unwrap().unwrap();
 
@@ -1654,8 +1905,11 @@ mod tests {
             Some("old_broken_branch_tip"),
             true,
         );
-        assert_eq!(parents, vec![main_github_sha],
-            "force upload should resolve parent via leaf chain, not existing branch tip");
+        assert_eq!(
+            parents,
+            vec![main_github_sha],
+            "force upload should resolve parent via leaf chain, not existing branch tip"
+        );
     }
 
     #[test]
@@ -1667,14 +1921,17 @@ mod tests {
         let mut repo = Repo::open(dir.path()).unwrap();
 
         // Commit A (will be mapped)
-        repo.commit(B3Hash::digest(b"t1"), "author", "commit A").unwrap();
+        repo.commit(B3Hash::digest(b"t1"), "author", "commit A")
+            .unwrap();
         let a_leaf = repo.get_leaf(0).unwrap().unwrap();
 
         // Commit B (unmapped)
-        repo.commit(B3Hash::digest(b"t2"), "author", "commit B").unwrap();
+        repo.commit(B3Hash::digest(b"t2"), "author", "commit B")
+            .unwrap();
 
         // Commit C (unmapped, this is the head)
-        repo.commit(B3Hash::digest(b"t3"), "author", "commit C").unwrap();
+        repo.commit(B3Hash::digest(b"t3"), "author", "commit C")
+            .unwrap();
 
         let head_idx = repo.get_timeline_head("main").unwrap().unwrap();
         let head_leaf = repo.get_leaf(head_idx).unwrap().unwrap();
@@ -1698,20 +1955,24 @@ mod tests {
         let mut repo = Repo::open(dir.path()).unwrap();
 
         // Branch point
-        repo.commit(B3Hash::digest(b"base"), "author", "base").unwrap();
+        repo.commit(B3Hash::digest(b"base"), "author", "base")
+            .unwrap();
 
         // "main" commit
-        repo.commit(B3Hash::digest(b"main-work"), "author", "main work").unwrap();
+        repo.commit(B3Hash::digest(b"main-work"), "author", "main work")
+            .unwrap();
         let main_leaf = repo.get_leaf(1).unwrap().unwrap();
 
         // "feature" commit (simulate by raw commit with prev=base)
-        let mut feat_leaf_data = Leaf::new(B3Hash::digest(b"feat"), "main", "author", 1000, "feature");
+        let mut feat_leaf_data =
+            Leaf::new(B3Hash::digest(b"feat"), "main", "author", 1000, "feature");
         feat_leaf_data.prev_idx = 0;
         let feat_result = repo.commit_raw(feat_leaf_data, "main").unwrap();
         let feat_leaf = repo.get_leaf(feat_result.index).unwrap().unwrap();
 
         // Merge commit: prev_idx=main(1), merge_idxs=[feature(2)]
-        let mut merge_leaf_data = Leaf::new(B3Hash::digest(b"merged"), "main", "author", 2000, "merge");
+        let mut merge_leaf_data =
+            Leaf::new(B3Hash::digest(b"merged"), "main", "author", 2000, "merge");
         merge_leaf_data.prev_idx = 1;
         merge_leaf_data.merge_idxs = vec![feat_result.index];
         let merge_result = repo.commit_raw(merge_leaf_data, "main").unwrap();
@@ -1777,17 +2038,15 @@ mod tests {
 
     /// Helper: build a tree in the CAS from a map of path→content, commit it,
     /// and return the repo + CAS for checkout testing.
-    fn setup_checkout_repo(
-        dir: &Path,
-        files: &BTreeMap<String, Vec<u8>>,
-    ) -> (Repo, FileCas) {
+    fn setup_checkout_repo(dir: &Path, files: &BTreeMap<String, Vec<u8>>) -> (Repo, FileCas) {
         crate::forge::forge(dir).unwrap();
         let mut repo = Repo::open(dir).unwrap();
         let ivaldi_dir = dir.join(".ivaldi");
         let cas = FileCas::new(ivaldi_dir.join("objects")).unwrap();
         let store = FsStore::new(&cas);
         let tree_hash = store.build_tree_from_map(files).unwrap();
-        repo.commit(tree_hash, "test-author", "test commit").unwrap();
+        repo.commit(tree_hash, "test-author", "test commit")
+            .unwrap();
         (repo, cas)
     }
 
@@ -1802,8 +2061,14 @@ mod tests {
 
         let count = checkout_tree_to_workspace(&repo, &store, "main").unwrap();
         assert_eq!(count, 2);
-        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "hello a");
-        assert_eq!(fs::read_to_string(dir.path().join("b.txt")).unwrap(), "hello b");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "hello a"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+            "hello b"
+        );
     }
 
     #[test]
@@ -1834,7 +2099,10 @@ mod tests {
         assert_eq!(count, 2);
         assert!(dir.path().join("a.txt").exists());
         assert!(dir.path().join("b.txt").exists());
-        assert!(!dir.path().join("c.txt").exists(), "c.txt should be deleted");
+        assert!(
+            !dir.path().join("c.txt").exists(),
+            "c.txt should be deleted"
+        );
     }
 
     #[test]
@@ -1847,7 +2115,10 @@ mod tests {
         let (mut repo, cas) = setup_checkout_repo(dir.path(), &files);
         let store = FsStore::new(&cas);
         checkout_tree_to_workspace(&repo, &store, "main").unwrap();
-        assert_eq!(fs::read_to_string(dir.path().join("doc.txt")).unwrap(), "version 1");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("doc.txt")).unwrap(),
+            "version 1"
+        );
 
         // Second commit with modified content
         let mut files2 = BTreeMap::new();
@@ -1856,7 +2127,10 @@ mod tests {
         repo.commit(tree2, "test-author", "update doc").unwrap();
 
         checkout_tree_to_workspace(&repo, &store, "main").unwrap();
-        assert_eq!(fs::read_to_string(dir.path().join("doc.txt")).unwrap(), "version 2");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("doc.txt")).unwrap(),
+            "version 2"
+        );
     }
 
     #[test]
@@ -1909,11 +2183,15 @@ mod tests {
         let mut files2 = BTreeMap::new();
         files2.insert("a.txt".into(), b"root file".to_vec());
         let tree2 = store.build_tree_from_map(&files2).unwrap();
-        repo.commit(tree2, "test-author", "remove sub/deep.txt").unwrap();
+        repo.commit(tree2, "test-author", "remove sub/deep.txt")
+            .unwrap();
 
         checkout_tree_to_workspace(&repo, &store, "main").unwrap();
         assert!(!dir.path().join("sub/deep.txt").exists());
-        assert!(!dir.path().join("sub").exists(), "empty sub/ dir should be cleaned up");
+        assert!(
+            !dir.path().join("sub").exists(),
+            "empty sub/ dir should be cleaned up"
+        );
     }
 
     #[test]
@@ -1957,7 +2235,11 @@ mod tests {
             while let Some(idx) = cur {
                 reachable.insert(idx);
                 if let Ok(Some(leaf)) = repo.get_leaf(idx) {
-                    cur = if leaf.has_parent() { Some(leaf.prev_idx) } else { None };
+                    cur = if leaf.has_parent() {
+                        Some(leaf.prev_idx)
+                    } else {
+                        None
+                    };
                 } else {
                     break;
                 }
@@ -1999,14 +2281,7 @@ mod tests {
         let client = GitHubClient::new();
         let mut mapping = HashMapping::new(&ivaldi_dir);
 
-        let result = upload_blobs_parallel(
-            &client,
-            &store,
-            &files,
-            &mut mapping,
-            "owner",
-            "repo",
-        );
+        let result = upload_blobs_parallel(&client, &store, &files, &mut mapping, "owner", "repo");
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();

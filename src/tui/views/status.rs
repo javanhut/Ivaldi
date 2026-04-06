@@ -146,7 +146,9 @@ impl StatusView {
         };
 
         let config = crate::config::load_config(&ctx.ivaldi_dir);
-        let author = config.author().unwrap_or_else(|| "unknown <unknown>".into());
+        let author = config
+            .author()
+            .unwrap_or_else(|| "unknown <unknown>".into());
 
         match ctx.repo.commit(tree_root, &author, &message) {
             Ok(result) => {
@@ -159,7 +161,6 @@ impl StatusView {
             Err(e) => Action::Error(format!("Seal failed: {}", e)),
         }
     }
-
 }
 
 impl TabView for StatusView {
@@ -214,10 +215,7 @@ impl TabView for StatusView {
 
     fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         if self.file_list.items.is_empty() {
-            let msg = Paragraph::new(Span::styled(
-                "Working directory clean",
-                theme.success,
-            ));
+            let msg = Paragraph::new(Span::styled("Working directory clean", theme.success));
             frame.render_widget(msg, area);
         } else {
             self.file_list.render(frame, area, "Files", theme);
@@ -252,10 +250,16 @@ impl TabView for StatusView {
             .repo
             .walk_history(&timeline)
             .ok()
-            .and_then(|h| h.first().map(|e| {
-                // Get the tree root from the leaf
-                ctx.repo.get_leaf(e.index).ok().flatten().map(|l| l.tree_root)
-            }))
+            .and_then(|h| {
+                h.first().map(|e| {
+                    // Get the tree root from the leaf
+                    ctx.repo
+                        .get_leaf(e.index)
+                        .ok()
+                        .flatten()
+                        .map(|l| l.tree_root)
+                })
+            })
             .flatten();
 
         let files = ws.status(last_tree, &ignore).unwrap_or_default();

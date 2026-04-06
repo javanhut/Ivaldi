@@ -49,7 +49,9 @@ impl Dialog {
         }
 
         // Center a dialog box
-        let width = (screen.width / 2).max(30).min(screen.width.saturating_sub(4));
+        let width = (screen.width / 2)
+            .max(30)
+            .min(screen.width.saturating_sub(4));
         let height = 5;
         let x = (screen.width.saturating_sub(width)) / 2;
         let y = (screen.height.saturating_sub(height)) / 2;
@@ -62,34 +64,19 @@ impl Dialog {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(theme.brand)
-            .title(Span::styled(
-                format!(" {} ", self.title),
-                theme.title,
-            ));
+            .title(Span::styled(format!(" {} ", self.title), theme.title));
 
         frame.render_widget(block, area);
 
         // Input area inside the block
-        let input_area = Rect::new(
-            area.x + 2,
-            area.y + 2,
-            area.width.saturating_sub(4),
-            1,
-        );
+        let input_area = Rect::new(area.x + 2, area.y + 2, area.width.saturating_sub(4), 1);
 
-        self.input.render(frame, input_area, Style::default().fg(Color::White));
+        self.input
+            .render(frame, input_area, Style::default().fg(Color::White));
 
         // Hint at bottom
-        let hint_area = Rect::new(
-            area.x + 2,
-            area.y + 3,
-            area.width.saturating_sub(4),
-            1,
-        );
-        let hint = Paragraph::new(Span::styled(
-            "Enter: submit  Esc: cancel",
-            theme.dim,
-        ));
+        let hint_area = Rect::new(area.x + 2, area.y + 3, area.width.saturating_sub(4), 1);
+        let hint = Paragraph::new(Span::styled("Enter: submit  Esc: cancel", theme.dim));
         frame.render_widget(hint, hint_area);
     }
 }

@@ -164,7 +164,12 @@ impl PortalManager {
                 Platform::GitLab => "gitlab",
             };
             if let Some(ref url) = portal.base_url {
-                lines.push(format!("{} {} {}", platform_str, portal.to_string_repr(), url));
+                lines.push(format!(
+                    "{} {} {}",
+                    platform_str,
+                    portal.to_string_repr(),
+                    url
+                ));
             } else {
                 lines.push(format!("{} {}", platform_str, portal.to_string_repr()));
             }

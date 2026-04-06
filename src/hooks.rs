@@ -41,7 +41,10 @@ impl Hook {
     }
 
     pub fn is_pre(&self) -> bool {
-        matches!(self, Hook::PreSeal | Hook::PreFuse | Hook::PreUpload | Hook::PreSwitch)
+        matches!(
+            self,
+            Hook::PreSeal | Hook::PreFuse | Hook::PreUpload | Hook::PreSwitch
+        )
     }
 }
 

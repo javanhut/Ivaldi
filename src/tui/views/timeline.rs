@@ -69,15 +69,13 @@ impl TabView for TimelineView {
                     }
 
                     return match mode {
-                        Some(DialogMode::Create) => {
-                            match ctx.repo.create_timeline(&value, None) {
-                                Ok(()) => {
-                                    let _ = ctx.repo.switch_timeline(&value);
-                                    Action::Refresh
-                                }
-                                Err(e) => Action::Error(format!("Create failed: {}", e)),
+                        Some(DialogMode::Create) => match ctx.repo.create_timeline(&value, None) {
+                            Ok(()) => {
+                                let _ = ctx.repo.switch_timeline(&value);
+                                Action::Refresh
                             }
-                        }
+                            Err(e) => Action::Error(format!("Create failed: {}", e)),
+                        },
                         Some(DialogMode::Rename) => {
                             if let Some((old_name, _, _)) = self.timelines.get(self.cursor) {
                                 match ctx.repo.rename_timeline(old_name, &value) {
@@ -191,12 +189,10 @@ impl TabView for TimelineView {
             })
             .collect();
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(Span::styled(
-                format!(" Timelines ({}) ", self.timelines.len()),
-                theme.title,
-            ));
+        let block = Block::default().borders(Borders::ALL).title(Span::styled(
+            format!(" Timelines ({}) ", self.timelines.len()),
+            theme.title,
+        ));
 
         let list = List::new(items).block(block);
         frame.render_widget(list, area);
@@ -249,9 +245,8 @@ impl TabView for TimelineView {
             .collect();
 
         // Sort: current first, then alphabetical
-        self.timelines.sort_by(|a, b| {
-            b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0))
-        });
+        self.timelines
+            .sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
 
         if self.cursor >= self.timelines.len() && !self.timelines.is_empty() {
             self.cursor = self.timelines.len() - 1;

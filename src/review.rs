@@ -147,9 +147,7 @@ pub fn create_review(
     let target_seal = crate::seal::generate_seal_name(target_leaf.hash());
 
     let cfg = config::load_config(&repo.ivaldi_dir);
-    let author = cfg
-        .author()
-        .unwrap_or_else(|| "unknown <unknown>".into());
+    let author = cfg.author().unwrap_or_else(|| "unknown <unknown>".into());
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -211,9 +209,7 @@ pub fn add_comment(
     }
 
     let cfg = config::load_config(&repo.ivaldi_dir);
-    let author = cfg
-        .author()
-        .unwrap_or_else(|| "unknown <unknown>".into());
+    let author = cfg.author().unwrap_or_else(|| "unknown <unknown>".into());
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -261,9 +257,7 @@ pub fn submit_verdict(
     }
 
     let cfg = config::load_config(&repo.ivaldi_dir);
-    let author = cfg
-        .author()
-        .unwrap_or_else(|| "unknown <unknown>".into());
+    let author = cfg.author().unwrap_or_else(|| "unknown <unknown>".into());
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -334,8 +328,7 @@ pub fn merge_review(repo: &mut Repo, review_id: u64) -> Result<Review, RepoError
     let result = FuseEngine::fuse(&base_files, &ours_files, &theirs_files, strategy);
 
     if !result.success {
-        let conflict_paths: Vec<String> =
-            result.conflicts.iter().map(|c| c.path.clone()).collect();
+        let conflict_paths: Vec<String> = result.conflicts.iter().map(|c| c.path.clone()).collect();
         return Err(RepoError::Other(format!(
             "merge has {} conflict(s): {}",
             conflict_paths.len(),
@@ -349,9 +342,7 @@ pub fn merge_review(repo: &mut Repo, review_id: u64) -> Result<Review, RepoError
         .map_err(|e| RepoError::Other(e.to_string()))?;
 
     let cfg = config::load_config(&repo.ivaldi_dir);
-    let author = cfg
-        .author()
-        .unwrap_or_else(|| "unknown <unknown>".into());
+    let author = cfg.author().unwrap_or_else(|| "unknown <unknown>".into());
     let message = format!(
         "Review #{}: {} (fuse {} into {})",
         review.id, review.title, review.source_timeline, review.target_timeline
@@ -384,9 +375,7 @@ pub fn close_review(repo: &Repo, review_id: u64) -> Result<Review, RepoError> {
         .ok_or_else(|| RepoError::Other(format!("review #{} not found", review_id)))?;
 
     if review.status == ReviewStatus::Merged {
-        return Err(RepoError::Other(
-            "cannot close a merged review".into(),
-        ));
+        return Err(RepoError::Other("cannot close a merged review".into()));
     }
 
     let now = std::time::SystemTime::now()
@@ -425,10 +414,7 @@ pub fn reopen_review(repo: &Repo, review_id: u64) -> Result<Review, RepoError> {
 }
 
 /// Get the diff between source and target timelines for a review.
-pub fn review_diff(
-    repo: &Repo,
-    review_id: u64,
-) -> Result<Vec<fsmerkle::Change>, RepoError> {
+pub fn review_diff(repo: &Repo, review_id: u64) -> Result<Vec<fsmerkle::Change>, RepoError> {
     let review = repo
         .load_review(review_id)?
         .ok_or_else(|| RepoError::Other(format!("review #{} not found", review_id)))?;
@@ -526,12 +512,8 @@ mod tests {
         repo.create_timeline("feature", None).unwrap();
         repo.switch_timeline("feature").unwrap();
         let tree2 = B3Hash::digest(b"feature tree");
-        repo.commit(
-            tree2,
-            "Test User <test@ivaldi.dev>",
-            "Feature work",
-        )
-        .unwrap();
+        repo.commit(tree2, "Test User <test@ivaldi.dev>", "Feature work")
+            .unwrap();
 
         repo.switch_timeline("main").unwrap();
         (dir, repo)
@@ -560,14 +542,8 @@ mod tests {
             ReviewStatus::from_str("changes-requested"),
             Some(ReviewStatus::ChangesRequested)
         );
-        assert_eq!(
-            ReviewStatus::from_str("merged"),
-            Some(ReviewStatus::Merged)
-        );
-        assert_eq!(
-            ReviewStatus::from_str("closed"),
-            Some(ReviewStatus::Closed)
-        );
+        assert_eq!(ReviewStatus::from_str("merged"), Some(ReviewStatus::Merged));
+        assert_eq!(ReviewStatus::from_str("closed"), Some(ReviewStatus::Closed));
         assert_eq!(ReviewStatus::from_str("invalid"), None);
     }
 
@@ -673,9 +649,7 @@ mod tests {
         }
 
         // Update next_id counter
-        repo.store
-            .set_meta("review.next_id", "4")
-            .unwrap();
+        repo.store.set_meta("review.next_id", "4").unwrap();
 
         let all = list_reviews(&repo, &ReviewFilter::default()).unwrap();
         assert_eq!(all.len(), 3);
@@ -727,9 +701,15 @@ mod tests {
     fn create_review_success() {
         let (_dir, repo) = setup_repo_with_branches();
 
-        let review =
-            create_review(&repo, "Add login", "Implements login", "feature", "main", "auto")
-                .unwrap();
+        let review = create_review(
+            &repo,
+            "Add login",
+            "Implements login",
+            "feature",
+            "main",
+            "auto",
+        )
+        .unwrap();
 
         assert_eq!(review.id, 1);
         assert_eq!(review.title, "Add login");
@@ -743,8 +723,7 @@ mod tests {
     #[test]
     fn add_comment_to_review() {
         let (_dir, repo) = setup_repo_with_branches();
-        let review =
-            create_review(&repo, "Test", "", "feature", "main", "auto").unwrap();
+        let review = create_review(&repo, "Test", "", "feature", "main", "auto").unwrap();
 
         let updated =
             add_comment(&repo, review.id, "src/main.rs", Some(10), "Fix this", None).unwrap();
@@ -763,19 +742,21 @@ mod tests {
     #[test]
     fn approval_flow() {
         let (_dir, repo) = setup_repo_with_branches();
-        let review =
-            create_review(&repo, "Test", "", "feature", "main", "auto").unwrap();
+        let review = create_review(&repo, "Test", "", "feature", "main", "auto").unwrap();
         assert_eq!(review.status, ReviewStatus::Open);
 
         // Request changes
-        let r2 =
-            submit_verdict(&repo, review.id, ReviewStatus::ChangesRequested, "Needs work")
-                .unwrap();
+        let r2 = submit_verdict(
+            &repo,
+            review.id,
+            ReviewStatus::ChangesRequested,
+            "Needs work",
+        )
+        .unwrap();
         assert_eq!(r2.status, ReviewStatus::ChangesRequested);
 
         // Approve
-        let r3 =
-            submit_verdict(&repo, review.id, ReviewStatus::Approved, "LGTM").unwrap();
+        let r3 = submit_verdict(&repo, review.id, ReviewStatus::Approved, "LGTM").unwrap();
         assert_eq!(r3.status, ReviewStatus::Approved);
         assert_eq!(r3.verdicts.len(), 2);
     }
@@ -783,8 +764,7 @@ mod tests {
     #[test]
     fn merge_requires_approval() {
         let (_dir, mut repo) = setup_repo_with_branches();
-        let review =
-            create_review(&repo, "Test", "", "feature", "main", "auto").unwrap();
+        let review = create_review(&repo, "Test", "", "feature", "main", "auto").unwrap();
 
         // Merging unapproved review should fail
         let err = merge_review(&mut repo, review.id);
@@ -795,8 +775,7 @@ mod tests {
     #[test]
     fn close_and_reopen() {
         let (_dir, repo) = setup_repo_with_branches();
-        let review =
-            create_review(&repo, "Test", "", "feature", "main", "auto").unwrap();
+        let review = create_review(&repo, "Test", "", "feature", "main", "auto").unwrap();
 
         let closed = close_review(&repo, review.id).unwrap();
         assert_eq!(closed.status, ReviewStatus::Closed);
@@ -808,8 +787,7 @@ mod tests {
     #[test]
     fn reopen_non_closed_fails() {
         let (_dir, repo) = setup_repo_with_branches();
-        let review =
-            create_review(&repo, "Test", "", "feature", "main", "auto").unwrap();
+        let review = create_review(&repo, "Test", "", "feature", "main", "auto").unwrap();
 
         // Can't reopen an already-open review
         let err = reopen_review(&repo, review.id);
@@ -819,8 +797,7 @@ mod tests {
     #[test]
     fn cannot_comment_on_closed_review() {
         let (_dir, repo) = setup_repo_with_branches();
-        let review =
-            create_review(&repo, "Test", "", "feature", "main", "auto").unwrap();
+        let review = create_review(&repo, "Test", "", "feature", "main", "auto").unwrap();
         close_review(&repo, review.id).unwrap();
 
         let err = add_comment(&repo, review.id, "file.rs", None, "comment", None);
@@ -830,8 +807,7 @@ mod tests {
     #[test]
     fn cannot_verdict_on_closed_review() {
         let (_dir, repo) = setup_repo_with_branches();
-        let review =
-            create_review(&repo, "Test", "", "feature", "main", "auto").unwrap();
+        let review = create_review(&repo, "Test", "", "feature", "main", "auto").unwrap();
         close_review(&repo, review.id).unwrap();
 
         let err = submit_verdict(&repo, review.id, ReviewStatus::Approved, "LGTM");

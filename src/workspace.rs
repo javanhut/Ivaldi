@@ -12,9 +12,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::cas::{Cas, CasError};
+use crate::fsmerkle::{self, BlobNode, FsStore, NodeKind};
 #[cfg(test)]
 use crate::fsmerkle::{Entry, MODE_DIR, MODE_FILE};
-use crate::fsmerkle::{self, BlobNode, FsStore, NodeKind};
 use crate::hash::B3Hash;
 use crate::ignore::PatternCache;
 
@@ -224,7 +224,10 @@ impl<'a> Workspace<'a> {
 
             // Dotfiles need explicit confirmation unless already allowed
             let basename = path.rsplit('/').next().unwrap_or(path);
-            if basename.starts_with('.') && basename != ".ivaldiignore" && !allowlist.is_allowed(path) {
+            if basename.starts_with('.')
+                && basename != ".ivaldiignore"
+                && !allowlist.is_allowed(path)
+            {
                 needs_confirmation.push(path.to_string());
                 continue;
             }
@@ -232,7 +235,9 @@ impl<'a> Workspace<'a> {
             let content = fs::read(&full_path).map_err(WorkspaceError::Io)?;
             let canonical = BlobNode::canonical_bytes(&content);
             let hash = B3Hash::digest(&canonical);
-            self.cas.put(hash, &canonical).map_err(WorkspaceError::Cas)?;
+            self.cas
+                .put(hash, &canonical)
+                .map_err(WorkspaceError::Cas)?;
 
             self.staging.stage(path, hash);
             gathered.push(path.to_string());
@@ -261,7 +266,9 @@ impl<'a> Workspace<'a> {
             let content = fs::read(&full_path).map_err(WorkspaceError::Io)?;
             let canonical = BlobNode::canonical_bytes(&content);
             let hash = B3Hash::digest(&canonical);
-            self.cas.put(hash, &canonical).map_err(WorkspaceError::Cas)?;
+            self.cas
+                .put(hash, &canonical)
+                .map_err(WorkspaceError::Cas)?;
 
             self.staging.stage(path, hash);
             gathered.push(path.to_string());
@@ -277,7 +284,10 @@ impl<'a> Workspace<'a> {
         let files = self.scan(ignore)?;
         // scan() already excludes dotfiles via is_ignored(), so no allowlist needed
         let allowlist = DotfileAllowlist::load(&self.ivaldi_dir);
-        let result = self.gather(&files.iter().map(|s| s.as_str()).collect::<Vec<_>>(), &allowlist)?;
+        let result = self.gather(
+            &files.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            &allowlist,
+        )?;
 
         // Discover dotfiles that were skipped so the caller can report them
         let skipped = self.find_dotfiles(ignore)?;
@@ -435,7 +445,9 @@ impl<'a> Workspace<'a> {
         // Write/update files
         for (path, blob_hash) in &target_files {
             let full_path = self.work_dir.join(path);
-            let (_, content) = store.load_blob(*blob_hash).map_err(WorkspaceError::FsMerkle)?;
+            let (_, content) = store
+                .load_blob(*blob_hash)
+                .map_err(WorkspaceError::FsMerkle)?;
 
             // Only write if different
             let should_write = if full_path.exists() {
@@ -473,7 +485,9 @@ impl<'a> Workspace<'a> {
         prefix: &str,
         files: &mut BTreeMap<String, B3Hash>,
     ) -> Result<(), WorkspaceError> {
-        let tree = store.load_tree(tree_hash).map_err(WorkspaceError::FsMerkle)?;
+        let tree = store
+            .load_tree(tree_hash)
+            .map_err(WorkspaceError::FsMerkle)?;
 
         for entry in &tree.entries {
             let path = if prefix.is_empty() {
@@ -497,7 +511,9 @@ impl<'a> Workspace<'a> {
 
     /// Save workspace state to disk.
     pub fn save(&self) -> Result<(), WorkspaceError> {
-        self.staging.save(&self.ivaldi_dir).map_err(WorkspaceError::Io)
+        self.staging
+            .save(&self.ivaldi_dir)
+            .map_err(WorkspaceError::Io)
     }
 }
 
@@ -874,7 +890,10 @@ mod tests {
         let result = ws.gather(&[".env"], &allowlist);
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), WorkspaceError::SecurityBlocked(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            WorkspaceError::SecurityBlocked(_)
+        ));
     }
 
     #[test]
@@ -924,7 +943,10 @@ mod tests {
 
         let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
         let result = ws.gather_confirmed(&[".env"]);
-        assert!(matches!(result.unwrap_err(), WorkspaceError::SecurityBlocked(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            WorkspaceError::SecurityBlocked(_)
+        ));
     }
 
     #[test]

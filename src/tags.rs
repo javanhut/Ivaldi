@@ -35,66 +35,95 @@ pub struct TagManager {
 
 impl TagManager {
     pub fn new() -> Self {
-        Self { tags: BTreeMap::new() }
+        Self {
+            tags: BTreeMap::new(),
+        }
     }
 
     /// Create a lightweight tag.
-    pub fn create_lightweight(&mut self, name: &str, target_hash: B3Hash, target_index: u64) -> Result<(), TagError> {
+    pub fn create_lightweight(
+        &mut self,
+        name: &str,
+        target_hash: B3Hash,
+        target_index: u64,
+    ) -> Result<(), TagError> {
         if self.tags.contains_key(name) {
             return Err(TagError::AlreadyExists(name.to_string()));
         }
-        self.tags.insert(name.to_string(), Tag {
-            name: name.to_string(),
-            target_hash,
-            target_index,
-            kind: TagKind::Lightweight,
-            message: None,
-            tagger: None,
-            timestamp: None,
-        });
+        self.tags.insert(
+            name.to_string(),
+            Tag {
+                name: name.to_string(),
+                target_hash,
+                target_index,
+                kind: TagKind::Lightweight,
+                message: None,
+                tagger: None,
+                timestamp: None,
+            },
+        );
         Ok(())
     }
 
     /// Create an annotated tag with message and tagger info.
     pub fn create_annotated(
-        &mut self, name: &str, target_hash: B3Hash, target_index: u64,
-        message: &str, tagger: &str, timestamp: i64,
+        &mut self,
+        name: &str,
+        target_hash: B3Hash,
+        target_index: u64,
+        message: &str,
+        tagger: &str,
+        timestamp: i64,
     ) -> Result<(), TagError> {
         if self.tags.contains_key(name) {
             return Err(TagError::AlreadyExists(name.to_string()));
         }
-        self.tags.insert(name.to_string(), Tag {
-            name: name.to_string(),
-            target_hash,
-            target_index,
-            kind: TagKind::Annotated,
-            message: Some(message.to_string()),
-            tagger: Some(tagger.to_string()),
-            timestamp: Some(timestamp),
-        });
+        self.tags.insert(
+            name.to_string(),
+            Tag {
+                name: name.to_string(),
+                target_hash,
+                target_index,
+                kind: TagKind::Annotated,
+                message: Some(message.to_string()),
+                tagger: Some(tagger.to_string()),
+                timestamp: Some(timestamp),
+            },
+        );
         Ok(())
     }
 
     /// Delete a tag.
     pub fn delete(&mut self, name: &str) -> Result<(), TagError> {
-        self.tags.remove(name).ok_or(TagError::NotFound(name.to_string()))?;
+        self.tags
+            .remove(name)
+            .ok_or(TagError::NotFound(name.to_string()))?;
         Ok(())
     }
 
     /// Get a tag by name.
-    pub fn get(&self, name: &str) -> Option<&Tag> { self.tags.get(name) }
+    pub fn get(&self, name: &str) -> Option<&Tag> {
+        self.tags.get(name)
+    }
 
     /// List all tags sorted by name.
-    pub fn list(&self) -> Vec<&Tag> { self.tags.values().collect() }
+    pub fn list(&self) -> Vec<&Tag> {
+        self.tags.values().collect()
+    }
 
     /// Find tags pointing to a specific commit.
     pub fn tags_for_commit(&self, hash: B3Hash) -> Vec<&Tag> {
-        self.tags.values().filter(|t| t.target_hash == hash).collect()
+        self.tags
+            .values()
+            .filter(|t| t.target_hash == hash)
+            .collect()
     }
 }
 
 impl Default for TagManager {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -123,7 +152,8 @@ mod tests {
     fn annotated_tag() {
         let mut mgr = TagManager::new();
         let hash = B3Hash::digest(b"commit");
-        mgr.create_annotated("v2.0", hash, 1, "Release 2.0", "Alice", 1700000000).unwrap();
+        mgr.create_annotated("v2.0", hash, 1, "Release 2.0", "Alice", 1700000000)
+            .unwrap();
         let tag = mgr.get("v2.0").unwrap();
         assert_eq!(tag.kind, TagKind::Annotated);
         assert_eq!(tag.message.as_deref(), Some("Release 2.0"));

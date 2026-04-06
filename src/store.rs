@@ -50,13 +50,27 @@ impl Store {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let db = Database::create(path)?;
         let w = db.begin_write()?;
-        { let _ = w.open_table(LEAVES)?; }
-        { let _ = w.open_table(TIMELINE_HEADS)?; }
-        { let _ = w.open_table(SEAL_NAME_TO_HASH)?; }
-        { let _ = w.open_table(HASH_TO_SEAL_NAME)?; }
-        { let _ = w.open_table(BUTTERFLY_DATA)?; }
-        { let _ = w.open_table(BUTTERFLY_CHILDREN)?; }
-        { let _ = w.open_table(META)?; }
+        {
+            let _ = w.open_table(LEAVES)?;
+        }
+        {
+            let _ = w.open_table(TIMELINE_HEADS)?;
+        }
+        {
+            let _ = w.open_table(SEAL_NAME_TO_HASH)?;
+        }
+        {
+            let _ = w.open_table(HASH_TO_SEAL_NAME)?;
+        }
+        {
+            let _ = w.open_table(BUTTERFLY_DATA)?;
+        }
+        {
+            let _ = w.open_table(BUTTERFLY_CHILDREN)?;
+        }
+        {
+            let _ = w.open_table(META)?;
+        }
         w.commit()?;
         Ok(Self { db })
     }
@@ -65,7 +79,9 @@ impl Store {
 
     pub fn put_leaf(&self, idx: u64, data: &[u8]) -> Result<(), StoreError> {
         let w = self.db.begin_write()?;
-        { w.open_table(LEAVES)?.insert(idx, data)?; }
+        {
+            w.open_table(LEAVES)?.insert(idx, data)?;
+        }
         w.commit()?;
         Ok(())
     }
@@ -80,7 +96,9 @@ impl Store {
         let r = self.db.begin_read()?;
         let t = r.open_table(LEAVES)?;
         let mut n = 0u64;
-        for _ in t.iter()? { n += 1; }
+        for _ in t.iter()? {
+            n += 1;
+        }
         Ok(n)
     }
 
@@ -88,7 +106,10 @@ impl Store {
         let r = self.db.begin_read()?;
         let t = r.open_table(LEAVES)?;
         let mut v = Vec::new();
-        for e in t.iter()? { let (k, _) = e?; v.push(k.value()); }
+        for e in t.iter()? {
+            let (k, _) = e?;
+            v.push(k.value());
+        }
         Ok(v)
     }
 
@@ -96,7 +117,9 @@ impl Store {
 
     pub fn set_timeline_head(&self, name: &str, idx: u64) -> Result<(), StoreError> {
         let w = self.db.begin_write()?;
-        { w.open_table(TIMELINE_HEADS)?.insert(name, idx)?; }
+        {
+            w.open_table(TIMELINE_HEADS)?.insert(name, idx)?;
+        }
         w.commit()?;
         Ok(())
     }
@@ -110,7 +133,9 @@ impl Store {
     pub fn remove_timeline_head(&self, name: &str) -> Result<bool, StoreError> {
         let w = self.db.begin_write()?;
         let removed;
-        { removed = w.open_table(TIMELINE_HEADS)?.remove(name)?.is_some(); }
+        {
+            removed = w.open_table(TIMELINE_HEADS)?.remove(name)?.is_some();
+        }
         w.commit()?;
         Ok(removed)
     }
@@ -132,8 +157,10 @@ impl Store {
     pub fn put_seal_name(&self, name: &str, hash: B3Hash) -> Result<(), StoreError> {
         let w = self.db.begin_write()?;
         {
-            w.open_table(SEAL_NAME_TO_HASH)?.insert(name, hash.as_bytes().as_slice())?;
-            w.open_table(HASH_TO_SEAL_NAME)?.insert(hash.as_bytes().as_slice(), name)?;
+            w.open_table(SEAL_NAME_TO_HASH)?
+                .insert(name, hash.as_bytes().as_slice())?;
+            w.open_table(HASH_TO_SEAL_NAME)?
+                .insert(hash.as_bytes().as_slice(), name)?;
         }
         w.commit()?;
         Ok(())
@@ -148,7 +175,8 @@ impl Store {
     pub fn get_seal_name_by_hash(&self, hash: B3Hash) -> Result<Option<String>, StoreError> {
         let r = self.db.begin_read()?;
         let t = r.open_table(HASH_TO_SEAL_NAME)?;
-        Ok(t.get(hash.as_bytes().as_slice())?.map(|v| v.value().to_string()))
+        Ok(t.get(hash.as_bytes().as_slice())?
+            .map(|v| v.value().to_string()))
     }
 
     pub fn find_seal_names_by_prefix(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
@@ -157,7 +185,9 @@ impl Store {
         let mut m = Vec::new();
         for e in t.iter()? {
             let (k, _) = e?;
-            if k.value().starts_with(prefix) { m.push(k.value().to_string()); }
+            if k.value().starts_with(prefix) {
+                m.push(k.value().to_string());
+            }
         }
         Ok(m)
     }
@@ -166,7 +196,9 @@ impl Store {
 
     pub fn put_butterfly(&self, name: &str, data: &[u8]) -> Result<(), StoreError> {
         let w = self.db.begin_write()?;
-        { w.open_table(BUTTERFLY_DATA)?.insert(name, data)?; }
+        {
+            w.open_table(BUTTERFLY_DATA)?.insert(name, data)?;
+        }
         w.commit()?;
         Ok(())
     }
@@ -180,7 +212,9 @@ impl Store {
     pub fn delete_butterfly(&self, name: &str) -> Result<bool, StoreError> {
         let w = self.db.begin_write()?;
         let removed;
-        { removed = w.open_table(BUTTERFLY_DATA)?.remove(name)?.is_some(); }
+        {
+            removed = w.open_table(BUTTERFLY_DATA)?.remove(name)?.is_some();
+        }
         w.commit()?;
         Ok(removed)
     }
@@ -189,13 +223,24 @@ impl Store {
         let r = self.db.begin_read()?;
         let t = r.open_table(BUTTERFLY_DATA)?;
         let mut v = Vec::new();
-        for e in t.iter()? { let (k, _) = e?; v.push(k.value().to_string()); }
+        for e in t.iter()? {
+            let (k, _) = e?;
+            v.push(k.value().to_string());
+        }
         Ok(v)
     }
 
-    pub fn set_butterfly_children(&self, parent: &str, children: &[String]) -> Result<(), StoreError> {
+    pub fn set_butterfly_children(
+        &self,
+        parent: &str,
+        children: &[String],
+    ) -> Result<(), StoreError> {
         let w = self.db.begin_write()?;
-        { let val = children.join(","); w.open_table(BUTTERFLY_CHILDREN)?.insert(parent, val.as_str())?; }
+        {
+            let val = children.join(",");
+            w.open_table(BUTTERFLY_CHILDREN)?
+                .insert(parent, val.as_str())?;
+        }
         w.commit()?;
         Ok(())
     }
@@ -203,17 +248,25 @@ impl Store {
     pub fn get_butterfly_children(&self, parent: &str) -> Result<Vec<String>, StoreError> {
         let r = self.db.begin_read()?;
         let t = r.open_table(BUTTERFLY_CHILDREN)?;
-        Ok(t.get(parent)?.map(|v| {
-            let s = v.value();
-            if s.is_empty() { Vec::new() } else { s.split(',').map(|x| x.to_string()).collect() }
-        }).unwrap_or_default())
+        Ok(t.get(parent)?
+            .map(|v| {
+                let s = v.value();
+                if s.is_empty() {
+                    Vec::new()
+                } else {
+                    s.split(',').map(|x| x.to_string()).collect()
+                }
+            })
+            .unwrap_or_default())
     }
 
     // -- Meta --
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<(), StoreError> {
         let w = self.db.begin_write()?;
-        { w.open_table(META)?.insert(key, value)?; }
+        {
+            w.open_table(META)?.insert(key, value)?;
+        }
         w.commit()?;
         Ok(())
     }
@@ -235,14 +288,16 @@ mod tests {
         (dir, store)
     }
 
-    #[test] fn leaf_put_get() {
+    #[test]
+    fn leaf_put_get() {
         let (_d, s) = setup();
         s.put_leaf(0, b"data").unwrap();
         assert_eq!(s.get_leaf(0).unwrap().unwrap(), b"data");
         assert!(s.get_leaf(99).unwrap().is_none());
     }
 
-    #[test] fn leaf_count_and_indices() {
+    #[test]
+    fn leaf_count_and_indices() {
         let (_d, s) = setup();
         s.put_leaf(0, b"a").unwrap();
         s.put_leaf(1, b"b").unwrap();
@@ -251,7 +306,8 @@ mod tests {
         assert_eq!(s.all_leaf_indices().unwrap(), vec![0, 1, 5]);
     }
 
-    #[test] fn timeline_head_crud() {
+    #[test]
+    fn timeline_head_crud() {
         let (_d, s) = setup();
         s.set_timeline_head("main", 42).unwrap();
         assert_eq!(s.get_timeline_head("main").unwrap(), Some(42));
@@ -261,7 +317,8 @@ mod tests {
         assert!(s.get_timeline_head("main").unwrap().is_none());
     }
 
-    #[test] fn timeline_list_sorted() {
+    #[test]
+    fn timeline_list_sorted() {
         let (_d, s) = setup();
         s.set_timeline_head("zeta", 0).unwrap();
         s.set_timeline_head("alpha", 1).unwrap();
@@ -270,23 +327,30 @@ mod tests {
         assert_eq!(list[1].0, "zeta");
     }
 
-    #[test] fn seal_name_bidirectional() {
+    #[test]
+    fn seal_name_bidirectional() {
         let (_d, s) = setup();
         let h = B3Hash::digest(b"x");
         s.put_seal_name("swift-eagle", h).unwrap();
         assert_eq!(s.get_hash_by_seal_name("swift-eagle").unwrap(), Some(h));
-        assert_eq!(s.get_seal_name_by_hash(h).unwrap(), Some("swift-eagle".into()));
+        assert_eq!(
+            s.get_seal_name_by_hash(h).unwrap(),
+            Some("swift-eagle".into())
+        );
     }
 
-    #[test] fn seal_name_prefix() {
+    #[test]
+    fn seal_name_prefix() {
         let (_d, s) = setup();
-        s.put_seal_name("swift-eagle", B3Hash::digest(b"1")).unwrap();
+        s.put_seal_name("swift-eagle", B3Hash::digest(b"1"))
+            .unwrap();
         s.put_seal_name("swift-wolf", B3Hash::digest(b"2")).unwrap();
         s.put_seal_name("bold-hawk", B3Hash::digest(b"3")).unwrap();
         assert_eq!(s.find_seal_names_by_prefix("swift").unwrap().len(), 2);
     }
 
-    #[test] fn butterfly_crud() {
+    #[test]
+    fn butterfly_crud() {
         let (_d, s) = setup();
         s.put_butterfly("exp", b"json").unwrap();
         assert_eq!(s.get_butterfly("exp").unwrap().unwrap(), b"json");
@@ -294,29 +358,44 @@ mod tests {
         assert!(s.get_butterfly("exp").unwrap().is_none());
     }
 
-    #[test] fn butterfly_children() {
+    #[test]
+    fn butterfly_children() {
         let (_d, s) = setup();
-        s.set_butterfly_children("main", &["a".into(), "b".into()]).unwrap();
+        s.set_butterfly_children("main", &["a".into(), "b".into()])
+            .unwrap();
         assert_eq!(s.get_butterfly_children("main").unwrap(), vec!["a", "b"]);
         assert!(s.get_butterfly_children("empty").unwrap().is_empty());
     }
 
-    #[test] fn meta() {
+    #[test]
+    fn meta() {
         let (_d, s) = setup();
         s.set_meta("k", "v").unwrap();
         assert_eq!(s.get_meta("k").unwrap(), Some("v".into()));
     }
 
-    #[test] fn persistence() {
+    #[test]
+    fn persistence() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("s.db");
-        { let s = Store::open(&p).unwrap(); s.put_leaf(0, b"persist").unwrap(); s.set_timeline_head("main", 0).unwrap(); }
-        { let s = Store::open(&p).unwrap(); assert_eq!(s.get_leaf(0).unwrap().unwrap(), b"persist"); assert_eq!(s.get_timeline_head("main").unwrap(), Some(0)); }
+        {
+            let s = Store::open(&p).unwrap();
+            s.put_leaf(0, b"persist").unwrap();
+            s.set_timeline_head("main", 0).unwrap();
+        }
+        {
+            let s = Store::open(&p).unwrap();
+            assert_eq!(s.get_leaf(0).unwrap().unwrap(), b"persist");
+            assert_eq!(s.get_timeline_head("main").unwrap(), Some(0));
+        }
     }
 
-    #[test] fn many_leaves() {
+    #[test]
+    fn many_leaves() {
         let (_d, s) = setup();
-        for i in 0..500u64 { s.put_leaf(i, format!("l{}", i).as_bytes()).unwrap(); }
+        for i in 0..500u64 {
+            s.put_leaf(i, format!("l{}", i).as_bytes()).unwrap();
+        }
         assert_eq!(s.leaf_count().unwrap(), 500);
     }
 }

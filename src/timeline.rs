@@ -100,7 +100,11 @@ impl HistoryManager {
     ///
     /// Automatically fills `prev_idx` from the current timeline head
     /// and sets `timeline_id`.
-    pub fn commit(&mut self, timeline: &str, mut leaf: Leaf) -> Result<(u64, B3Hash), TimelineError> {
+    pub fn commit(
+        &mut self,
+        timeline: &str,
+        mut leaf: Leaf,
+    ) -> Result<(u64, B3Hash), TimelineError> {
         // Fill prev_idx from current timeline head
         leaf.prev_idx = self.timelines.get_head(timeline).unwrap_or(NO_PARENT);
         leaf.timeline_id = timeline.to_string();
@@ -112,7 +116,11 @@ impl HistoryManager {
     }
 
     /// Create a new timeline pointing at the same commit as `source` (or current).
-    pub fn create_timeline(&mut self, name: &str, source: Option<&str>) -> Result<(), TimelineError> {
+    pub fn create_timeline(
+        &mut self,
+        name: &str,
+        source: Option<&str>,
+    ) -> Result<(), TimelineError> {
         if self.timelines.exists(name) {
             return Err(TimelineError::AlreadyExists(name.to_string()));
         }
@@ -215,7 +223,7 @@ mod tests {
     fn make_leaf(msg: &str) -> Leaf {
         Leaf::new(
             B3Hash::digest(msg.as_bytes()),
-            "",  // will be set by commit
+            "", // will be set by commit
             "Author <a@b.com>",
             1700000000,
             msg,
@@ -385,13 +393,13 @@ mod tests {
     fn lca_divergent_timelines() {
         let mut mgr = HistoryManager::new();
         // Base commit
-        mgr.commit("main", make_leaf("base")).unwrap();  // idx=0
+        mgr.commit("main", make_leaf("base")).unwrap(); // idx=0
 
         // Create feature from main
         mgr.create_timeline("feature", None).unwrap();
 
         // Diverge
-        mgr.commit("main", make_leaf("main-1")).unwrap();      // idx=1
+        mgr.commit("main", make_leaf("main-1")).unwrap(); // idx=1
         mgr.commit("feature", make_leaf("feature-1")).unwrap(); // idx=2
 
         // LCA of main head (1) and feature head (2) should be base (0)
@@ -403,13 +411,15 @@ mod tests {
         let mut mgr = HistoryManager::new();
         // Build a chain of 20 commits on main
         for i in 0..20 {
-            mgr.commit("main", make_leaf(&format!("commit {}", i))).unwrap();
+            mgr.commit("main", make_leaf(&format!("commit {}", i)))
+                .unwrap();
         }
 
         // Fork at commit 10
         mgr.timelines.set_head("feature", 10);
         for i in 0..5 {
-            mgr.commit("feature", make_leaf(&format!("feature {}", i))).unwrap();
+            mgr.commit("feature", make_leaf(&format!("feature {}", i)))
+                .unwrap();
         }
 
         let main_head = mgr.get_timeline_head("main").unwrap();

@@ -11,47 +11,157 @@
 use crate::hash::B3Hash;
 
 static ADJECTIVES: &[&str] = &[
-    "swift", "brave", "bold", "clever", "mighty", "gentle", "wise", "noble",
-    "fierce", "calm", "bright", "dark", "ancient", "young", "strong", "quick",
-    "silent", "loud", "warm", "cool", "sharp", "smooth", "rough", "soft",
-    "hard", "light", "heavy", "deep", "shallow", "wide", "narrow", "tall",
-    "short", "long", "round", "square", "curved", "straight", "twisted", "pure",
-    "wild", "tame", "free", "bound", "open", "closed", "full", "empty",
-    "rich", "simple", "complex", "clear", "misty", "vivid", "dim", "golden",
-    "pale", "silver", "crystal", "iron", "steel", "stone", "wooden", "grand",
+    "swift", "brave", "bold", "clever", "mighty", "gentle", "wise", "noble", "fierce", "calm",
+    "bright", "dark", "ancient", "young", "strong", "quick", "silent", "loud", "warm", "cool",
+    "sharp", "smooth", "rough", "soft", "hard", "light", "heavy", "deep", "shallow", "wide",
+    "narrow", "tall", "short", "long", "round", "square", "curved", "straight", "twisted", "pure",
+    "wild", "tame", "free", "bound", "open", "closed", "full", "empty", "rich", "simple",
+    "complex", "clear", "misty", "vivid", "dim", "golden", "pale", "silver", "crystal", "iron",
+    "steel", "stone", "wooden", "grand",
 ];
 
 static NOUNS: &[&str] = &[
-    "eagle", "mountain", "river", "falcon", "wolf", "bear", "storm", "thunder",
-    "forest", "ocean", "phoenix", "dragon", "tiger", "lion", "hawk", "raven",
-    "fox", "deer", "star", "moon", "sun", "comet", "galaxy", "planet",
-    "valley", "peak", "canyon", "meadow", "grove", "spring", "waterfall", "lake",
-    "island", "lighthouse", "castle", "tower", "bridge", "gate", "path", "road",
-    "sword", "shield", "crown", "gem", "crystal", "flame", "spark", "ember",
-    "wind", "wave", "stone", "tree", "flower", "rose", "oak", "pine",
-    "marble", "granite", "diamond", "ruby", "sapphire", "emerald", "pearl", "gold",
+    "eagle",
+    "mountain",
+    "river",
+    "falcon",
+    "wolf",
+    "bear",
+    "storm",
+    "thunder",
+    "forest",
+    "ocean",
+    "phoenix",
+    "dragon",
+    "tiger",
+    "lion",
+    "hawk",
+    "raven",
+    "fox",
+    "deer",
+    "star",
+    "moon",
+    "sun",
+    "comet",
+    "galaxy",
+    "planet",
+    "valley",
+    "peak",
+    "canyon",
+    "meadow",
+    "grove",
+    "spring",
+    "waterfall",
+    "lake",
+    "island",
+    "lighthouse",
+    "castle",
+    "tower",
+    "bridge",
+    "gate",
+    "path",
+    "road",
+    "sword",
+    "shield",
+    "crown",
+    "gem",
+    "crystal",
+    "flame",
+    "spark",
+    "ember",
+    "wind",
+    "wave",
+    "stone",
+    "tree",
+    "flower",
+    "rose",
+    "oak",
+    "pine",
+    "marble",
+    "granite",
+    "diamond",
+    "ruby",
+    "sapphire",
+    "emerald",
+    "pearl",
+    "gold",
 ];
 
 static VERBS: &[&str] = &[
-    "flies", "runs", "leaps", "soars", "dives", "climbs", "swims", "hunts",
-    "rests", "guards", "watches", "seeks", "finds", "builds", "grows", "shines",
-    "glows", "moves", "stands", "waits", "rises", "falls", "turns", "spins",
-    "flows", "burns", "melts", "freezes", "breaks", "heals", "creates", "destroys",
-    "protects", "attacks", "defends", "conquers", "explores", "discovers", "reveals", "hides",
-    "opens", "closes", "starts", "ends", "begins", "finishes", "travels", "arrives",
-    "departs", "returns", "calls", "whispers", "sings", "roars", "echoes", "resonates",
-    "reflects", "absorbs", "radiates", "pulsates", "vibrates", "oscillates", "rotates", "revolves",
+    "flies",
+    "runs",
+    "leaps",
+    "soars",
+    "dives",
+    "climbs",
+    "swims",
+    "hunts",
+    "rests",
+    "guards",
+    "watches",
+    "seeks",
+    "finds",
+    "builds",
+    "grows",
+    "shines",
+    "glows",
+    "moves",
+    "stands",
+    "waits",
+    "rises",
+    "falls",
+    "turns",
+    "spins",
+    "flows",
+    "burns",
+    "melts",
+    "freezes",
+    "breaks",
+    "heals",
+    "creates",
+    "destroys",
+    "protects",
+    "attacks",
+    "defends",
+    "conquers",
+    "explores",
+    "discovers",
+    "reveals",
+    "hides",
+    "opens",
+    "closes",
+    "starts",
+    "ends",
+    "begins",
+    "finishes",
+    "travels",
+    "arrives",
+    "departs",
+    "returns",
+    "calls",
+    "whispers",
+    "sings",
+    "roars",
+    "echoes",
+    "resonates",
+    "reflects",
+    "absorbs",
+    "radiates",
+    "pulsates",
+    "vibrates",
+    "oscillates",
+    "rotates",
+    "revolves",
 ];
 
 static ADVERBS: &[&str] = &[
-    "high", "fast", "slow", "well", "far", "near", "deep", "wide",
-    "soft", "hard", "bright", "dark", "quiet", "loud", "free", "true",
-    "bold", "wise", "swift", "strong", "gentle", "fierce", "calm", "wild",
-    "proud", "humble", "grand", "small", "great", "tiny", "vast", "narrow",
-    "smooth", "rough", "sharp", "dull", "clear", "misty", "warm", "cool",
-    "hot", "cold", "dry", "wet", "fresh", "stale", "new", "old",
-    "young", "ancient", "modern", "classic", "pure", "mixed", "simple", "complex",
-    "easy", "light", "heavy", "quick", "early", "late", "still", "steady",
+    "high", "fast", "slow", "well", "far", "near", "deep", "wide", "soft", "hard", "bright",
+    "dark", "quiet", "loud", "free", "true", "bold", "wise", "swift", "strong", "gentle", "fierce",
+    "calm", "wild", "proud", "humble", "grand", "small", "great", "tiny", "vast", "narrow",
+    "smooth", "rough", "sharp", "dull", "clear", "misty", "warm", "cool", "hot", "cold", "dry",
+    "wet", "fresh", "stale", "new", "old", "young", "ancient", "modern", "classic", "pure",
+    "mixed", "simple", "complex", "easy", "light", "heavy", "quick", "early", "late", "still",
+    "steady",
 ];
 
 /// Simple seeded pseudo-random number generator (compatible with Go's math/rand).
@@ -156,26 +266,46 @@ mod tests {
         let name = generate_seal_name(hash);
         let parts: Vec<&str> = name.split('-').collect();
 
-        assert!(ADJECTIVES.contains(&parts[0]), "adjective not in list: {}", parts[0]);
+        assert!(
+            ADJECTIVES.contains(&parts[0]),
+            "adjective not in list: {}",
+            parts[0]
+        );
         assert!(NOUNS.contains(&parts[1]), "noun not in list: {}", parts[1]);
         assert!(VERBS.contains(&parts[2]), "verb not in list: {}", parts[2]);
-        assert!(ADVERBS.contains(&parts[3]), "adverb not in list: {}", parts[3]);
+        assert!(
+            ADVERBS.contains(&parts[3]),
+            "adverb not in list: {}",
+            parts[3]
+        );
     }
 
     #[test]
     fn matches_full_name() {
-        assert!(matches_seal_name("swift-eagle-flies-high-447abe9b", "swift-eagle-flies-high-447abe9b"));
+        assert!(matches_seal_name(
+            "swift-eagle-flies-high-447abe9b",
+            "swift-eagle-flies-high-447abe9b"
+        ));
     }
 
     #[test]
     fn matches_partial_prefix() {
-        assert!(matches_seal_name("swift-eagle-flies-high-447abe9b", "swift-eagle"));
-        assert!(matches_seal_name("swift-eagle-flies-high-447abe9b", "swift"));
+        assert!(matches_seal_name(
+            "swift-eagle-flies-high-447abe9b",
+            "swift-eagle"
+        ));
+        assert!(matches_seal_name(
+            "swift-eagle-flies-high-447abe9b",
+            "swift"
+        ));
     }
 
     #[test]
     fn no_match() {
-        assert!(!matches_seal_name("swift-eagle-flies-high-447abe9b", "bold-wolf"));
+        assert!(!matches_seal_name(
+            "swift-eagle-flies-high-447abe9b",
+            "bold-wolf"
+        ));
     }
 
     #[test]

@@ -11,8 +11,15 @@ const BITS_PER_LEVEL: u32 = 5;
 /// A HAMT node — either a leaf (key-value) or a branch (bitmap + children).
 #[derive(Debug, Clone)]
 enum Node<V: Clone> {
-    Leaf { key: String, hash: B3Hash, value: V },
-    Branch { bitmap: u32, children: Vec<Box<Node<V>>> },
+    Leaf {
+        key: String,
+        hash: B3Hash,
+        value: V,
+    },
+    Branch {
+        bitmap: u32,
+        children: Vec<Box<Node<V>>>,
+    },
 }
 
 /// Immutable HAMT directory tree.
@@ -28,13 +35,19 @@ impl<V: Clone> Hamt<V> {
     }
 
     /// Number of entries.
-    pub fn len(&self) -> usize { self.len }
-    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 
     /// Lookup a value by key.
     pub fn get(&self, key: &str) -> Option<&V> {
         let hash = B3Hash::digest(key.as_bytes());
-        self.root.as_ref().and_then(|node| get_recursive(node, key, hash, 0))
+        self.root
+            .as_ref()
+            .and_then(|node| get_recursive(node, key, hash, 0))
     }
 
     /// Insert a key-value pair. Returns a new HAMT (structural sharing).
@@ -58,8 +71,15 @@ impl<V: Clone> Hamt<V> {
             None => self.clone(),
             Some(node) => {
                 let new_root = remove_recursive(node, key, hash, 0);
-                let new_len = if self.get(key).is_some() { self.len - 1 } else { self.len };
-                Self { root: new_root, len: new_len }
+                let new_len = if self.get(key).is_some() {
+                    self.len - 1
+                } else {
+                    self.len
+                };
+                Self {
+                    root: new_root,
+                    len: new_len,
+                }
             }
         }
     }
@@ -76,7 +96,9 @@ impl<V: Clone> Hamt<V> {
 }
 
 impl<V: Clone> Default for Hamt<V> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn index_at_level(hash: B3Hash, level: u32) -> usize {
@@ -85,44 +107,82 @@ fn index_at_level(hash: B3Hash, level: u32) -> usize {
     let bit_offset = shift as usize;
     let byte_idx = bit_offset / 8;
     let bit_idx = bit_offset % 8;
-    if byte_idx >= 32 { return 0; }
+    if byte_idx >= 32 {
+        return 0;
+    }
     ((bytes[byte_idx] >> bit_idx) & 0x1F) as usize
 }
 
-fn get_recursive<'a, V: Clone>(node: &'a Node<V>, key: &str, hash: B3Hash, level: u32) -> Option<&'a V> {
+fn get_recursive<'a, V: Clone>(
+    node: &'a Node<V>,
+    key: &str,
+    hash: B3Hash,
+    level: u32,
+) -> Option<&'a V> {
     match node {
-        Node::Leaf { key: k, value: v, .. } => {
-            if k == key { Some(v) } else { None }
+        Node::Leaf {
+            key: k, value: v, ..
+        } => {
+            if k == key {
+                Some(v)
+            } else {
+                None
+            }
         }
         Node::Branch { bitmap, children } => {
             let idx = index_at_level(hash, level);
             let bit = 1u32 << idx;
-            if bitmap & bit == 0 { return None; }
+            if bitmap & bit == 0 {
+                return None;
+            }
             let child_idx = (bitmap & (bit - 1)).count_ones() as usize;
             get_recursive(&children[child_idx], key, hash, level + 1)
         }
     }
 }
 
-fn insert_recursive<V: Clone>(node: &Node<V>, key: String, hash: B3Hash, value: V, level: u32) -> Box<Node<V>> {
+fn insert_recursive<V: Clone>(
+    node: &Node<V>,
+    key: String,
+    hash: B3Hash,
+    value: V,
+    level: u32,
+) -> Box<Node<V>> {
     match node {
-        Node::Leaf { key: existing_key, hash: existing_hash, value: existing_value } => {
+        Node::Leaf {
+            key: existing_key,
+            hash: existing_hash,
+            value: existing_value,
+        } => {
             if *existing_key == key {
                 Box::new(Node::Leaf { key, hash, value })
             } else {
                 // Collision at this level — create branch
-                let branch = Node::Branch { bitmap: 0, children: Vec::new() };
-                let b = insert_into_branch(&branch, existing_key.clone(), *existing_hash, existing_value.clone(), level);
+                let branch = Node::Branch {
+                    bitmap: 0,
+                    children: Vec::new(),
+                };
+                let b = insert_into_branch(
+                    &branch,
+                    existing_key.clone(),
+                    *existing_hash,
+                    existing_value.clone(),
+                    level,
+                );
                 insert_into_branch(&b, key, hash, value, level)
             }
         }
-        Node::Branch { .. } => {
-            insert_into_branch(node, key, hash, value, level)
-        }
+        Node::Branch { .. } => insert_into_branch(node, key, hash, value, level),
     }
 }
 
-fn insert_into_branch<V: Clone>(node: &Node<V>, key: String, hash: B3Hash, value: V, level: u32) -> Box<Node<V>> {
+fn insert_into_branch<V: Clone>(
+    node: &Node<V>,
+    key: String,
+    hash: B3Hash,
+    value: V,
+    level: u32,
+) -> Box<Node<V>> {
     match node {
         Node::Branch { bitmap, children } => {
             let idx = index_at_level(hash, level);
@@ -133,27 +193,45 @@ fn insert_into_branch<V: Clone>(node: &Node<V>, key: String, hash: B3Hash, value
                 // Empty slot — insert leaf
                 let mut new_children = children.clone();
                 new_children.insert(child_idx, Box::new(Node::Leaf { key, hash, value }));
-                Box::new(Node::Branch { bitmap: bitmap | bit, children: new_children })
+                Box::new(Node::Branch {
+                    bitmap: bitmap | bit,
+                    children: new_children,
+                })
             } else {
                 // Slot occupied — recurse
                 let mut new_children = children.clone();
-                new_children[child_idx] = insert_recursive(&children[child_idx], key, hash, value, level + 1);
-                Box::new(Node::Branch { bitmap: *bitmap, children: new_children })
+                new_children[child_idx] =
+                    insert_recursive(&children[child_idx], key, hash, value, level + 1);
+                Box::new(Node::Branch {
+                    bitmap: *bitmap,
+                    children: new_children,
+                })
             }
         }
         _ => Box::new(Node::Leaf { key, hash, value }),
     }
 }
 
-fn remove_recursive<V: Clone>(node: &Node<V>, key: &str, hash: B3Hash, level: u32) -> Option<Box<Node<V>>> {
+fn remove_recursive<V: Clone>(
+    node: &Node<V>,
+    key: &str,
+    hash: B3Hash,
+    level: u32,
+) -> Option<Box<Node<V>>> {
     match node {
         Node::Leaf { key: k, .. } => {
-            if k == key { None } else { Some(Box::new(node.clone())) }
+            if k == key {
+                None
+            } else {
+                Some(Box::new(node.clone()))
+            }
         }
         Node::Branch { bitmap, children } => {
             let idx = index_at_level(hash, level);
             let bit = 1u32 << idx;
-            if bitmap & bit == 0 { return Some(Box::new(node.clone())); }
+            if bitmap & bit == 0 {
+                return Some(Box::new(node.clone()));
+            }
             let child_idx = (bitmap & (bit - 1)).count_ones() as usize;
             let new_child = remove_recursive(&children[child_idx], key, hash, level + 1);
             let mut new_children = children.clone();
@@ -174,10 +252,16 @@ fn remove_recursive<V: Clone>(node: &Node<V>, key: &str, hash: B3Hash, level: u3
                 if let Node::Leaf { .. } = *new_children[0] {
                     Some(new_children.into_iter().next().unwrap())
                 } else {
-                    Some(Box::new(Node::Branch { bitmap: new_bitmap, children: new_children }))
+                    Some(Box::new(Node::Branch {
+                        bitmap: new_bitmap,
+                        children: new_children,
+                    }))
                 }
             } else {
-                Some(Box::new(Node::Branch { bitmap: new_bitmap, children: new_children }))
+                Some(Box::new(Node::Branch {
+                    bitmap: new_bitmap,
+                    children: new_children,
+                }))
             }
         }
     }
@@ -187,7 +271,9 @@ fn collect_entries<'a, V: Clone>(node: &'a Node<V>, result: &mut Vec<(&'a str, &
     match node {
         Node::Leaf { key, value, .. } => result.push((key, value)),
         Node::Branch { children, .. } => {
-            for child in children { collect_entries(child, result); }
+            for child in children {
+                collect_entries(child, result);
+            }
         }
     }
 }

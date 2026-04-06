@@ -7,7 +7,6 @@
 //! 4. User tests and marks good/bad
 //! 5. Repeat until the offending commit is found.
 
-
 /// Bisect session state.
 #[derive(Debug, Clone)]
 pub struct BisectState {
@@ -57,7 +56,11 @@ impl BisectState {
     /// Remaining steps (worst case).
     pub fn remaining_steps(&self) -> u32 {
         let n = self.search_range_size();
-        if n <= 1 { 0 } else { (n as f64).log2().ceil() as u32 }
+        if n <= 1 {
+            0
+        } else {
+            (n as f64).log2().ceil() as u32
+        }
     }
 
     /// Mark the current commit as good.
@@ -77,7 +80,10 @@ impl BisectState {
     fn search_range_size(&self) -> usize {
         let latest_good = self.confirmed_good.iter().max().copied().unwrap_or(0);
         let earliest_bad = self.confirmed_bad.iter().min().copied().unwrap_or(u64::MAX);
-        self.range.iter().filter(|&&i| i > latest_good && i < earliest_bad).count()
+        self.range
+            .iter()
+            .filter(|&&i| i > latest_good && i < earliest_bad)
+            .count()
     }
 
     fn narrow_range(&mut self) {
@@ -85,7 +91,9 @@ impl BisectState {
         let earliest_bad = self.confirmed_bad.iter().min().copied().unwrap_or(u64::MAX);
 
         // Find remaining candidates
-        let candidates: Vec<u64> = self.range.iter()
+        let candidates: Vec<u64> = self
+            .range
+            .iter()
             .filter(|&&i| i > latest_good && i < earliest_bad)
             .copied()
             .collect();

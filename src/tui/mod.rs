@@ -6,22 +6,22 @@
 //! - `resolver` — per-file conflict resolution during fuse
 //! - `app` — tabbed dashboard with status, log, diff, timelines, remote, fuse
 
-pub mod travel;
-pub mod shift;
-pub mod resolver;
 pub mod app;
-pub mod theme;
-pub mod types;
-pub mod input;
 pub mod components;
+pub mod input;
+pub mod resolver;
+pub mod shift;
+pub mod theme;
+pub mod travel;
+pub mod types;
 pub mod views;
 
-use std::io;
 use crossterm::{
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::prelude::*;
+use std::io;
 
 /// Initialize the terminal for TUI mode.
 pub fn init_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {

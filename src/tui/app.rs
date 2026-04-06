@@ -12,15 +12,15 @@ use crate::tui::components::status_bar::StatusBar;
 use crate::tui::components::tab_bar::TabBar;
 use crate::tui::theme::Theme;
 use crate::tui::types::{Action, AppContext, StatusData, TabId};
-use crate::tui::views::help::render_help;
 use crate::tui::views::TabView;
+use crate::tui::views::help::render_help;
 
 use crate::tui::views::diff::DiffTabView;
 use crate::tui::views::fuse::FuseView;
 use crate::tui::views::log::LogView;
 use crate::tui::views::remote::RemoteView;
-use crate::tui::views::status::StatusView;
 use crate::tui::views::review::ReviewView;
+use crate::tui::views::status::StatusView;
 use crate::tui::views::timeline::TimelineView;
 
 /// Run the TUI dashboard.
@@ -146,10 +146,8 @@ impl App {
                         let mut handled = true;
                         match key.code {
                             KeyCode::Char('q') => break,
-                            KeyCode::Char('c')
-                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                            {
-                                break
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                break;
                             }
                             KeyCode::Char('?') => {
                                 self.show_help = !self.show_help;
@@ -206,14 +204,10 @@ impl App {
                         TabId::Status => self.status_view.handle_event(&key, &mut self.ctx),
                         TabId::Log => self.log_view.handle_event(&key, &mut self.ctx),
                         TabId::Diff => self.diff_view.handle_event(&key, &mut self.ctx),
-                        TabId::Timelines => {
-                            self.timeline_view.handle_event(&key, &mut self.ctx)
-                        }
+                        TabId::Timelines => self.timeline_view.handle_event(&key, &mut self.ctx),
                         TabId::Remote => self.remote_view.handle_event(&key, &mut self.ctx),
                         TabId::Fuse => self.fuse_view.handle_event(&key, &mut self.ctx),
-                        TabId::Review => {
-                            self.review_view.handle_event(&key, &mut self.ctx)
-                        }
+                        TabId::Review => self.review_view.handle_event(&key, &mut self.ctx),
                     };
 
                     self.handle_action(action);
@@ -289,8 +283,7 @@ impl App {
         TabBar::render(frame, tab_bar_area, self.active_tab, &self.theme);
 
         // Render content
-        self.active_view()
-            .render(frame, content_area, &self.theme);
+        self.active_view().render(frame, content_area, &self.theme);
 
         // Render status bar
         StatusBar::render(

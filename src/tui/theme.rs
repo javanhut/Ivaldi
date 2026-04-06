@@ -58,12 +58,8 @@ impl Theme {
             success: Style::default().fg(Color::Rgb(0, 255, 0)),
             warning: Style::default().fg(Color::Rgb(255, 255, 85)),
             info: Style::default().fg(Color::Rgb(85, 255, 255)),
-            status_bar: Style::default()
-                .fg(Color::White)
-                .bg(Color::Rgb(40, 40, 40)),
-            help_key: Style::default()
-                .fg(purple)
-                .add_modifier(Modifier::BOLD),
+            status_bar: Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 40)),
+            help_key: Style::default().fg(purple).add_modifier(Modifier::BOLD),
             help_desc: Style::default().fg(Color::Rgb(200, 200, 200)),
             title: Style::default()
                 .fg(Color::White)

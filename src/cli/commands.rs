@@ -92,12 +92,21 @@ fn cmd_forge(quiet: bool) -> Result<(), String> {
     let result = forge::forge(&cwd).map_err(|e| e.to_string())?;
     if !quiet {
         if result.already_existed {
-            println!("Ivaldi repository already exists at {}", result.ivaldi_dir.display());
+            println!(
+                "Ivaldi repository already exists at {}",
+                result.ivaldi_dir.display()
+            );
         } else {
-            println!("Initialized empty Ivaldi repository in {}", result.ivaldi_dir.display());
+            println!(
+                "Initialized empty Ivaldi repository in {}",
+                result.ivaldi_dir.display()
+            );
             println!("Created timeline: {}", result.default_timeline);
             if result.git_imported > 0 {
-                println!("Imported {} Git branch(es) as timelines", result.git_imported);
+                println!(
+                    "Imported {} Git branch(es) as timelines",
+                    result.git_imported
+                );
             }
         }
     }
@@ -139,9 +148,14 @@ fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
         if !result.needs_confirmation.is_empty() {
             if args.allow_all {
                 // --allow-all pre-approves all dotfiles (except security-blocked)
-                let confirmed_refs: Vec<&str> =
-                    result.needs_confirmation.iter().map(|s| s.as_str()).collect();
-                let extra = ws.gather_confirmed(&confirmed_refs).map_err(|e| e.to_string())?;
+                let confirmed_refs: Vec<&str> = result
+                    .needs_confirmation
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                let extra = ws
+                    .gather_confirmed(&confirmed_refs)
+                    .map_err(|e| e.to_string())?;
                 for path in &extra {
                     allowlist.allow(path);
                 }
@@ -149,7 +163,10 @@ fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
             } else {
                 // Prompt for each dotfile individually
                 for dotfile in &result.needs_confirmation {
-                    eprint!("WARNING: '{}' is a hidden (dot) file — stage it? [y/N]: ", dotfile);
+                    eprint!(
+                        "WARNING: '{}' is a hidden (dot) file — stage it? [y/N]: ",
+                        dotfile
+                    );
                     std::io::stderr().flush().map_err(|e| e.to_string())?;
 
                     let mut input = String::new();
@@ -186,7 +203,8 @@ fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
 }
 
 fn cmd_seal(args: SealArgs, quiet: bool) -> Result<(), String> {
-    let message = args.get_message()
+    let message = args
+        .get_message()
         .ok_or("seal message required. Usage: ivaldi seal \"your message\"")?
         .to_string();
 
@@ -207,7 +225,9 @@ fn cmd_seal(args: SealArgs, quiet: bool) -> Result<(), String> {
     let author = cfg.author()
         .ok_or("user.name and user.email not configured. Run:\n  ivaldi config --set user.name \"Your Name\"\n  ivaldi config --set user.email \"you@example.com\"")?;
 
-    let result = repo.commit(tree_hash, &author, &message).map_err(|e| e.to_string())?;
+    let result = repo
+        .commit(tree_hash, &author, &message)
+        .map_err(|e| e.to_string())?;
 
     // Clear staging area
     let mut ws_mut = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
@@ -215,7 +235,11 @@ fn cmd_seal(args: SealArgs, quiet: bool) -> Result<(), String> {
     ws_mut.save().map_err(|e| e.to_string())?;
 
     if !quiet {
-        println!("Created seal: {} ({})", result.seal_name, result.hash.short8());
+        println!(
+            "Created seal: {} ({})",
+            result.seal_name,
+            result.hash.short8()
+        );
     }
     Ok(())
 }
@@ -223,12 +247,15 @@ fn cmd_seal(args: SealArgs, quiet: bool) -> Result<(), String> {
 fn cmd_status() -> Result<(), String> {
     let ctx = find_repo()?;
     let repo = open_repo()?;
-    let timeline = repo.current_timeline().unwrap_or_else(|_| "detached".into());
+    let timeline = repo
+        .current_timeline()
+        .unwrap_or_else(|_| "detached".into());
 
     println!("Timeline: {}", color::timeline(&timeline));
 
     // Get last seal tree hash for comparison
-    let last_tree = repo.get_timeline_head(&timeline)
+    let last_tree = repo
+        .get_timeline_head(&timeline)
         .map_err(|e| e.to_string())?
         .and_then(|idx| repo.get_leaf(idx).ok().flatten())
         .map(|leaf| leaf.tree_root);
@@ -236,21 +263,42 @@ fn cmd_status() -> Result<(), String> {
     let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
     let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
     let ignore_cache = ignore::load_pattern_cache(&ctx.work_dir);
-    let status = ws.status(last_tree, &ignore_cache).map_err(|e| e.to_string())?;
+    let status = ws
+        .status(last_tree, &ignore_cache)
+        .map_err(|e| e.to_string())?;
 
     // Show last seal info
-    if let Some(head_idx) = repo.get_timeline_head(&timeline).map_err(|e| e.to_string())? {
+    if let Some(head_idx) = repo
+        .get_timeline_head(&timeline)
+        .map_err(|e| e.to_string())?
+    {
         if let Some(leaf) = repo.get_leaf(head_idx).map_err(|e| e.to_string())? {
             let hash = leaf.hash();
             let name = seal::generate_seal_name(hash);
-            println!("Last seal: {} ({})", color::seal_name(&name), color::hash(&hash.short8()));
+            println!(
+                "Last seal: {} ({})",
+                color::seal_name(&name),
+                color::hash(&hash.short8())
+            );
         }
     }
 
-    let staged: Vec<_> = status.iter().filter(|f| f.state == FileState::Staged).collect();
-    let modified: Vec<_> = status.iter().filter(|f| f.state == FileState::Modified).collect();
-    let untracked: Vec<_> = status.iter().filter(|f| f.state == FileState::Untracked).collect();
-    let deleted: Vec<_> = status.iter().filter(|f| f.state == FileState::Deleted).collect();
+    let staged: Vec<_> = status
+        .iter()
+        .filter(|f| f.state == FileState::Staged)
+        .collect();
+    let modified: Vec<_> = status
+        .iter()
+        .filter(|f| f.state == FileState::Modified)
+        .collect();
+    let untracked: Vec<_> = status
+        .iter()
+        .filter(|f| f.state == FileState::Untracked)
+        .collect();
+    let deleted: Vec<_> = status
+        .iter()
+        .filter(|f| f.state == FileState::Deleted)
+        .collect();
 
     let has_changes = !modified.is_empty() || !untracked.is_empty() || !deleted.is_empty();
 
@@ -284,12 +332,17 @@ fn cmd_status() -> Result<(), String> {
 
 fn cmd_whereami() -> Result<(), String> {
     let repo = open_repo()?;
-    let timeline = repo.current_timeline().unwrap_or_else(|_| "detached".into());
+    let timeline = repo
+        .current_timeline()
+        .unwrap_or_else(|_| "detached".into());
 
     println!("Timeline: {}", timeline);
     println!("Type: Local Timeline");
 
-    if let Some(head_idx) = repo.get_timeline_head(&timeline).map_err(|e| e.to_string())? {
+    if let Some(head_idx) = repo
+        .get_timeline_head(&timeline)
+        .map_err(|e| e.to_string())?
+    {
         if let Some(leaf) = repo.get_leaf(head_idx).map_err(|e| e.to_string())? {
             let hash = leaf.hash();
             let name = seal::generate_seal_name(hash);
@@ -341,9 +394,18 @@ fn cmd_log(args: LogArgs) -> Result<(), String> {
 
     for entry in entries {
         if args.oneline {
-            println!("{} {} {}", color::hash(&entry.short_hash), color::seal_name(&entry.seal_name), entry.message);
+            println!(
+                "{} {} {}",
+                color::hash(&entry.short_hash),
+                color::seal_name(&entry.seal_name),
+                entry.message
+            );
         } else {
-            println!("Seal: {} ({})", color::seal_name(&entry.seal_name), color::hash(&entry.short_hash));
+            println!(
+                "Seal: {} ({})",
+                color::seal_name(&entry.seal_name),
+                color::hash(&entry.short_hash)
+            );
             println!("Timeline: {}", color::timeline(&entry.timeline));
             println!("Author: {}", color::author(&entry.author));
             println!("Date: {}", entry.time_unix);
@@ -383,16 +445,29 @@ fn cmd_diff(args: DiffArgs) -> Result<(), String> {
                 let mut deleted = 0usize;
                 for c in &changes {
                     let (marker, marker_fn): (&str, fn(&str) -> String) = match c.kind {
-                        crate::fsmerkle::ChangeKind::Added => { added += 1; ("++", color::bold_green) }
-                        crate::fsmerkle::ChangeKind::Deleted => { deleted += 1; ("--", color::bold_red) }
-                        crate::fsmerkle::ChangeKind::Modified | crate::fsmerkle::ChangeKind::TypeChange => {
-                            modified += 1; ("~~", color::bold_yellow)
+                        crate::fsmerkle::ChangeKind::Added => {
+                            added += 1;
+                            ("++", color::bold_green)
+                        }
+                        crate::fsmerkle::ChangeKind::Deleted => {
+                            deleted += 1;
+                            ("--", color::bold_red)
+                        }
+                        crate::fsmerkle::ChangeKind::Modified
+                        | crate::fsmerkle::ChangeKind::TypeChange => {
+                            modified += 1;
+                            ("~~", color::bold_yellow)
                         }
                     };
                     println!("  {} {}", marker_fn(marker), c.path);
                 }
-                println!("\n{} change(s): {} added, {} modified, {} deleted",
-                    changes.len(), added, modified, deleted);
+                println!(
+                    "\n{} change(s): {} added, {} modified, {} deleted",
+                    changes.len(),
+                    added,
+                    modified,
+                    deleted
+                );
             }
         }
         1 => {
@@ -401,12 +476,20 @@ fn cmd_diff(args: DiffArgs) -> Result<(), String> {
             match repo.resolve_seal(target).map_err(|e| e.to_string())? {
                 Some((_, leaf)) => {
                     let hash = leaf.hash();
-                    println!("Comparing against seal: {} ({})", seal::generate_seal_name(hash), hash.short8());
+                    println!(
+                        "Comparing against seal: {} ({})",
+                        seal::generate_seal_name(hash),
+                        hash.short8()
+                    );
                     println!("  Message: {}", leaf.message);
                 }
                 None => {
                     // Try as timeline name
-                    if repo.get_timeline_head(target).map_err(|e| e.to_string())?.is_some() {
+                    if repo
+                        .get_timeline_head(target)
+                        .map_err(|e| e.to_string())?
+                        .is_some()
+                    {
                         return Err(format!(
                             "'{}' is a timeline. Use two targets for timeline diff: ivaldi diff <a> <b>",
                             target
@@ -418,7 +501,8 @@ fn cmd_diff(args: DiffArgs) -> Result<(), String> {
         }
         0 => {
             if args.staged {
-                let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
+                let cas =
+                    FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
                 let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
                 if ws.staging.is_empty() {
                     println!("No staged changes.");
@@ -430,26 +514,52 @@ fn cmd_diff(args: DiffArgs) -> Result<(), String> {
                 }
             } else {
                 // Working directory changes vs last seal
-                let last_tree = repo.get_timeline_head(&timeline).map_err(|e| e.to_string())?
+                let last_tree = repo
+                    .get_timeline_head(&timeline)
+                    .map_err(|e| e.to_string())?
                     .and_then(|idx| repo.get_leaf(idx).ok().flatten())
                     .map(|l| l.tree_root);
 
-                let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
+                let cas =
+                    FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
                 let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
                 let ignore_cache = ignore::load_pattern_cache(&ctx.work_dir);
-                let status = ws.status(last_tree, &ignore_cache).map_err(|e| e.to_string())?;
+                let status = ws
+                    .status(last_tree, &ignore_cache)
+                    .map_err(|e| e.to_string())?;
 
-                let changes: Vec<_> = status.iter().filter(|f| f.state != FileState::Unmodified).collect();
+                let changes: Vec<_> = status
+                    .iter()
+                    .filter(|f| f.state != FileState::Unmodified)
+                    .collect();
 
                 if changes.is_empty() {
                     println!("No changes.");
                 } else if args.stat {
-                    let mod_count = changes.iter().filter(|f| f.state == FileState::Modified).count();
-                    let add_count = changes.iter().filter(|f| f.state == FileState::Untracked).count();
-                    let del_count = changes.iter().filter(|f| f.state == FileState::Deleted).count();
-                    let stg_count = changes.iter().filter(|f| f.state == FileState::Staged).count();
-                    println!("{} file(s) changed: {} modified, {} added, {} deleted, {} staged",
-                        changes.len(), mod_count, add_count, del_count, stg_count);
+                    let mod_count = changes
+                        .iter()
+                        .filter(|f| f.state == FileState::Modified)
+                        .count();
+                    let add_count = changes
+                        .iter()
+                        .filter(|f| f.state == FileState::Untracked)
+                        .count();
+                    let del_count = changes
+                        .iter()
+                        .filter(|f| f.state == FileState::Deleted)
+                        .count();
+                    let stg_count = changes
+                        .iter()
+                        .filter(|f| f.state == FileState::Staged)
+                        .count();
+                    println!(
+                        "{} file(s) changed: {} modified, {} added, {} deleted, {} staged",
+                        changes.len(),
+                        mod_count,
+                        add_count,
+                        del_count,
+                        stg_count
+                    );
                 } else {
                     for f in &changes {
                         let (marker, marker_fn): (&str, fn(&str) -> String) = match f.state {
@@ -486,7 +596,10 @@ fn resolve_tree(repo: &Repo, target: &str) -> Result<(String, crate::hash::B3Has
         return Ok((format!("seal:{}", name), leaf.tree_root));
     }
 
-    Err(format!("could not resolve '{}' as timeline or seal", target))
+    Err(format!(
+        "could not resolve '{}' as timeline or seal",
+        target
+    ))
 }
 
 fn cmd_reset(args: ResetArgs, quiet: bool) -> Result<(), String> {
@@ -496,16 +609,22 @@ fn cmd_reset(args: ResetArgs, quiet: bool) -> Result<(), String> {
         // Materialize workspace from last seal tree
         let repo = open_repo()?;
         let timeline = repo.current_timeline().unwrap_or_else(|_| "main".into());
-        if let Some(head_idx) = repo.get_timeline_head(&timeline).map_err(|e| e.to_string())? {
+        if let Some(head_idx) = repo
+            .get_timeline_head(&timeline)
+            .map_err(|e| e.to_string())?
+        {
             if let Some(leaf) = repo.get_leaf(head_idx).map_err(|e| e.to_string())? {
-                let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
+                let cas =
+                    FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
                 let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
                 ws.materialize(leaf.tree_root).map_err(|e| e.to_string())?;
                 // Clear staging
                 let mut ws_mut = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
                 ws_mut.staging.clear();
                 ws_mut.save().map_err(|e| e.to_string())?;
-                if !quiet { println!("Reset to last seal. Working directory restored."); }
+                if !quiet {
+                    println!("Reset to last seal. Working directory restored.");
+                }
                 return Ok(());
             }
         }
@@ -517,10 +636,14 @@ fn cmd_reset(args: ResetArgs, quiet: bool) -> Result<(), String> {
 
     if args.files.is_empty() {
         ws.staging.clear();
-        if !quiet { println!("All files unstaged"); }
+        if !quiet {
+            println!("All files unstaged");
+        }
     } else {
         for file in &args.files {
-            if ws.staging.unstage(file) && !quiet { println!("  unstaged: {}", file); }
+            if ws.staging.unstage(file) && !quiet {
+                println!("  unstaged: {}", file);
+            }
         }
     }
     ws.save().map_err(|e| e.to_string())?;
@@ -533,13 +656,17 @@ fn cmd_timeline(args: TimelineArgs, quiet: bool) -> Result<(), String> {
             let repo = open_repo()?;
             repo.create_timeline(&create_args.name, create_args.from.as_deref())
                 .map_err(|e| e.to_string())?;
-            repo.switch_timeline(&create_args.name).map_err(|e| e.to_string())?;
+            repo.switch_timeline(&create_args.name)
+                .map_err(|e| e.to_string())?;
             if !quiet {
                 println!("Created timeline: {}", color::timeline(&create_args.name));
                 if let Some(from) = &create_args.from {
                     println!("  from: {}", from);
                 }
-                println!("Switched to timeline: {}", color::timeline(&create_args.name));
+                println!(
+                    "Switched to timeline: {}",
+                    color::timeline(&create_args.name)
+                );
             }
             Ok(())
         }
@@ -562,14 +689,19 @@ fn cmd_timeline(args: TimelineArgs, quiet: bool) -> Result<(), String> {
                     timeline: current.clone(),
                     staged_files: staged,
                     created_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64,
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64,
                 };
                 shelf_mgr.save_shelf(&shelf).map_err(|e| e.to_string())?;
-                if !quiet { println!("Changes auto-shelved for '{}'", current); }
+                if !quiet {
+                    println!("Changes auto-shelved for '{}'", current);
+                }
             }
 
             // Switch
-            repo.switch_timeline(&switch_args.name).map_err(|e| e.to_string())?;
+            repo.switch_timeline(&switch_args.name)
+                .map_err(|e| e.to_string())?;
 
             // Auto-restore: load shelf for target timeline
             {
@@ -583,7 +715,9 @@ fn cmd_timeline(args: TimelineArgs, quiet: bool) -> Result<(), String> {
                     }
                     ws_mut.save().map_err(|e| e.to_string())?;
                     shelf_mgr.remove_shelf(&switch_args.name).ok();
-                    if !quiet { println!("Restored shelved changes for '{}'", switch_args.name); }
+                    if !quiet {
+                        println!("Restored shelved changes for '{}'", switch_args.name);
+                    }
                 } else {
                     // Clear staging for clean switch
                     let mut ws_mut = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
@@ -592,7 +726,9 @@ fn cmd_timeline(args: TimelineArgs, quiet: bool) -> Result<(), String> {
                 }
             }
 
-            if !quiet { println!("Switched to timeline: {}", switch_args.name); }
+            if !quiet {
+                println!("Switched to timeline: {}", switch_args.name);
+            }
             Ok(())
         }
         TimelineCommands::List => {
@@ -612,16 +748,24 @@ fn cmd_timeline(args: TimelineArgs, quiet: bool) -> Result<(), String> {
         }
         TimelineCommands::Remove(remove_args) => {
             let repo = open_repo()?;
-            repo.remove_timeline(&remove_args.name).map_err(|e| e.to_string())?;
-            if !quiet { println!("Removed timeline: {}", remove_args.name); }
+            repo.remove_timeline(&remove_args.name)
+                .map_err(|e| e.to_string())?;
+            if !quiet {
+                println!("Removed timeline: {}", remove_args.name);
+            }
             Ok(())
         }
         TimelineCommands::Rename(rename_args) => {
             let repo = open_repo()?;
             let current = repo.current_timeline().map_err(|e| e.to_string())?;
-            repo.rename_timeline(&current, &rename_args.new_name).map_err(|e| e.to_string())?;
+            repo.rename_timeline(&current, &rename_args.new_name)
+                .map_err(|e| e.to_string())?;
             if !quiet {
-                println!("Renamed timeline: {} → {}", color::dim(&current), color::timeline(&rename_args.new_name));
+                println!(
+                    "Renamed timeline: {} → {}",
+                    color::dim(&current),
+                    color::timeline(&rename_args.new_name)
+                );
             }
             Ok(())
         }
@@ -639,19 +783,25 @@ fn cmd_butterfly(args: ButterflyArgs, _ctx: &RepoContext, quiet: bool) -> Result
             let parent = repo.current_timeline().unwrap_or_else(|_| "main".into());
 
             // Store butterfly metadata
-            let divergence_hash = repo.get_timeline_head(&parent)
+            let divergence_hash = repo
+                .get_timeline_head(&parent)
                 .map_err(|e| e.to_string())?
                 .and_then(|idx| repo.get_leaf(idx).ok().flatten())
                 .map(|l| l.hash())
                 .unwrap_or(crate::hash::B3Hash::ZERO);
 
-            repo.create_timeline(&create_args.name, Some(&parent)).map_err(|e| e.to_string())?;
+            repo.create_timeline(&create_args.name, Some(&parent))
+                .map_err(|e| e.to_string())?;
             repo.store_butterfly_meta(&create_args.name, &parent, divergence_hash)
                 .map_err(|e| e.to_string())?;
-            repo.switch_timeline(&create_args.name).map_err(|e| e.to_string())?;
+            repo.switch_timeline(&create_args.name)
+                .map_err(|e| e.to_string())?;
 
             if !quiet {
-                println!("Creating butterfly timeline '{}' from '{}'", create_args.name, parent);
+                println!(
+                    "Creating butterfly timeline '{}' from '{}'",
+                    create_args.name, parent
+                );
                 println!("Switched to butterfly timeline");
             }
             Ok(())
@@ -659,27 +809,42 @@ fn cmd_butterfly(args: ButterflyArgs, _ctx: &RepoContext, quiet: bool) -> Result
         ButterflyCommands::Up => {
             let mut repo = open_repo()?;
             let current = repo.current_timeline().map_err(|e| e.to_string())?;
-            let result = repo.butterfly_sync_up(&current).map_err(|e| e.to_string())?;
+            let result = repo
+                .butterfly_sync_up(&current)
+                .map_err(|e| e.to_string())?;
             if !quiet {
                 println!("Synced butterfly '{}' up to parent", current);
-                println!("  Parent updated: {} ({})", result.seal_name, result.hash.short8());
+                println!(
+                    "  Parent updated: {} ({})",
+                    result.seal_name,
+                    result.hash.short8()
+                );
             }
             Ok(())
         }
         ButterflyCommands::Down => {
             let mut repo = open_repo()?;
             let current = repo.current_timeline().map_err(|e| e.to_string())?;
-            let result = repo.butterfly_sync_down(&current).map_err(|e| e.to_string())?;
+            let result = repo
+                .butterfly_sync_down(&current)
+                .map_err(|e| e.to_string())?;
             if !quiet {
                 println!("Synced butterfly '{}' down from parent", current);
-                println!("  Butterfly updated: {} ({})", result.seal_name, result.hash.short8());
+                println!(
+                    "  Butterfly updated: {} ({})",
+                    result.seal_name,
+                    result.hash.short8()
+                );
             }
             Ok(())
         }
         ButterflyCommands::Remove(remove_args) => {
             let repo = open_repo()?;
-            repo.remove_timeline(&remove_args.name).map_err(|e| e.to_string())?;
-            if !quiet { println!("Removed butterfly '{}'", remove_args.name); }
+            repo.remove_timeline(&remove_args.name)
+                .map_err(|e| e.to_string())?;
+            if !quiet {
+                println!("Removed butterfly '{}'", remove_args.name);
+            }
             Ok(())
         }
     }
@@ -695,7 +860,9 @@ fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
     if args.abort {
         if repo.has_merge_in_progress() {
             repo.clear_merge_state().map_err(|e| e.to_string())?;
-            if !quiet { println!("Merge aborted."); }
+            if !quiet {
+                println!("Merge aborted.");
+            }
         } else {
             return Err("no merge in progress".into());
         }
@@ -703,14 +870,20 @@ fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
     }
 
     if args.continue_merge {
-        let state = repo.load_merge_state().map_err(|e| e.to_string())?
+        let state = repo
+            .load_merge_state()
+            .map_err(|e| e.to_string())?
             .ok_or("no merge in progress")?;
         if state.conflicts.is_empty() {
             repo.clear_merge_state().map_err(|e| e.to_string())?;
-            if !quiet { println!("Merge completed."); }
+            if !quiet {
+                println!("Merge completed.");
+            }
         } else {
             println!("Unresolved conflicts:");
-            for c in &state.conflicts { println!("  CONFLICT: {}", c); }
+            for c in &state.conflicts {
+                println!("  CONFLICT: {}", c);
+            }
             println!("\nResolve conflicts, then run 'ivaldi fuse --continue'");
         }
         return Ok(());
@@ -720,22 +893,34 @@ fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
         return Err("merge already in progress. Use --continue or --abort.".into());
     }
 
-    let source = args.source.as_deref()
+    let source = args
+        .source
+        .as_deref()
         .ok_or("source timeline required. Usage: ivaldi fuse <source> to <target>")?;
-    let strategy = Strategy::from_str(&args.strategy)
-        .ok_or(format!("unknown strategy: {}. Options: auto, ours, theirs, union, base", args.strategy))?;
+    let strategy = Strategy::from_str(&args.strategy).ok_or(format!(
+        "unknown strategy: {}. Options: auto, ours, theirs, union, base",
+        args.strategy
+    ))?;
 
     let target = repo.current_timeline().map_err(|e| e.to_string())?;
 
     // Get trees for source and target
-    let source_head = repo.get_timeline_head(source).map_err(|e| e.to_string())?
+    let source_head = repo
+        .get_timeline_head(source)
+        .map_err(|e| e.to_string())?
         .ok_or(format!("timeline '{}' has no commits", source))?;
-    let target_head = repo.get_timeline_head(&target).map_err(|e| e.to_string())?
+    let target_head = repo
+        .get_timeline_head(&target)
+        .map_err(|e| e.to_string())?
         .ok_or(format!("timeline '{}' has no commits", target))?;
 
-    let source_leaf = repo.get_leaf(source_head).map_err(|e| e.to_string())?
+    let source_leaf = repo
+        .get_leaf(source_head)
+        .map_err(|e| e.to_string())?
         .ok_or("corrupt source head")?;
-    let target_leaf = repo.get_leaf(target_head).map_err(|e| e.to_string())?
+    let target_leaf = repo
+        .get_leaf(target_head)
+        .map_err(|e| e.to_string())?
         .ok_or("corrupt target head")?;
 
     // Build file maps from trees
@@ -756,7 +941,8 @@ fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
 
     if result.success {
         // Build merged tree (blobs already in CAS, just build tree structure)
-        let merged_tree = store.build_tree_from_hash_map(&result.merged_files)
+        let merged_tree = store
+            .build_tree_from_hash_map(&result.merged_files)
             .map_err(|e| e.to_string())?;
 
         let cfg = repo.config();
@@ -772,11 +958,17 @@ fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
         let mut fuse_leaf = crate::leaf::Leaf::new(merged_tree, &target, &author, now, &message);
         fuse_leaf.prev_idx = target_head;
         fuse_leaf.merge_idxs = vec![source_head];
-        let commit_result = repo.commit_raw(fuse_leaf, &target).map_err(|e| e.to_string())?;
+        let commit_result = repo
+            .commit_raw(fuse_leaf, &target)
+            .map_err(|e| e.to_string())?;
 
         if !quiet {
             println!("[OK] Merge completed successfully!");
-            println!("  Merge seal: {} ({})", commit_result.seal_name, commit_result.hash.short8());
+            println!(
+                "  Merge seal: {} ({})",
+                commit_result.seal_name,
+                commit_result.hash.short8()
+            );
         }
     } else {
         // Save merge state with conflicts
@@ -790,7 +982,9 @@ fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
         repo.save_merge_state(&state).map_err(|e| e.to_string())?;
 
         println!("[CONFLICTS] Merge conflicts detected:\n");
-        for path in &conflict_paths { println!("  CONFLICT: {}", path); }
+        for path in &conflict_paths {
+            println!("  CONFLICT: {}", path);
+        }
         println!("\n>> {} file(s) with conflicts", conflict_paths.len());
         println!("\nResolution options:");
         println!("  ivaldi fuse --continue          - after manual resolution");
@@ -809,17 +1003,25 @@ fn collect_blob_hashes(
 ) -> Result<(), String> {
     let tree = store.load_tree(tree_hash).map_err(|e| e.to_string())?;
     for entry in &tree.entries {
-        let path = if prefix.is_empty() { entry.name.clone() } else { format!("{}/{}", prefix, entry.name) };
+        let path = if prefix.is_empty() {
+            entry.name.clone()
+        } else {
+            format!("{}/{}", prefix, entry.name)
+        };
         match entry.kind {
-            crate::fsmerkle::NodeKind::Blob => { files.insert(path, entry.hash); }
-            crate::fsmerkle::NodeKind::Tree => { collect_blob_hashes(store, entry.hash, &path, files)?; }
+            crate::fsmerkle::NodeKind::Blob => {
+                files.insert(path, entry.hash);
+            }
+            crate::fsmerkle::NodeKind::Tree => {
+                collect_blob_hashes(store, entry.hash, &path, files)?;
+            }
         }
     }
     Ok(())
 }
 
 fn cmd_travel(args: TravelArgs) -> Result<(), String> {
-    use crate::tui::travel::{run_travel, TravelAction};
+    use crate::tui::travel::{TravelAction, run_travel};
 
     let repo = open_repo()?;
     let timeline = repo.current_timeline().unwrap_or_else(|_| "main".into());
@@ -832,17 +1034,30 @@ fn cmd_travel(args: TravelArgs) -> Result<(), String> {
     let action = run_travel(entries, &timeline, args.search).map_err(|e| e.to_string())?;
 
     match action {
-        TravelAction::Diverge { seal_index, new_timeline } => {
-            repo.create_timeline(&new_timeline, Some(&timeline)).map_err(|e| e.to_string())?;
-            repo.switch_timeline(&new_timeline).map_err(|e| e.to_string())?;
-            println!("Created timeline '{}' from seal at index {}", new_timeline, seal_index);
+        TravelAction::Diverge {
+            seal_index,
+            new_timeline,
+        } => {
+            repo.create_timeline(&new_timeline, Some(&timeline))
+                .map_err(|e| e.to_string())?;
+            repo.switch_timeline(&new_timeline)
+                .map_err(|e| e.to_string())?;
+            println!(
+                "Created timeline '{}' from seal at index {}",
+                new_timeline, seal_index
+            );
             println!("Switched to timeline '{}'", new_timeline);
         }
         TravelAction::Overwrite { seal_index } => {
             if let Some(_leaf) = repo.get_leaf(seal_index).map_err(|e| e.to_string())? {
                 // Update timeline head to this seal
-                repo.store.set_timeline_head(&timeline, seal_index).map_err(|e| e.to_string())?;
-                println!("Timeline '{}' reset to seal at index {}", timeline, seal_index);
+                repo.store
+                    .set_timeline_head(&timeline, seal_index)
+                    .map_err(|e| e.to_string())?;
+                println!(
+                    "Timeline '{}' reset to seal at index {}",
+                    timeline, seal_index
+                );
             }
         }
         TravelAction::Cancel => {
@@ -857,11 +1072,18 @@ fn cmd_shift(args: ShiftArgs, quiet: bool) -> Result<(), String> {
     let timeline = repo.current_timeline().unwrap_or_else(|_| "main".into());
 
     if let Some(n) = args.last {
-        if n < 2 { return Err("need at least 2 commits to squash".into()); }
+        if n < 2 {
+            return Err("need at least 2 commits to squash".into());
+        }
 
         let history = repo.walk_history(&timeline).map_err(|e| e.to_string())?;
         if history.len() < n {
-            return Err(format!("only {} commits on '{}', need {}", history.len(), timeline, n));
+            return Err(format!(
+                "only {} commits on '{}', need {}",
+                history.len(),
+                timeline,
+                n
+            ));
         }
 
         if !quiet {
@@ -874,29 +1096,50 @@ fn cmd_shift(args: ShiftArgs, quiet: bool) -> Result<(), String> {
         // Use the newest commit's tree and oldest's parent
         let newest = &history[0];
         let oldest = &history[n - 1];
-        let tree_root = repo.get_leaf(newest.index).map_err(|e| e.to_string())?
-            .ok_or("corrupt head")?.tree_root;
-        let _oldest_leaf = repo.get_leaf(oldest.index).map_err(|e| e.to_string())?
+        let tree_root = repo
+            .get_leaf(newest.index)
+            .map_err(|e| e.to_string())?
+            .ok_or("corrupt head")?
+            .tree_root;
+        let _oldest_leaf = repo
+            .get_leaf(oldest.index)
+            .map_err(|e| e.to_string())?
             .ok_or("corrupt oldest")?;
 
         let cfg = repo.config();
         let author = cfg.author().unwrap_or_else(|| newest.author.clone());
-        let message = format!("Squashed {} commits:\n\n{}", n,
-            history.iter().take(n).map(|e| e.message.as_str()).collect::<Vec<_>>().join("\n"));
+        let message = format!(
+            "Squashed {} commits:\n\n{}",
+            n,
+            history
+                .iter()
+                .take(n)
+                .map(|e| e.message.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
 
-        let result = repo.commit(tree_root, &author, &message).map_err(|e| e.to_string())?;
+        let result = repo
+            .commit(tree_root, &author, &message)
+            .map_err(|e| e.to_string())?;
 
         if !quiet {
-            println!("\n🔨 Created squashed seal: {} ({})", result.seal_name, result.hash.short8());
+            println!(
+                "\n🔨 Created squashed seal: {} ({})",
+                result.seal_name,
+                result.hash.short8()
+            );
             println!("✓ {} commits squashed into 1", n);
         }
     } else if args.start.is_some() || args.end.is_some() {
         let start_q = args.start.as_deref().ok_or("start seal required")?;
         let end_q = args.end.as_deref().unwrap_or("HEAD");
-        if !quiet { println!("Squashing from {} to {}", start_q, end_q); }
+        if !quiet {
+            println!("Squashing from {} to {}", start_q, end_q);
+        }
     } else {
         // Interactive mode with TUI
-        use crate::tui::shift::{run_shift, ShiftAction};
+        use crate::tui::shift::{ShiftAction, run_shift};
 
         let history = repo.walk_history(&timeline).map_err(|e| e.to_string())?;
         if history.len() < 2 {
@@ -906,14 +1149,25 @@ fn cmd_shift(args: ShiftArgs, quiet: bool) -> Result<(), String> {
         let action = run_shift(history).map_err(|e| e.to_string())?;
 
         match action {
-            ShiftAction::Squash { start_index: _, end_index, message } => {
-                let newest_leaf = repo.get_leaf(end_index).map_err(|e| e.to_string())?
+            ShiftAction::Squash {
+                start_index: _,
+                end_index,
+                message,
+            } => {
+                let newest_leaf = repo
+                    .get_leaf(end_index)
+                    .map_err(|e| e.to_string())?
                     .ok_or("corrupt")?;
                 let cfg = repo.config();
                 let author = cfg.author().unwrap_or_else(|| newest_leaf.author.clone());
-                let result = repo.commit(newest_leaf.tree_root, &author, &message)
+                let result = repo
+                    .commit(newest_leaf.tree_root, &author, &message)
                     .map_err(|e| e.to_string())?;
-                println!("🔨 Created squashed seal: {} ({})", result.seal_name, result.hash.short8());
+                println!(
+                    "🔨 Created squashed seal: {} ({})",
+                    result.seal_name,
+                    result.hash.short8()
+                );
             }
             ShiftAction::Cancel => println!("Cancelled."),
         }
@@ -940,9 +1194,12 @@ fn cmd_config(args: ConfigArgs) -> Result<(), String> {
     }
     if let Some(key) = &args.set {
         let value = args.value.as_deref().ok_or("value required for --set")?;
-        let mut repo_cfg = Config::load(&ctx.ivaldi_dir.join("config")).unwrap_or_else(|_| Config::new());
+        let mut repo_cfg =
+            Config::load(&ctx.ivaldi_dir.join("config")).unwrap_or_else(|_| Config::new());
         repo_cfg.set(key, value);
-        repo_cfg.save(&ctx.ivaldi_dir.join("config")).map_err(|e| e.to_string())?;
+        repo_cfg
+            .save(&ctx.ivaldi_dir.join("config"))
+            .map_err(|e| e.to_string())?;
         println!("{}={}", key, value);
         return Ok(());
     }
@@ -956,27 +1213,38 @@ fn interactive_config(ivaldi_dir: &std::path::Path) -> Result<(), String> {
     let mut cfg = Config::load(&ivaldi_dir.join("config")).unwrap_or_else(|_| Config::new());
 
     println!("{}", color::bold("Ivaldi Configuration"));
-    println!("{}\n", color::dim("Press Enter to keep current value, or type a new one."));
+    println!(
+        "{}\n",
+        color::dim("Press Enter to keep current value, or type a new one.")
+    );
 
     // user.name
     let current_name = cfg.get("user.name").unwrap_or("").to_string();
     let name = prompt_with_default("user.name", &current_name)?;
-    if !name.is_empty() { cfg.set("user.name", &name); }
+    if !name.is_empty() {
+        cfg.set("user.name", &name);
+    }
 
     // user.email
     let current_email = cfg.get("user.email").unwrap_or("").to_string();
     let email = prompt_with_default("user.email", &current_email)?;
-    if !email.is_empty() { cfg.set("user.email", &email); }
+    if !email.is_empty() {
+        cfg.set("user.email", &email);
+    }
 
     // color.ui
     let current_color = cfg.get("color.ui").unwrap_or("true").to_string();
     let color_ui = prompt_with_default("color.ui", &current_color)?;
-    if !color_ui.is_empty() { cfg.set("color.ui", &color_ui); }
+    if !color_ui.is_empty() {
+        cfg.set("color.ui", &color_ui);
+    }
 
     // core.autoshelf
     let current_shelf = cfg.get("core.autoshelf").unwrap_or("true").to_string();
     let autoshelf = prompt_with_default("core.autoshelf", &current_shelf)?;
-    if !autoshelf.is_empty() { cfg.set("core.autoshelf", &autoshelf); }
+    if !autoshelf.is_empty() {
+        cfg.set("core.autoshelf", &autoshelf);
+    }
 
     cfg.save(&ivaldi_dir.join("config"))
         .map_err(|e| e.to_string())?;
@@ -1001,7 +1269,9 @@ fn prompt_with_default(key: &str, default: &str) -> Result<String, String> {
     std::io::stdout().flush().map_err(|e| e.to_string())?;
 
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input).map_err(|e| e.to_string())?;
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| e.to_string())?;
     let input = input.trim();
 
     if input.is_empty() {
@@ -1017,10 +1287,14 @@ fn cmd_exclude(args: ExcludeArgs, quiet: bool) -> Result<(), String> {
     let mut content = std::fs::read_to_string(&ignore_path).unwrap_or_default();
     for pattern in &args.patterns {
         if !content.lines().any(|l| l.trim() == pattern) {
-            if !content.is_empty() && !content.ends_with('\n') { content.push('\n'); }
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
             content.push_str(pattern);
             content.push('\n');
-            if !quiet { println!("  excluded: {}", pattern); }
+            if !quiet {
+                println!("  excluded: {}", pattern);
+            }
         }
     }
     std::fs::write(&ignore_path, &content).map_err(|e| e.to_string())?;
@@ -1032,25 +1306,40 @@ fn cmd_portal(args: PortalArgs, quiet: bool) -> Result<(), String> {
     let mgr = PortalManager::new(&ctx.ivaldi_dir);
     match args.command {
         PortalCommands::Add(add_args) => {
-            let mut portal = Portal::parse(&add_args.repo)
-                .ok_or(format!("invalid portal format: {}. Expected: owner/repo", add_args.repo))?;
-            if add_args.gitlab { portal.platform = Platform::GitLab; }
-            if let Some(url) = add_args.url { portal.base_url = Some(url); }
+            let mut portal = Portal::parse(&add_args.repo).ok_or(format!(
+                "invalid portal format: {}. Expected: owner/repo",
+                add_args.repo
+            ))?;
+            if add_args.gitlab {
+                portal.platform = Platform::GitLab;
+            }
+            if let Some(url) = add_args.url {
+                portal.base_url = Some(url);
+            }
             let added = mgr.add(&portal).map_err(|e| e.to_string())?;
             if !quiet {
-                if added { println!("Added portal: {}", portal.to_string_repr()); }
-                else { println!("Portal already configured: {}", portal.to_string_repr()); }
+                if added {
+                    println!("Added portal: {}", portal.to_string_repr());
+                } else {
+                    println!("Portal already configured: {}", portal.to_string_repr());
+                }
             }
         }
         PortalCommands::List => {
             let portals = mgr.list().map_err(|e| e.to_string())?;
-            if portals.is_empty() { println!("No portals configured."); }
-            else {
+            if portals.is_empty() {
+                println!("No portals configured.");
+            } else {
                 println!("Configured portals:");
                 for p in &portals {
-                    let plat = match p.platform { Platform::GitHub => "github", Platform::GitLab => "gitlab" };
+                    let plat = match p.platform {
+                        Platform::GitHub => "github",
+                        Platform::GitLab => "gitlab",
+                    };
                     print!("  {} ({})", p.to_string_repr(), plat);
-                    if let Some(url) = &p.base_url { print!(" [{}]", url); }
+                    if let Some(url) = &p.base_url {
+                        print!(" [{}]", url);
+                    }
                     println!();
                 }
             }
@@ -1058,8 +1347,11 @@ fn cmd_portal(args: PortalArgs, quiet: bool) -> Result<(), String> {
         PortalCommands::Remove(remove_args) => {
             let removed = mgr.remove(&remove_args.repo).map_err(|e| e.to_string())?;
             if !quiet {
-                if removed { println!("Removed portal: {}", remove_args.repo); }
-                else { println!("Portal not found: {}", remove_args.repo); }
+                if removed {
+                    println!("Removed portal: {}", remove_args.repo);
+                } else {
+                    println!("Portal not found: {}", remove_args.repo);
+                }
             }
         }
     }
@@ -1073,22 +1365,30 @@ fn cmd_auth(args: AuthArgs) -> Result<(), String> {
             use crate::github::GitHubClient;
 
             if login_args.gitlab {
-                println!("GitLab OAuth not yet implemented. Set GITLAB_TOKEN environment variable.");
+                println!(
+                    "GitLab OAuth not yet implemented. Set GITLAB_TOKEN environment variable."
+                );
                 return Ok(());
             }
 
             println!("Initiating GitHub authentication...");
             let device_code = GitHubClient::request_device_code().map_err(|e| e.to_string())?;
 
-            println!("\nFirst, copy your one-time code: {}", device_code.user_code);
+            println!(
+                "\nFirst, copy your one-time code: {}",
+                device_code.user_code
+            );
             println!("Then visit: {}", device_code.verification_uri);
             println!("\nWaiting for authentication...");
 
-            let token = GitHubClient::poll_for_token(&device_code.device_code, device_code.interval)
-                .map_err(|e| e.to_string())?;
+            let token =
+                GitHubClient::poll_for_token(&device_code.device_code, device_code.interval)
+                    .map_err(|e| e.to_string())?;
 
             let store = TokenStore::new().map_err(|e| e.to_string())?;
-            store.save_token(Platform::GitHub, token).map_err(|e| e.to_string())?;
+            store
+                .save_token(Platform::GitHub, token)
+                .map_err(|e| e.to_string())?;
             println!("\nAuthentication successful!");
         }
         AuthCommands::Status => {
@@ -1103,9 +1403,16 @@ fn cmd_auth(args: AuthArgs) -> Result<(), String> {
         }
         AuthCommands::Logout(logout_args) => {
             use crate::auth::TokenStore;
-            let platform = if logout_args.gitlab { Platform::GitLab } else { Platform::GitHub };
+            let platform = if logout_args.gitlab {
+                Platform::GitLab
+            } else {
+                Platform::GitHub
+            };
             match TokenStore::new() {
-                Ok(store) => { store.delete_token(platform).map_err(|e| e.to_string())?; println!("Logged out successfully"); }
+                Ok(store) => {
+                    store.delete_token(platform).map_err(|e| e.to_string())?;
+                    println!("Logged out successfully");
+                }
                 Err(e) => println!("Warning: {}", e),
             }
         }
@@ -1120,14 +1427,7 @@ fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<(), String> {
     let (owner, repo_name) = parse_repo_arg(&args.repo)?;
     let client = GitHubClient::new();
 
-    let target_dir = std::path::PathBuf::from(
-        args.directory.as_deref().unwrap_or(&repo_name),
-    );
-
-    if target_dir.exists() && target_dir.read_dir().map(|mut d| d.next().is_some()).unwrap_or(false) {
-        return Err(format!("directory '{}' already exists and is not empty", target_dir.display()));
-    }
-    std::fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
+    let target_dir = std::path::PathBuf::from(args.directory.as_deref().unwrap_or(&repo_name));
 
     let result = sync::download(&client, &owner, &repo_name, &target_dir, None)
         .map_err(|e| e.to_string())?;
@@ -1161,7 +1461,9 @@ fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
         print!("WARNING: Force push will OVERWRITE remote history! Type 'force push' to confirm: ");
         std::io::stdout().flush().map_err(|e| e.to_string())?;
         let mut input = String::new();
-        std::io::stdin().read_line(&mut input).map_err(|e| e.to_string())?;
+        std::io::stdin()
+            .read_line(&mut input)
+            .map_err(|e| e.to_string())?;
         if input.trim() != "force push" {
             println!("Aborted.");
             return Ok(());
@@ -1179,7 +1481,10 @@ fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
 
     if !quiet {
-        println!("Uploaded to {}/{} (branch: {})", portal.owner, portal.repo, result.branch);
+        println!(
+            "Uploaded to {}/{} (branch: {})",
+            portal.owner, portal.repo, result.branch
+        );
         println!("  {} files uploaded", result.files_uploaded);
         println!("  commit: {}", result.commit_sha);
     }
@@ -1198,12 +1503,18 @@ fn cmd_scout(_args: ScoutArgs) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .ok_or("no portal configured. Run 'ivaldi portal add owner/repo'.")?;
 
-    let branches = sync::scout(&client, &portal.owner, &portal.repo)
+    let branches = sync::scout_with_status(&client, &repo, &portal.owner, &portal.repo)
         .map_err(|e| e.to_string())?;
 
     println!("Remote timelines available:");
     for branch in &branches {
-        println!("  {}", branch);
+        let status = match branch.state {
+            sync::RemoteTimelineState::NotDownloaded => "not downloaded",
+            sync::RemoteTimelineState::UpToDate => "local, up to date",
+            sync::RemoteTimelineState::OutOfSync => "local, out of sync",
+            sync::RemoteTimelineState::LocalOnly => "local, no remote mapping",
+        };
+        println!("  {} [{}]", branch.name, status);
     }
     println!("\nUse 'ivaldi harvest <name>' to download");
     Ok(())
@@ -1223,16 +1534,24 @@ fn cmd_harvest(args: HarvestArgs, quiet: bool) -> Result<(), String> {
 
     if args.timelines.is_empty() {
         // List available and prompt
-        let branches = sync::scout(&client, &portal.owner, &portal.repo)
-            .map_err(|e| e.to_string())?;
+        let branches =
+            sync::scout(&client, &portal.owner, &portal.repo).map_err(|e| e.to_string())?;
         println!("Available remote timelines:");
-        for b in &branches { println!("  {}", b); }
+        for b in &branches {
+            println!("  {}", b);
+        }
         println!("\nSpecify timelines to harvest: ivaldi harvest <name> [<name>...]");
         return Ok(());
     }
 
-    let harvested = sync::harvest(&client, &mut repo, &portal.owner, &portal.repo, &args.timelines)
-        .map_err(|e| e.to_string())?;
+    let harvested = sync::harvest(
+        &client,
+        &mut repo,
+        &portal.owner,
+        &portal.repo,
+        &args.timelines,
+    )
+    .map_err(|e| e.to_string())?;
 
     if !quiet {
         for name in &harvested {
@@ -1254,38 +1573,71 @@ fn cmd_sync(args: SyncArgs, quiet: bool) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .ok_or("no portal configured. Run 'ivaldi portal add owner/repo'.")?;
 
-    let timeline = args.timeline
+    let timeline = args
+        .timeline
         .unwrap_or_else(|| repo.current_timeline().unwrap_or_else(|_| "main".into()));
 
     if !quiet {
-        println!("Syncing timeline '{}' with {}/{}...\n",
-            color::timeline(&timeline), portal.owner, portal.repo);
+        println!(
+            "Syncing timeline '{}' with {}/{}...\n",
+            color::timeline(&timeline),
+            portal.owner,
+            portal.repo
+        );
     }
 
     let result = sync::sync_timeline(&client, &mut repo, &portal.owner, &portal.repo, &timeline)
         .map_err(|e| e.to_string())?;
 
     if result.no_changes {
-        println!("{} Timeline '{}' is already up to date", color::green("✓"), color::bold(&timeline));
+        println!(
+            "{} Timeline '{}' is already up to date",
+            color::green("✓"),
+            color::bold(&timeline)
+        );
         return Ok(());
     }
 
-    for f in &result.added { println!("{} {}", color::green("++"), f); }
-    for f in &result.modified { println!("{} {}", color::green("++"), f); }
-    for f in &result.deleted { println!("{} {}", color::red("--"), f); }
+    for f in &result.added {
+        println!("{} {}", color::green("++"), f);
+    }
+    for f in &result.modified {
+        println!("{} {}", color::green("++"), f);
+    }
+    for f in &result.deleted {
+        println!("{} {}", color::red("--"), f);
+    }
 
     let total = result.added.len() + result.modified.len() + result.deleted.len();
-    println!("\n{} Synced {} file(s) from remote", color::green("✓"), total);
-    if !result.added.is_empty() { println!("  Added: {}", color::green(&result.added.len().to_string())); }
-    if !result.modified.is_empty() { println!("  Modified: {}", color::blue(&result.modified.len().to_string())); }
-    if !result.deleted.is_empty() { println!("  Deleted: {}", color::red(&result.deleted.len().to_string())); }
+    println!(
+        "\n{} Synced {} file(s) from remote",
+        color::green("✓"),
+        total
+    );
+    if !result.added.is_empty() {
+        println!("  Added: {}", color::green(&result.added.len().to_string()));
+    }
+    if !result.modified.is_empty() {
+        println!(
+            "  Modified: {}",
+            color::blue(&result.modified.len().to_string())
+        );
+    }
+    if !result.deleted.is_empty() {
+        println!(
+            "  Deleted: {}",
+            color::red(&result.deleted.len().to_string())
+        );
+    }
 
     Ok(())
 }
 
 /// Format a change marker for display.
 /// Returns (marker, color_fn) for the given ChangeKind.
-pub(crate) fn change_marker(kind: crate::fsmerkle::ChangeKind) -> (&'static str, fn(&str) -> String) {
+pub(crate) fn change_marker(
+    kind: crate::fsmerkle::ChangeKind,
+) -> (&'static str, fn(&str) -> String) {
     match kind {
         crate::fsmerkle::ChangeKind::Added => ("++", color::bold_green),
         crate::fsmerkle::ChangeKind::Deleted => ("--", color::bold_red),
@@ -1314,7 +1666,10 @@ fn parse_repo_arg(arg: &str) -> Result<(String, String), String> {
             return Ok((owner.to_string(), repo.to_string()));
         }
     }
-    Err(format!("invalid repository format: '{}'. Expected: owner/repo", arg))
+    Err(format!(
+        "invalid repository format: '{}'. Expected: owner/repo",
+        arg
+    ))
 }
 
 fn cmd_review(args: ReviewArgs, quiet: bool) -> Result<(), String> {
@@ -1436,7 +1791,12 @@ fn cmd_review(args: ReviewArgs, quiet: bool) -> Result<(), String> {
             if !review.verdicts.is_empty() {
                 println!("\n--- Verdicts ({}) ---", review.verdicts.len());
                 for v in &review.verdicts {
-                    println!("  {} - {} {}", v.status, v.author, if v.body.is_empty() { "" } else { &v.body });
+                    println!(
+                        "  {} - {} {}",
+                        v.status,
+                        v.author,
+                        if v.body.is_empty() { "" } else { &v.body }
+                    );
                 }
             }
             Ok(())

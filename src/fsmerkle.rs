@@ -439,11 +439,7 @@ pub struct Change {
 }
 
 /// Compute differences between two filesystem trees.
-pub fn diff_trees(
-    a: B3Hash,
-    b: B3Hash,
-    store: &FsStore<'_>,
-) -> Result<Vec<Change>, FsMerkleError> {
+pub fn diff_trees(a: B3Hash, b: B3Hash, store: &FsStore<'_>) -> Result<Vec<Change>, FsMerkleError> {
     let mut changes = Vec::new();
     diff_recursive(a, b, "", store, &mut changes)?;
     Ok(changes)
@@ -473,8 +469,16 @@ fn diff_recursive(
         store.load_tree(b_hash)?
     };
 
-    let a_map: HashMap<&str, &Entry> = a_tree.entries.iter().map(|e| (e.name.as_str(), e)).collect();
-    let b_map: HashMap<&str, &Entry> = b_tree.entries.iter().map(|e| (e.name.as_str(), e)).collect();
+    let a_map: HashMap<&str, &Entry> = a_tree
+        .entries
+        .iter()
+        .map(|e| (e.name.as_str(), e))
+        .collect();
+    let b_map: HashMap<&str, &Entry> = b_tree
+        .entries
+        .iter()
+        .map(|e| (e.name.as_str(), e))
+        .collect();
 
     // Collect all unique names
     let mut all_names: Vec<&str> = a_map.keys().chain(b_map.keys()).copied().collect();
@@ -521,13 +525,7 @@ fn diff_recursive(
                     });
                 } else if a_entry.hash != b_entry.hash {
                     if a_entry.kind == NodeKind::Tree {
-                        diff_recursive(
-                            a_entry.hash,
-                            b_entry.hash,
-                            &child_path,
-                            store,
-                            changes,
-                        )?;
+                        diff_recursive(a_entry.hash, b_entry.hash, &child_path, store, changes)?;
                     } else {
                         changes.push(Change {
                             path: child_path,
