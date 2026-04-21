@@ -156,6 +156,22 @@ fn dirs_path() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }
 
+/// Path to the global config file (`~/.ivaldi/config`), if $HOME is set.
+pub fn global_config_path() -> Option<PathBuf> {
+    dirs_path().map(|home| home.join(".ivaldi").join("config"))
+}
+
+/// Load only the global config (ignoring any repo config).
+pub fn load_global() -> Config {
+    let mut cfg = Config::new();
+    if let Some(path) = global_config_path() {
+        if let Ok(user_cfg) = Config::load(&path) {
+            cfg.merge(&user_cfg);
+        }
+    }
+    cfg
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("I/O error: {0}")]

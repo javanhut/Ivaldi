@@ -110,9 +110,6 @@ impl RemoteView {
             std::thread::spawn(move || {
                 let result = (|| -> Result<Vec<String>, String> {
                     let client = crate::github::GitHubClient::new();
-                    if !client.is_authenticated() {
-                        return Err("Not authenticated. Run 'ivaldi auth login' first.".to_string());
-                    }
                     crate::sync::scout(&client, &owner, &repo).map_err(|e| e.to_string())
                 })();
                 let _ = tx.send(BgResult::ScoutDone(result));
@@ -210,9 +207,6 @@ impl RemoteView {
             std::thread::spawn(move || {
                 let result = (|| -> Result<String, String> {
                     let client = crate::github::GitHubClient::new();
-                    if !client.is_authenticated() {
-                        return Err("Not authenticated".to_string());
-                    }
                     let mut repo = crate::repo::Repo::open(&work_dir).map_err(|e| e.to_string())?;
                     crate::sync::harvest(&client, &mut repo, &owner, &repo_name, &names)
                         .map(|harvested| format!("Harvested {} timeline(s)", harvested.len()))

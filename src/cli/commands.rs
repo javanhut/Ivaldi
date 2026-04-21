@@ -1176,16 +1176,59 @@ fn cmd_shift(args: ShiftArgs, quiet: bool) -> Result<(), String> {
 }
 
 fn cmd_config(args: ConfigArgs) -> Result<(), String> {
-    let ctx = find_repo()?;
-    let cfg = config::load_config(&ctx.ivaldi_dir);
+    // Resolve which config file to target and whether we're in a repo.
+    let repo_ctx = find_repo().ok();
+    let use_global = args.global || repo_ctx.is_none();
+    let target_path = if use_global {
+        let path = config::global_config_path()
+            .ok_or("cannot locate global config: $HOME is not set")?;
+        if !args.global && args.set.is_some() {
+            // Auto-fallback: the user didn't pass --global but we're outside a repo.
+            eprintln!(
+                "{}",
+                color::dim(&format!(
+                    "not in an Ivaldi repo — using global config at {}",
+                    path.display()
+                ))
+            );
+        }
+        path
+    } else {
+        // Safe unwrap: repo_ctx is Some when use_global is false.
+        repo_ctx.as_ref().unwrap().ivaldi_dir.join("config")
+    };
 
     if args.list {
-        for (key, value) in cfg.list() {
-            println!("{}={}", color::dim(key), value);
+        // Merged view when inside a repo; annotate provenance.
+        let global = config::load_global();
+        let local = repo_ctx
+            .as_ref()
+            .filter(|_| !args.global)
+            .map(|ctx| Config::load(&ctx.ivaldi_dir.join("config")).unwrap_or_else(|_| Config::new()));
+
+        let mut merged = Config::new();
+        merged.merge(&global);
+        if let Some(l) = &local {
+            merged.merge(l);
+        }
+
+        for (key, value) in merged.list() {
+            let provenance = match (&local, global.get(key)) {
+                (Some(l), _) if l.get(key).is_some() => "local",
+                (_, Some(_)) => "global",
+                _ => "default",
+            };
+            println!("{} = {} {}", color::cyan(key), value, color::dim(&format!("({})", provenance)));
         }
         return Ok(());
     }
     if let Some(key) = &args.get {
+        let cfg = if use_global {
+            config::load_global()
+        } else {
+            // Safe unwrap: repo_ctx is Some when use_global is false.
+            config::load_config(&repo_ctx.as_ref().unwrap().ivaldi_dir)
+        };
         match cfg.get(key) {
             Some(value) => println!("{}", value),
             None => return Err(format!("config key not found: {}", key)),
@@ -1194,91 +1237,18 @@ fn cmd_config(args: ConfigArgs) -> Result<(), String> {
     }
     if let Some(key) = &args.set {
         let value = args.value.as_deref().ok_or("value required for --set")?;
-        let mut repo_cfg =
-            Config::load(&ctx.ivaldi_dir.join("config")).unwrap_or_else(|_| Config::new());
-        repo_cfg.set(key, value);
-        repo_cfg
-            .save(&ctx.ivaldi_dir.join("config"))
-            .map_err(|e| e.to_string())?;
-        println!("{}={}", key, value);
+        let mut cfg = Config::load(&target_path).unwrap_or_else(|_| Config::new());
+        cfg.set(key, value);
+        cfg.save(&target_path).map_err(|e| e.to_string())?;
+        let scope = if use_global { "global" } else { "local" };
+        println!("{}={} ({})", key, value, scope);
         return Ok(());
     }
 
-    // No flags — interactive mode
-    interactive_config(&ctx.ivaldi_dir)?;
+    // No flags — launch the interactive form.
+    let inside_repo = repo_ctx.is_some() && !args.global;
+    crate::tui::config_form::run(&target_path, inside_repo).map_err(|e| e.to_string())?;
     Ok(())
-}
-
-fn interactive_config(ivaldi_dir: &std::path::Path) -> Result<(), String> {
-    let mut cfg = Config::load(&ivaldi_dir.join("config")).unwrap_or_else(|_| Config::new());
-
-    println!("{}", color::bold("Ivaldi Configuration"));
-    println!(
-        "{}\n",
-        color::dim("Press Enter to keep current value, or type a new one.")
-    );
-
-    // user.name
-    let current_name = cfg.get("user.name").unwrap_or("").to_string();
-    let name = prompt_with_default("user.name", &current_name)?;
-    if !name.is_empty() {
-        cfg.set("user.name", &name);
-    }
-
-    // user.email
-    let current_email = cfg.get("user.email").unwrap_or("").to_string();
-    let email = prompt_with_default("user.email", &current_email)?;
-    if !email.is_empty() {
-        cfg.set("user.email", &email);
-    }
-
-    // color.ui
-    let current_color = cfg.get("color.ui").unwrap_or("true").to_string();
-    let color_ui = prompt_with_default("color.ui", &current_color)?;
-    if !color_ui.is_empty() {
-        cfg.set("color.ui", &color_ui);
-    }
-
-    // core.autoshelf
-    let current_shelf = cfg.get("core.autoshelf").unwrap_or("true").to_string();
-    let autoshelf = prompt_with_default("core.autoshelf", &current_shelf)?;
-    if !autoshelf.is_empty() {
-        cfg.set("core.autoshelf", &autoshelf);
-    }
-
-    cfg.save(&ivaldi_dir.join("config"))
-        .map_err(|e| e.to_string())?;
-
-    println!("\n{} Configuration saved.", color::green("✓"));
-
-    if let Some(author) = cfg.author() {
-        println!("Author: {}", color::author(&author));
-    }
-
-    Ok(())
-}
-
-fn prompt_with_default(key: &str, default: &str) -> Result<String, String> {
-    use std::io::Write;
-
-    if default.is_empty() {
-        print!("  {} = ", color::cyan(key));
-    } else {
-        print!("  {} [{}] = ", color::cyan(key), color::dim(default));
-    }
-    std::io::stdout().flush().map_err(|e| e.to_string())?;
-
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .map_err(|e| e.to_string())?;
-    let input = input.trim();
-
-    if input.is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(input.to_string())
-    }
 }
 
 fn cmd_exclude(args: ExcludeArgs, quiet: bool) -> Result<(), String> {
@@ -1306,10 +1276,13 @@ fn cmd_portal(args: PortalArgs, quiet: bool) -> Result<(), String> {
     let mgr = PortalManager::new(&ctx.ivaldi_dir);
     match args.command {
         PortalCommands::Add(add_args) => {
-            let mut portal = Portal::parse(&add_args.repo).ok_or(format!(
-                "invalid portal format: {}. Expected: owner/repo",
-                add_args.repo
-            ))?;
+            let spec = parse_repo_arg(&add_args.repo)?;
+            let mut portal = Portal {
+                owner: spec.owner,
+                repo: spec.repo,
+                platform: spec.platform,
+                base_url: None,
+            };
             if add_args.gitlab {
                 portal.platform = Platform::GitLab;
             }
@@ -1424,16 +1397,22 @@ fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<(), String> {
     use crate::github::GitHubClient;
     use crate::sync;
 
-    let (owner, repo_name) = parse_repo_arg(&args.repo)?;
+    let spec = parse_repo_arg(&args.repo)?;
     let client = GitHubClient::new();
 
-    let target_dir = std::path::PathBuf::from(args.directory.as_deref().unwrap_or(&repo_name));
+    let target_dir = std::path::PathBuf::from(args.directory.as_deref().unwrap_or(&spec.repo));
+    let branch = spec.branch_hint.as_deref();
 
-    let result = sync::download(&client, &owner, &repo_name, &target_dir, None)
+    let result = sync::download(&client, &spec.owner, &spec.repo, &target_dir, branch)
         .map_err(|e| e.to_string())?;
 
     if !quiet {
-        println!("Cloned {}/{} → {}", owner, repo_name, target_dir.display());
+        println!(
+            "Cloned {}/{} → {}",
+            spec.owner,
+            spec.repo,
+            target_dir.display()
+        );
         println!("  {} files downloaded", result.files_downloaded);
     }
     Ok(())
@@ -1658,18 +1637,15 @@ pub(crate) fn state_marker(state: FileState) -> (&'static str, fn(&str) -> Strin
     }
 }
 
-// Helper: parse "owner/repo" from CLI arg
-fn parse_repo_arg(arg: &str) -> Result<(String, String), String> {
-    // Handle "owner/repo" format
-    if let Some((owner, repo)) = arg.split_once('/') {
-        if !owner.is_empty() && !repo.is_empty() {
-            return Ok((owner.to_string(), repo.to_string()));
-        }
-    }
-    Err(format!(
-        "invalid repository format: '{}'. Expected: owner/repo",
-        arg
-    ))
+// Helper: parse a repo identifier from a CLI arg.
+// Accepts owner/repo, full URLs, SSH URLs, github:/gitlab: shorthand.
+fn parse_repo_arg(arg: &str) -> Result<crate::portal::RepoSpec, String> {
+    crate::portal::parse_repo_spec(arg).map_err(|e| {
+        format!(
+            "invalid repository: '{}' ({})\n  accepted formats:\n    owner/repo\n    https://github.com/owner/repo\n    git@github.com:owner/repo.git\n    github:owner/repo",
+            arg, e
+        )
+    })
 }
 
 fn cmd_review(args: ReviewArgs, quiet: bool) -> Result<(), String> {

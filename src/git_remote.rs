@@ -189,20 +189,40 @@ impl SmartHttpClient {
     fn discover_refs(&self, base: &str) -> Result<Discovery, GitRemoteError> {
         let pb = progress::spinner("Discovering remote refs");
         let url = format!("{}/info/refs?service=git-upload-pack", base);
-        let mut req = self
-            .agent
-            .get(&url)
-            .set("Accept", "application/x-git-upload-pack-advertisement")
-            .set("User-Agent", "ivaldi-vcs/0.1.0");
-        if let Some(token) = &self.token {
-            req = req.set("Authorization", &format!("Bearer {}", token));
-        }
+        let build = |token: Option<&str>| {
+            let mut r = self
+                .agent
+                .get(&url)
+                .set("Accept", "application/x-git-upload-pack-advertisement")
+                .set("User-Agent", "ivaldi-vcs/0.1.0");
+            if let Some(t) = token {
+                r = r.set("Authorization", &format!("Bearer {}", t));
+            }
+            r
+        };
 
-        let resp = match req.call() {
+        let resp = match build(self.token.as_deref()).call() {
             Ok(resp) => resp,
             Err(err) => {
-                pb.finish_and_clear();
-                return Err(map_http_error(err));
+                // If we attached a stored token and the server rejected it,
+                // the repo may still be public — retry anonymously once.
+                if self.token.is_some() && is_auth_failure(&err) {
+                    match build(None).call() {
+                        Ok(resp) => {
+                            crate::logging::warn(
+                                "stored token rejected — falling back to anonymous access",
+                            );
+                            resp
+                        }
+                        Err(e2) => {
+                            pb.finish_and_clear();
+                            return Err(map_http_error(e2));
+                        }
+                    }
+                } else {
+                    pb.finish_and_clear();
+                    return Err(map_http_error(err));
+                }
             }
         };
         let mut bytes = Vec::new();
@@ -222,17 +242,37 @@ impl SmartHttpClient {
         body.extend_from_slice(b"0000");
         body.extend(pkt_line("done\n"));
 
-        let mut req = self
-            .agent
-            .post(&url)
-            .set("Content-Type", "application/x-git-upload-pack-request")
-            .set("Accept", "application/x-git-upload-pack-result")
-            .set("User-Agent", "ivaldi-vcs/0.1.0");
-        if let Some(token) = &self.token {
-            req = req.set("Authorization", &format!("Bearer {}", token));
-        }
+        let build = |token: Option<&str>| {
+            let mut r = self
+                .agent
+                .post(&url)
+                .set("Content-Type", "application/x-git-upload-pack-request")
+                .set("Accept", "application/x-git-upload-pack-result")
+                .set("User-Agent", "ivaldi-vcs/0.1.0");
+            if let Some(t) = token {
+                r = r.set("Authorization", &format!("Bearer {}", t));
+            }
+            r
+        };
 
-        let resp = req.send_bytes(&body).map_err(map_http_error)?;
+        let resp = match build(self.token.as_deref()).send_bytes(&body) {
+            Ok(resp) => resp,
+            Err(err) => {
+                if self.token.is_some() && is_auth_failure(&err) {
+                    match build(None).send_bytes(&body) {
+                        Ok(resp) => {
+                            crate::logging::warn(
+                                "stored token rejected — falling back to anonymous access",
+                            );
+                            resp
+                        }
+                        Err(e2) => return Err(map_http_error(e2)),
+                    }
+                } else {
+                    return Err(map_http_error(err));
+                }
+            }
+        };
         let total = resp
             .header("Content-Length")
             .and_then(|h| h.parse::<u64>().ok());
@@ -267,9 +307,30 @@ struct Discovery {
     default_branch: Option<String>,
 }
 
+/// True for status codes that suggest the token was the problem, not the repo.
+fn is_auth_failure(err: &ureq::Error) -> bool {
+    match err {
+        ureq::Error::Status(401, _) => true,
+        ureq::Error::Status(403, resp) => {
+            // 403 with rate-limit headers is NOT an auth failure; retrying
+            // anonymously would hit the same (or stricter) limit.
+            resp.header("X-RateLimit-Remaining") != Some("0")
+        }
+        _ => false,
+    }
+}
+
 fn map_http_error(err: ureq::Error) -> GitRemoteError {
     match err {
         ureq::Error::Status(status, resp) => {
+            // Detect rate-limiting before consuming the body.
+            if status == 403 && resp.header("X-RateLimit-Remaining") == Some("0") {
+                let reset_at = resp
+                    .header("X-RateLimit-Reset")
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+                return GitRemoteError::RateLimited { reset_at };
+            }
             let mut body = String::new();
             let mut reader = resp.into_reader();
             let _ = reader.read_to_string(&mut body);
@@ -883,6 +944,10 @@ pub enum GitRemoteError {
     RepoUnavailable,
     #[error("branch not found: {0}")]
     BranchNotFound(String),
+    #[error(
+        "GitHub rate limit reached (60/hr unauthenticated). Run 'ivaldi auth login' to raise the limit to 5000/hr."
+    )]
+    RateLimited { reset_at: u64 },
     #[error("HTTP {status}: {message}")]
     Http { status: u16, message: String },
     #[error("{0}")]

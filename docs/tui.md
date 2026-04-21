@@ -46,6 +46,27 @@ ivaldi shift --last 3       # non-interactive, squash last 3
 - Creates squashed seal with combined message
 - No TUI needed
 
+### Config form (`tui/config_form.rs`)
+
+Full-screen editor for Ivaldi configuration, launched by `ivaldi config` with
+no flags. Works both inside a repo (writes `.ivaldi/config`) and outside
+(writes `~/.ivaldi/config`).
+
+**Sections:** User, Appearance, Core, Remote (repo-local only).
+
+**Controls:**
+| Key | Action |
+|-----|--------|
+| ↑/↓ or j/k | Navigate fields |
+| Enter | Edit focused text field (or toggle bool) |
+| ←/→ or h/l | Toggle bool fields |
+| Esc | Cancel edit, or exit without saving |
+| `s` | Save and exit |
+| `q` | Quit (prompts if modified) |
+
+Validates `user.email` (`x@y.z`) and `portal.default` (must parse via
+`parse_repo_spec`). See [config.md](config.md) for the full field list.
+
 ### Resolver (`tui/resolver.rs`)
 
 Per-file conflict resolution during fuse operations.
@@ -74,7 +95,7 @@ The TUI dashboard has 7 tabs, switchable with number keys or Tab/Shift+Tab:
 | 2 | Log | Commit history |
 | 3 | Diff | Change comparison |
 | 4 | Timelines | Timeline management |
-| 5 | Remote | Remote operations |
+| 5 | Remote | Remote operations (scout/harvest work without auth on public repos; upload/sync require auth) |
 | 6 | Fuse | Merge timelines |
 | 7 | Review | Local code review |
 
@@ -120,9 +141,10 @@ tui/types.rs     — TabId, Action, AppContext
 tui/theme.rs     — Color themes
 tui/views/       — Tab view implementations (status, log, diff, timeline, remote, fuse, review)
 tui/components/  — Reusable widgets (tab_bar, status_bar, file_list, diff_view, dialog)
-tui/travel.rs    — History browser
-tui/shift.rs     — Squash range selector
-tui/resolver.rs  — Conflict resolver
+tui/travel.rs      — History browser
+tui/shift.rs       — Squash range selector
+tui/resolver.rs    — Conflict resolver
+tui/config_form.rs — Interactive config form
 ```
 
 All TUI components use the same pattern:

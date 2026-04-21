@@ -22,17 +22,16 @@ pub struct Portal {
 }
 
 impl Portal {
-    /// Parse from "owner/repo" format.
+    /// Parse from any supported repo spec (`owner/repo`, full URL, SSH, etc).
+    ///
+    /// Returns `None` on parse failure. For structured error info or branch
+    /// hints, use [`parse_repo_spec`] directly.
     pub fn parse(s: &str) -> Option<Self> {
-        let s = s.trim();
-        let (owner, repo) = s.split_once('/')?;
-        if owner.is_empty() || repo.is_empty() {
-            return None;
-        }
+        let spec = parse_repo_spec(s).ok()?;
         Some(Self {
-            owner: owner.to_string(),
-            repo: repo.to_string(),
-            platform: Platform::GitHub,
+            owner: spec.owner,
+            repo: spec.repo,
+            platform: spec.platform,
             base_url: None,
         })
     }
@@ -69,6 +68,124 @@ impl std::fmt::Display for Platform {
             Platform::GitLab => write!(f, "gitlab"),
         }
     }
+}
+
+/// Structured result of parsing a repo identifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoSpec {
+    pub owner: String,
+    pub repo: String,
+    pub platform: Platform,
+    /// Optional branch extracted from a `/tree/<branch>` URL suffix.
+    pub branch_hint: Option<String>,
+}
+
+/// Parser errors for repo identifiers.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RepoSpecError {
+    #[error("empty repository spec")]
+    Empty,
+    #[error("missing owner or repository name")]
+    MissingSegment,
+    #[error("unsupported host: {0}")]
+    UnsupportedHost(String),
+    #[error("invalid repository spec")]
+    Invalid,
+}
+
+/// Parse a repository identifier in any supported format.
+///
+/// Accepts (produces `owner=torvalds, repo=linux`):
+/// - `torvalds/linux`, `torvalds/linux.git`, `torvalds/linux/`
+/// - `https://github.com/torvalds/linux[.git][/]`, `http://…`
+/// - `github.com/torvalds/linux`, `github:torvalds/linux`
+/// - `git@github.com:torvalds/linux[.git]`, `ssh://git@github.com/torvalds/linux[.git]`
+/// - `https://github.com/torvalds/linux/tree/master` → `branch_hint = Some("master")`
+///
+/// `gitlab.com` / `gitlab:` variants set `platform = Platform::GitLab`.
+pub fn parse_repo_spec(input: &str) -> Result<RepoSpec, RepoSpecError> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        return Err(RepoSpecError::Empty);
+    }
+
+    // Host (if one can be determined) and the "owner/repo/..." remainder.
+    let (host, remainder) = extract_host_and_path(raw)?;
+    let platform = match host.as_deref() {
+        Some("github.com") | None => Platform::GitHub,
+        Some("gitlab.com") => Platform::GitLab,
+        Some(other) => return Err(RepoSpecError::UnsupportedHost(other.to_string())),
+    };
+
+    // Strip trailing slashes then a trailing `.git`.
+    let cleaned = remainder.trim_matches('/');
+    let cleaned = cleaned.strip_suffix(".git").unwrap_or(cleaned);
+
+    let segments: Vec<&str> = cleaned.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.len() < 2 {
+        return Err(RepoSpecError::MissingSegment);
+    }
+
+    let owner = segments[0].to_string();
+    let mut repo = segments[1].to_string();
+    // `owner/repo.git/extra` shouldn't happen often, but be defensive.
+    if let Some(stripped) = repo.strip_suffix(".git") {
+        repo = stripped.to_string();
+    }
+    if owner.is_empty() || repo.is_empty() {
+        return Err(RepoSpecError::MissingSegment);
+    }
+
+    let branch_hint = if segments.len() >= 4 && segments[2] == "tree" {
+        Some(segments[3..].join("/"))
+    } else {
+        None
+    };
+
+    Ok(RepoSpec {
+        owner,
+        repo,
+        platform,
+        branch_hint,
+    })
+}
+
+fn extract_host_and_path(raw: &str) -> Result<(Option<String>, String), RepoSpecError> {
+    // ssh://git@host/owner/repo
+    if let Some(rest) = raw.strip_prefix("ssh://") {
+        let after_user = rest.splitn(2, '@').last().unwrap_or(rest);
+        let (host, path) = after_user
+            .split_once('/')
+            .ok_or(RepoSpecError::Invalid)?;
+        return Ok((Some(host.to_string()), path.to_string()));
+    }
+    // git@host:owner/repo
+    if let Some(rest) = raw.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':').ok_or(RepoSpecError::Invalid)?;
+        return Ok((Some(host.to_string()), path.to_string()));
+    }
+    // https://host/owner/repo  |  http://host/owner/repo
+    for scheme in ["https://", "http://"] {
+        if let Some(rest) = raw.strip_prefix(scheme) {
+            let (host, path) = rest.split_once('/').ok_or(RepoSpecError::Invalid)?;
+            return Ok((Some(host.to_string()), path.to_string()));
+        }
+    }
+    // github:owner/repo  |  gitlab:owner/repo
+    for (prefix, host) in [("github:", "github.com"), ("gitlab:", "gitlab.com")] {
+        if let Some(rest) = raw.strip_prefix(prefix) {
+            return Ok((Some(host.to_string()), rest.to_string()));
+        }
+    }
+    // bare host prefix: github.com/owner/repo | gitlab.com/owner/repo
+    for host in ["github.com", "gitlab.com"] {
+        let with_slash = format!("{}/", host);
+        if let Some(rest) = raw.strip_prefix(&with_slash) {
+            return Ok((Some(host.to_string()), rest.to_string()));
+        }
+    }
+    // Plain shorthand: owner/repo (host unknown, default to GitHub).
+    Ok((None, raw.to_string()))
 }
 
 /// Manages portal configurations for a repository.
@@ -211,6 +328,123 @@ mod tests {
         assert!(Portal::parse("/empty").is_none());
         assert!(Portal::parse("empty/").is_none());
         assert!(Portal::parse("").is_none());
+    }
+
+    #[test]
+    fn spec_shorthand() {
+        let s = parse_repo_spec("torvalds/linux").unwrap();
+        assert_eq!(s.owner, "torvalds");
+        assert_eq!(s.repo, "linux");
+        assert_eq!(s.platform, Platform::GitHub);
+        assert!(s.branch_hint.is_none());
+    }
+
+    #[test]
+    fn spec_strips_dotgit_and_slash() {
+        assert_eq!(parse_repo_spec("torvalds/linux.git").unwrap().repo, "linux");
+        assert_eq!(parse_repo_spec("torvalds/linux/").unwrap().repo, "linux");
+        assert_eq!(
+            parse_repo_spec("torvalds/linux.git/").unwrap().repo,
+            "linux"
+        );
+    }
+
+    #[test]
+    fn spec_https() {
+        let s = parse_repo_spec("https://github.com/torvalds/linux").unwrap();
+        assert_eq!(s.owner, "torvalds");
+        assert_eq!(s.repo, "linux");
+        assert_eq!(s.platform, Platform::GitHub);
+
+        let s = parse_repo_spec("https://github.com/torvalds/linux.git").unwrap();
+        assert_eq!(s.repo, "linux");
+
+        let s = parse_repo_spec("http://github.com/torvalds/linux/").unwrap();
+        assert_eq!(s.repo, "linux");
+    }
+
+    #[test]
+    fn spec_bare_host() {
+        let s = parse_repo_spec("github.com/torvalds/linux").unwrap();
+        assert_eq!(s.owner, "torvalds");
+        assert_eq!(s.repo, "linux");
+        assert_eq!(s.platform, Platform::GitHub);
+    }
+
+    #[test]
+    fn spec_shorthand_prefix() {
+        let s = parse_repo_spec("github:torvalds/linux").unwrap();
+        assert_eq!(s.platform, Platform::GitHub);
+        assert_eq!(s.repo, "linux");
+
+        let s = parse_repo_spec("gitlab:foo/bar").unwrap();
+        assert_eq!(s.platform, Platform::GitLab);
+    }
+
+    #[test]
+    fn spec_ssh() {
+        let s = parse_repo_spec("git@github.com:torvalds/linux.git").unwrap();
+        assert_eq!(s.owner, "torvalds");
+        assert_eq!(s.repo, "linux");
+
+        let s = parse_repo_spec("git@github.com:torvalds/linux").unwrap();
+        assert_eq!(s.repo, "linux");
+
+        let s = parse_repo_spec("ssh://git@github.com/torvalds/linux.git").unwrap();
+        assert_eq!(s.owner, "torvalds");
+        assert_eq!(s.repo, "linux");
+    }
+
+    #[test]
+    fn spec_gitlab_host() {
+        let s = parse_repo_spec("https://gitlab.com/foo/bar").unwrap();
+        assert_eq!(s.platform, Platform::GitLab);
+        assert_eq!(s.owner, "foo");
+    }
+
+    #[test]
+    fn spec_tree_branch_hint() {
+        let s = parse_repo_spec("https://github.com/torvalds/linux/tree/master").unwrap();
+        assert_eq!(s.branch_hint.as_deref(), Some("master"));
+
+        let s = parse_repo_spec("https://github.com/owner/repo/tree/feature/nested").unwrap();
+        assert_eq!(s.branch_hint.as_deref(), Some("feature/nested"));
+    }
+
+    #[test]
+    fn spec_unsupported_host() {
+        let err = parse_repo_spec("https://bitbucket.org/foo/bar").unwrap_err();
+        assert!(matches!(err, RepoSpecError::UnsupportedHost(_)));
+    }
+
+    #[test]
+    fn spec_empty_and_missing() {
+        assert_eq!(parse_repo_spec("").unwrap_err(), RepoSpecError::Empty);
+        assert_eq!(parse_repo_spec("   ").unwrap_err(), RepoSpecError::Empty);
+        assert!(matches!(
+            parse_repo_spec("noslash").unwrap_err(),
+            RepoSpecError::MissingSegment
+        ));
+        assert!(matches!(
+            parse_repo_spec("/empty").unwrap_err(),
+            RepoSpecError::MissingSegment
+        ));
+        assert!(matches!(
+            parse_repo_spec("empty/").unwrap_err(),
+            RepoSpecError::MissingSegment
+        ));
+    }
+
+    #[test]
+    fn portal_parse_accepts_url() {
+        let p = Portal::parse("https://github.com/torvalds/linux.git").unwrap();
+        assert_eq!(p.owner, "torvalds");
+        assert_eq!(p.repo, "linux");
+        assert_eq!(p.platform, Platform::GitHub);
+
+        let p = Portal::parse("git@gitlab.com:foo/bar.git").unwrap();
+        assert_eq!(p.owner, "foo");
+        assert_eq!(p.platform, Platform::GitLab);
     }
 
     #[test]

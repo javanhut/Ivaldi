@@ -4,7 +4,10 @@ GitHub API client for Ivaldi VCS.
 
 ## Overview
 
-Synchronous HTTP client using `ureq` for all GitHub API interactions. Handles authentication automatically via the `auth` module's credential resolution.
+Synchronous HTTP client using `ureq` for all GitHub API interactions. Handles
+authentication automatically via the `auth` module's credential resolution.
+Auth is **optional** — read-only operations on public repositories work
+anonymously (see [Public repo access](#public-repo-access) below).
 
 ## Operations
 
@@ -34,6 +37,40 @@ export GITHUB_TOKEN=ghp_...
 
 # Option 3: GitHub CLI (automatic fallback)
 gh auth login
+```
+
+## Public repo access
+
+The Git smart-HTTP transport (`src/git_remote.rs`) works anonymously for public
+repositories. `download`, `scout`, and `harvest` all tolerate a missing
+token — only write operations (`upload`, `sync`) require authentication.
+
+### Stale-token fallback
+
+If a stored token (from `~/.config/ivaldi/auth.json`, `GITHUB_TOKEN`, `.netrc`,
+or `gh` CLI) is expired or revoked, GitHub returns `401 Bad credentials` even
+for public repos. Ivaldi detects this and automatically retries the request
+anonymously, printing a one-line notice:
+
+```
+$ ivaldi download rust-lang/book
+stored token rejected — falling back to anonymous access
+Downloading rust-lang/book...
+```
+
+The retry fires only for `401` and for `403` responses that are **not**
+rate-limit errors (detected via `X-RateLimit-Remaining: 0`). If the anonymous
+retry also fails, the original error is surfaced.
+
+### Rate limiting
+
+Anonymous GitHub requests are capped at 60/hour. When the Git transport sees a
+`403` with `X-RateLimit-Remaining: 0`, it returns
+`GitRemoteError::RateLimited { reset_at }` with a clear message:
+
+```
+Error: GitHub rate limit reached (60/hr unauthenticated).
+Run 'ivaldi auth login' to raise the limit to 5000/hr.
 ```
 
 ## OAuth Device Flow

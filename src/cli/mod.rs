@@ -338,6 +338,10 @@ pub struct ConfigArgs {
     #[arg(long)]
     pub get: Option<String>,
 
+    /// Operate on the global config (~/.ivaldi/config) instead of repo-local
+    #[arg(long)]
+    pub global: bool,
+
     /// Value for --set
     pub value: Option<String>,
 }

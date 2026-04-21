@@ -40,10 +40,13 @@ ivaldi timeline list               # List all timelines
 ivaldi fuse feature to main        # Merge
 
 # Remote operations
-ivaldi portal add owner/repo       # Connect to GitHub
-ivaldi auth login                  # Authenticate via OAuth
+ivaldi portal add owner/repo       # Connect (also accepts full URLs / SSH / github: shorthand)
+ivaldi auth login                  # Authenticate via OAuth (only needed for upload/sync)
 ivaldi upload                      # Push to GitHub
-ivaldi download owner/repo         # Clone a repository
+ivaldi download owner/repo         # Clone (no auth required for public repos)
+ivaldi download https://github.com/owner/repo.git      # URL form works
+ivaldi download git@github.com:owner/repo.git          # SSH form works
+ivaldi download https://github.com/owner/repo/tree/dev # /tree/<branch> selects the branch
 ivaldi scout                       # List remote branches
 ivaldi harvest feature-branch      # Fetch specific branch
 ivaldi sync                        # Pull remote changes (delta only)
@@ -168,23 +171,34 @@ make clean
 ## Configuration
 
 ```bash
-# Required
-ivaldi config --set user.name "Your Name"
-ivaldi config --set user.email "you@example.com"
+# Required — set globally once, works across all repos
+ivaldi config --global --set user.name "Your Name"
+ivaldi config --global --set user.email "you@example.com"
 
-# Optional
+# Inside a repo, --set writes to the repo-local config by default
 ivaldi config --set color.ui true
 ivaldi config --set core.autoshelf true
 
-# View all
+# View all (annotated with global / local / default provenance)
 ivaldi config --list
+
+# Interactive form (ratatui — works inside or outside a repo)
+ivaldi config
 ```
+
+`ivaldi config` runs fine outside a repo — it automatically targets the
+global config at `~/.ivaldi/config`.
 
 Config files:
 - User: `~/.ivaldi/config`
 - Repository: `.ivaldi/config` (overrides user)
 
 ## Authentication
+
+Authentication is **optional** for read-only operations on public
+repositories — `download`, `scout`, and `harvest` work anonymously. Only
+`upload` and `sync` require a token. If a stored token is stale, Ivaldi
+automatically retries anonymously and prints a notice.
 
 ```bash
 # OAuth (recommended — works like gh auth login)

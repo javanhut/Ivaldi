@@ -8,6 +8,7 @@
 
 pub mod app;
 pub mod components;
+pub mod config_form;
 pub mod input;
 pub mod resolver;
 pub mod shift;

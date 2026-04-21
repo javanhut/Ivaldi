@@ -41,9 +41,11 @@ Command-line interface for Ivaldi VCS, built with `clap`.
 # Initialize
 ivaldi forge
 
-# Configure
+# Configure (repo-local by default; --global writes ~/.ivaldi/config;
+# outside a repo, falls back to global automatically)
 ivaldi config --set user.name "Alice"
-ivaldi config --set user.email "alice@example.com"
+ivaldi config --global --set user.email "alice@example.com"
+ivaldi config                       # launches interactive ratatui form
 
 # Daily workflow
 ivaldi gather .
@@ -56,13 +58,32 @@ ivaldi tl sw feature
 ivaldi tl ls
 ivaldi tl rm feature
 
-# Portals
+# Portals — any URL/SSH/shorthand form works
 ivaldi portal add owner/repo
+ivaldi portal add https://github.com/owner/repo.git
+ivaldi portal add git@github.com:owner/repo.git
 ivaldi portal list
+
+# Download public repos anonymously (no auth required)
+ivaldi download torvalds/linux
+ivaldi download https://github.com/rust-lang/book/tree/main   # /tree/<branch> picks the branch
 
 # Ignore patterns
 ivaldi exclude "*.log" "build/" "node_modules/"
 ```
+
+## Config flags
+
+| Flag | Behavior |
+|------|----------|
+| `--list` | Show all values with `(global)` / `(local)` / `(default)` provenance |
+| `--get <key>` | Print a single value |
+| `--set <key> <value>` | Write to repo-local `.ivaldi/config` by default |
+| `--global` | Target `~/.ivaldi/config` instead of repo-local |
+| (no flag) | Launch the interactive ratatui form |
+
+`ivaldi config` **no longer requires being inside an Ivaldi repo** — outside
+a repo it automatically operates on the global config.
 
 ## Architecture
 
