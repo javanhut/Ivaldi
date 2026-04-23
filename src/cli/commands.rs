@@ -1331,6 +1331,35 @@ fn cmd_portal(args: PortalArgs, quiet: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Try to open `url` in the user's default browser. Best-effort: returns
+/// false when no opener exists, the environment is headless, or the user
+/// opted out via IVALDI_NO_BROWSER. The caller still prints the URL so the
+/// user can fall back to copy/paste.
+fn open_in_browser(url: &str) -> bool {
+    if std::env::var_os("IVALDI_NO_BROWSER").is_some() {
+        return false;
+    }
+    use std::process::{Command, Stdio};
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    } else if cfg!(target_os = "windows") {
+        let mut c = Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    } else {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    cmd.stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
 fn cmd_auth(args: AuthArgs) -> Result<(), String> {
     match args.command {
         AuthCommands::Login(login_args) => {
@@ -1351,7 +1380,15 @@ fn cmd_auth(args: AuthArgs) -> Result<(), String> {
                 "\nFirst, copy your one-time code: {}",
                 device_code.user_code
             );
-            println!("Then visit: {}", device_code.verification_uri);
+            if open_in_browser(&device_code.verification_uri) {
+                println!(
+                    "Opened {} in your browser.",
+                    device_code.verification_uri
+                );
+                println!("(If nothing opened, visit the URL above manually.)");
+            } else {
+                println!("Then visit: {}", device_code.verification_uri);
+            }
             println!("\nWaiting for authentication...");
 
             let token =

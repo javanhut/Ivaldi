@@ -207,16 +207,14 @@ impl SmartHttpClient {
                 // If we attached a stored token and the server rejected it,
                 // the repo may still be public — retry anonymously once.
                 if self.token.is_some() && is_auth_failure(&err) {
+                    crate::logging::warn(
+                        "GitHub rejected the stored authentication token — retrying anonymously",
+                    );
                     match build(None).call() {
-                        Ok(resp) => {
-                            crate::logging::warn(
-                                "stored token rejected — falling back to anonymous access",
-                            );
-                            resp
-                        }
+                        Ok(resp) => resp,
                         Err(e2) => {
                             pb.finish_and_clear();
-                            return Err(map_http_error(e2));
+                            return Err(token_rejected_or(e2));
                         }
                     }
                 } else {
@@ -259,14 +257,12 @@ impl SmartHttpClient {
             Ok(resp) => resp,
             Err(err) => {
                 if self.token.is_some() && is_auth_failure(&err) {
+                    crate::logging::warn(
+                        "GitHub rejected the stored authentication token — retrying anonymously",
+                    );
                     match build(None).send_bytes(&body) {
-                        Ok(resp) => {
-                            crate::logging::warn(
-                                "stored token rejected — falling back to anonymous access",
-                            );
-                            resp
-                        }
-                        Err(e2) => return Err(map_http_error(e2)),
+                        Ok(resp) => resp,
+                        Err(e2) => return Err(token_rejected_or(e2)),
                     }
                 } else {
                     return Err(map_http_error(err));
@@ -318,6 +314,17 @@ fn is_auth_failure(err: &ureq::Error) -> bool {
         }
         _ => false,
     }
+}
+
+/// Mapper used after an anonymous retry that followed a stored-token rejection.
+/// A 401 here means the repo also requires auth, so the actionable problem is
+/// the rejected stored token — surface that explicitly instead of the generic
+/// "authentication required" the second 401 would otherwise produce.
+fn token_rejected_or(err: ureq::Error) -> GitRemoteError {
+    if matches!(&err, ureq::Error::Status(401, _)) {
+        return GitRemoteError::TokenRejected;
+    }
+    map_http_error(err)
 }
 
 fn map_http_error(err: ureq::Error) -> GitRemoteError {
@@ -938,8 +945,12 @@ fn encode_object_header(kind: GitObjectKind, size: usize) -> Vec<u8> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum GitRemoteError {
-    #[error("authentication required")]
+    #[error("authentication required — run 'ivaldi auth login' or set GITHUB_TOKEN")]
     AuthRequired,
+    #[error(
+        "GitHub rejected the stored authentication token. Run 'ivaldi auth logout && ivaldi auth login' to re-authenticate."
+    )]
+    TokenRejected,
     #[error("repository not found or requires authentication")]
     RepoUnavailable,
     #[error("branch not found: {0}")]
