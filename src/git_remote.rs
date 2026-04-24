@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 
+use base64::Engine;
 use flate2::Compression;
 use flate2::bufread::ZlibDecoder;
 use flate2::write::ZlibEncoder;
@@ -16,6 +17,17 @@ use crate::progress;
 use crate::remote::RemoteBranch;
 
 const GITHUB_BASE: &str = "https://github.com";
+
+/// Build an HTTP Basic auth header for a GitHub token.
+///
+/// GitHub's smart-HTTP git endpoints (`github.com/.../info/refs`,
+/// `git-upload-pack`) accept tokens via Basic auth with `x-access-token` as the
+/// username. Bearer tokens work for `api.github.com` but are not consistently
+/// accepted on the git endpoints, so we use Basic here.
+fn basic_auth_header(token: &str) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{}", token));
+    format!("Basic {}", encoded)
+}
 
 #[derive(Debug, Clone)]
 pub struct AdvertisedRef {
@@ -196,7 +208,7 @@ impl SmartHttpClient {
                 .set("Accept", "application/x-git-upload-pack-advertisement")
                 .set("User-Agent", "ivaldi-vcs/0.1.0");
             if let Some(t) = token {
-                r = r.set("Authorization", &format!("Bearer {}", t));
+                r = r.set("Authorization", &basic_auth_header(t));
             }
             r
         };
@@ -248,7 +260,7 @@ impl SmartHttpClient {
                 .set("Accept", "application/x-git-upload-pack-result")
                 .set("User-Agent", "ivaldi-vcs/0.1.0");
             if let Some(t) = token {
-                r = r.set("Authorization", &format!("Bearer {}", t));
+                r = r.set("Authorization", &basic_auth_header(t));
             }
             r
         };
