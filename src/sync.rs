@@ -276,6 +276,36 @@ pub fn upload(
     let mut hash_mapping = HashMapping::new(&repo.ivaldi_dir);
     let total = files.len();
 
+    // GitHub's Git Data API returns 409 on every endpoint (blobs included) when
+    // the repo has no initial commit. Detect that up front and seed the repo
+    // via the Contents API so the rest of the upload can proceed.
+    let existing_branches = client
+        .list_branches(owner, repo_name)
+        .map_err(SyncError::GitHub)?;
+    let mut bootstrapped = false;
+    if existing_branches.is_empty() {
+        let default_branch = client
+            .get_repo(owner, repo_name)
+            .map(|info| info.default_branch)
+            .unwrap_or_default();
+        let seed_branch = if default_branch.is_empty() {
+            branch_name
+        } else {
+            default_branch.as_str()
+        };
+        client
+            .create_file_contents(
+                owner,
+                repo_name,
+                ".ivaldi-bootstrap",
+                seed_branch,
+                b"Ivaldi bootstrap placeholder. Safe to remove after first upload.\n",
+                "chore: initialize repository for Ivaldi",
+            )
+            .map_err(SyncError::GitHub)?;
+        bootstrapped = true;
+    }
+
     let tree_entries =
         upload_blobs_parallel(client, &store, &files, &mut hash_mapping, owner, repo_name)?;
 
@@ -295,12 +325,17 @@ pub fn upload(
                 .map(|b| b.commit.sha.clone())
         });
 
+    // After a bootstrap, the seed commit on the branch is not a real ancestor
+    // of our local history, so treat this like a force-push for parent
+    // resolution and ref update to replace the placeholder commit.
+    let effective_force = force || bootstrapped;
+
     let parents = resolve_github_parent(
         repo,
         &head_leaf,
         &hash_mapping,
         existing_branch_sha.as_deref(),
-        force,
+        effective_force,
     );
     let is_new_branch = existing_branch_sha.is_none();
 
@@ -322,7 +357,7 @@ pub fn upload(
             .map_err(SyncError::GitHub)?;
     } else {
         client
-            .update_ref(owner, repo_name, branch_name, &commit_sha, force)
+            .update_ref(owner, repo_name, branch_name, &commit_sha, effective_force)
             .map_err(SyncError::GitHub)?;
     }
 

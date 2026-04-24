@@ -244,6 +244,33 @@ impl GitHubClient {
         Ok(r.sha)
     }
 
+    /// Create a file via the Contents API. Used to bootstrap an empty
+    /// repository — GitHub's Git Data API returns 409 on empty repos, but the
+    /// Contents API accepts a PUT and creates the initial commit/branch.
+    pub fn create_file_contents(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        branch: &str,
+        content: &[u8],
+        message: &str,
+    ) -> Result<(), GitHubError> {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(content);
+        let body = serde_json::json!({
+            "message": message,
+            "content": encoded,
+            "branch": branch,
+        });
+        self.req(
+            "PUT",
+            &format!("/repos/{}/{}/contents/{}", owner, repo, path),
+        )
+        .send_json(body)
+        .map_err(gh_err)?;
+        Ok(())
+    }
+
     pub fn create_tree(
         &self,
         owner: &str,
