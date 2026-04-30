@@ -90,6 +90,23 @@ pub fn download(
         let import = git_remote::import_fetch_result(&mut repo, &remote)
             .map_err(|e| SyncError::Other(e.to_string()))?;
 
+        // forge() initialised HEAD to a hardcoded "main"; point it at the
+        // branch we actually fetched so `whereami` and `timeline list` agree
+        // with the working tree. Also materialise the on-disk ref file so the
+        // timeline shows up in tools that scan refs/heads.
+        let ref_path = ivaldi_dir.join("refs/heads").join(&remote.branch);
+        if let Some(parent) = ref_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| SyncError::Other(e.to_string()))?;
+        }
+        if !ref_path.exists() {
+            fs::write(&ref_path, "").map_err(|e| SyncError::Other(e.to_string()))?;
+        }
+        crate::forge::write_head(
+            &ivaldi_dir,
+            &crate::forge::HeadRef::Timeline(remote.branch.clone()),
+        )
+        .map_err(|e| SyncError::Other(e.to_string()))?;
+
         let cas = FileCas::new(ivaldi_dir.join("objects"))
             .map_err(|e| SyncError::Other(e.to_string()))?;
         let store = FsStore::new(&cas);
@@ -436,10 +453,14 @@ pub fn harvest(
             .map_err(|e| SyncError::Other(e.to_string()))?;
         let import = git_remote::import_fetch_result(repo, &fetch)
             .map_err(|e| SyncError::Other(e.to_string()))?;
-        eprintln!(
-            "  {} commits imported, {} skipped",
-            import.commits_imported, import.commits_skipped
-        );
+        if import.commits_skipped > 0 {
+            eprintln!(
+                "  {} new commits imported ({} already present)",
+                import.commits_imported, import.commits_skipped
+            );
+        } else {
+            eprintln!("  {} commits imported", import.commits_imported);
+        }
 
         harvested.push(target_name.clone());
     }

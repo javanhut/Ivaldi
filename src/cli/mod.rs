@@ -223,6 +223,10 @@ pub struct TimelineCreateArgs {
 pub struct TimelineSwitchArgs {
     /// Timeline to switch to
     pub name: String,
+
+    /// Discard uncommitted working-tree changes when switching
+    #[arg(long, short = 'f')]
+    pub force: bool,
 }
 
 #[derive(clap::Args, Debug)]

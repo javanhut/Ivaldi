@@ -17,7 +17,7 @@ use crate::log as ivaldi_log;
 use crate::portal::{Platform, Portal, PortalManager};
 use crate::repo::Repo;
 use crate::seal;
-use crate::workspace::{FileState, Workspace};
+use crate::workspace::{FileState, Workspace, WorkspaceFile};
 
 use super::*;
 
@@ -360,7 +360,7 @@ fn cmd_whereami() -> Result<(), String> {
         }
     }
 
-    println!("Commits: {}", repo.commit_count());
+    println!("Commits: {}", repo.timeline_commit_count(&timeline));
     Ok(())
 }
 
@@ -444,22 +444,51 @@ fn cmd_diff(args: DiffArgs) -> Result<(), String> {
                 let mut modified = 0usize;
                 let mut deleted = 0usize;
                 for c in &changes {
-                    let (marker, marker_fn): (&str, fn(&str) -> String) = match c.kind {
-                        crate::fsmerkle::ChangeKind::Added => {
-                            added += 1;
-                            ("++", color::bold_green)
-                        }
-                        crate::fsmerkle::ChangeKind::Deleted => {
-                            deleted += 1;
-                            ("--", color::bold_red)
-                        }
+                    match c.kind {
+                        crate::fsmerkle::ChangeKind::Added => added += 1,
+                        crate::fsmerkle::ChangeKind::Deleted => deleted += 1,
                         crate::fsmerkle::ChangeKind::Modified
-                        | crate::fsmerkle::ChangeKind::TypeChange => {
-                            modified += 1;
-                            ("~~", color::bold_yellow)
+                        | crate::fsmerkle::ChangeKind::TypeChange => modified += 1,
+                    }
+                }
+
+                if args.stat {
+                    // Summary only
+                    for c in &changes {
+                        let marker_fn: fn(&str) -> String = match c.kind {
+                            crate::fsmerkle::ChangeKind::Added => color::bold_green,
+                            crate::fsmerkle::ChangeKind::Deleted => color::bold_red,
+                            _ => color::bold_yellow,
+                        };
+                        let kind = match c.kind {
+                            crate::fsmerkle::ChangeKind::Added => "added",
+                            crate::fsmerkle::ChangeKind::Deleted => "deleted",
+                            crate::fsmerkle::ChangeKind::Modified => "modified",
+                            crate::fsmerkle::ChangeKind::TypeChange => "type-change",
+                        };
+                        println!("  {} {}  ({})", marker_fn("|"), c.path, kind);
+                    }
+                } else {
+                    // Per-file markers + line-level hunks for modified text files
+                    for c in &changes {
+                        match c.kind {
+                            crate::fsmerkle::ChangeKind::Added => {
+                                println!("  {} {}", color::bold_green("++"), c.path);
+                                crate::diff::print_blob_as_added(&store, c.new_hash);
+                            }
+                            crate::fsmerkle::ChangeKind::Deleted => {
+                                println!("  {} {}", color::bold_red("--"), c.path);
+                                crate::diff::print_blob_as_deleted(&store, c.old_hash);
+                            }
+                            crate::fsmerkle::ChangeKind::Modified => {
+                                println!("  {} {}", color::bold_yellow("~~"), c.path);
+                                crate::diff::print_blob_diff(&store, c.old_hash, c.new_hash);
+                            }
+                            crate::fsmerkle::ChangeKind::TypeChange => {
+                                println!("  {} {}", color::bold_yellow("~~"), c.path);
+                            }
                         }
-                    };
-                    println!("  {} {}", marker_fn(marker), c.path);
+                    }
                 }
                 println!(
                     "\n{} change(s): {} added, {} modified, {} deleted",
@@ -675,9 +704,56 @@ fn cmd_timeline(args: TimelineArgs, quiet: bool) -> Result<(), String> {
             let repo = open_repo()?;
             let current = repo.current_timeline().unwrap_or_default();
 
-            // Auto-shelve: save current staging area before switch
+            // Verify target exists before any side effects
+            let target_head_idx = repo
+                .get_timeline_head(&switch_args.name)
+                .map_err(|e| e.to_string())?;
+            if target_head_idx.is_none() {
+                let ref_path = ctx.ivaldi_dir.join("refs/heads").join(&switch_args.name);
+                if !ref_path.exists() {
+                    return Err(format!("timeline '{}' not found", switch_args.name));
+                }
+            }
+
             let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
             let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
+
+            // Refuse if working tree has uncommitted changes that materialize would
+            // overwrite (modified/untracked/deleted). Staged-only state is fine —
+            // the shelf preserves it across the switch.
+            if !switch_args.force {
+                let current_tree = repo
+                    .get_timeline_head(&current)
+                    .map_err(|e| e.to_string())?
+                    .and_then(|idx| repo.get_leaf(idx).ok().flatten())
+                    .map(|l| l.tree_root);
+                let ignore_cache = ignore::load_pattern_cache(&ctx.work_dir);
+                let status = ws.status(current_tree, &ignore_cache).map_err(|e| e.to_string())?;
+                let dirty: Vec<&WorkspaceFile> = status
+                    .iter()
+                    .filter(|f| {
+                        matches!(
+                            f.state,
+                            FileState::Modified | FileState::Untracked | FileState::Deleted
+                        )
+                    })
+                    .collect();
+                if !dirty.is_empty() {
+                    let mut msg = String::from(
+                        "working tree has uncommitted changes that would be overwritten:\n",
+                    );
+                    for f in dirty.iter().take(10) {
+                        msg.push_str(&format!("  {:?}  {}\n", f.state, f.path));
+                    }
+                    if dirty.len() > 10 {
+                        msg.push_str(&format!("  ... and {} more\n", dirty.len() - 10));
+                    }
+                    msg.push_str("seal them, reset --hard, or pass --force to discard");
+                    return Err(msg);
+                }
+            }
+
+            // Auto-shelve: save current staging area before switch
             if !ws.staging.is_empty() {
                 use crate::shelf::{Shelf, ShelfManager};
                 let shelf_mgr = ShelfManager::new(&ctx.ivaldi_dir);
@@ -699,9 +775,21 @@ fn cmd_timeline(args: TimelineArgs, quiet: bool) -> Result<(), String> {
                 }
             }
 
-            // Switch
+            // Update HEAD
             repo.switch_timeline(&switch_args.name)
                 .map_err(|e| e.to_string())?;
+
+            // Materialize the target timeline's tip tree to the working directory.
+            // Without this, the working tree silently keeps the old timeline's files
+            // and `status` reports them as "deleted" relative to the new timeline.
+            if let Some(idx) = target_head_idx {
+                if let Some(leaf) = repo.get_leaf(idx).map_err(|e| e.to_string())? {
+                    let ws_mat = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
+                    ws_mat
+                        .materialize(leaf.tree_root)
+                        .map_err(|e| format!("failed to materialize timeline: {}", e))?;
+                }
+            }
 
             // Auto-restore: load shelf for target timeline
             {

@@ -424,9 +424,20 @@ impl Repo {
         config::load_config(&self.ivaldi_dir)
     }
 
-    /// Number of commits in the repository.
+    /// Total number of commits in the store across all timelines.
+    ///
+    /// This is the global count of every leaf ever appended to the MMR. Use
+    /// [`Self::timeline_commit_count`] when you want the count reachable from
+    /// a specific timeline's head.
     pub fn commit_count(&self) -> u64 {
         self.mmr.size()
+    }
+
+    /// Number of commits reachable from the given timeline's head (first-parent walk).
+    pub fn timeline_commit_count(&self, timeline: &str) -> u64 {
+        self.walk_history(timeline)
+            .map(|h| h.len() as u64)
+            .unwrap_or(0)
     }
 
     /// MMR root hash.

@@ -1089,10 +1089,15 @@ pub fn import_fetch_result(
     }
 
     pb_blobs.finish_with_message(format!("{} blobs imported", blobs_downloaded));
-    pb_commits.finish_with_message(format!(
-        "{} commits imported, {} skipped",
-        commits_imported, commits_skipped
-    ));
+    let commit_msg = if commits_skipped > 0 {
+        format!(
+            "{} new commits imported ({} already present)",
+            commits_imported, commits_skipped
+        )
+    } else {
+        format!("{} commits imported", commits_imported)
+    };
+    pb_commits.finish_with_message(commit_msg);
     mapping
         .save()
         .map_err(|e| GitRemoteError::Io(e.to_string()))?;
