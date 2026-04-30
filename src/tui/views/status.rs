@@ -12,9 +12,20 @@ use crate::tui::types::{Action, AppContext};
 use crate::tui::views::TabView;
 use crate::workspace::{DotfileAllowlist, FileState, StagingArea, Workspace};
 
+/// What action the dialog will perform when the user submits with Enter.
+///
+/// The `Dialog` widget is generic, so the StatusView remembers which prompt
+/// it last opened in order to dispatch the right business-logic call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialogPurpose {
+    Seal,
+    ConfirmResetHard,
+}
+
 pub struct StatusView {
     file_list: FileListWidget,
     dialog: Dialog,
+    dialog_purpose: DialogPurpose,
     show_ignored: bool,
     message: Option<String>,
 }
@@ -24,6 +35,7 @@ impl StatusView {
         Self {
             file_list: FileListWidget::new(),
             dialog: Dialog::new("Seal Message"),
+            dialog_purpose: DialogPurpose::Seal,
             show_ignored: false,
             message: None,
         }
@@ -175,6 +187,42 @@ impl StatusView {
             Err(e) => Action::Error(format!("Seal failed: {}", e)),
         }
     }
+
+    fn do_reset_hard(&mut self, ctx: &mut AppContext) -> Action {
+        let confirmation = self.dialog.value().trim().to_string();
+        self.dialog.hide();
+        if !confirmation.eq_ignore_ascii_case("yes") {
+            self.message = Some("Reset cancelled".into());
+            return Action::Consumed;
+        }
+
+        // Resolve the current timeline tip's tree and materialize it.
+        let timeline = match ctx.repo.current_timeline() {
+            Ok(t) => t,
+            Err(e) => return Action::Error(format!("Failed to read HEAD: {}", e)),
+        };
+        let tree_root = match ctx.repo.get_timeline_head(&timeline) {
+            Ok(Some(idx)) => match ctx.repo.get_leaf(idx) {
+                Ok(Some(leaf)) => leaf.tree_root,
+                Ok(None) => return Action::Error("Timeline tip not found".into()),
+                Err(e) => return Action::Error(format!("Failed to load tip: {}", e)),
+            },
+            Ok(None) => return Action::Error("Timeline has no commits yet".into()),
+            Err(e) => return Action::Error(format!("Failed to read timeline: {}", e)),
+        };
+
+        let ws = Workspace::new(&ctx.repo.cas, &ctx.work_dir, &ctx.ivaldi_dir);
+        if let Err(e) = ws.materialize(tree_root) {
+            return Action::Error(format!("Reset failed: {}", e));
+        }
+
+        // Clear staging too — `reset --hard` discards everything.
+        let empty = StagingArea::new();
+        let _ = empty.save(&ctx.ivaldi_dir);
+
+        self.message = Some("Reset to tip".into());
+        Action::Refresh
+    }
 }
 
 impl TabView for StatusView {
@@ -182,7 +230,10 @@ impl TabView for StatusView {
         // Dialog mode
         if self.dialog.visible {
             match event.code {
-                KeyCode::Enter => return self.do_seal(ctx),
+                KeyCode::Enter => match self.dialog_purpose {
+                    DialogPurpose::Seal => return self.do_seal(ctx),
+                    DialogPurpose::ConfirmResetHard => return self.do_reset_hard(ctx),
+                },
                 KeyCode::Esc => {
                     self.dialog.hide();
                     return Action::Consumed;
@@ -215,7 +266,14 @@ impl TabView for StatusView {
             KeyCode::Char('u') => self.ungather_selected(ctx),
             KeyCode::Char('a') => self.gather_all(ctx),
             KeyCode::Char('s') => {
+                self.dialog_purpose = DialogPurpose::Seal;
                 self.dialog.show("Seal Message");
+                Action::Consumed
+            }
+            KeyCode::Char('R') => {
+                self.dialog_purpose = DialogPurpose::ConfirmResetHard;
+                self.dialog
+                    .show("Reset --hard? Type 'yes' to discard all working-tree changes");
                 Action::Consumed
             }
             KeyCode::Char('i') => {
@@ -244,7 +302,7 @@ impl TabView for StatusView {
                 height: 1,
             };
             let help = Paragraph::new(Span::styled(
-                " Space:gather  u:ungather  a:all  s:seal  i:ignored  r:refresh",
+                " Space:gather  u:ungather  a:all  s:seal  R:reset-hard  i:ignored  r:refresh",
                 theme.dim,
             ));
             frame.render_widget(help, help_area);
@@ -305,7 +363,7 @@ impl TabView for StatusView {
     }
 
     fn short_help(&self) -> &str {
-        "Space:gather u:ungather a:all s:seal i:ignored"
+        "Space:gather u:ungather a:all s:seal R:reset-hard i:ignored"
     }
 
     fn has_active_input(&self) -> bool {

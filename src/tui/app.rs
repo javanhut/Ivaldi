@@ -296,7 +296,8 @@ impl App {
 
         // Help overlay (on top of everything)
         if self.show_help {
-            render_help(frame, &self.theme);
+            let tab_help = self.active_view().short_help().to_string();
+            render_help(frame, &self.theme, self.active_tab, &tab_help);
         }
     }
 }
