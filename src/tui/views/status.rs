@@ -139,8 +139,22 @@ impl StatusView {
             return Action::Error("Nothing to seal (staging area is empty)".into());
         }
 
+        // Resolve the current timeline's tip tree so the new seal inherits
+        // unchanged files from the parent rather than dropping them.
+        let timeline = match ctx.repo.current_timeline() {
+            Ok(t) => t,
+            Err(e) => return Action::Error(format!("Failed to read HEAD: {}", e)),
+        };
+        let parent_tree = match ctx.repo.get_timeline_head(&timeline) {
+            Ok(Some(idx)) => match ctx.repo.get_leaf(idx) {
+                Ok(Some(leaf)) => Some(leaf.tree_root),
+                _ => None,
+            },
+            _ => None,
+        };
+
         let ws = Workspace::new(&ctx.repo.cas, &ctx.work_dir, &ctx.ivaldi_dir);
-        let tree_root = match ws.build_staged_tree() {
+        let tree_root = match ws.build_seal_tree(parent_tree) {
             Ok(h) => h,
             Err(e) => return Action::Error(format!("Failed to build tree: {}", e)),
         };

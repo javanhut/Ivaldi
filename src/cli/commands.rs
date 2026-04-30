@@ -122,13 +122,40 @@ fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
     let ignore_cache = ignore::load_pattern_cache(&ctx.work_dir);
     let mut allowlist = DotfileAllowlist::load(&ctx.ivaldi_dir);
 
+    // Resolve the current timeline's tip tree so we can detect deletions
+    // (paths in the parent tree that are missing from disk). For a brand-new
+    // timeline with no parent commits the map is simply empty.
+    let parent_tree_files: std::collections::BTreeMap<String, crate::hash::B3Hash> = {
+        let repo = open_repo()?;
+        let timeline = repo.current_timeline().map_err(|e| e.to_string())?;
+        match repo
+            .get_timeline_head(&timeline)
+            .map_err(|e| e.to_string())?
+            .and_then(|idx| repo.get_leaf(idx).ok().flatten())
+            .map(|l| l.tree_root)
+        {
+            Some(root) => ws.list_tree_files(root).map_err(|e| e.to_string())?,
+            None => std::collections::BTreeMap::new(),
+        }
+    };
+
     let mut all_gathered: Vec<String>;
+    let mut all_deleted: Vec<String> = Vec::new();
 
     if args.files.is_empty() || args.files == ["."] {
         let result = ws.gather_all(&ignore_cache).map_err(|e| e.to_string())?;
         all_gathered = result.gathered;
 
-        // Report skipped dotfiles so the user knows they were found but excluded
+        // Anything in the parent tree but missing from disk is a deletion.
+        let on_disk: std::collections::BTreeSet<String> =
+            ws.scan(&ignore_cache).map_err(|e| e.to_string())?.into_iter().collect();
+        for path in parent_tree_files.keys() {
+            if !on_disk.contains(path.as_str()) {
+                ws.staging.stage_deletion(path.clone());
+                all_deleted.push(path.clone());
+            }
+        }
+
         if !quiet && !result.needs_confirmation.is_empty() {
             eprintln!(
                 "Skipped {} hidden (dot) file(s):",
@@ -144,10 +171,23 @@ fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
         let result = ws.gather(&refs, &allowlist).map_err(|e| e.to_string())?;
         all_gathered = result.gathered;
 
-        // Handle dotfiles that need confirmation
+        // For each requested path that wasn't gathered (because it's missing
+        // from disk), record it as a deletion if it was present in the parent
+        // tree. Paths that aren't in the parent tree and aren't on disk are
+        // silently skipped, matching the prior behaviour.
+        for path in &refs {
+            if ws.staging.is_staged(path) {
+                continue;
+            }
+            let full_path = ws.work_dir().join(path);
+            if !full_path.exists() && parent_tree_files.contains_key(*path) {
+                ws.staging.stage_deletion(path.to_string());
+                all_deleted.push(path.to_string());
+            }
+        }
+
         if !result.needs_confirmation.is_empty() {
             if args.allow_all {
-                // --allow-all pre-approves all dotfiles (except security-blocked)
                 let confirmed_refs: Vec<&str> = result
                     .needs_confirmation
                     .iter()
@@ -161,7 +201,6 @@ fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
                 }
                 all_gathered.extend(extra);
             } else {
-                // Prompt for each dotfile individually
                 for dotfile in &result.needs_confirmation {
                     eprint!(
                         "WARNING: '{}' is a hidden (dot) file — stage it? [y/N]: ",
@@ -186,7 +225,6 @@ fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
                 }
             }
 
-            // Persist allowlist so confirmed dotfiles don't prompt again
             allowlist.save().map_err(|e| e.to_string())?;
         }
     }
@@ -197,7 +235,20 @@ fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
         for file in &all_gathered {
             println!("  gathered: {}", file);
         }
-        println!("{} file(s) staged", all_gathered.len());
+        for file in &all_deleted {
+            println!("  removed:  {}", file);
+        }
+        let total = all_gathered.len() + all_deleted.len();
+        if all_deleted.is_empty() {
+            println!("{} file(s) staged", total);
+        } else {
+            println!(
+                "{} file(s) staged ({} added, {} deleted)",
+                total,
+                all_gathered.len(),
+                all_deleted.len()
+            );
+        }
     }
     Ok(())
 }
@@ -216,11 +267,20 @@ fn cmd_seal(args: SealArgs, quiet: bool) -> Result<(), String> {
         return Err("no changes staged for seal. Use 'ivaldi gather' to stage files first.".into());
     }
 
-    // Build tree from staged files
-    let tree_hash = ws.build_staged_tree().map_err(|e| e.to_string())?;
-
-    // Open persistent repo and commit
+    // Open persistent repo first so we can resolve the current timeline's
+    // parent tree, then build the seal tree as parent + staging.
     let mut repo = open_repo()?;
+    let timeline = repo.current_timeline().map_err(|e| e.to_string())?;
+    let parent_tree = repo
+        .get_timeline_head(&timeline)
+        .map_err(|e| e.to_string())?
+        .and_then(|idx| repo.get_leaf(idx).ok().flatten())
+        .map(|l| l.tree_root);
+
+    let tree_hash = ws
+        .build_seal_tree(parent_tree)
+        .map_err(|e| e.to_string())?;
+
     let cfg = repo.config();
     let author = cfg.author()
         .ok_or("user.name and user.email not configured. Run:\n  ivaldi config --set user.name \"Your Name\"\n  ivaldi config --set user.email \"you@example.com\"")?;
@@ -295,14 +355,19 @@ fn cmd_status() -> Result<(), String> {
         .iter()
         .filter(|f| f.state == FileState::Untracked)
         .collect();
+    // Deletions that have been staged for the next seal are shown under the
+    // Staged section, not under unstaged Changes.
+    let staged_deletions: std::collections::BTreeSet<&String> =
+        ws.staging.staged_deletions().iter().collect();
     let deleted: Vec<_> = status
         .iter()
-        .filter(|f| f.state == FileState::Deleted)
+        .filter(|f| f.state == FileState::Deleted && !staged_deletions.contains(&f.path))
         .collect();
 
     let has_changes = !modified.is_empty() || !untracked.is_empty() || !deleted.is_empty();
+    let has_staged = !staged.is_empty() || !staged_deletions.is_empty();
 
-    if !has_changes && staged.is_empty() {
+    if !has_changes && !has_staged {
         println!("\nWorking directory: clean");
         return Ok(());
     }
@@ -320,10 +385,17 @@ fn cmd_status() -> Result<(), String> {
         }
     }
 
-    if !staged.is_empty() {
+    if has_staged {
         println!("\nStaged:");
         for f in &staged {
             println!("  {} {:<30} (staged)", color::bold_green("++"), f.path);
+        }
+        for path in &staged_deletions {
+            println!(
+                "  {} {:<30} (staged for deletion)",
+                color::bold_red("--"),
+                path
+            );
         }
     }
 
@@ -539,6 +611,9 @@ fn cmd_diff(args: DiffArgs) -> Result<(), String> {
                     println!("Staged changes:");
                     for (path, _) in ws.staging.staged_files() {
                         println!("  {} {}", color::bold_green("++"), path);
+                    }
+                    for path in ws.staging.staged_deletions() {
+                        println!("  {} {}", color::bold_red("--"), path);
                     }
                 }
             } else {
