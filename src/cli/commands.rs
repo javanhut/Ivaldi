@@ -2155,8 +2155,46 @@ fn cmd_review(args: ReviewArgs, quiet: bool) -> Result<(), String> {
 }
 
 fn cmd_tui() -> Result<(), String> {
-    let ctx = find_repo()?;
-    crate::tui::app::run(&ctx.work_dir, &ctx.ivaldi_dir)
+    if let Ok(ctx) = find_repo() {
+        return crate::tui::app::run(&ctx.work_dir, &ctx.ivaldi_dir);
+    }
+
+    // No repository here — drop the user into the launcher so they can
+    // download, forge, or open one without going back to the CLI.
+    use crate::tui::launcher::{self, LauncherChoice};
+    let choice = launcher::run().map_err(|e| format!("Launcher error: {}", e))?;
+
+    match choice {
+        LauncherChoice::Quit => Ok(()),
+        LauncherChoice::Download {
+            repo_arg,
+            target_dir,
+        } => {
+            // Same path the CLI's `cmd_download` takes, just inlined so we can
+            // chain into the dashboard on success.
+            let spec = parse_repo_arg(&repo_arg)?;
+            let client = crate::github::GitHubClient::new();
+            let branch = spec.branch_hint.as_deref();
+            crate::sync::download(&client, &spec.owner, &spec.repo, &target_dir, branch)
+                .map_err(|e| e.to_string())?;
+            crate::tui::app::run(&target_dir, &target_dir.join(".ivaldi"))
+        }
+        LauncherChoice::Forge { target_dir } => {
+            std::fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
+            forge::forge(&target_dir).map_err(|e| e.to_string())?;
+            crate::tui::app::run(&target_dir, &target_dir.join(".ivaldi"))
+        }
+        LauncherChoice::Open { target_dir } => {
+            let ivaldi_dir = target_dir.join(".ivaldi");
+            if !ivaldi_dir.join("HEAD").exists() {
+                return Err(format!(
+                    "{} is not an Ivaldi repository",
+                    target_dir.display()
+                ));
+            }
+            crate::tui::app::run(&target_dir, &ivaldi_dir)
+        }
+    }
 }
 
 #[cfg(test)]
