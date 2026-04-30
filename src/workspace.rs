@@ -431,15 +431,29 @@ impl<'a> Workspace<'a> {
     }
 
     /// Materialize a tree hash to the working directory.
-    /// Only modifies files that differ from current state.
+    ///
+    /// Writes any files in `tree_hash` that differ from disk and removes
+    /// non-ignored files that aren't in the tree. Ignored files (build
+    /// artifacts, editor swap files, etc.) are left untouched so a timeline
+    /// switch doesn't wipe out unrelated working state.
     pub fn materialize(&self, tree_hash: B3Hash) -> Result<(), WorkspaceError> {
+        let ignore = crate::ignore::load_pattern_cache(&self.work_dir);
+        self.materialize_with_ignore(tree_hash, &ignore)
+    }
+
+    /// Like [`Self::materialize`] but with a caller-supplied ignore cache.
+    pub fn materialize_with_ignore(
+        &self,
+        tree_hash: B3Hash,
+        ignore: &PatternCache,
+    ) -> Result<(), WorkspaceError> {
         let store = FsStore::new(self.cas);
         let mut target_files = BTreeMap::new();
         self.collect_tree_files(&store, tree_hash, "", &mut target_files)?;
 
-        // Collect current files
-        let ignore = PatternCache::new(&[]);
-        let current_files = self.scan(&ignore).unwrap_or_default();
+        // Scan the working dir respecting ignores; any file not in this set
+        // is either ignored or absent — either way we won't delete it below.
+        let current_files = self.scan(ignore).unwrap_or_default();
         let current_set: BTreeSet<String> = current_files.into_iter().collect();
 
         // Write/update files
@@ -449,7 +463,6 @@ impl<'a> Workspace<'a> {
                 .load_blob(*blob_hash)
                 .map_err(WorkspaceError::FsMerkle)?;
 
-            // Only write if different
             let should_write = if full_path.exists() {
                 let existing = fs::read(&full_path).map_err(WorkspaceError::Io)?;
                 existing != content
@@ -465,7 +478,7 @@ impl<'a> Workspace<'a> {
             }
         }
 
-        // Remove files not in target tree
+        // Remove non-ignored files not in target tree
         let target_set: BTreeSet<&str> = target_files.keys().map(|s| s.as_str()).collect();
         for path in &current_set {
             if !target_set.contains(path.as_str()) {
@@ -514,6 +527,111 @@ impl<'a> Workspace<'a> {
         self.staging
             .save(&self.ivaldi_dir)
             .map_err(WorkspaceError::Io)
+    }
+
+    /// Capture working-tree changes vs `base_tree` for auto-shelving.
+    ///
+    /// For Modified and Untracked files, the disk content is hashed into the
+    /// CAS so the bytes survive a subsequent `materialize` (which will
+    /// overwrite the working tree). For Deleted files only the path is
+    /// recorded — the original bytes are recoverable from `base_tree` itself.
+    pub fn capture_changes(
+        &self,
+        base_tree: Option<B3Hash>,
+        ignore: &PatternCache,
+    ) -> Result<Vec<crate::shelf::WorkspaceChange>, WorkspaceError> {
+        let store = FsStore::new(self.cas);
+        let mut known_files: BTreeMap<String, B3Hash> = BTreeMap::new();
+        if let Some(tree_hash) = base_tree {
+            if tree_hash != B3Hash::ZERO {
+                self.collect_tree_files(&store, tree_hash, "", &mut known_files)?;
+            }
+        }
+
+        let disk_files = self.scan(ignore)?;
+        let disk_set: BTreeSet<&str> = disk_files.iter().map(|s| s.as_str()).collect();
+
+        let mut changes = Vec::new();
+
+        for path in &disk_files {
+            let full_path = self.work_dir.join(path);
+            let content = fs::read(&full_path).map_err(WorkspaceError::Io)?;
+            let current_hash = BlobNode::hash_content(&content);
+
+            match known_files.get(path.as_str()) {
+                Some(known_hash) if *known_hash == current_hash => {
+                    // Unmodified — nothing to capture.
+                }
+                Some(_) => {
+                    // Modified — store blob in CAS so it survives materialize.
+                    store.put_blob(&content).map_err(WorkspaceError::FsMerkle)?;
+                    changes.push(crate::shelf::WorkspaceChange::Modified {
+                        path: path.clone(),
+                        hash: current_hash,
+                    });
+                }
+                None => {
+                    // Untracked — store blob and record.
+                    store.put_blob(&content).map_err(WorkspaceError::FsMerkle)?;
+                    changes.push(crate::shelf::WorkspaceChange::Untracked {
+                        path: path.clone(),
+                        hash: current_hash,
+                    });
+                }
+            }
+        }
+
+        // Files in the base tree but missing from disk are Deleted.
+        for path in known_files.keys() {
+            if !disk_set.contains(path.as_str()) {
+                changes.push(crate::shelf::WorkspaceChange::Deleted {
+                    path: path.clone(),
+                });
+            }
+        }
+
+        Ok(changes)
+    }
+
+    /// Re-apply previously-captured working-tree changes after switching to
+    /// a timeline. Called after `materialize` has written the target tip
+    /// tree to disk.
+    pub fn apply_changes(
+        &self,
+        changes: &[crate::shelf::WorkspaceChange],
+    ) -> Result<(), WorkspaceError> {
+        let store = FsStore::new(self.cas);
+        for change in changes {
+            match change {
+                crate::shelf::WorkspaceChange::Modified { path, hash }
+                | crate::shelf::WorkspaceChange::Untracked { path, hash } => {
+                    let (_, content) =
+                        store.load_blob(*hash).map_err(WorkspaceError::FsMerkle)?;
+                    let full_path = self.work_dir.join(path);
+                    if let Some(parent) = full_path.parent() {
+                        fs::create_dir_all(parent).map_err(WorkspaceError::Io)?;
+                    }
+                    fs::write(&full_path, &content).map_err(WorkspaceError::Io)?;
+                }
+                crate::shelf::WorkspaceChange::Deleted { path } => {
+                    let full_path = self.work_dir.join(path);
+                    let _ = fs::remove_file(&full_path);
+                    // Best-effort cleanup of empty parents.
+                    if let Some(mut parent) = full_path.parent().map(Path::to_path_buf) {
+                        while parent.starts_with(&self.work_dir) && parent != self.work_dir {
+                            if fs::remove_dir(&parent).is_err() {
+                                break;
+                            }
+                            parent = match parent.parent() {
+                                Some(p) => p.to_path_buf(),
+                                None => break,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 

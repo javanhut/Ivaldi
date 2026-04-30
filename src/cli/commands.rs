@@ -17,7 +17,7 @@ use crate::log as ivaldi_log;
 use crate::portal::{Platform, Portal, PortalManager};
 use crate::repo::Repo;
 use crate::seal;
-use crate::workspace::{FileState, Workspace, WorkspaceFile};
+use crate::workspace::{FileState, Workspace};
 
 use super::*;
 
@@ -704,6 +704,13 @@ fn cmd_timeline(args: TimelineArgs, quiet: bool) -> Result<(), String> {
             let repo = open_repo()?;
             let current = repo.current_timeline().unwrap_or_default();
 
+            if current == switch_args.name {
+                if !quiet {
+                    println!("Already on timeline: {}", switch_args.name);
+                }
+                return Ok(());
+            }
+
             // Verify target exists before any side effects
             let target_head_idx = repo
                 .get_timeline_head(&switch_args.name)
@@ -716,106 +723,142 @@ fn cmd_timeline(args: TimelineArgs, quiet: bool) -> Result<(), String> {
             }
 
             let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
-            let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
+            let ignore_cache = ignore::load_pattern_cache(&ctx.work_dir);
 
-            // Refuse if working tree has uncommitted changes that materialize would
-            // overwrite (modified/untracked/deleted). Staged-only state is fine —
-            // the shelf preserves it across the switch.
-            if !switch_args.force {
+            // ---- Auto-shelve: capture everything dirty about `current` ----
+            //
+            // We save staging + working-tree changes (Modified, Untracked,
+            // Deleted) into a shelf keyed by `current`. This must happen
+            // BEFORE materialize, since materialize will rewrite the working
+            // tree to look like the target timeline.
+            use crate::shelf::{Shelf, ShelfManager, WorkspaceChange};
+            let shelf_mgr = ShelfManager::new(&ctx.ivaldi_dir);
+            let mut shelved_summary: Vec<String> = Vec::new();
+
+            {
+                let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
                 let current_tree = repo
                     .get_timeline_head(&current)
                     .map_err(|e| e.to_string())?
                     .and_then(|idx| repo.get_leaf(idx).ok().flatten())
                     .map(|l| l.tree_root);
-                let ignore_cache = ignore::load_pattern_cache(&ctx.work_dir);
-                let status = ws.status(current_tree, &ignore_cache).map_err(|e| e.to_string())?;
-                let dirty: Vec<&WorkspaceFile> = status
-                    .iter()
-                    .filter(|f| {
-                        matches!(
-                            f.state,
-                            FileState::Modified | FileState::Untracked | FileState::Deleted
-                        )
-                    })
-                    .collect();
-                if !dirty.is_empty() {
-                    let mut msg = String::from(
-                        "working tree has uncommitted changes that would be overwritten:\n",
-                    );
-                    for f in dirty.iter().take(10) {
-                        msg.push_str(&format!("  {:?}  {}\n", f.state, f.path));
-                    }
-                    if dirty.len() > 10 {
-                        msg.push_str(&format!("  ... and {} more\n", dirty.len() - 10));
-                    }
-                    msg.push_str("seal them, reset --hard, or pass --force to discard");
-                    return Err(msg);
-                }
-            }
+                let workspace_changes = ws
+                    .capture_changes(current_tree, &ignore_cache)
+                    .map_err(|e| format!("failed to auto-shelve: {}", e))?;
 
-            // Auto-shelve: save current staging area before switch
-            if !ws.staging.is_empty() {
-                use crate::shelf::{Shelf, ShelfManager};
-                let shelf_mgr = ShelfManager::new(&ctx.ivaldi_dir);
                 let mut staged = std::collections::BTreeMap::new();
                 for (path, hash) in ws.staging.staged_files() {
                     staged.insert(path.clone(), *hash);
                 }
-                let shelf = Shelf {
-                    timeline: current.clone(),
-                    staged_files: staged,
-                    created_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs() as i64,
-                };
-                shelf_mgr.save_shelf(&shelf).map_err(|e| e.to_string())?;
-                if !quiet {
-                    println!("Changes auto-shelved for '{}'", current);
+
+                if !staged.is_empty() || !workspace_changes.is_empty() {
+                    let mut counts = (0usize, 0usize, 0usize, staged.len());
+                    for c in &workspace_changes {
+                        match c {
+                            WorkspaceChange::Modified { .. } => counts.0 += 1,
+                            WorkspaceChange::Untracked { .. } => counts.1 += 1,
+                            WorkspaceChange::Deleted { .. } => counts.2 += 1,
+                        }
+                    }
+                    if counts.0 > 0 {
+                        shelved_summary.push(format!("{} modified", counts.0));
+                    }
+                    if counts.1 > 0 {
+                        shelved_summary.push(format!("{} untracked", counts.1));
+                    }
+                    if counts.2 > 0 {
+                        shelved_summary.push(format!("{} deleted", counts.2));
+                    }
+                    if counts.3 > 0 {
+                        shelved_summary.push(format!("{} staged", counts.3));
+                    }
+
+                    let shelf = Shelf {
+                        timeline: current.clone(),
+                        staged_files: staged,
+                        workspace_changes,
+                        created_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs() as i64,
+                    };
+                    shelf_mgr.save_shelf(&shelf).map_err(|e| e.to_string())?;
+                } else {
+                    // No dirty state — clear any stale shelf so we don't
+                    // reapply stale changes if the user switches back.
+                    shelf_mgr.remove_shelf(&current).ok();
                 }
             }
 
-            // Update HEAD
+            // ---- Update HEAD and materialize target tree ----
             repo.switch_timeline(&switch_args.name)
                 .map_err(|e| e.to_string())?;
 
-            // Materialize the target timeline's tip tree to the working directory.
-            // Without this, the working tree silently keeps the old timeline's files
-            // and `status` reports them as "deleted" relative to the new timeline.
             if let Some(idx) = target_head_idx {
                 if let Some(leaf) = repo.get_leaf(idx).map_err(|e| e.to_string())? {
                     let ws_mat = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
                     ws_mat
-                        .materialize(leaf.tree_root)
+                        .materialize_with_ignore(leaf.tree_root, &ignore_cache)
                         .map_err(|e| format!("failed to materialize timeline: {}", e))?;
                 }
             }
 
-            // Auto-restore: load shelf for target timeline
+            // ---- Restore target's shelf (if any) ----
+            let mut restored_summary: Vec<String> = Vec::new();
             {
-                use crate::shelf::ShelfManager;
-                let shelf_mgr = ShelfManager::new(&ctx.ivaldi_dir);
+                let mut ws_mut = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
+                ws_mut.staging.clear();
+
                 if let Ok(Some(shelf)) = shelf_mgr.load_shelf(&switch_args.name) {
-                    let mut ws_mut = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
-                    ws_mut.staging.clear();
+                    if !shelf.workspace_changes.is_empty() {
+                        ws_mut
+                            .apply_changes(&shelf.workspace_changes)
+                            .map_err(|e| format!("failed to restore shelved changes: {}", e))?;
+                    }
                     for (path, hash) in &shelf.staged_files {
                         ws_mut.staging.stage(path, *hash);
                     }
-                    ws_mut.save().map_err(|e| e.to_string())?;
-                    shelf_mgr.remove_shelf(&switch_args.name).ok();
-                    if !quiet {
-                        println!("Restored shelved changes for '{}'", switch_args.name);
+                    let mut counts = (0usize, 0usize, 0usize, shelf.staged_files.len());
+                    for c in &shelf.workspace_changes {
+                        match c {
+                            WorkspaceChange::Modified { .. } => counts.0 += 1,
+                            WorkspaceChange::Untracked { .. } => counts.1 += 1,
+                            WorkspaceChange::Deleted { .. } => counts.2 += 1,
+                        }
                     }
-                } else {
-                    // Clear staging for clean switch
-                    let mut ws_mut = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
-                    ws_mut.staging.clear();
-                    ws_mut.save().map_err(|e| e.to_string())?;
+                    if counts.0 > 0 {
+                        restored_summary.push(format!("{} modified", counts.0));
+                    }
+                    if counts.1 > 0 {
+                        restored_summary.push(format!("{} untracked", counts.1));
+                    }
+                    if counts.2 > 0 {
+                        restored_summary.push(format!("{} deleted", counts.2));
+                    }
+                    if counts.3 > 0 {
+                        restored_summary.push(format!("{} staged", counts.3));
+                    }
+                    shelf_mgr.remove_shelf(&switch_args.name).ok();
                 }
+                ws_mut.save().map_err(|e| e.to_string())?;
             }
 
             if !quiet {
+                if !shelved_summary.is_empty() {
+                    println!(
+                        "Auto-shelved on '{}': {}",
+                        current,
+                        shelved_summary.join(", ")
+                    );
+                }
                 println!("Switched to timeline: {}", switch_args.name);
+                if !restored_summary.is_empty() {
+                    println!(
+                        "Restored shelved changes for '{}': {}",
+                        switch_args.name,
+                        restored_summary.join(", ")
+                    );
+                }
             }
             Ok(())
         }

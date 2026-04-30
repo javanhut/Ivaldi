@@ -2,15 +2,36 @@
 //!
 //! When switching timelines, uncommitted changes are automatically saved
 //! to a shelf and restored when returning. Shelves are transparent to the
-//! user and managed automatically.
+//! user and managed automatically — there is no `stash` command.
 //!
-//! Storage: `.ivaldi/shelves/<timeline-name>.json`
+//! A shelf captures three kinds of state for a timeline at the moment of
+//! switch-away:
+//!
+//! - **Staged files** — entries in the staging area, by path and blob hash.
+//! - **Workspace changes** — modifications, untracked files, and deletions
+//!   relative to the timeline's tip tree. Modified/Untracked file content
+//!   is hashed into the CAS so the bytes survive even after the working
+//!   tree is rewritten by the next timeline's materialize.
+//!
+//! Storage: `.ivaldi/shelves/<timeline-name>.shelf`
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::hash::B3Hash;
+
+/// A single working-tree change captured by the shelf.
+///
+/// `Modified` and `Untracked` carry a hash because the content lives in the
+/// CAS and must be re-applied on switch-back. `Deleted` only needs the path
+/// because the tip tree itself supplies the original bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceChange {
+    Modified { path: String, hash: B3Hash },
+    Untracked { path: String, hash: B3Hash },
+    Deleted { path: String },
+}
 
 /// A shelved workspace state.
 #[derive(Debug, Clone)]
@@ -19,8 +40,17 @@ pub struct Shelf {
     pub timeline: String,
     /// Staged files at the time of shelving: path → content hash.
     pub staged_files: BTreeMap<String, B3Hash>,
+    /// Working-tree changes vs the timeline tip at shelf time.
+    pub workspace_changes: Vec<WorkspaceChange>,
     /// Timestamp when shelf was created (Unix seconds).
     pub created_at: i64,
+}
+
+impl Shelf {
+    /// True if the shelf has nothing to restore.
+    pub fn is_empty(&self) -> bool {
+        self.staged_files.is_empty() && self.workspace_changes.is_empty()
+    }
 }
 
 /// Manages auto-shelving operations.
@@ -48,6 +78,20 @@ impl ShelfManager {
             lines.push(format!("staged {} {}", hash, file_path));
         }
 
+        for change in &shelf.workspace_changes {
+            match change {
+                WorkspaceChange::Modified { path, hash } => {
+                    lines.push(format!("modified {} {}", hash, path));
+                }
+                WorkspaceChange::Untracked { path, hash } => {
+                    lines.push(format!("untracked {} {}", hash, path));
+                }
+                WorkspaceChange::Deleted { path } => {
+                    lines.push(format!("deleted {}", path));
+                }
+            }
+        }
+
         fs::write(&path, lines.join("\n")).map_err(ShelfError::Io)?;
         Ok(())
     }
@@ -64,6 +108,7 @@ impl ShelfManager {
         let mut shelf = Shelf {
             timeline: timeline.to_string(),
             staged_files: BTreeMap::new(),
+            workspace_changes: Vec::new(),
             created_at: 0,
         };
 
@@ -79,6 +124,28 @@ impl ShelfManager {
                         shelf.staged_files.insert(path.to_string(), hash);
                     }
                 }
+            } else if let Some(rest) = line.strip_prefix("modified ") {
+                if let Some((hash_str, path)) = rest.split_once(' ') {
+                    if let Some(hash) = B3Hash::from_hex(hash_str) {
+                        shelf.workspace_changes.push(WorkspaceChange::Modified {
+                            path: path.to_string(),
+                            hash,
+                        });
+                    }
+                }
+            } else if let Some(rest) = line.strip_prefix("untracked ") {
+                if let Some((hash_str, path)) = rest.split_once(' ') {
+                    if let Some(hash) = B3Hash::from_hex(hash_str) {
+                        shelf.workspace_changes.push(WorkspaceChange::Untracked {
+                            path: path.to_string(),
+                            hash,
+                        });
+                    }
+                }
+            } else if let Some(rest) = line.strip_prefix("deleted ") {
+                shelf.workspace_changes.push(WorkspaceChange::Deleted {
+                    path: rest.to_string(),
+                });
             }
         }
 
@@ -150,6 +217,7 @@ mod tests {
         let mut shelf = Shelf {
             timeline: "feature".into(),
             staged_files: BTreeMap::new(),
+            workspace_changes: Vec::new(),
             created_at: 1700000000,
         };
         shelf
@@ -171,6 +239,48 @@ mod tests {
     }
 
     #[test]
+    fn workspace_changes_round_trip() {
+        let (_dir, mgr) = setup();
+
+        let h_mod = B3Hash::digest(b"modified content");
+        let h_unt = B3Hash::digest(b"new file content");
+        let shelf = Shelf {
+            timeline: "feature".into(),
+            staged_files: BTreeMap::new(),
+            workspace_changes: vec![
+                WorkspaceChange::Modified {
+                    path: "src/main.rs".into(),
+                    hash: h_mod,
+                },
+                WorkspaceChange::Untracked {
+                    path: "scratch/notes.md".into(),
+                    hash: h_unt,
+                },
+                WorkspaceChange::Deleted {
+                    path: ".gitignore".into(),
+                },
+            ],
+            created_at: 1700000000,
+        };
+        mgr.save_shelf(&shelf).unwrap();
+
+        let loaded = mgr.load_shelf("feature").unwrap().unwrap();
+        assert_eq!(loaded.workspace_changes.len(), 3);
+        assert!(loaded
+            .workspace_changes
+            .iter()
+            .any(|c| matches!(c, WorkspaceChange::Modified { path, hash } if path == "src/main.rs" && *hash == h_mod)));
+        assert!(loaded
+            .workspace_changes
+            .iter()
+            .any(|c| matches!(c, WorkspaceChange::Untracked { path, hash } if path == "scratch/notes.md" && *hash == h_unt)));
+        assert!(loaded
+            .workspace_changes
+            .iter()
+            .any(|c| matches!(c, WorkspaceChange::Deleted { path } if path == ".gitignore")));
+    }
+
+    #[test]
     fn load_nonexistent() {
         let (_dir, mgr) = setup();
         let result = mgr.load_shelf("nonexistent").unwrap();
@@ -184,6 +294,7 @@ mod tests {
         let shelf = Shelf {
             timeline: "feature".into(),
             staged_files: BTreeMap::new(),
+            workspace_changes: Vec::new(),
             created_at: 0,
         };
         mgr.save_shelf(&shelf).unwrap();
@@ -196,7 +307,7 @@ mod tests {
     #[test]
     fn remove_nonexistent_ok() {
         let (_dir, mgr) = setup();
-        mgr.remove_shelf("nonexistent").unwrap(); // Should not error
+        mgr.remove_shelf("nonexistent").unwrap();
     }
 
     #[test]
@@ -207,13 +318,14 @@ mod tests {
             let shelf = Shelf {
                 timeline: name.to_string(),
                 staged_files: BTreeMap::new(),
+                workspace_changes: Vec::new(),
                 created_at: 0,
             };
             mgr.save_shelf(&shelf).unwrap();
         }
 
         let list = mgr.list_shelves().unwrap();
-        assert_eq!(list, vec!["feature", "hotfix", "main"]); // sorted
+        assert_eq!(list, vec!["feature", "hotfix", "main"]);
     }
 
     #[test]
@@ -224,6 +336,7 @@ mod tests {
         let shelf = Shelf {
             timeline: "feature".into(),
             staged_files: BTreeMap::new(),
+            workspace_changes: Vec::new(),
             created_at: 0,
         };
         mgr.save_shelf(&shelf).unwrap();
@@ -237,12 +350,13 @@ mod tests {
         let shelf = Shelf {
             timeline: "empty".into(),
             staged_files: BTreeMap::new(),
+            workspace_changes: Vec::new(),
             created_at: 0,
         };
         mgr.save_shelf(&shelf).unwrap();
 
         let loaded = mgr.load_shelf("empty").unwrap().unwrap();
-        assert!(loaded.staged_files.is_empty());
+        assert!(loaded.is_empty());
     }
 
     #[test]
@@ -252,6 +366,7 @@ mod tests {
         let shelf1 = Shelf {
             timeline: "feature".into(),
             staged_files: BTreeMap::from([("old.txt".into(), B3Hash::digest(b"old"))]),
+            workspace_changes: Vec::new(),
             created_at: 100,
         };
         mgr.save_shelf(&shelf1).unwrap();
@@ -259,6 +374,7 @@ mod tests {
         let shelf2 = Shelf {
             timeline: "feature".into(),
             staged_files: BTreeMap::from([("new.txt".into(), B3Hash::digest(b"new"))]),
+            workspace_changes: Vec::new(),
             created_at: 200,
         };
         mgr.save_shelf(&shelf2).unwrap();
