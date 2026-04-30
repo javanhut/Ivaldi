@@ -20,6 +20,8 @@ use crate::workspace::{DotfileAllowlist, FileState, StagingArea, Workspace};
 enum DialogPurpose {
     Seal,
     ConfirmResetHard,
+    /// Add a glob pattern to .ivaldiignore. Same logic as `ivaldi exclude`.
+    AddIgnorePattern,
 }
 
 pub struct StatusView {
@@ -188,6 +190,33 @@ impl StatusView {
         }
     }
 
+    fn do_add_ignore_pattern(&mut self, ctx: &mut AppContext) -> Action {
+        let pattern = self.dialog.value().trim().to_string();
+        self.dialog.hide();
+
+        if pattern.is_empty() {
+            return Action::Consumed;
+        }
+
+        // Same append-if-absent logic as `ivaldi exclude`.
+        let path = ctx.work_dir.join(".ivaldiignore");
+        let mut content = std::fs::read_to_string(&path).unwrap_or_default();
+        if content.lines().any(|l| l.trim() == pattern) {
+            self.message = Some(format!("Already in .ivaldiignore: {}", pattern));
+            return Action::Refresh;
+        }
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(&pattern);
+        content.push('\n');
+        if let Err(e) = std::fs::write(&path, &content) {
+            return Action::Error(format!("Failed to write .ivaldiignore: {}", e));
+        }
+        self.message = Some(format!("Added to .ivaldiignore: {}", pattern));
+        Action::Refresh
+    }
+
     fn do_reset_hard(&mut self, ctx: &mut AppContext) -> Action {
         let confirmation = self.dialog.value().trim().to_string();
         self.dialog.hide();
@@ -233,6 +262,7 @@ impl TabView for StatusView {
                 KeyCode::Enter => match self.dialog_purpose {
                     DialogPurpose::Seal => return self.do_seal(ctx),
                     DialogPurpose::ConfirmResetHard => return self.do_reset_hard(ctx),
+                    DialogPurpose::AddIgnorePattern => return self.do_add_ignore_pattern(ctx),
                 },
                 KeyCode::Esc => {
                     self.dialog.hide();
@@ -276,6 +306,23 @@ impl TabView for StatusView {
                     .show("Reset --hard? Type 'yes' to discard all working-tree changes");
                 Action::Consumed
             }
+            KeyCode::Char('E') => {
+                // Pre-fill the dialog with the path under the cursor so the
+                // common case (ignore this untracked file) is one keystroke.
+                let preset = self
+                    .file_list
+                    .current_item()
+                    .map(|i| i.path.clone())
+                    .unwrap_or_default();
+                self.dialog_purpose = DialogPurpose::AddIgnorePattern;
+                if preset.is_empty() {
+                    self.dialog.show("Add .ivaldiignore pattern");
+                } else {
+                    self.dialog
+                        .show_with_value("Add .ivaldiignore pattern", preset);
+                }
+                Action::Consumed
+            }
             KeyCode::Char('i') => {
                 self.show_ignored = !self.show_ignored;
                 Action::Refresh
@@ -302,7 +349,7 @@ impl TabView for StatusView {
                 height: 1,
             };
             let help = Paragraph::new(Span::styled(
-                " Space:gather  u:ungather  a:all  s:seal  R:reset-hard  i:ignored  r:refresh",
+                " Space:gather  u:ungather  a:all  s:seal  R:reset-hard  E:exclude  i:ignored  r:refresh",
                 theme.dim,
             ));
             frame.render_widget(help, help_area);
@@ -363,7 +410,7 @@ impl TabView for StatusView {
     }
 
     fn short_help(&self) -> &str {
-        "Space:gather u:ungather a:all s:seal R:reset-hard i:ignored"
+        "Space:gather u:ungather a:all s:seal R:reset-hard E:exclude i:ignored"
     }
 
     fn has_active_input(&self) -> bool {
