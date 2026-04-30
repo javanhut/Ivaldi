@@ -18,6 +18,20 @@ pub enum BgResult {
     UploadDone(Result<String, String>),
     SyncDone(Result<String, String>),
     HarvestDone(Result<String, String>),
+    /// Intermediate signal during auth login — the GitHub device code response
+    /// arrived; the UI should display the user_code + verification_uri while the
+    /// thread keeps polling for the access token.
+    AuthLoginCode {
+        user_code: String,
+        verification_uri: String,
+    },
+    /// Auth login finished (success or failure). Clears the device-code prompt.
+    AuthLoginDone(Result<(), String>),
+    /// Auth status query finished. Each line is a "<Platform>: <description>"
+    /// or "<Platform>: Not authenticated" string ready to display.
+    AuthStatusDone(Vec<String>),
+    /// Auth logout finished.
+    AuthLogoutDone(Result<(), String>),
 }
 
 pub struct RemoteView {
@@ -27,6 +41,12 @@ pub struct RemoteView {
     dialog: Dialog,
     busy: bool,
     status_message: Option<(String, bool)>,
+    /// While a device-code login is in flight, holds the code + verification
+    /// URL so the user can complete the prompt in their browser. Cleared when
+    /// `AuthLoginDone` arrives.
+    auth_device_prompt: Option<(String, String)>,
+    /// Last result of an auth status query.
+    auth_status_lines: Vec<String>,
     pub bg_sender: Option<mpsc::Sender<BgResult>>,
     pub bg_receiver: Option<mpsc::Receiver<BgResult>>,
 }
@@ -41,6 +61,8 @@ impl RemoteView {
             dialog: Dialog::new(""),
             busy: false,
             status_message: None,
+            auth_device_prompt: None,
+            auth_status_lines: Vec::new(),
             bg_sender: Some(tx),
             bg_receiver: Some(rx),
         }
@@ -51,7 +73,13 @@ impl RemoteView {
         if let Some(ref rx) = self.bg_receiver {
             match rx.try_recv() {
                 Ok(result) => {
-                    self.busy = false;
+                    // AuthLoginCode is *intermediate* — keep `busy` true until
+                    // AuthLoginDone arrives so the user knows polling is still
+                    // happening. All other results are terminal.
+                    let terminal = !matches!(result, BgResult::AuthLoginCode { .. });
+                    if terminal {
+                        self.busy = false;
+                    }
                     match result {
                         BgResult::ScoutDone(Ok(branches)) => {
                             self.remote_timelines = branches;
@@ -81,6 +109,33 @@ impl RemoteView {
                         BgResult::HarvestDone(Err(e)) => {
                             self.status_message = Some((format!("Harvest failed: {}", e), true));
                         }
+                        BgResult::AuthLoginCode {
+                            user_code,
+                            verification_uri,
+                        } => {
+                            self.auth_device_prompt = Some((user_code, verification_uri));
+                            self.status_message =
+                                Some(("Waiting for browser confirmation...".into(), false));
+                        }
+                        BgResult::AuthLoginDone(Ok(())) => {
+                            self.auth_device_prompt = None;
+                            self.status_message = Some(("Logged in to GitHub".into(), false));
+                        }
+                        BgResult::AuthLoginDone(Err(e)) => {
+                            self.auth_device_prompt = None;
+                            self.status_message = Some((format!("Login failed: {}", e), true));
+                        }
+                        BgResult::AuthStatusDone(lines) => {
+                            self.auth_status_lines = lines;
+                            self.status_message = Some(("Auth status updated".into(), false));
+                        }
+                        BgResult::AuthLogoutDone(Ok(())) => {
+                            self.auth_status_lines.clear();
+                            self.status_message = Some(("Logged out".into(), false));
+                        }
+                        BgResult::AuthLogoutDone(Err(e)) => {
+                            self.status_message = Some((format!("Logout failed: {}", e), true));
+                        }
                     }
                     Some(Action::Consumed)
                 }
@@ -90,6 +145,93 @@ impl RemoteView {
         } else {
             None
         }
+    }
+
+    fn do_auth_login(&mut self) -> Action {
+        if self.busy {
+            return Action::Consumed;
+        }
+        self.busy = true;
+        self.auth_device_prompt = None;
+        self.status_message = Some(("Requesting device code...".into(), false));
+
+        if let Some(tx) = self.bg_sender.clone() {
+            std::thread::spawn(move || {
+                use crate::auth::TokenStore;
+                use crate::github::GitHubClient;
+                use crate::portal::Platform;
+
+                let device = match GitHubClient::request_device_code() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let _ = tx.send(BgResult::AuthLoginDone(Err(e.to_string())));
+                        return;
+                    }
+                };
+                let _ = tx.send(BgResult::AuthLoginCode {
+                    user_code: device.user_code.clone(),
+                    verification_uri: device.verification_uri.clone(),
+                });
+                let result = (|| -> Result<(), String> {
+                    let token =
+                        GitHubClient::poll_for_token(&device.device_code, device.interval)
+                            .map_err(|e| e.to_string())?;
+                    let store = TokenStore::new().map_err(|e| e.to_string())?;
+                    store
+                        .save_token(Platform::GitHub, token)
+                        .map_err(|e| e.to_string())
+                })();
+                let _ = tx.send(BgResult::AuthLoginDone(result));
+            });
+        }
+        Action::Consumed
+    }
+
+    fn do_auth_status(&mut self) -> Action {
+        if self.busy {
+            return Action::Consumed;
+        }
+        self.busy = true;
+        self.status_message = Some(("Checking auth status...".into(), false));
+
+        if let Some(tx) = self.bg_sender.clone() {
+            std::thread::spawn(move || {
+                use crate::auth;
+                use crate::portal::Platform;
+                let lines: Vec<String> = [(Platform::GitHub, "GitHub"), (Platform::GitLab, "GitLab")]
+                    .iter()
+                    .map(|(platform, name)| match auth::resolve_auth(*platform) {
+                        Some(method) => format!("{}: {}", name, method.description),
+                        None => format!("{}: Not authenticated", name),
+                    })
+                    .collect();
+                let _ = tx.send(BgResult::AuthStatusDone(lines));
+            });
+        }
+        Action::Consumed
+    }
+
+    fn do_auth_logout(&mut self) -> Action {
+        if self.busy {
+            return Action::Consumed;
+        }
+        self.busy = true;
+        self.status_message = Some(("Logging out...".into(), false));
+
+        if let Some(tx) = self.bg_sender.clone() {
+            std::thread::spawn(move || {
+                use crate::auth::TokenStore;
+                use crate::portal::Platform;
+                let result = (|| -> Result<(), String> {
+                    let store = TokenStore::new().map_err(|e| e.to_string())?;
+                    store
+                        .delete_token(Platform::GitHub)
+                        .map_err(|e| e.to_string())
+                })();
+                let _ = tx.send(BgResult::AuthLogoutDone(result));
+            });
+        }
+        Action::Consumed
     }
 
     fn do_scout(&mut self, ctx: &AppContext) -> Action {
@@ -259,7 +401,15 @@ impl TabView for RemoteView {
         }
 
         if self.busy {
-            return Action::Consumed; // Block input while busy
+            // While a device-code login is in flight we still want the user to
+            // be able to cancel via Esc, but everything else is blocked.
+            if self.auth_device_prompt.is_some() && matches!(event.code, KeyCode::Esc) {
+                self.auth_device_prompt = None;
+                self.busy = false;
+                self.status_message = Some(("Login cancelled".into(), true));
+                return Action::Consumed;
+            }
+            return Action::Consumed;
         }
 
         match event.code {
@@ -301,17 +451,34 @@ impl TabView for RemoteView {
                 self.dialog.show("Portal (owner/repo)");
                 Action::Consumed
             }
+            KeyCode::Char('L') => self.do_auth_login(),
+            KeyCode::Char('A') => self.do_auth_status(),
+            KeyCode::Char('O') => self.do_auth_logout(),
             KeyCode::Char('r') => Action::Refresh,
             _ => Action::None,
         }
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        // Portal info at top
-        let portal_area = Rect { height: 2, ..area };
+        // Top header: portal line + status line
+        let header_lines = 2u16;
+        // Optional auth panel (device-code prompt and/or status query result).
+        let auth_lines: u16 = self
+            .auth_device_prompt
+            .as_ref()
+            .map(|_| 3)
+            .unwrap_or(0)
+            + self.auth_status_lines.len() as u16;
+
         let portal_text = match &self.portal_info {
             Some(p) => format!("Portal: {}", p),
             None => "No portal configured (press 'p' to add)".into(),
+        };
+        let portal_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
         };
         let portal_para = Paragraph::new(Span::styled(
             portal_text,
@@ -336,12 +503,75 @@ impl TabView for RemoteView {
             frame.render_widget(para, msg_area);
         }
 
+        // Auth panel (device-code prompt + status lines)
+        if auth_lines > 0 {
+            let mut y = area.y + header_lines;
+            if let Some((code, url)) = &self.auth_device_prompt {
+                let code_line = Paragraph::new(Line::from(vec![
+                    Span::styled("Code: ", theme.dim),
+                    Span::styled(code.clone(), theme.help_key),
+                ]));
+                frame.render_widget(
+                    code_line,
+                    Rect {
+                        x: area.x,
+                        y,
+                        width: area.width,
+                        height: 1,
+                    },
+                );
+                y += 1;
+                let url_line = Paragraph::new(Line::from(vec![
+                    Span::styled("Open: ", theme.dim),
+                    Span::styled(url.clone(), theme.info),
+                ]));
+                frame.render_widget(
+                    url_line,
+                    Rect {
+                        x: area.x,
+                        y,
+                        width: area.width,
+                        height: 1,
+                    },
+                );
+                y += 1;
+                let cancel_hint = Paragraph::new(Span::styled(
+                    "Esc to cancel — polling for confirmation...",
+                    theme.warning,
+                ));
+                frame.render_widget(
+                    cancel_hint,
+                    Rect {
+                        x: area.x,
+                        y,
+                        width: area.width,
+                        height: 1,
+                    },
+                );
+                y += 1;
+            }
+            for line in &self.auth_status_lines {
+                let para = Paragraph::new(Span::styled(line.clone(), theme.info));
+                frame.render_widget(
+                    para,
+                    Rect {
+                        x: area.x,
+                        y,
+                        width: area.width,
+                        height: 1,
+                    },
+                );
+                y += 1;
+            }
+        }
+
         // Remote timelines list
+        let list_y = area.y + header_lines + auth_lines;
         let list_area = Rect {
             x: area.x,
-            y: area.y + 2,
+            y: list_y,
             width: area.width,
-            height: area.height.saturating_sub(3),
+            height: area.height.saturating_sub(header_lines + auth_lines + 1),
         };
 
         if self.remote_timelines.is_empty() {
@@ -389,7 +619,7 @@ impl TabView for RemoteView {
                 height: 1,
             };
             let help = Paragraph::new(Span::styled(
-                " s:scout u:upload y:sync h:harvest-all Enter:harvest p:portal r:refresh",
+                " s:scout u:upload y:sync h:harvest-all Enter:harvest p:portal L:login A:auth-status O:logout r:refresh",
                 theme.dim,
             ));
             frame.render_widget(help, help_area);
@@ -405,7 +635,7 @@ impl TabView for RemoteView {
     }
 
     fn short_help(&self) -> &str {
-        "s:scout u:upload y:sync h:harvest p:portal"
+        "s:scout u:upload y:sync h:harvest p:portal L:login A:auth-status O:logout"
     }
 
     fn has_active_input(&self) -> bool {
