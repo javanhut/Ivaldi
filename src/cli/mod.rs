@@ -382,6 +382,12 @@ pub struct TravelArgs {
     /// Filter seals by message, author, or name
     #[arg(short, long)]
     pub search: Option<String>,
+
+    /// Browse every seal in the MMR — including ones orphaned from the
+    /// current timeline head (e.g., commits welded out of the chain).
+    /// Without this flag, travel only shows seals reachable from HEAD.
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(clap::Args, Debug)]

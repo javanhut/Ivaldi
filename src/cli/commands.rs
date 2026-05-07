@@ -1266,7 +1266,14 @@ fn cmd_travel(args: TravelArgs) -> Result<(), String> {
 
     let repo = open_repo()?;
     let timeline = repo.current_timeline().unwrap_or_else(|_| "main".into());
-    let entries = repo.walk_history(&timeline).map_err(|e| e.to_string())?;
+
+    let entries = if args.all {
+        // Walk every leaf in the MMR — useful when the head was welded
+        // and most seals are orphaned from the current timeline.
+        repo.walk_all_leaves().map_err(|e| e.to_string())?
+    } else {
+        repo.walk_history(&timeline).map_err(|e| e.to_string())?
+    };
 
     if entries.is_empty() {
         return Err(format!("no commits on timeline '{}'", timeline));

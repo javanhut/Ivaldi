@@ -340,7 +340,12 @@ impl Repo {
     }
 
     /// Walk commit history from a timeline head backwards.
-    pub fn walk_history(&self, timeline: &str) -> Result<Vec<HistoryEntry>, RepoError> {
+    /// Walk the timeline's history along `prev_idx` only (first-parent
+    /// view). Used internally by `walk_history` and `walk_history_dag`.
+    fn walk_history_first_parent(
+        &self,
+        timeline: &str,
+    ) -> Result<Vec<HistoryEntry>, RepoError> {
         let head_idx = match self.get_timeline_head(timeline)? {
             Some(idx) => idx,
             None => return Ok(Vec::new()),
@@ -375,6 +380,99 @@ impl Repo {
             };
         }
 
+        Ok(entries)
+    }
+
+    /// Walk the timeline's history. **Now follows the full DAG**
+    /// (`prev_idx` + `merge_idxs`), not just first-parent. Returns one
+    /// entry per reachable leaf, sorted newest-first by index.
+    ///
+    /// For repos with no merges this is identical to first-parent. For
+    /// merge-heavy repos (anything imported from GitHub typically), this
+    /// surfaces the second-parent ancestry that the prior first-parent-
+    /// only walk silently dropped.
+    pub fn walk_history(&self, timeline: &str) -> Result<Vec<HistoryEntry>, RepoError> {
+        self.walk_history_dag(timeline)
+    }
+
+    /// Every leaf in the MMR, sorted newest-first by index. Includes
+    /// commits orphaned from any timeline head (e.g., seals replaced by
+    /// `weld`, which leaves the originals in the append-only MMR but
+    /// removes them from the head's prev_idx chain).
+    ///
+    /// This is the closest thing Ivaldi has to `git reflog` today: the
+    /// MMR is content-addressed and append-only, so destructive history
+    /// rewrites still leave the underlying leaves recoverable.
+    pub fn walk_all_leaves(&self) -> Result<Vec<HistoryEntry>, RepoError> {
+        let count = self.mmr.size();
+        let mut entries: Vec<HistoryEntry> = Vec::with_capacity(count as usize);
+        for idx in 0..count {
+            if let Some(leaf) = self.get_leaf(idx)? {
+                let leaf_hash = leaf.hash();
+                let is_merge = leaf.is_merge();
+                entries.push(HistoryEntry {
+                    index: idx,
+                    hash: leaf_hash,
+                    seal_name: seal::generate_seal_name(leaf_hash),
+                    short_hash: leaf_hash.short8(),
+                    author: leaf.author,
+                    message: leaf.message,
+                    time_unix: leaf.time_unix,
+                    timeline: leaf.timeline_id,
+                    is_merge,
+                });
+            }
+        }
+        // Newest-first to match walk_history.
+        entries.sort_by(|a, b| b.index.cmp(&a.index));
+        Ok(entries)
+    }
+
+    /// Full-DAG walk reachable from a timeline's head, sorted newest-first
+    /// by MMR index (which is monotonic in commit creation order).
+    pub fn walk_history_dag(
+        &self,
+        timeline: &str,
+    ) -> Result<Vec<HistoryEntry>, RepoError> {
+        use std::collections::{BTreeSet, VecDeque};
+
+        let head_idx = match self.get_timeline_head(timeline)? {
+            Some(idx) => idx,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut visited: BTreeSet<u64> = BTreeSet::new();
+        let mut entries: Vec<HistoryEntry> = Vec::new();
+        let mut q: VecDeque<u64> = VecDeque::new();
+        q.push_back(head_idx);
+        while let Some(idx) = q.pop_front() {
+            if !visited.insert(idx) {
+                continue;
+            }
+            let leaf = match self.get_leaf(idx)? {
+                Some(l) => l,
+                None => continue,
+            };
+            let leaf_hash = leaf.hash();
+            entries.push(HistoryEntry {
+                index: idx,
+                hash: leaf_hash,
+                seal_name: seal::generate_seal_name(leaf_hash),
+                short_hash: leaf_hash.short8(),
+                author: leaf.author.clone(),
+                message: leaf.message.clone(),
+                time_unix: leaf.time_unix,
+                timeline: leaf.timeline_id.clone(),
+                is_merge: leaf.is_merge(),
+            });
+            for parent in leaf.all_parents() {
+                if !visited.contains(&parent) {
+                    q.push_back(parent);
+                }
+            }
+        }
+        // Newest-first: higher MMR index = newer commit.
+        entries.sort_by(|a, b| b.index.cmp(&a.index));
         Ok(entries)
     }
 
@@ -1116,6 +1214,52 @@ mod tests {
         repo.commit(B3Hash::digest(b"t"), "A", "init").unwrap();
         repo.rename_timeline("main", "main").unwrap(); // should not error
         assert_eq!(repo.current_timeline().unwrap(), "main");
+    }
+
+    #[test]
+    fn walk_history_includes_merge_parents() {
+        // Build a tiny diamond: r → a, r → b, a + b → m.
+        // First-parent walk from m sees [m, a, r] (3 commits).
+        // Full-DAG walk from m must also see b → [m, a, b, r] (4 commits).
+        let (_dir, mut repo) = setup_repo();
+        let r = repo.commit(B3Hash::digest(b"r"), "A", "root").unwrap();
+
+        // a is the first child of r on `main`
+        let a = repo.commit(B3Hash::digest(b"a"), "A", "a").unwrap();
+        let _ = a;
+
+        // b is a sibling of a — give it `prev_idx = r` directly via commit_raw.
+        let mut b_leaf = crate::leaf::Leaf::new(
+            B3Hash::digest(b"b"),
+            "main",
+            "A",
+            42,
+            "b (sibling)",
+        );
+        b_leaf.prev_idx = r.index;
+        let b = repo.commit_raw(b_leaf, "main").unwrap();
+
+        // m is a merge: prev = current head (b), merge parent = a.
+        let mut m_leaf = crate::leaf::Leaf::new(
+            B3Hash::digest(b"m"),
+            "main",
+            "A",
+            43,
+            "merge",
+        );
+        m_leaf.prev_idx = b.index;
+        m_leaf.merge_idxs = vec![a.index];
+        let m = repo.commit_raw(m_leaf, "main").unwrap();
+
+        let entries = repo.walk_history("main").unwrap();
+        let indices: Vec<u64> = entries.iter().map(|e| e.index).collect();
+        // All 4 leaves reachable from m must appear, sorted newest-first.
+        assert_eq!(indices, vec![m.index, b.index, a.index, r.index]);
+
+        // First-parent walk only sees m, b, r (skips a).
+        let fp = repo.walk_history_first_parent("main").unwrap();
+        let fp_indices: Vec<u64> = fp.iter().map(|e| e.index).collect();
+        assert_eq!(fp_indices, vec![m.index, b.index, r.index]);
     }
 
     #[test]
