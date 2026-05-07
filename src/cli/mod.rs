@@ -10,7 +10,7 @@ pub use commands::run_command;
 
 /// Ivaldi Version Control System
 #[derive(Parser, Debug)]
-#[command(name = "ivaldi", version = "0.1.0")]
+#[command(name = "ivaldi", version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "Ivaldi is a Version Control System")]
 #[command(
     long_about = "Ivaldi is a VCS used to control repositories that can replace Git in your normal workflow"
