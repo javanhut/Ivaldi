@@ -187,6 +187,21 @@ impl Repo {
         self.store.get_timeline_head(name).map_err(RepoError::Store)
     }
 
+    /// Point a timeline at an existing leaf and ensure its `refs/heads/<name>`
+    /// file exists. Used by import paths (e.g. `harvest`) when no new commits
+    /// were created but the timeline still needs to materialize locally.
+    pub fn set_timeline_head(&self, name: &str, leaf_idx: u64) -> Result<(), RepoError> {
+        self.store
+            .set_timeline_head(name, leaf_idx)
+            .map_err(RepoError::Store)?;
+        let ref_path = self.ivaldi_dir.join("refs/heads").join(name);
+        if let Some(parent) = ref_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&ref_path, "").ok();
+        Ok(())
+    }
+
     /// List all timelines with their head indices.
     pub fn list_timelines(&self) -> Result<Vec<(String, u64)>, RepoError> {
         self.store.list_timeline_heads().map_err(RepoError::Store)

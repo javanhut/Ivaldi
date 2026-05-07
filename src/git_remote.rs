@@ -1119,6 +1119,26 @@ pub fn import_fetch_result(
         format!("{} commits imported", commits_imported)
     };
     pb_commits.finish_with_message(commit_msg);
+
+    // Make sure the timeline head + ref file exist for the harvested branch,
+    // even if every commit was already present in the repo (e.g. harvesting
+    // a branch whose tip is an ancestor of an already-imported timeline).
+    // `commit_raw` only updates the head when it actually writes a commit,
+    // so without this the branch silently fails to materialize as a local
+    // timeline.
+    let head_idx = leaf_idx_by_sha
+        .get(&fetch.head_sha)
+        .copied()
+        .or_else(|| {
+            mapping
+                .get_blake3(&fetch.head_sha)
+                .and_then(|b3| leaf_idx_by_hash.get(&b3).copied())
+        });
+    if let Some(idx) = head_idx {
+        repo.set_timeline_head(&fetch.branch, idx)
+            .map_err(|e| GitRemoteError::Io(e.to_string()))?;
+    }
+
     mapping
         .save()
         .map_err(|e| GitRemoteError::Io(e.to_string()))?;
@@ -1170,30 +1190,69 @@ fn import_tree(
         .get(sha)
         .ok_or_else(|| GitRemoteError::Protocol(format!("missing tree object {}", sha)))?;
     let entries = parse_tree(&object.data)?;
-    let mut ivaldi_entries = Vec::new();
+    // Track which output names we've added so duplicates from rename collisions
+    // (`.gitignore` → `.ivaldiignore` when both exist) resolve deterministically:
+    // a real `.ivaldiignore` always wins over a renamed `.gitignore`.
+    let mut ivaldi_entries: Vec<Entry> = Vec::new();
+    let mut seen_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut rename_present: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for entry in entries {
+        // Translate dotfile policy at import time:
+        // - `.gitignore` is renamed to `.ivaldiignore` (same blob, new name).
+        // - `.ivaldiignore` passes through unchanged.
+        // - Every other dotfile is dropped — ivaldi auto-ignores dotfiles
+        //   in the workspace, and importing them would just create phantom
+        //   "deleted" entries in status/auto-shelf.
+        let mapped_name = match entry.name.as_str() {
+            ".ivaldiignore" => Some(entry.name.clone()),
+            ".gitignore" => Some(".ivaldiignore".to_string()),
+            n if n.starts_with('.')
+                && entry.mode != "40000"
+                && entry.mode != "040000" =>
+            {
+                None
+            }
+            _ => Some(entry.name.clone()),
+        };
+
+        let Some(out_name) = mapped_name else { continue };
+
         match entry.mode.as_str() {
             "40000" | "040000" => {
                 let hash = import_tree(&entry.sha, objects, store, mapping, tree_cache)?;
                 ivaldi_entries.push(Entry {
-                    name: entry.name,
+                    name: out_name,
                     mode: MODE_DIR,
                     kind: NodeKind::Tree,
                     hash,
                 });
             }
             "100644" | "100755" | "120000" => {
-                // Blobs are written ahead of time by `prefetch_blobs`, so
-                // every reachable sha is already in `mapping`.
                 let hash = mapping.get_blake3(&entry.sha).ok_or_else(|| {
                     GitRemoteError::Protocol(format!(
                         "blob {} missing from mapping after prefetch",
                         entry.sha
                     ))
                 })?;
+                let was_renamed = entry.name == ".gitignore";
+                if was_renamed {
+                    rename_present.insert(out_name.clone());
+                    if seen_names.contains(&out_name) {
+                        // A real `.ivaldiignore` already won this slot; drop
+                        // the renamed `.gitignore`.
+                        continue;
+                    }
+                } else if out_name == ".ivaldiignore"
+                    && rename_present.contains(&out_name)
+                {
+                    // We earlier kept a renamed `.gitignore`; replace it now
+                    // that the real `.ivaldiignore` is here.
+                    ivaldi_entries.retain(|e| e.name != out_name);
+                }
+                seen_names.insert(out_name.clone());
                 ivaldi_entries.push(Entry {
-                    name: entry.name,
+                    name: out_name,
                     mode: MODE_FILE,
                     kind: NodeKind::Blob,
                     hash,
