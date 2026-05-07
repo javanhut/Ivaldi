@@ -5,7 +5,16 @@
 //! - Commit processing progress
 //! - Indeterminate spinners for waiting operations
 
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+
+/// Cap progress redraws so high-frequency `inc(1)` calls during bulk import
+/// don't dominate CPU on large repos.
+const REDRAW_HZ: u8 = 12;
+
+fn throttled(pb: ProgressBar) -> ProgressBar {
+    pb.set_draw_target(ProgressDrawTarget::stderr_with_hz(REDRAW_HZ));
+    pb
+}
 
 /// Create a progress bar for file operations (download/upload).
 pub fn file_bar(total: u64, action: &str) -> ProgressBar {
@@ -19,7 +28,7 @@ pub fn file_bar(total: u64, action: &str) -> ProgressBar {
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("█▓░"),
     );
-    pb
+    throttled(pb)
 }
 
 /// Create a progress bar for commit processing.
@@ -31,7 +40,7 @@ pub fn commit_bar(total: u64) -> ProgressBar {
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("█▓░"),
     );
-    pb
+    throttled(pb)
 }
 
 /// Create an indeterminate spinner.
@@ -59,7 +68,7 @@ pub fn byte_bar(total: u64, action: &str) -> ProgressBar {
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("█▓░"),
     );
-    pb
+    throttled(pb)
 }
 
 #[cfg(test)]

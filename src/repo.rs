@@ -141,29 +141,24 @@ impl Repo {
         let leaf_hash = leaf.hash();
         let seal_name = seal::generate_seal_name(leaf_hash);
 
-        // Persist leaf canonical bytes
+        // Compute canonical bytes + indices, append to in-memory MMR.
         let canonical = leaf.canonical_bytes();
         let idx = self.mmr.size();
-        self.store
-            .put_leaf(idx, &canonical)
-            .map_err(RepoError::Store)?;
-
-        // Append to in-memory MMR
         let (leaf_idx, root) = self.mmr.append_leaf(leaf);
 
-        // Update timeline head
+        // Persist all four redb writes (leaf, timeline head, seal mapping,
+        // mmr size) in a single transaction → one fsync per commit instead
+        // of four. Hot path during bulk import.
         self.store
-            .set_timeline_head(timeline, leaf_idx)
-            .map_err(RepoError::Store)?;
-
-        // Store seal name mapping
-        self.store
-            .put_seal_name(&seal_name, leaf_hash)
-            .map_err(RepoError::Store)?;
-
-        // Store MMR size
-        self.store
-            .set_meta("mmr.size", &self.mmr.size().to_string())
+            .commit_leaf_atomic(
+                idx,
+                &canonical,
+                timeline,
+                leaf_idx,
+                &seal_name,
+                leaf_hash,
+                self.mmr.size(),
+            )
             .map_err(RepoError::Store)?;
 
         Ok(CommitResult {

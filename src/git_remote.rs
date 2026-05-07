@@ -11,6 +11,7 @@ use flate2::Compression;
 use flate2::bufread::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use indicatif::MultiProgress;
+use rayon::prelude::*;
 
 use crate::hash::B3Hash;
 use crate::progress;
@@ -590,73 +591,109 @@ fn parse_packfile(data: &[u8]) -> Result<HashMap<String, GitObject>, GitRemoteEr
         });
     }
 
-    let mut by_offset = HashMap::new();
-    for entry in entries {
-        by_offset.insert(entry.offset, entry);
-    }
-
-    let offsets: Vec<usize> = by_offset.keys().copied().collect();
-    let mut resolved = HashMap::new();
-    for offset in offsets {
-        resolve_object(offset, &by_offset, &mut resolved)?;
-    }
-    Ok(resolved)
+    resolve_pack_entries(entries)
 }
 
-fn resolve_object(
-    offset: usize,
-    entries: &HashMap<usize, PackedEntry>,
-    resolved: &mut HashMap<String, GitObject>,
-) -> Result<(String, GitObject), GitRemoteError> {
-    let entry = entries.get(&offset).ok_or_else(|| {
-        GitRemoteError::Protocol(format!("missing pack entry at offset {}", offset))
-    })?;
+/// Resolve all pack entries (bases + delta chains) into a `sha → GitObject`
+/// map using parallel waves. Each wave contains entries whose parent has
+/// already been resolved, so SHA-1 + delta apply run on multiple cores.
+fn resolve_pack_entries(
+    entries: Vec<PackedEntry>,
+) -> Result<HashMap<String, GitObject>, GitRemoteError> {
+    let n = entries.len();
+    let entry_idx_by_offset: HashMap<usize, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.offset, i))
+        .collect();
 
-    match &entry.kind {
-        PackedKind::Base(kind) => {
-            let sha = git_object_id(*kind, &entry.data);
-            if let Some(existing) = resolved.get(&sha) {
-                return Ok((sha, existing.clone()));
-            }
-            let object = GitObject {
-                kind: *kind,
-                data: entry.data.clone(),
+    // Slot per entry, populated as its wave completes.
+    let mut slot: Vec<Option<(Vec<u8>, String, GitObjectKind)>> =
+        (0..n).map(|_| None).collect();
+    let mut sha_to_idx: HashMap<String, usize> = HashMap::with_capacity(n);
+
+    // Wave 0: all base objects, hashed in parallel.
+    let base_indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| matches!(e.kind, PackedKind::Base(_)).then_some(i))
+        .collect();
+
+    let base_outputs: Vec<(usize, String, GitObjectKind)> = base_indices
+        .par_iter()
+        .map(|&i| {
+            let e = &entries[i];
+            let kind = match e.kind {
+                PackedKind::Base(k) => k,
+                _ => unreachable!(),
             };
-            resolved.insert(sha.clone(), object.clone());
-            Ok((sha, object))
-        }
-        PackedKind::OfsDelta { base_offset } => {
-            let (base_sha, base_obj) = resolve_object(*base_offset, entries, resolved)?;
-            let _ = base_sha;
-            let data = apply_delta(&base_obj.data, &entry.data)?;
-            let sha = git_object_id(base_obj.kind, &data);
-            if let Some(existing) = resolved.get(&sha) {
-                return Ok((sha, existing.clone()));
-            }
-            let object = GitObject {
-                kind: base_obj.kind,
-                data,
-            };
-            resolved.insert(sha.clone(), object.clone());
-            Ok((sha, object))
-        }
-        PackedKind::RefDelta { base_sha } => {
-            let base_obj = resolved.get(base_sha).cloned().ok_or_else(|| {
-                GitRemoteError::Protocol(format!("missing ref-delta base {}", base_sha))
-            })?;
-            let data = apply_delta(&base_obj.data, &entry.data)?;
-            let sha = git_object_id(base_obj.kind, &data);
-            if let Some(existing) = resolved.get(&sha) {
-                return Ok((sha, existing.clone()));
-            }
-            let object = GitObject {
-                kind: base_obj.kind,
-                data,
-            };
-            resolved.insert(sha.clone(), object.clone());
-            Ok((sha, object))
-        }
+            let sha = git_object_id(kind, &e.data);
+            (i, sha, kind)
+        })
+        .collect();
+
+    for (i, sha, kind) in base_outputs {
+        sha_to_idx.entry(sha.clone()).or_insert(i);
+        slot[i] = Some((entries[i].data.clone(), sha, kind));
     }
+
+    let mut remaining: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| (!matches!(e.kind, PackedKind::Base(_))).then_some(i))
+        .collect();
+
+    while !remaining.is_empty() {
+        // Partition into entries whose parent is already resolved (ready)
+        // vs. entries that need a later wave (deferred).
+        let (ready, deferred): (Vec<usize>, Vec<usize>) =
+            remaining.iter().copied().partition(|&i| match &entries[i].kind {
+                PackedKind::OfsDelta { base_offset } => entry_idx_by_offset
+                    .get(base_offset)
+                    .is_some_and(|&pi| slot[pi].is_some()),
+                PackedKind::RefDelta { base_sha } => sha_to_idx
+                    .get(base_sha)
+                    .is_some_and(|&pi| slot[pi].is_some()),
+                PackedKind::Base(_) => true,
+            });
+
+        if ready.is_empty() {
+            return Err(GitRemoteError::Protocol(
+                "unresolvable delta chain in packfile".into(),
+            ));
+        }
+
+        let outputs: Result<Vec<(usize, Vec<u8>, String, GitObjectKind)>, GitRemoteError> = ready
+            .par_iter()
+            .map(|&i| {
+                let e = &entries[i];
+                let parent_idx = match &e.kind {
+                    PackedKind::OfsDelta { base_offset } => entry_idx_by_offset[base_offset],
+                    PackedKind::RefDelta { base_sha } => sha_to_idx[base_sha],
+                    PackedKind::Base(_) => unreachable!(),
+                };
+                let (parent_data, _, parent_kind) = slot[parent_idx].as_ref().unwrap();
+                let data = apply_delta(parent_data, &e.data)?;
+                let sha = git_object_id(*parent_kind, &data);
+                Ok((i, data, sha, *parent_kind))
+            })
+            .collect();
+        let outputs = outputs?;
+
+        for (i, data, sha, kind) in outputs {
+            sha_to_idx.entry(sha.clone()).or_insert(i);
+            slot[i] = Some((data, sha, kind));
+        }
+
+        remaining = deferred;
+    }
+
+    let mut out = HashMap::with_capacity(n);
+    for opt in slot.into_iter() {
+        let (data, sha, kind) = opt.expect("every entry resolved");
+        out.entry(sha).or_insert(GitObject { kind, data });
+    }
+    Ok(out)
 }
 
 fn parse_object_header(data: &[u8]) -> Result<(u8, usize, usize), GitRemoteError> {
@@ -809,64 +846,10 @@ fn read_varint(data: &[u8], cursor: &mut usize) -> Result<usize, GitRemoteError>
 }
 
 fn sha1_digest(data: &[u8]) -> [u8; 20] {
-    let mut h0: u32 = 0x67452301;
-    let mut h1: u32 = 0xefcdab89;
-    let mut h2: u32 = 0x98badcfe;
-    let mut h3: u32 = 0x10325476;
-    let mut h4: u32 = 0xc3d2e1f0;
-
-    let bit_len = (data.len() as u64) * 8;
-    let mut padded = data.to_vec();
-    padded.push(0x80);
-    while (padded.len() % 64) != 56 {
-        padded.push(0);
-    }
-    padded.extend_from_slice(&bit_len.to_be_bytes());
-
-    for chunk in padded.chunks_exact(64) {
-        let mut w = [0u32; 80];
-        for (i, bytes) in chunk.chunks_exact(4).enumerate().take(16) {
-            w[i] = u32::from_be_bytes(bytes.try_into().unwrap());
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-
-        let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
-        for (i, word) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5a827999),
-                20..=39 => (b ^ c ^ d, 0x6ed9eba1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
-                _ => (b ^ c ^ d, 0xca62c1d6),
-            };
-            let temp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(*word);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = temp;
-        }
-
-        h0 = h0.wrapping_add(a);
-        h1 = h1.wrapping_add(b);
-        h2 = h2.wrapping_add(c);
-        h3 = h3.wrapping_add(d);
-        h4 = h4.wrapping_add(e);
-    }
-
-    let mut out = [0u8; 20];
-    out[..4].copy_from_slice(&h0.to_be_bytes());
-    out[4..8].copy_from_slice(&h1.to_be_bytes());
-    out[8..12].copy_from_slice(&h2.to_be_bytes());
-    out[12..16].copy_from_slice(&h3.to_be_bytes());
-    out[16..20].copy_from_slice(&h4.to_be_bytes());
-    out
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(data);
+    hasher.finalize().into()
 }
 
 pub fn parse_commit(data: &[u8]) -> Result<ParsedCommit, GitRemoteError> {
@@ -1037,8 +1020,6 @@ pub fn import_fetch_result(
     let mut leaf_idx_by_hash: HashMap<B3Hash, u64> = HashMap::new();
     let mut commits_imported = 0usize;
     let mut commits_skipped = 0usize;
-    let mut blobs_downloaded = 0usize;
-    let mut seen_blob_shas = std::collections::HashSet::new();
 
     for idx in 0..repo.commit_count() {
         if let Ok(Some(leaf)) = repo.get_leaf(idx) {
@@ -1046,13 +1027,28 @@ pub fn import_fetch_result(
         }
     }
 
-    let total_blobs = count_reachable_blobs(&fetch.head_sha, &fetch.objects)?;
+    // Walk every reachable blob once, then write the new ones to CAS in
+    // parallel up front. After this, the per-commit tree import is pure
+    // mapping lookups + tree assembly — no blob I/O on the hot path.
+    let all_blobs = collect_reachable_blobs(&fetch.head_sha, &fetch.objects)?;
+    let pending_count = all_blobs
+        .iter()
+        .filter(|sha| mapping.get_blake3(sha).is_none())
+        .count();
+
     let mp = MultiProgress::new();
-    let pb_blobs = mp.add(progress::file_bar(total_blobs as u64, "Importing blobs"));
+    let pb_blobs = mp.add(progress::file_bar(pending_count as u64, "Importing blobs"));
     let pb_commits = mp.add(progress::file_bar(
         commit_order.len() as u64,
         "Importing commits",
     ));
+
+    let prefetched =
+        prefetch_blobs(&all_blobs, &fetch.objects, &store, &mapping, &pb_blobs)?;
+    let blobs_downloaded = prefetched.len();
+    for (git_sha, hash) in prefetched {
+        mapping.insert(&git_sha, hash);
+    }
 
     for sha in &commit_order {
         if let Some(existing_hash) = mapping.get_blake3(sha) {
@@ -1075,9 +1071,6 @@ pub fn import_fetch_result(
             &store,
             &mut mapping,
             &mut tree_cache,
-            &mut blobs_downloaded,
-            &mut seen_blob_shas,
-            &pb_blobs,
         )?;
         let author = if commit.author_name.is_empty() || commit.author_email.is_empty() {
             "unknown <unknown>".to_string()
@@ -1129,6 +1122,9 @@ pub fn import_fetch_result(
     mapping
         .save()
         .map_err(|e| GitRemoteError::Io(e.to_string()))?;
+    // One fsync at the end of the import covers all blobs written without
+    // per-`put` fsync. See `FileCas::flush`.
+    cas.flush().map_err(|e| GitRemoteError::Io(e.to_string()))?;
     Ok(crate::sync::ImportResult {
         commits_imported,
         commits_skipped,
@@ -1163,9 +1159,6 @@ fn import_tree(
     store: &crate::fsmerkle::FsStore<'_>,
     mapping: &mut crate::remote::HashMapping,
     tree_cache: &mut HashMap<String, B3Hash>,
-    blob_count: &mut usize,
-    seen_blob_shas: &mut std::collections::HashSet<String>,
-    pb_blobs: &indicatif::ProgressBar,
 ) -> Result<B3Hash, GitRemoteError> {
     use crate::fsmerkle::{Entry, MODE_DIR, MODE_FILE, NodeKind};
 
@@ -1182,16 +1175,7 @@ fn import_tree(
     for entry in entries {
         match entry.mode.as_str() {
             "40000" | "040000" => {
-                let hash = import_tree(
-                    &entry.sha,
-                    objects,
-                    store,
-                    mapping,
-                    tree_cache,
-                    blob_count,
-                    seen_blob_shas,
-                    pb_blobs,
-                )?;
+                let hash = import_tree(&entry.sha, objects, store, mapping, tree_cache)?;
                 ivaldi_entries.push(Entry {
                     name: entry.name,
                     mode: MODE_DIR,
@@ -1200,25 +1184,14 @@ fn import_tree(
                 });
             }
             "100644" | "100755" | "120000" => {
-                let hash = if let Some(existing) = mapping.get_blake3(&entry.sha) {
-                    if seen_blob_shas.insert(entry.sha.clone()) {
-                        pb_blobs.inc(1);
-                    }
-                    existing
-                } else {
-                    let blob = objects.get(&entry.sha).ok_or_else(|| {
-                        GitRemoteError::Protocol(format!("missing blob object {}", entry.sha))
-                    })?;
-                    let (hash, _) = store
-                        .put_blob(&blob.data)
-                        .map_err(|e| GitRemoteError::Io(e.to_string()))?;
-                    mapping.insert(&entry.sha, hash);
-                    if seen_blob_shas.insert(entry.sha.clone()) {
-                        *blob_count += 1;
-                        pb_blobs.inc(1);
-                    }
-                    hash
-                };
+                // Blobs are written ahead of time by `prefetch_blobs`, so
+                // every reachable sha is already in `mapping`.
+                let hash = mapping.get_blake3(&entry.sha).ok_or_else(|| {
+                    GitRemoteError::Protocol(format!(
+                        "blob {} missing from mapping after prefetch",
+                        entry.sha
+                    ))
+                })?;
                 ivaldi_entries.push(Entry {
                     name: entry.name,
                     mode: MODE_FILE,
@@ -1243,29 +1216,32 @@ fn import_tree(
     Ok(hash)
 }
 
-fn count_reachable_blobs(
+fn collect_reachable_blobs(
     head_sha: &str,
     objects: &HashMap<String, GitObject>,
-) -> Result<usize, GitRemoteError> {
+) -> Result<Vec<String>, GitRemoteError> {
     let mut seen_commits = std::collections::HashSet::new();
     let mut seen_trees = std::collections::HashSet::new();
     let mut seen_blobs = std::collections::HashSet::new();
-    count_reachable_blobs_from_commit(
+    let mut order = Vec::new();
+    walk_commit_for_blobs(
         head_sha,
         objects,
         &mut seen_commits,
         &mut seen_trees,
         &mut seen_blobs,
+        &mut order,
     )?;
-    Ok(seen_blobs.len())
+    Ok(order)
 }
 
-fn count_reachable_blobs_from_commit(
+fn walk_commit_for_blobs(
     sha: &str,
     objects: &HashMap<String, GitObject>,
     seen_commits: &mut std::collections::HashSet<String>,
     seen_trees: &mut std::collections::HashSet<String>,
     seen_blobs: &mut std::collections::HashSet<String>,
+    order: &mut Vec<String>,
 ) -> Result<(), GitRemoteError> {
     if !seen_commits.insert(sha.to_string()) {
         return Ok(());
@@ -1274,18 +1250,19 @@ fn count_reachable_blobs_from_commit(
         .get(sha)
         .ok_or_else(|| GitRemoteError::Protocol(format!("missing commit object {}", sha)))?;
     let commit = parse_commit(&object.data)?;
-    count_reachable_blobs_from_tree(&commit.tree, objects, seen_trees, seen_blobs)?;
+    walk_tree_for_blobs(&commit.tree, objects, seen_trees, seen_blobs, order)?;
     for parent in &commit.parents {
-        count_reachable_blobs_from_commit(parent, objects, seen_commits, seen_trees, seen_blobs)?;
+        walk_commit_for_blobs(parent, objects, seen_commits, seen_trees, seen_blobs, order)?;
     }
     Ok(())
 }
 
-fn count_reachable_blobs_from_tree(
+fn walk_tree_for_blobs(
     sha: &str,
     objects: &HashMap<String, GitObject>,
     seen_trees: &mut std::collections::HashSet<String>,
     seen_blobs: &mut std::collections::HashSet<String>,
+    order: &mut Vec<String>,
 ) -> Result<(), GitRemoteError> {
     if !seen_trees.insert(sha.to_string()) {
         return Ok(());
@@ -1296,10 +1273,12 @@ fn count_reachable_blobs_from_tree(
     for entry in parse_tree(&object.data)? {
         match entry.mode.as_str() {
             "40000" | "040000" => {
-                count_reachable_blobs_from_tree(&entry.sha, objects, seen_trees, seen_blobs)?;
+                walk_tree_for_blobs(&entry.sha, objects, seen_trees, seen_blobs, order)?;
             }
             "100644" | "100755" | "120000" => {
-                seen_blobs.insert(entry.sha);
+                if seen_blobs.insert(entry.sha.clone()) {
+                    order.push(entry.sha);
+                }
             }
             "160000" => {}
             other => {
@@ -1311,6 +1290,36 @@ fn count_reachable_blobs_from_tree(
         }
     }
     Ok(())
+}
+
+/// Write every reachable blob to the CAS in parallel and return the
+/// (git_sha → blake3) pairs to merge into `HashMapping`. Skips blobs already
+/// known to the mapping. Drives the blob progress bar.
+fn prefetch_blobs(
+    blob_shas: &[String],
+    objects: &HashMap<String, GitObject>,
+    store: &crate::fsmerkle::FsStore<'_>,
+    mapping: &crate::remote::HashMapping,
+    pb_blobs: &indicatif::ProgressBar,
+) -> Result<Vec<(String, B3Hash)>, GitRemoteError> {
+    let pending: Vec<&String> = blob_shas
+        .iter()
+        .filter(|sha| mapping.get_blake3(sha).is_none())
+        .collect();
+
+    pending
+        .par_iter()
+        .map(|sha| {
+            let blob = objects.get(sha.as_str()).ok_or_else(|| {
+                GitRemoteError::Protocol(format!("missing blob object {}", sha))
+            })?;
+            let (hash, _) = store
+                .put_blob(&blob.data)
+                .map_err(|e| GitRemoteError::Io(e.to_string()))?;
+            pb_blobs.inc(1);
+            Ok(((*sha).clone(), hash))
+        })
+        .collect()
 }
 
 #[cfg(test)]

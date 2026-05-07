@@ -7,7 +7,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+use std::process;
 
 use crate::hash::B3Hash;
 
@@ -24,8 +27,9 @@ pub enum CasError {
     Io(#[from] std::io::Error),
 }
 
-/// Content-Addressable Storage trait.
-pub trait Cas {
+/// Content-Addressable Storage trait. `Send + Sync` so implementations can
+/// be shared across rayon worker threads during parallel imports.
+pub trait Cas: Send + Sync {
     /// Store data keyed by its hash. Verifies hash matches content.
     fn put(&self, hash: B3Hash, data: &[u8]) -> Result<(), CasError>;
 
@@ -134,6 +138,29 @@ impl FileCas {
     }
 }
 
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+impl FileCas {
+    /// Flush directory metadata to disk for all touched shards. Call once at
+    /// the end of a bulk import. Per-`put` fsyncs are intentionally skipped to
+    /// keep the hot path fast — content-addressed blobs are re-fetchable, so
+    /// losing the tail of an import on crash is harmless.
+    pub fn flush(&self) -> Result<(), CasError> {
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                if let Ok(dir) = fs::File::open(entry.path()) {
+                    let _ = dir.sync_all();
+                }
+            }
+        }
+        if let Ok(root) = fs::File::open(&self.root) {
+            let _ = root.sync_all();
+        }
+        Ok(())
+    }
+}
+
 impl Cas for FileCas {
     fn put(&self, hash: B3Hash, data: &[u8]) -> Result<(), CasError> {
         // Verify hash matches content
@@ -157,12 +184,25 @@ impl Cas for FileCas {
             fs::create_dir_all(parent)?;
         }
 
-        // Write to temp file then rename (atomic on most filesystems)
-        let tmp_path = path.with_extension("tmp");
-        let mut file = fs::File::create(&tmp_path)?;
-        file.write_all(data)?;
-        file.sync_all()?;
-        fs::rename(&tmp_path, &path)?;
+        // Write to a per-process, per-call unique temp file then rename
+        // (atomic on most filesystems). The unique suffix lets concurrent
+        // writers race on the same hash without clobbering each other's tmp.
+        // No fsync on the hot path — rely on the atomic rename for visibility,
+        // and on `FileCas::flush` for end-of-import durability.
+        let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = path.with_extension(format!("tmp.{}.{}", process::id(), n));
+        {
+            let mut file = fs::File::create(&tmp_path)?;
+            file.write_all(data)?;
+        }
+        if let Err(e) = fs::rename(&tmp_path, &path) {
+            // If a concurrent writer already published the same hash, that's
+            // fine — drop our tmp and move on.
+            let _ = fs::remove_file(&tmp_path);
+            if !path.exists() {
+                return Err(CasError::Io(e));
+            }
+        }
 
         Ok(())
     }
