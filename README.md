@@ -64,11 +64,11 @@ ivaldi sync                        # Pull remote changes (delta only)
 | `log` | | View commit history |
 | `diff` | | Compare changes |
 | `reset` | | Unstage files or hard reset |
-| `timeline` | `tl` | Manage timelines (create/switch/list/remove) |
+| `timeline` | `tl` | Manage timelines (create/switch/list/rename/remove) |
 | `butterfly` | `tl bf` | Experimental sandbox timelines |
-| `fuse` | | Merge timelines |
+| `fuse` | | Merge timelines (auto strategy uses MMR-based merge base) |
 | `travel` | | Interactive history browser |
-| `shift` | | Squash commits |
+| `weld` | `w` | Combine a range of seals into one (linear history) |
 | `config` | | View/modify settings |
 | `exclude` | | Add to .ivaldiignore |
 | `portal` | | Manage remote connections |
@@ -108,7 +108,7 @@ ivaldi sync                        # Pull remote changes (delta only)
 | Shelf | Stash (automatic) |
 | Butterfly | Experimental branch |
 | Travel | Interactive log + checkout |
-| Shift | Rebase --squash |
+| Weld | Rebase --squash (range collapse, linear history) |
 
 ## Architecture
 

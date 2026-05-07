@@ -42,6 +42,27 @@ let timelines = mgr.list_timelines();
 mgr.remove_timeline("feature")?;
 ```
 
+## Rename (CLI)
+
+`ivaldi tl rename` accepts three forms:
+
+| Form | Behavior |
+|---|---|
+| `ivaldi tl rename NEW` | Rename the current timeline to NEW. |
+| `ivaldi tl rename OLD NEW` | Rename OLD to NEW. |
+| `ivaldi tl rename OLD to NEW` | Same as above with `to` as a connector word, for ergonomics: `ivaldi tl rename master to main`. |
+
+Backed by `Repo::rename_timeline(old, new)`, which:
+
+1. Refuses if NEW already exists.
+2. Copies the timeline head from OLD to NEW in the store.
+3. Removes the OLD head entry.
+4. Renames `.ivaldi/refs/heads/OLD` → `.ivaldi/refs/heads/NEW` (or creates the new ref file if the old one was missing).
+5. Updates HEAD if the renamed timeline was the current one.
+
+Connectors other than `to` are rejected with a clear error
+(`expected 'tl rename OLD to NEW' (got '<word>' between names)`).
+
 ## Commit Behavior
 
 When committing to a timeline, `HistoryManager` automatically:

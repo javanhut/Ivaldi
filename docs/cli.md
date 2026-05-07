@@ -14,11 +14,11 @@ Command-line interface for Ivaldi VCS, built with `clap`.
 | `log` | | View commit history |
 | `diff` | | Compare changes |
 | `reset [files]` | | Unstage files |
-| `timeline create/switch/list/remove` | `tl` | Manage timelines |
+| `timeline create/switch/list/rename/remove` | `tl` | Manage timelines |
 | `timeline butterfly create/up/down/rm` | `tl bf` | Butterfly timelines |
-| `fuse <src> to <tgt>` | | Merge timelines |
+| `fuse <src> to <tgt>` | | Merge timelines (auto strategy uses MMR-based merge base) |
 | `travel` | | Interactive history (TUI pending) |
-| `shift` | | Squash commits |
+| `weld --last N` / `weld START to END` | `w` | Combine seal range into one (linear history) |
 | `config` | | View/modify settings |
 | `exclude <patterns>` | | Add to .ivaldiignore |
 | `portal add/list/remove` | | Manage remotes |
@@ -57,6 +57,17 @@ ivaldi tl create feature
 ivaldi tl sw feature
 ivaldi tl ls
 ivaldi tl rm feature
+
+# Rename a timeline — three accepted forms
+ivaldi tl rename main-v2                  # rename the current timeline
+ivaldi tl rename feature feat             # rename feature → feat
+ivaldi tl rename master to main           # `to` connector (ergonomic form)
+
+# Weld — collapse a range of seals into one (linear history is preserved)
+ivaldi weld --last 5 -m "consolidate"     # combine the last 5 seals
+ivaldi weld bold-tower -m "msg"           # combine bold-tower..HEAD
+ivaldi weld bold-tower to clear-galaxy    # explicit range, auto-summary message
+ivaldi weld                               # interactive picker (TUI)
 
 # Portals — any URL/SSH/shorthand form works
 ivaldi portal add owner/repo

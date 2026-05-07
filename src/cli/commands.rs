@@ -35,7 +35,7 @@ pub fn run_command(cli: Cli) {
             Commands::Timeline(args) => cmd_timeline(args, cli.quiet),
             Commands::Fuse(args) => cmd_fuse(args, cli.quiet),
             Commands::Travel(args) => cmd_travel(args),
-            Commands::Shift(args) => cmd_shift(args, cli.quiet),
+            Commands::Weld(args) => cmd_weld(args, cli.quiet),
             Commands::Config(args) => cmd_config(args),
             Commands::Exclude(args) => cmd_exclude(args, cli.quiet),
             Commands::Portal(args) => cmd_portal(args, cli.quiet),
@@ -964,13 +964,32 @@ fn cmd_timeline(args: TimelineArgs, quiet: bool) -> Result<(), String> {
         TimelineCommands::Rename(rename_args) => {
             let repo = open_repo()?;
             let current = repo.current_timeline().map_err(|e| e.to_string())?;
-            repo.rename_timeline(&current, &rename_args.new_name)
-                .map_err(|e| e.to_string())?;
+
+            // Accept three forms:
+            //   tl rename NEW              → rename current to NEW
+            //   tl rename OLD NEW          → rename OLD to NEW
+            //   tl rename OLD to NEW       → same as above with `to` connector
+            let (old, new) = match rename_args.names.as_slice() {
+                [new] => (current.clone(), new.clone()),
+                [old, new] => (old.clone(), new.clone()),
+                [old, mid, new] if mid.eq_ignore_ascii_case("to") => {
+                    (old.clone(), new.clone())
+                }
+                [_, mid, _] => {
+                    return Err(format!(
+                        "expected `tl rename OLD to NEW` (got `{}` between names)",
+                        mid
+                    ));
+                }
+                _ => return Err("usage: tl rename [OLD [to]] NEW".into()),
+            };
+
+            repo.rename_timeline(&old, &new).map_err(|e| e.to_string())?;
             if !quiet {
                 println!(
                     "Renamed timeline: {} → {}",
-                    color::dim(&current),
-                    color::timeline(&rename_args.new_name)
+                    color::dim(&old),
+                    color::timeline(&new)
                 );
             }
             Ok(())
@@ -1287,109 +1306,284 @@ fn cmd_travel(args: TravelArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_shift(args: ShiftArgs, quiet: bool) -> Result<(), String> {
+/// `ivaldi weld` — combine a contiguous range of seals on the current
+/// timeline into a single new seal that replaces them in the linear chain.
+///
+/// Three invocation forms:
+///   * `ivaldi weld --last N [-m MSG]`               — last N seals
+///   * `ivaldi weld START [-m MSG]`                  — START..HEAD
+///   * `ivaldi weld START to END [-m MSG]`           — explicit range
+///   * `ivaldi weld START END [-m MSG]`              — same, no connector
+///   * `ivaldi weld` (no args)                       — interactive TUI picker
+///
+/// Semantics: the range is replaced by one new leaf whose `prev_idx` is
+/// the parent of the oldest seal in the range. The original leaves stay
+/// in the MMR for content-addressed integrity but become unreachable
+/// from the timeline head. Tree content matches the newest seal in the
+/// range (no merging — these were already linear).
+fn cmd_weld(args: WeldArgs, quiet: bool) -> Result<(), String> {
+    use crate::leaf::{Leaf, NO_PARENT};
+
     let mut repo = open_repo()?;
     let timeline = repo.current_timeline().unwrap_or_else(|_| "main".into());
+    let history = repo.walk_history(&timeline).map_err(|e| e.to_string())?;
 
-    if let Some(n) = args.last {
+    if history.len() < 2 {
+        return Err("need at least 2 seals to weld".into());
+    }
+
+    // Resolve range: returns (range_indices_newest_first, optional_message).
+    // `range_indices_newest_first[0]` is END (newest), `[len-1]` is START (oldest).
+    let (range, picker_message): (Vec<u64>, Option<String>) = if let Some(n) = args.last {
         if n < 2 {
-            return Err("need at least 2 commits to squash".into());
+            return Err("need at least 2 seals to weld".into());
         }
-
-        let history = repo.walk_history(&timeline).map_err(|e| e.to_string())?;
         if history.len() < n {
             return Err(format!(
-                "only {} commits on '{}', need {}",
+                "only {} seals on '{}', need {}",
                 history.len(),
                 timeline,
                 n
             ));
         }
+        (history.iter().take(n).map(|e| e.index).collect(), None)
+    } else if let Some(start_q) = &args.start {
+        // Normalize the optional `to` connector: accept
+        //   weld START          → END = HEAD
+        //   weld START END
+        //   weld START to END
+        let end_q: Option<&str> = match (&args.second, &args.end) {
+            (None, None) => None,
+            (Some(s), None) => Some(s.as_str()),
+            (Some(mid), Some(e)) if mid.eq_ignore_ascii_case("to") => Some(e.as_str()),
+            (Some(mid), Some(_)) => {
+                return Err(format!(
+                    "expected `weld START to END` (got `{}` between names)",
+                    mid
+                ));
+            }
+            (None, Some(_)) => unreachable!("clap fills `second` before `end`"),
+        };
 
-        if !quiet {
-            println!("Commits to squash:");
-            for entry in history.iter().take(n) {
-                println!("  {} - {}", entry.short_hash, entry.message);
+        let (start_idx, _) = repo
+            .resolve_seal(start_q)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("seal not found: {}", start_q))?;
+        let end_idx = match end_q {
+            Some(q) => {
+                repo.resolve_seal(q)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("seal not found: {}", q))?
+                    .0
+            }
+            None => history[0].index,
+        };
+
+        // Walk from end back along the timeline chain, collecting until we hit start.
+        let mut indices = Vec::new();
+        let mut found_start = false;
+        for entry in &history {
+            indices.push(entry.index);
+            if entry.index == start_idx {
+                found_start = true;
+                break;
+            }
+            if entry.index == end_idx && entry.index != end_idx {
+                break;
             }
         }
-
-        // Use the newest commit's tree and oldest's parent
-        let newest = &history[0];
-        let oldest = &history[n - 1];
-        let tree_root = repo
-            .get_leaf(newest.index)
-            .map_err(|e| e.to_string())?
-            .ok_or("corrupt head")?
-            .tree_root;
-        let _oldest_leaf = repo
-            .get_leaf(oldest.index)
-            .map_err(|e| e.to_string())?
-            .ok_or("corrupt oldest")?;
-
-        let cfg = repo.config();
-        let author = cfg.author().unwrap_or_else(|| newest.author.clone());
-        let message = format!(
-            "Squashed {} commits:\n\n{}",
-            n,
-            history
-                .iter()
-                .take(n)
-                .map(|e| e.message.as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-
-        let result = repo
-            .commit(tree_root, &author, &message)
-            .map_err(|e| e.to_string())?;
-
-        if !quiet {
-            println!(
-                "\n🔨 Created squashed seal: {} ({})",
-                result.seal_name,
-                result.hash.short8()
-            );
-            println!("✓ {} commits squashed into 1", n);
+        // Trim leading entries above `end_idx` if `end_idx` isn't the head.
+        if let Some(end_pos) = indices.iter().position(|i| *i == end_idx) {
+            indices = indices[end_pos..].to_vec();
+            // Re-check: after trimming we still need to find start_idx in what remains.
+            found_start = indices.iter().any(|i| *i == start_idx);
+        } else {
+            return Err(format!(
+                "end seal {} is not reachable from current timeline head",
+                end_q.unwrap_or("HEAD")
+            ));
         }
-    } else if args.start.is_some() || args.end.is_some() {
-        let start_q = args.start.as_deref().ok_or("start seal required")?;
-        let end_q = args.end.as_deref().unwrap_or("HEAD");
-        if !quiet {
-            println!("Squashing from {} to {}", start_q, end_q);
+        if !found_start {
+            return Err(format!(
+                "start seal {} is not an ancestor of {} on '{}'",
+                start_q,
+                end_q.unwrap_or("HEAD"),
+                timeline
+            ));
         }
+        if indices.len() < 2 {
+            return Err("range must contain at least 2 seals to weld".into());
+        }
+        (indices, None)
     } else {
-        // Interactive mode with TUI
+        // Interactive picker.
         use crate::tui::shift::{ShiftAction, run_shift};
-
-        let history = repo.walk_history(&timeline).map_err(|e| e.to_string())?;
-        if history.len() < 2 {
-            return Err("need at least 2 commits to squash".into());
-        }
-
-        let action = run_shift(history).map_err(|e| e.to_string())?;
-
+        let action = run_shift(history.clone()).map_err(|e| e.to_string())?;
         match action {
+            ShiftAction::Cancel => {
+                println!("Cancelled.");
+                return Ok(());
+            }
             ShiftAction::Squash {
-                start_index: _,
+                start_index,
                 end_index,
                 message,
             } => {
-                let newest_leaf = repo
-                    .get_leaf(end_index)
-                    .map_err(|e| e.to_string())?
-                    .ok_or("corrupt")?;
-                let cfg = repo.config();
-                let author = cfg.author().unwrap_or_else(|| newest_leaf.author.clone());
-                let result = repo
-                    .commit(newest_leaf.tree_root, &author, &message)
-                    .map_err(|e| e.to_string())?;
-                println!(
-                    "🔨 Created squashed seal: {} ({})",
-                    result.seal_name,
-                    result.hash.short8()
-                );
+                let mut indices = Vec::new();
+                let mut started = false;
+                for entry in &history {
+                    if entry.index == end_index {
+                        started = true;
+                    }
+                    if started {
+                        indices.push(entry.index);
+                    }
+                    if entry.index == start_index {
+                        break;
+                    }
+                }
+                if indices.len() < 2 {
+                    return Err("interactive picker returned an empty range".into());
+                }
+                (indices, Some(message))
             }
-            ShiftAction::Cancel => println!("Cancelled."),
+        }
+    };
+
+    // `range` is newest-first: [END, ..., START]. Validate contiguity on the
+    // timeline chain — each entry's prev_idx must equal the next entry's idx.
+    for w in range.windows(2) {
+        let leaf = repo
+            .get_leaf(w[0])
+            .map_err(|e| e.to_string())?
+            .ok_or("corrupt leaf in range")?;
+        if leaf.prev_idx != w[1] {
+            return Err(format!(
+                "range is not contiguous on '{}' (seal at idx {} does not parent {})",
+                timeline, w[1], w[0]
+            ));
+        }
+    }
+
+    let end_idx = range[0];
+    let start_idx = *range.last().unwrap();
+
+    let end_leaf = repo
+        .get_leaf(end_idx)
+        .map_err(|e| e.to_string())?
+        .ok_or("corrupt end leaf")?;
+    let start_leaf = repo
+        .get_leaf(start_idx)
+        .map_err(|e| e.to_string())?
+        .ok_or("corrupt start leaf")?;
+
+    // The new welded seal takes the parent of the oldest seal in the range.
+    let welded_prev = if start_leaf.has_parent() {
+        start_leaf.prev_idx
+    } else {
+        NO_PARENT
+    };
+
+    // Compose the message.
+    let cfg = repo.config();
+    let author = cfg.author().unwrap_or_else(|| end_leaf.author.clone());
+    let message = if let Some(m) = args.m {
+        m
+    } else if let Some(m) = picker_message {
+        m
+    } else {
+        // Oldest → newest summary so the welded message reads in chronological order.
+        let mut bullets: Vec<String> = Vec::new();
+        for idx in range.iter().rev() {
+            if let Some(leaf) = repo.get_leaf(*idx).map_err(|e| e.to_string())? {
+                let first_line = leaf.message.lines().next().unwrap_or("").trim().to_string();
+                bullets.push(format!("- {}", first_line));
+            }
+        }
+        format!("Welded {} seals:\n\n{}", range.len(), bullets.join("\n"))
+    };
+
+    if !quiet {
+        println!("Welding {} seals on '{}':", range.len(), timeline);
+        for idx in range.iter().rev() {
+            if let Some(leaf) = repo.get_leaf(*idx).map_err(|e| e.to_string())? {
+                let short = leaf.hash().short8();
+                let first_line = leaf.message.lines().next().unwrap_or("").trim();
+                println!("  {} {}", short, first_line);
+            }
+        }
+    }
+
+    // Trailing seals = anything between END (exclusive) and the timeline head
+    // (inclusive). They must be replayed on top of the welded seal so the
+    // linear chain stays intact. With `--last N` the END is always the head,
+    // so this list is empty; with a middle-range weld it isn't.
+    // `history` is newest-first, so trailing seals appear before END.
+    let trailing: Vec<u64> = history
+        .iter()
+        .map(|e| e.index)
+        .take_while(|idx| *idx != end_idx)
+        .collect();
+
+    // Build the welded leaf and append on the current timeline. `commit_raw`
+    // assigns a fresh MMR index, parents at our chosen `prev_idx`, and updates
+    // the timeline head to point at the new seal.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let mut welded_leaf = Leaf::new(end_leaf.tree_root, &timeline, &author, now, &message);
+    welded_leaf.prev_idx = welded_prev;
+
+    let welded_result = repo
+        .commit_raw(welded_leaf, &timeline)
+        .map_err(|e| e.to_string())?;
+
+    // Replay trailing seals on top of the welded seal, oldest-first, each
+    // parented on the previous replay (or on the welded seal itself for the
+    // first one). Tree, author, message, and timestamp are preserved; only
+    // `prev_idx` changes, which produces a new hash — there is no way to
+    // keep the original seal hashes when their parent linkage changes.
+    let mut prev_for_next = welded_result.index;
+    for trailing_idx in trailing.iter().rev() {
+        let original = repo
+            .get_leaf(*trailing_idx)
+            .map_err(|e| e.to_string())?
+            .ok_or("corrupt trailing leaf")?;
+        let mut replayed = Leaf::new(
+            original.tree_root,
+            &timeline,
+            &original.author,
+            original.time_unix,
+            &original.message,
+        );
+        replayed.prev_idx = prev_for_next;
+        replayed.merge_idxs = original.merge_idxs.clone();
+        let r = repo
+            .commit_raw(replayed, &timeline)
+            .map_err(|e| e.to_string())?;
+        prev_for_next = r.index;
+    }
+
+    if !quiet {
+        println!(
+            "\nCreated welded seal: {} ({})",
+            welded_result.seal_name,
+            welded_result.hash.short8()
+        );
+        if trailing.is_empty() {
+            println!(
+                "{} seals welded into 1 on '{}'",
+                range.len(),
+                color::timeline(&timeline)
+            );
+        } else {
+            println!(
+                "{} seals welded into 1; {} trailing seal(s) replayed on top of '{}'",
+                range.len(),
+                trailing.len(),
+                color::timeline(&timeline)
+            );
         }
     }
     Ok(())

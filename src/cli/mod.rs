@@ -67,8 +67,9 @@ pub enum Commands {
     /// Interactive time travel through history
     Travel(TravelArgs),
 
-    /// Squash commits interactively
-    Shift(ShiftArgs),
+    /// Combine a range of seals into a single seal (linear history)
+    #[command(alias = "w")]
+    Weld(WeldArgs),
 
     /// View and modify configuration
     Config(ConfigArgs),
@@ -233,8 +234,13 @@ pub struct TimelineRemoveArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct TimelineRenameArgs {
-    /// New name for the current timeline
-    pub new_name: String,
+    /// One of three forms:
+    ///
+    ///   `tl rename NEW`             — rename the current timeline to NEW
+    ///   `tl rename OLD NEW`         — rename OLD to NEW
+    ///   `tl rename OLD to NEW`      — same as above with `to` as a connector
+    #[arg(num_args = 1..=3)]
+    pub names: Vec<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -312,16 +318,27 @@ pub struct TravelArgs {
 }
 
 #[derive(clap::Args, Debug)]
-pub struct ShiftArgs {
-    /// Squash last N commits
+pub struct WeldArgs {
+    /// Combine the last N seals on the current timeline.
     #[arg(long)]
     pub last: Option<usize>,
 
-    /// Start seal name or hash
+    /// Range start: first seal to include (oldest). Seal name or hash prefix.
+    /// Optional connector `to` is accepted between START and END for ergonomics:
+    ///   `ivaldi weld bold-tower to clear-galaxy`
     pub start: Option<String>,
 
-    /// End seal name or hash
+    /// Either the literal `to` (connector) or the END seal of the range.
+    pub second: Option<String>,
+
+    /// Range end: last seal to include (newest, defaults to current head).
+    /// Only used when the connector form `START to END` is given.
     pub end: Option<String>,
+
+    /// Message for the welded seal. If omitted, a summary of the welded
+    /// seals' messages is generated.
+    #[arg(short)]
+    pub m: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -710,11 +727,38 @@ mod tests {
     }
 
     #[test]
-    fn parse_timeline_rename() {
+    fn parse_timeline_rename_one_arg() {
         let cli = Cli::try_parse_from(["ivaldi", "tl", "rename", "new-name"]).unwrap();
         match cli.command.unwrap() {
             Commands::Timeline(args) => match args.command {
-                TimelineCommands::Rename(r) => assert_eq!(r.new_name, "new-name"),
+                TimelineCommands::Rename(r) => assert_eq!(r.names, vec!["new-name"]),
+                _ => panic!("expected Rename"),
+            },
+            _ => panic!("expected Timeline"),
+        }
+    }
+
+    #[test]
+    fn parse_timeline_rename_two_args() {
+        let cli = Cli::try_parse_from(["ivaldi", "tl", "rename", "master", "main"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Timeline(args) => match args.command {
+                TimelineCommands::Rename(r) => assert_eq!(r.names, vec!["master", "main"]),
+                _ => panic!("expected Rename"),
+            },
+            _ => panic!("expected Timeline"),
+        }
+    }
+
+    #[test]
+    fn parse_timeline_rename_with_to_connector() {
+        let cli =
+            Cli::try_parse_from(["ivaldi", "tl", "rename", "master", "to", "main"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Timeline(args) => match args.command {
+                TimelineCommands::Rename(r) => {
+                    assert_eq!(r.names, vec!["master", "to", "main"])
+                }
                 _ => panic!("expected Rename"),
             },
             _ => panic!("expected Timeline"),
@@ -726,7 +770,7 @@ mod tests {
         let cli = Cli::try_parse_from(["ivaldi", "tl", "rn", "new-name"]).unwrap();
         match cli.command.unwrap() {
             Commands::Timeline(args) => match args.command {
-                TimelineCommands::Rename(r) => assert_eq!(r.new_name, "new-name"),
+                TimelineCommands::Rename(r) => assert_eq!(r.names, vec!["new-name"]),
                 _ => panic!("expected Rename via rn alias"),
             },
             _ => panic!("expected Timeline"),
