@@ -378,6 +378,59 @@ impl Repo {
         Ok(entries)
     }
 
+    /// Find the lowest common ancestor of two leaves by walking the
+    /// commit DAG (prev_idx + merge_idxs). Returns `None` if the leaves
+    /// share no ancestry. Used by `fuse` to compute a real three-way
+    /// merge base from the MMR-backed history.
+    pub fn merge_base(&self, a: u64, b: u64) -> Result<Option<u64>, RepoError> {
+        use std::collections::{BTreeSet, VecDeque};
+
+        // Collect every ancestor of `a` (including itself).
+        let mut a_ancestors: BTreeSet<u64> = BTreeSet::new();
+        let mut q: VecDeque<u64> = VecDeque::new();
+        q.push_back(a);
+        while let Some(idx) = q.pop_front() {
+            if !a_ancestors.insert(idx) {
+                continue;
+            }
+            if let Some(leaf) = self.get_leaf(idx)? {
+                for p in leaf.all_parents() {
+                    if !a_ancestors.contains(&p) {
+                        q.push_back(p);
+                    }
+                }
+            }
+        }
+
+        // BFS from `b`; the first hit is the lowest by BFS distance,
+        // and since indices are monotonic in commit order, the highest
+        // index in the intersection is the LCA. Track the max.
+        let mut best: Option<u64> = None;
+        let mut visited: BTreeSet<u64> = BTreeSet::new();
+        let mut q2: VecDeque<u64> = VecDeque::new();
+        q2.push_back(b);
+        while let Some(idx) = q2.pop_front() {
+            if !visited.insert(idx) {
+                continue;
+            }
+            if a_ancestors.contains(&idx) {
+                // Found a common ancestor; record the highest index seen
+                // (= most recent commit) and don't walk past it on this
+                // branch (its ancestors are also `a`'s ancestors).
+                best = Some(best.map_or(idx, |cur| cur.max(idx)));
+                continue;
+            }
+            if let Some(leaf) = self.get_leaf(idx)? {
+                for p in leaf.all_parents() {
+                    if !visited.contains(&p) {
+                        q2.push_back(p);
+                    }
+                }
+            }
+        }
+        Ok(best)
+    }
+
     /// Get the seal name for a hash.
     pub fn get_seal_name(&self, hash: B3Hash) -> Result<Option<String>, RepoError> {
         self.store

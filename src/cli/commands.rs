@@ -1134,12 +1134,19 @@ fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
     let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
     let store = crate::fsmerkle::FsStore::new(&cas);
 
-    let base_files = BTreeMap::new();
+    let mut base_files = BTreeMap::new();
     let mut ours_files = BTreeMap::new();
     let mut theirs_files = BTreeMap::new();
 
-    // For simplicity, use empty base (treat as adding all). LCA-based base is ideal but requires
-    // walking history which we have. For now, use target as "ours" and source as "theirs".
+    // Walk the MMR-backed commit DAG to find the lowest common ancestor of
+    // the two heads, and use its tree as the merge base. This is what makes
+    // the `auto` strategy actually useful — without it, every file differing
+    // between sides would be reported as a conflict.
+    if let Some(base_idx) = repo.merge_base(target_head, source_head).map_err(|e| e.to_string())? {
+        if let Some(base_leaf) = repo.get_leaf(base_idx).map_err(|e| e.to_string())? {
+            collect_blob_hashes(&store, base_leaf.tree_root, "", &mut base_files)?;
+        }
+    }
     collect_blob_hashes(&store, target_leaf.tree_root, "", &mut ours_files)?;
     collect_blob_hashes(&store, source_leaf.tree_root, "", &mut theirs_files)?;
 
@@ -1167,6 +1174,13 @@ fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
         let commit_result = repo
             .commit_raw(fuse_leaf, &target)
             .map_err(|e| e.to_string())?;
+
+        // Write the merged tree out to the workspace so the user actually
+        // sees the resolved files. Without this the seal exists in the MMR
+        // but the working tree still shows pre-merge content.
+        let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
+        ws.materialize(merged_tree)
+            .map_err(|e| format!("merge committed but failed to materialize: {}", e))?;
 
         if !quiet {
             println!("[OK] Merge completed successfully!");
