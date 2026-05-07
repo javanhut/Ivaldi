@@ -20,7 +20,7 @@ anonymously (see [Public repo access](#public-repo-access) below).
 | `download_file` | Raw file content via raw.githubusercontent.com |
 | `create_blob` | Upload file content (base64 encoded) |
 | `create_tree` | Create Git tree object |
-| `create_commit` | Create Git commit object |
+| `create_commit` | Create Git commit object (preserves author + committer) |
 | `update_ref` | Update branch pointer (with force option) |
 | `create_ref` | Create new branch |
 | `request_device_code` | Start OAuth device flow |
@@ -38,6 +38,27 @@ export GITHUB_TOKEN=ghp_...
 # Option 3: GitHub CLI (automatic fallback)
 gh auth login
 ```
+
+## Commit-identity fidelity
+
+`create_commit` accepts optional `author: &CommitIdentity` and
+`committer: &CommitIdentity` parameters; `sync::upload` always supplies
+both. The upload path:
+
+1. Walks back from the local timeline head along `prev_idx`, collecting
+   every leaf whose BLAKE3 isn't already in `HashMapping`
+   (`collect_unpushed_leaves`).
+2. Replays each leaf as its own GitHub commit so multi-commit local
+   history isn't squashed into one on the server.
+3. For each leaf, fills `author` from `leaf.author + leaf.time_unix +
+   meta["git.author_tz"]` and `committer` from the `git.committer*`
+   meta keys (set during `download` import) — falling back to the
+   author when no meta is present (matches git's default behavior).
+
+Net effect: `download` → `upload` round-trips a real GitHub repo without
+silently rewriting commit identity. See
+[`docs/git_export.md`](git_export.md) for the analogous (canonical bytes)
+translation used by SSH push.
 
 ## Public repo access
 

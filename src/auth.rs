@@ -24,6 +24,18 @@ pub const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 pub const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 pub const GITHUB_SCOPES: &str = "repo,read:user,user:email";
 
+/// GitLab OAuth (Device Authorization Grant — RFC 8628).
+///
+/// Defaults target gitlab.com. For self-hosted GitLab, override the host with
+/// `gitlab_host` config or `IVALDI_GITLAB_HOST`, and the client id with
+/// `IVALDI_GITLAB_CLIENT_ID`. The default client id below is glab CLI's
+/// public OAuth application; replace via env if you ship your own.
+pub const GITLAB_HOST: &str = "https://gitlab.com";
+pub const GITLAB_CLIENT_ID: &str = "41d48f9422ebd655ee3b6e85a7b8f7560bb0b50ad08522bb720e15f93a072039"; // glab CLI public OAuth app
+pub const GITLAB_DEVICE_AUTH_PATH: &str = "/oauth/authorize_device";
+pub const GITLAB_TOKEN_PATH: &str = "/oauth/token";
+pub const GITLAB_SCOPES: &str = "read_user read_api write_repository";
+
 /// A stored OAuth token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Token {

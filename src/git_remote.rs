@@ -107,64 +107,7 @@ impl SmartHttpClient {
     ) -> Result<FetchResult, GitRemoteError> {
         let base = format!("{}/{}/{}.git", GITHUB_BASE, owner, repo);
         let discovery = self.discover_refs(&base)?;
-        let explicit_branch = branch.is_some();
-        let requested_branch = branch.map(str::to_string);
-        let wanted_ref = requested_branch
-            .as_deref()
-            .map(|name| {
-                if name.starts_with("refs/") {
-                    name.to_string()
-                } else {
-                    format!("refs/heads/{}", name)
-                }
-            })
-            .or_else(|| {
-                discovery
-                    .default_branch
-                    .as_ref()
-                    .map(|name| format!("refs/heads/{}", name))
-            });
-
-        let head_ref = discovery.refs.iter().find(|r| r.name == "HEAD");
-        let selected = wanted_ref
-            .as_ref()
-            .and_then(|name| discovery.refs.iter().find(|r| r.name == *name))
-            .cloned()
-            .or_else(|| {
-                if explicit_branch {
-                    None
-                } else {
-                    head_ref.cloned()
-                }
-            })
-            .ok_or_else(|| {
-                requested_branch
-                    .clone()
-                    .map(GitRemoteError::BranchNotFound)
-                    .unwrap_or_else(|| {
-                        GitRemoteError::Protocol(
-                            "remote did not advertise a usable default ref".into(),
-                        )
-                    })
-            })?;
-
-        let branch_name = if selected.name == "HEAD" {
-            discovery
-                .refs
-                .iter()
-                .find(|r| r.name.starts_with("refs/heads/") && r.id == selected.id)
-                .and_then(|r| r.name.strip_prefix("refs/heads/"))
-                .unwrap_or("HEAD")
-                .to_string()
-        } else {
-            selected
-                .name
-                .strip_prefix("refs/heads/")
-                .unwrap_or(&selected.name)
-                .to_string()
-        };
-        let head_sha = selected.id.clone();
-
+        let (branch_name, head_sha) = select_branch_from_discovery(&discovery, branch)?;
         let pack = self.fetch_pack(&base, &head_sha)?;
         let objects = parse_packfile(&pack)?;
 
@@ -341,9 +284,9 @@ impl SmartHttpClient {
 }
 
 #[derive(Debug)]
-struct Discovery {
-    refs: Vec<AdvertisedRef>,
-    default_branch: Option<String>,
+pub(crate) struct Discovery {
+    pub(crate) refs: Vec<AdvertisedRef>,
+    pub(crate) default_branch: Option<String>,
 }
 
 fn header_value<'a>(resp: &'a ureq::http::Response<ureq::Body>, name: &str) -> Option<&'a str> {
@@ -400,14 +343,83 @@ fn map_transport_error(err: ureq::Error) -> GitRemoteError {
     GitRemoteError::Io(err.to_string())
 }
 
-fn pkt_line(payload: &str) -> Vec<u8> {
+pub(crate) fn pkt_line(payload: &str) -> Vec<u8> {
     let len = payload.len() + 4;
     let mut out = format!("{:04x}", len).into_bytes();
     out.extend_from_slice(payload.as_bytes());
     out
 }
 
-fn parse_discovery(data: &[u8]) -> Result<Discovery, GitRemoteError> {
+/// Pick the (branch_name, head_sha) we want to fetch from a parsed
+/// advertisement. Shared by every transport (HTTPS, SSH, future ivaldi://).
+///
+/// `requested_branch` may be `None` (use the default branch / HEAD), a short
+/// name like `main`, or a full ref like `refs/heads/main`. Returns
+/// `BranchNotFound` if an explicit branch was asked for but isn't advertised.
+pub(crate) fn select_branch_from_discovery(
+    discovery: &Discovery,
+    requested_branch: Option<&str>,
+) -> Result<(String, String), GitRemoteError> {
+    let explicit_branch = requested_branch.is_some();
+    let requested_owned = requested_branch.map(str::to_string);
+    let wanted_ref = requested_owned
+        .as_deref()
+        .map(|name| {
+            if name.starts_with("refs/") {
+                name.to_string()
+            } else {
+                format!("refs/heads/{}", name)
+            }
+        })
+        .or_else(|| {
+            discovery
+                .default_branch
+                .as_ref()
+                .map(|name| format!("refs/heads/{}", name))
+        });
+
+    let head_ref = discovery.refs.iter().find(|r| r.name == "HEAD");
+    let selected = wanted_ref
+        .as_ref()
+        .and_then(|name| discovery.refs.iter().find(|r| r.name == *name))
+        .cloned()
+        .or_else(|| {
+            if explicit_branch {
+                None
+            } else {
+                head_ref.cloned()
+            }
+        })
+        .ok_or_else(|| {
+            requested_owned
+                .clone()
+                .map(GitRemoteError::BranchNotFound)
+                .unwrap_or_else(|| {
+                    GitRemoteError::Protocol(
+                        "remote did not advertise a usable default ref".into(),
+                    )
+                })
+        })?;
+
+    let branch_name = if selected.name == "HEAD" {
+        discovery
+            .refs
+            .iter()
+            .find(|r| r.name.starts_with("refs/heads/") && r.id == selected.id)
+            .and_then(|r| r.name.strip_prefix("refs/heads/"))
+            .unwrap_or("HEAD")
+            .to_string()
+    } else {
+        selected
+            .name
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&selected.name)
+            .to_string()
+    };
+    Ok((branch_name, selected.id.clone()))
+}
+
+pub(crate) fn parse_discovery(data: &[u8]) -> Result<Discovery, GitRemoteError> {
     let lines = parse_pkt_lines(data)?;
     if lines.is_empty() {
         return Err(GitRemoteError::Protocol("empty ref advertisement".into()));
@@ -496,7 +508,7 @@ fn parse_pkt_lines(data: &[u8]) -> Result<Vec<Option<Vec<u8>>>, GitRemoteError> 
     Ok(out)
 }
 
-fn extract_pack_from_upload_pack(data: &[u8]) -> Result<Vec<u8>, GitRemoteError> {
+pub(crate) fn extract_pack_from_upload_pack(data: &[u8]) -> Result<Vec<u8>, GitRemoteError> {
     let mut pack = Vec::new();
     for line in parse_pkt_lines(data)? {
         let Some(line) = line else { continue };
@@ -541,7 +553,9 @@ struct PackedEntry {
     data: Vec<u8>,
 }
 
-fn parse_packfile(data: &[u8]) -> Result<HashMap<String, GitObject>, GitRemoteError> {
+pub(crate) fn parse_packfile(
+    data: &[u8],
+) -> Result<HashMap<String, GitObject>, GitRemoteError> {
     if data.len() < 12 || &data[..4] != b"PACK" {
         return Err(GitRemoteError::Protocol("invalid packfile header".into()));
     }
@@ -757,7 +771,7 @@ fn inflate_from(data: &[u8]) -> Result<(Vec<u8>, usize), GitRemoteError> {
     Ok((out, consumed))
 }
 
-fn git_object_id(kind: GitObjectKind, data: &[u8]) -> String {
+pub(crate) fn git_object_id(kind: GitObjectKind, data: &[u8]) -> String {
     let kind_name = match kind {
         GitObjectKind::Commit => "commit",
         GitObjectKind::Tree => "tree",

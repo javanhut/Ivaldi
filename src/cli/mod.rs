@@ -104,6 +104,73 @@ pub enum Commands {
 
     /// Open interactive TUI dashboard
     Tui,
+
+    /// Serve the current repo to authorized peers over `ivaldi://`
+    Serve(ServeArgs),
+
+    /// Manage authorized peers for `ivaldi serve`
+    Peer(PeerArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ServeArgs {
+    /// Address to bind (default 0.0.0.0:9418)
+    #[arg(long, default_value = "0.0.0.0:9418")]
+    pub bind: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct PeerArgs {
+    #[command(subcommand)]
+    pub command: PeerCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PeerCommands {
+    /// Trust a peer's pubkey for incoming `ivaldi serve` connections
+    Trust(PeerTrustArgs),
+    /// List trusted peers
+    List,
+    /// Remove a trusted peer by pubkey-hex prefix
+    Forget(PeerForgetArgs),
+    /// Print this user's own pubkey
+    Whoami,
+    /// Manage TOFU `~/.ivaldi/known_peers` (servers we connect to)
+    Known(PeerKnownArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct PeerKnownArgs {
+    #[command(subcommand)]
+    pub command: PeerKnownCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PeerKnownCommands {
+    /// List known peers (host:port → pubkey)
+    List,
+    /// Forget a known peer by host[:port]
+    Forget(PeerKnownForgetArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct PeerKnownForgetArgs {
+    /// Host or host:port to forget. Defaults to the ivaldi default port.
+    pub host: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct PeerTrustArgs {
+    /// Hex-encoded 32-byte X25519 pubkey
+    pub pubkey: String,
+    /// Optional friendly name
+    pub name: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct PeerForgetArgs {
+    /// Pubkey or unique hex prefix
+    pub prefix: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +498,11 @@ pub struct AuthLoginArgs {
     /// Authenticate with GitLab instead of GitHub
     #[arg(long)]
     pub gitlab: bool,
+
+    /// GitLab base URL (defaults to https://gitlab.com or `IVALDI_GITLAB_HOST`).
+    /// Only meaningful with `--gitlab`.
+    #[arg(long)]
+    pub gitlab_host: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -455,6 +527,16 @@ pub struct DownloadArgs {
     /// Skip history, download only latest snapshot
     #[arg(long)]
     pub skip_history: bool,
+
+    /// (ivaldi:// only) Auto-trust the server's pubkey on first connect
+    /// instead of prompting. Useful for scripts/CI.
+    #[arg(long)]
+    pub accept_new_peer: bool,
+
+    /// (ivaldi:// only) Refuse to connect to any pubkey not already in
+    /// `~/.ivaldi/known_peers`. Mutually exclusive with `--accept-new-peer`.
+    #[arg(long, conflicts_with = "accept_new_peer")]
+    pub strict_peer: bool,
 
     /// Include tags and releases
     #[arg(long)]

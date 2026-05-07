@@ -22,18 +22,54 @@ pub struct Portal {
 }
 
 impl Portal {
-    /// Parse from any supported repo spec (`owner/repo`, full URL, SSH, etc).
+    /// Parse from any supported repo spec (`owner/repo`, full URL, SSH,
+    /// `ivaldi://`, etc).
     ///
     /// Returns `None` on parse failure. For structured error info or branch
     /// hints, use [`parse_repo_spec`] directly.
+    ///
+    /// SSH and `ivaldi://` inputs round-trip the original URL into
+    /// `base_url` so callers (notably `transport()`) can reconstruct the
+    /// transport target. P2P URLs synthesize `owner=peer`, `repo=<host>:<port>`
+    /// since the Ivaldi P2P transport doesn't have an owner/repo concept.
     pub fn parse(s: &str) -> Option<Self> {
+        // Ivaldi P2P URLs don't go through `parse_repo_spec` (which
+        // requires owner/repo segments). Handle them up front.
+        if let Some(peer) = crate::p2p::PeerUrl::parse(s) {
+            return Some(Self {
+                owner: "peer".to_string(),
+                repo: format!("{}:{}", peer.host, peer.port),
+                platform: Platform::GitHub, // unused for P2P transport
+                base_url: Some(s.to_string()),
+            });
+        }
         let spec = parse_repo_spec(s).ok()?;
+        let base_url = if crate::ssh_transport::SshTarget::parse(s).is_some() {
+            Some(s.to_string())
+        } else {
+            None
+        };
         Some(Self {
             owner: spec.owner,
             repo: spec.repo,
             platform: spec.platform,
-            base_url: None,
+            base_url,
         })
+    }
+
+    /// Derive the transport for this portal. Inspects `base_url` first
+    /// (which round-trips the original spec for SSH/P2P portals) and falls
+    /// back to the platform-default HTTPS endpoint.
+    pub fn transport(&self) -> Transport {
+        if let Some(ref url) = self.base_url {
+            if let Some(target) = crate::ssh_transport::SshTarget::parse(url) {
+                return Transport::Ssh(target);
+            }
+            if let Some(peer) = crate::p2p::PeerUrl::parse(url) {
+                return Transport::Peer(peer);
+            }
+        }
+        Transport::Https
     }
 
     /// Format as "owner/repo".
@@ -59,6 +95,21 @@ impl Portal {
 pub enum Platform {
     GitHub,
     GitLab,
+}
+
+/// Transport used to talk to a portal's remote. Derived from the portal's
+/// stored URL via [`Portal::transport`]; nothing on disk changes — SSH
+/// and `ivaldi://` portals just round-trip their original URL through
+/// `base_url`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Transport {
+    /// Default — talk to GitHub/GitLab over their HTTPS smart-HTTP +
+    /// REST APIs (existing `SmartHttpClient` + `GitHubClient` paths).
+    Https,
+    /// Talk to a Git server over SSH using the resolved target.
+    Ssh(crate::ssh_transport::SshTarget),
+    /// Ivaldi-native peer-to-peer over `ivaldi://`.
+    Peer(crate::p2p::PeerUrl),
 }
 
 impl std::fmt::Display for Platform {
@@ -111,10 +162,22 @@ pub fn parse_repo_spec(input: &str) -> Result<RepoSpec, RepoSpecError> {
 
     // Host (if one can be determined) and the "owner/repo/..." remainder.
     let (host, remainder) = extract_host_and_path(raw)?;
+    let is_ssh = raw.starts_with("ssh://") || raw.starts_with("git@");
     let platform = match host.as_deref() {
         Some("github.com") | None => Platform::GitHub,
         Some("gitlab.com") => Platform::GitLab,
-        Some(other) => return Err(RepoSpecError::UnsupportedHost(other.to_string())),
+        Some(other) => {
+            if is_ssh {
+                // Self-hosted Git over SSH (Gitea, Forgejo, GitLab CE on
+                // a custom host, ...) — we don't need to know the platform
+                // for the SSH transport. Pick a benign default; the
+                // platform field is only consulted for HTTPS-/REST-style
+                // flows, which this URL won't take.
+                Platform::GitHub
+            } else {
+                return Err(RepoSpecError::UnsupportedHost(other.to_string()));
+            }
+        }
     };
 
     // Strip trailing slashes then a trailing `.git`.
@@ -328,6 +391,54 @@ mod tests {
         assert!(Portal::parse("/empty").is_none());
         assert!(Portal::parse("empty/").is_none());
         assert!(Portal::parse("").is_none());
+    }
+
+    #[test]
+    fn portal_transport_https_for_github_shorthand() {
+        let p = Portal::parse("owner/repo").unwrap();
+        assert!(matches!(p.transport(), Transport::Https));
+    }
+
+    #[test]
+    fn portal_transport_https_for_https_url() {
+        let p = Portal::parse("https://github.com/owner/repo.git").unwrap();
+        assert!(matches!(p.transport(), Transport::Https));
+    }
+
+    #[test]
+    fn portal_transport_ssh_for_scp_form() {
+        let p = Portal::parse("git@github.com:owner/repo.git").unwrap();
+        match p.transport() {
+            Transport::Ssh(target) => {
+                assert_eq!(target.host, "github.com");
+                assert_eq!(target.user, "git");
+                assert_eq!(target.repo_path, "owner/repo.git");
+            }
+            other => panic!("expected SSH, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn portal_transport_ssh_for_ssh_url() {
+        let p = Portal::parse("ssh://git@example.com:2222/team/proj.git").unwrap();
+        match p.transport() {
+            Transport::Ssh(target) => {
+                assert_eq!(target.host, "example.com");
+                assert_eq!(target.port, Some(2222));
+                assert_eq!(target.repo_path, "team/proj.git");
+            }
+            other => panic!("expected SSH, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn portal_transport_ssh_round_trips_via_save_load() {
+        let (_dir, mgr) = setup();
+        let p = Portal::parse("git@example.com:owner/repo.git").unwrap();
+        mgr.add(&p).unwrap();
+        let loaded = mgr.list().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(matches!(loaded[0].transport(), Transport::Ssh(_)));
     }
 
     #[test]

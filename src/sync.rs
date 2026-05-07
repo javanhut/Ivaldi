@@ -9,13 +9,96 @@ use std::path::Path;
 
 use crate::cas::FileCas;
 use crate::fsmerkle::FsStore;
-use crate::git_remote::{self, SmartHttpClient};
+use crate::git_remote::{self, FetchResult, SmartHttpClient};
 use crate::github::{CommitIdentity, GitHubClient, GitHubError, TreeEntryCreate, TreeResponse};
 use crate::hash::B3Hash;
 use crate::ignore;
 use crate::leaf::Leaf;
+use crate::portal::{Portal, Transport};
 use crate::remote::{HashMapping, RemoteBranch};
 use crate::repo::Repo;
+use crate::ssh_transport::SshClient;
+
+/// Read-side dispatch: pick HTTPS or SSH based on a portal's transport, and
+/// expose the small surface that `scout` / `harvest` / `sync` need.
+///
+/// Construct via [`RemoteFetcher::for_portal`]. The HTTPS variant carries an
+/// optional auth token (matching `SmartHttpClient::new`), while the SSH
+/// variant carries the resolved `SshTarget` from `portal.transport()`.
+pub enum RemoteFetcher {
+    Https {
+        token: Option<String>,
+    },
+    Ssh {
+        target: crate::ssh_transport::SshTarget,
+    },
+}
+
+impl RemoteFetcher {
+    /// Build the fetcher matching a portal's transport. The token is used
+    /// only by the HTTPS variant.
+    pub fn for_portal(portal: &Portal, token: Option<&str>) -> Self {
+        match portal.transport() {
+            Transport::Ssh(target) => RemoteFetcher::Ssh { target },
+            // P2P portals can't be served by HTTPS scout/harvest/sync;
+            // those callers should branch on the portal first. Falling
+            // back to HTTPS gives a coherent error path.
+            Transport::Peer(_) | Transport::Https => RemoteFetcher::Https {
+                token: token.map(str::to_string),
+            },
+        }
+    }
+
+    /// List branches of the remote, name-only (no SHAs).
+    pub fn list_branches(
+        &self,
+        owner: &str,
+        repo_name: &str,
+    ) -> Result<Vec<String>, SyncError> {
+        match self {
+            RemoteFetcher::Https { token } => SmartHttpClient::new(token.as_deref())
+                .list_branches(owner, repo_name)
+                .map_err(|e| SyncError::Other(e.to_string())),
+            RemoteFetcher::Ssh { target } => SshClient::new(target.clone())
+                .list_branch_refs()
+                .map(|refs| refs.into_iter().map(|b| b.name).collect())
+                .map_err(|e| SyncError::Other(e.to_string())),
+        }
+    }
+
+    /// List branches with SHAs (for sync-state classification).
+    pub fn list_branch_refs(
+        &self,
+        owner: &str,
+        repo_name: &str,
+    ) -> Result<Vec<RemoteBranch>, SyncError> {
+        match self {
+            RemoteFetcher::Https { token } => SmartHttpClient::new(token.as_deref())
+                .list_branch_refs(owner, repo_name)
+                .map_err(|e| SyncError::Other(e.to_string())),
+            RemoteFetcher::Ssh { target } => SshClient::new(target.clone())
+                .list_branch_refs()
+                .map_err(|e| SyncError::Other(e.to_string())),
+        }
+    }
+
+    /// Fetch a branch's full pack.
+    pub fn fetch_repo(
+        &self,
+        owner: &str,
+        repo_name: &str,
+        branch: Option<&str>,
+    ) -> Result<FetchResult, SyncError> {
+        match self {
+            RemoteFetcher::Https { token } => SmartHttpClient::new(token.as_deref())
+                .fetch_repo(owner, repo_name, branch)
+                .map_err(|e| SyncError::Other(e.to_string())),
+            RemoteFetcher::Ssh { target } => SshClient::new(target.clone())
+                .fetch_repo(branch)
+                .map_err(|e| SyncError::Other(e.to_string())),
+        }
+    }
+}
 
 /// Result of a download (clone) operation.
 #[derive(Debug)]
@@ -56,6 +139,64 @@ pub fn download(
     target_dir: &Path,
     branch: Option<&str>,
 ) -> Result<DownloadResult, SyncError> {
+    download_with_fetch(target_dir, owner, repo_name, |branch| {
+        SmartHttpClient::new(client.token())
+            .fetch_repo(owner, repo_name, branch)
+            .map_err(|e| SyncError::Other(e.to_string()))
+    }, branch)
+}
+
+/// Download a repository from any SSH-reachable Git host into a local
+/// Ivaldi repo. `display_name` is used for "Downloading X..." messaging
+/// and the local portal entry (e.g. `git@github.com:owner/repo.git`).
+pub fn download_ssh(
+    target: &crate::ssh_transport::SshTarget,
+    target_dir: &Path,
+    branch: Option<&str>,
+) -> Result<DownloadResult, SyncError> {
+    let (owner, repo_name) = derive_owner_repo_from_path(&target.repo_path);
+    let target_clone = target.clone();
+    download_with_fetch(target_dir, &owner, &repo_name, move |branch| {
+        crate::ssh_transport::SshClient::new(target_clone.clone())
+            .fetch_repo(branch)
+            .map_err(|e| SyncError::Other(e.to_string()))
+    }, branch)
+}
+
+/// Best-effort split of a remote repo path like `owner/repo.git` into
+/// (owner, repo). For paths that don't fit `owner/repo` (e.g. nested
+/// subgroups like `team/subteam/repo.git` on GitLab), we keep the last two
+/// segments as (owner, repo) and discard the prefix — Ivaldi's local model
+/// is two-level only, and the portal entry will round-trip the original
+/// path.
+fn derive_owner_repo_from_path(path: &str) -> (String, String) {
+    let trimmed = path.trim_start_matches('/').trim_end_matches('/');
+    let stripped = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let parts: Vec<&str> = stripped.split('/').filter(|s| !s.is_empty()).collect();
+    match parts.as_slice() {
+        [] => ("local".to_string(), "repo".to_string()),
+        [single] => ("local".to_string(), (*single).to_string()),
+        many => (
+            many[many.len() - 2].to_string(),
+            many[many.len() - 1].to_string(),
+        ),
+    }
+}
+
+/// Common orchestration: ensure target dir, run the supplied fetch closure,
+/// import the resulting `FetchResult`, materialize, return DownloadResult.
+fn download_with_fetch<F>(
+    target_dir: &Path,
+    owner: &str,
+    repo_name: &str,
+    fetch: F,
+    branch: Option<&str>,
+) -> Result<DownloadResult, SyncError>
+where
+    F: FnOnce(
+        Option<&str>,
+    ) -> Result<crate::git_remote::FetchResult, SyncError>,
+{
     if target_dir.exists()
         && target_dir
             .read_dir()
@@ -71,9 +212,7 @@ pub fn download(
 
     eprintln!("Downloading {}/{}...", owner, repo_name);
     let result = (|| -> Result<DownloadResult, SyncError> {
-        let remote = SmartHttpClient::new(client.token())
-            .fetch_repo(owner, repo_name, branch)
-            .map_err(|e| SyncError::Other(e.to_string()))?;
+        let remote = fetch(branch)?;
 
         crate::forge::forge(target_dir).map_err(|e| SyncError::Other(e.to_string()))?;
         let ivaldi_dir = target_dir.join(".ivaldi");
@@ -604,26 +743,23 @@ fn civil_from_unix(unix_seconds: i64) -> (i32, u32, u32, u32, u32, u32) {
     (year, m, d, h, mi, s)
 }
 
-/// Scout — list remote branches without downloading.
+/// Scout — list remote branches without downloading. Routes through the
+/// portal's transport (HTTPS or SSH).
 pub fn scout(
     client: &GitHubClient,
-    owner: &str,
-    repo_name: &str,
+    portal: &Portal,
 ) -> Result<Vec<String>, SyncError> {
-    SmartHttpClient::new(client.token())
-        .list_branches(owner, repo_name)
-        .map_err(|e| SyncError::Other(e.to_string()))
+    RemoteFetcher::for_portal(portal, client.token())
+        .list_branches(&portal.owner, &portal.repo)
 }
 
 pub fn scout_with_status(
     client: &GitHubClient,
     repo: &Repo,
-    owner: &str,
-    repo_name: &str,
+    portal: &Portal,
 ) -> Result<Vec<RemoteTimelineInfo>, SyncError> {
-    let branches = SmartHttpClient::new(client.token())
-        .list_branch_refs(owner, repo_name)
-        .map_err(|e| SyncError::Other(e.to_string()))?;
+    let branches = RemoteFetcher::for_portal(portal, client.token())
+        .list_branch_refs(&portal.owner, &portal.repo)?;
     let mapping = HashMapping::new(&repo.ivaldi_dir);
 
     Ok(branches
@@ -640,13 +776,11 @@ pub fn scout_with_status(
 pub fn harvest(
     client: &GitHubClient,
     repo: &mut Repo,
-    owner: &str,
-    repo_name: &str,
+    portal: &Portal,
     timeline_names: &[String],
 ) -> Result<Vec<String>, SyncError> {
-    let branches = SmartHttpClient::new(client.token())
-        .list_branch_refs(owner, repo_name)
-        .map_err(|e| SyncError::Other(e.to_string()))?;
+    let fetcher = RemoteFetcher::for_portal(portal, client.token());
+    let branches = fetcher.list_branch_refs(&portal.owner, &portal.repo)?;
     let mapping = HashMapping::new(&repo.ivaldi_dir);
 
     let mut harvested = Vec::new();
@@ -667,9 +801,7 @@ pub fn harvest(
             RemoteTimelineState::LocalOnly => eprintln!("  Local state: local only"),
         }
 
-        let fetch = SmartHttpClient::new(client.token())
-            .fetch_repo(owner, repo_name, Some(target_name))
-            .map_err(|e| SyncError::Other(e.to_string()))?;
+        let fetch = fetcher.fetch_repo(&portal.owner, &portal.repo, Some(target_name))?;
         let import = git_remote::import_fetch_result(repo, &fetch)
             .map_err(|e| SyncError::Other(e.to_string()))?;
         if import.commits_skipped > 0 {

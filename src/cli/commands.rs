@@ -47,6 +47,8 @@ pub fn run_command(cli: Cli) {
             Commands::Sync(args) => cmd_sync(args, cli.quiet),
             Commands::Review(args) => cmd_review(args, cli.quiet),
             Commands::Tui => cmd_tui(),
+            Commands::Serve(args) => cmd_serve(args, cli.quiet),
+            Commands::Peer(args) => cmd_peer(args, cli.quiet),
         };
         if let Err(e) = result {
             eprintln!("Error: {}", e);
@@ -1690,12 +1692,30 @@ fn cmd_portal(args: PortalArgs, quiet: bool) -> Result<(), String> {
     let mgr = PortalManager::new(&ctx.ivaldi_dir);
     match args.command {
         PortalCommands::Add(add_args) => {
-            let spec = parse_repo_arg(&add_args.repo)?;
-            let mut portal = Portal {
-                owner: spec.owner,
-                repo: spec.repo,
-                platform: spec.platform,
-                base_url: None,
+            // `ivaldi://` URLs synthesize a portal directly (P2P has no
+            // owner/repo). Other inputs go through the parse_repo_spec
+            // pipeline and preserve SSH origin in base_url for transport
+            // dispatch.
+            let mut portal = if let Some(p) = Portal::parse(&add_args.repo) {
+                if p.base_url.is_some() {
+                    p
+                } else {
+                    let spec = parse_repo_arg(&add_args.repo)?;
+                    Portal {
+                        owner: spec.owner,
+                        repo: spec.repo,
+                        platform: spec.platform,
+                        base_url: None,
+                    }
+                }
+            } else {
+                let spec = parse_repo_arg(&add_args.repo)?;
+                Portal {
+                    owner: spec.owner,
+                    repo: spec.repo,
+                    platform: spec.platform,
+                    base_url: None,
+                }
             };
             if add_args.gitlab {
                 portal.platform = Platform::GitLab;
@@ -1779,11 +1799,36 @@ fn cmd_auth(args: AuthArgs) -> Result<(), String> {
         AuthCommands::Login(login_args) => {
             use crate::auth::TokenStore;
             use crate::github::GitHubClient;
+            use crate::gitlab;
 
             if login_args.gitlab {
+                let host = gitlab::resolve_host(login_args.gitlab_host.as_deref());
+                println!("Initiating GitLab authentication against {}...", host);
+                let device_code = gitlab::request_device_code(&host)
+                    .map_err(|e| e.to_string())?;
                 println!(
-                    "GitLab OAuth not yet implemented. Set GITLAB_TOKEN environment variable."
+                    "\nFirst, copy your one-time code: {}",
+                    device_code.user_code
                 );
+                let url = device_code.browser_url();
+                if open_in_browser(url) {
+                    println!("Opened {} in your browser.", url);
+                    println!("(If nothing opened, visit the URL above manually.)");
+                } else {
+                    println!("Then visit: {}", url);
+                }
+                println!("\nWaiting for authentication...");
+                let token = gitlab::poll_for_token(
+                    &host,
+                    &device_code.device_code,
+                    device_code.interval,
+                )
+                .map_err(|e| e.to_string())?;
+                let store = TokenStore::new().map_err(|e| e.to_string())?;
+                store
+                    .save_token(Platform::GitLab, token)
+                    .map_err(|e| e.to_string())?;
+                println!("\nAuthentication successful!");
                 return Ok(());
             }
 
@@ -1846,7 +1891,75 @@ fn cmd_auth(args: AuthArgs) -> Result<(), String> {
 
 fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<(), String> {
     use crate::github::GitHubClient;
+    use crate::ssh_transport::SshTarget;
     use crate::sync;
+
+    // `ivaldi://host[:port][/timeline]` — peer-to-peer transport, no
+    // GitHub / GitLab in the loop.
+    if let Some(url) = crate::p2p::PeerUrl::parse(&args.repo) {
+        use crate::identity;
+        use crate::known_peers::TofuPolicy;
+        let id_path = identity::default_path()
+            .ok_or("could not resolve $HOME for ~/.ivaldi/identity")?;
+        let id =
+            identity::Identity::load_or_create(&id_path).map_err(|e| e.to_string())?;
+        let default_dir = url
+            .timeline
+            .clone()
+            .unwrap_or_else(|| url.host.clone());
+        let target_dir =
+            std::path::PathBuf::from(args.directory.as_deref().unwrap_or(&default_dir));
+        let policy = if args.accept_new_peer {
+            TofuPolicy::AcceptAll
+        } else if args.strict_peer {
+            TofuPolicy::StrictKnown
+        } else {
+            TofuPolicy::Prompt
+        };
+        let summary = crate::p2p::fetch_into_with_policy(&url, &target_dir, &id, policy)
+            .map_err(|e| e.to_string())?;
+        if !quiet {
+            println!(
+                "Cloned ivaldi://{}:{} → {}",
+                url.host,
+                url.port,
+                target_dir.display()
+            );
+            println!(
+                "  timeline: {}, {} leaves, {} objects",
+                summary.timeline, summary.leaves_imported, summary.blobs_imported
+            );
+        }
+        return Ok(());
+    }
+
+    // Try SSH next — `git@host:owner/repo.git` and `ssh://...` go straight
+    // to the SSH transport. Anything that doesn't parse as SSH falls
+    // through to the existing HTTPS / GitHub flow.
+    if let Some(target) = SshTarget::parse(&args.repo) {
+        let default_dir = target
+            .repo_path
+            .trim_end_matches('/')
+            .trim_end_matches(".git")
+            .rsplit('/')
+            .next()
+            .unwrap_or("repo")
+            .to_string();
+        let target_dir =
+            std::path::PathBuf::from(args.directory.as_deref().unwrap_or(&default_dir));
+        let result = sync::download_ssh(&target, &target_dir, None).map_err(|e| e.to_string())?;
+        if !quiet {
+            println!(
+                "Cloned {}@{}:{} → {}",
+                target.user,
+                target.host,
+                target.repo_path,
+                target_dir.display()
+            );
+            println!("  {} files downloaded", result.files_downloaded);
+        }
+        return Ok(());
+    }
 
     let spec = parse_repo_arg(&args.repo)?;
     let client = GitHubClient::new();
@@ -1871,21 +1984,100 @@ fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<(), String> {
 
 fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
     use crate::github::GitHubClient;
+    use crate::portal::Transport;
     use crate::sync;
 
-    let repo = open_repo()?;
-    let client = GitHubClient::new();
+    let mut repo = open_repo()?;
 
-    if !client.is_authenticated() {
-        return Err("not authenticated. Run 'ivaldi auth login' or set GITHUB_TOKEN.".into());
-    }
-
-    // Get portal
     let portal_mgr = PortalManager::new(&repo.ivaldi_dir);
     let portal = portal_mgr
         .get_default()
         .map_err(|e| e.to_string())?
         .ok_or("no portal configured. Run 'ivaldi portal add owner/repo'.")?;
+
+    // SSH push — bypass the GitHub auth check entirely.
+    if let Transport::Ssh(target) = portal.transport() {
+        let timeline = args
+            .branch
+            .clone()
+            .unwrap_or_else(|| repo.current_timeline().unwrap_or_else(|_| "main".into()));
+        if args.force {
+            print!("WARNING: Force push will OVERWRITE remote history! Type 'force push' to confirm: ");
+            std::io::stdout().flush().map_err(|e| e.to_string())?;
+            let mut input = String::new();
+            std::io::stdin()
+                .read_line(&mut input)
+                .map_err(|e| e.to_string())?;
+            if input.trim() != "force push" {
+                println!("Aborted.");
+                return Ok(());
+            }
+        }
+        let report = crate::ssh_transport::SshClient::new(target)
+            .push_repo(&mut repo, &timeline, args.force)
+            .map_err(|e| e.to_string())?;
+
+        if !report.unpack_ok {
+            return Err(format!(
+                "remote rejected pack: {}",
+                report.unpack_error.unwrap_or_else(|| "unknown".into())
+            ));
+        }
+        let mut had_failure = false;
+        for r in &report.refs {
+            match &r.error {
+                Some(reason) => {
+                    println!("  {} REJECTED: {}", r.name, reason);
+                    had_failure = true;
+                }
+                None => {
+                    if !quiet {
+                        println!("  {} updated", r.name);
+                    }
+                }
+            }
+        }
+        if had_failure {
+            return Err("one or more refs were rejected".into());
+        }
+        if !quiet {
+            println!("Pushed timeline '{}' over SSH.", timeline);
+        }
+        return Ok(());
+    }
+
+    // Peer-to-peer push — branch out before the GitHub auth check.
+    if let Transport::Peer(peer_url) = portal.transport() {
+        use crate::identity;
+        use crate::known_peers::TofuPolicy;
+
+        let id_path = identity::default_path()
+            .ok_or("could not resolve $HOME for ~/.ivaldi/identity")?;
+        let id =
+            identity::Identity::load_or_create(&id_path).map_err(|e| e.to_string())?;
+        let timeline = args
+            .branch
+            .clone()
+            .unwrap_or_else(|| repo.current_timeline().unwrap_or_else(|_| "main".into()));
+        let summary = crate::p2p::push_to(&peer_url, &mut repo, &id, &timeline, TofuPolicy::Prompt)
+            .map_err(|e| e.to_string())?;
+        if !quiet {
+            println!(
+                "Pushed timeline '{}' to ivaldi://{}:{}",
+                timeline, peer_url.host, peer_url.port
+            );
+            println!(
+                "  landed as: {} ({} leaves, {} objects)",
+                summary.landed_as, summary.leaves_sent, summary.objects_sent
+            );
+        }
+        return Ok(());
+    }
+
+    let client = GitHubClient::new();
+    if !client.is_authenticated() {
+        return Err("not authenticated. Run 'ivaldi auth login' or set GITHUB_TOKEN.".into());
+    }
 
     if args.force {
         print!("WARNING: Force push will OVERWRITE remote history! Type 'force push' to confirm: ");
@@ -1933,7 +2125,7 @@ fn cmd_scout(_args: ScoutArgs) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .ok_or("no portal configured. Run 'ivaldi portal add owner/repo'.")?;
 
-    let branches = sync::scout_with_status(&client, &repo, &portal.owner, &portal.repo)
+    let branches = sync::scout_with_status(&client, &repo, &portal)
         .map_err(|e| e.to_string())?;
 
     println!("Remote timelines available:");
@@ -1964,8 +2156,7 @@ fn cmd_harvest(args: HarvestArgs, quiet: bool) -> Result<(), String> {
 
     if args.timelines.is_empty() {
         // List available and prompt
-        let branches =
-            sync::scout(&client, &portal.owner, &portal.repo).map_err(|e| e.to_string())?;
+        let branches = sync::scout(&client, &portal).map_err(|e| e.to_string())?;
         println!("Available remote timelines:");
         for b in &branches {
             println!("  {}", b);
@@ -1974,14 +2165,8 @@ fn cmd_harvest(args: HarvestArgs, quiet: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    let harvested = sync::harvest(
-        &client,
-        &mut repo,
-        &portal.owner,
-        &portal.repo,
-        &args.timelines,
-    )
-    .map_err(|e| e.to_string())?;
+    let harvested =
+        sync::harvest(&client, &mut repo, &portal, &args.timelines).map_err(|e| e.to_string())?;
 
     if !quiet {
         for name in &harvested {
@@ -2401,6 +2586,115 @@ fn cmd_tui() -> Result<(), String> {
                 ));
             }
             crate::tui::app::run(&target_dir, &ivaldi_dir)
+        }
+    }
+}
+
+fn cmd_serve(args: ServeArgs, _quiet: bool) -> Result<(), String> {
+    use crate::identity;
+    use crate::p2p;
+
+    let ctx = find_repo()?;
+
+    let id_path = identity::default_path()
+        .ok_or("could not resolve $HOME for ~/.ivaldi/identity")?;
+    let id = identity::Identity::load_or_create(&id_path).map_err(|e| e.to_string())?;
+    let peer_store_path = ctx.ivaldi_dir.join("authorized_peers");
+    p2p::serve(&args.bind, ctx.work_dir.clone(), &id, peer_store_path)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn cmd_peer(args: PeerArgs, _quiet: bool) -> Result<(), String> {
+    use crate::identity;
+    use crate::peers::{decode_pubkey, PeerStore};
+
+    match args.command {
+        PeerCommands::Whoami => {
+            let id_path = identity::default_path()
+                .ok_or("could not resolve $HOME for ~/.ivaldi/identity")?;
+            let id = identity::Identity::load_or_create(&id_path).map_err(|e| e.to_string())?;
+            println!("{}", id.pubkey_hex());
+            Ok(())
+        }
+        PeerCommands::Trust(t) => {
+            let ctx = find_repo()?;
+            let pubkey = decode_pubkey(&t.pubkey).map_err(|e| e)?;
+            let store = PeerStore::repo_local(&ctx.ivaldi_dir);
+            store
+                .trust(pubkey, t.name.as_deref())
+                .map_err(|e| e.to_string())?;
+            println!(
+                "Trusted peer {}{}",
+                t.pubkey,
+                t.name
+                    .as_ref()
+                    .map(|n| format!(" ({})", n))
+                    .unwrap_or_default()
+            );
+            Ok(())
+        }
+        PeerCommands::List => {
+            let ctx = find_repo()?;
+            let store = PeerStore::repo_local(&ctx.ivaldi_dir);
+            let entries = store.list().map_err(|e| e.to_string())?;
+            if entries.is_empty() {
+                println!("(no trusted peers)");
+            } else {
+                for e in entries {
+                    let key = e.pubkey_hex();
+                    match e.name {
+                        Some(n) => println!("{}  {}", key, n),
+                        None => println!("{}", key),
+                    }
+                }
+            }
+            Ok(())
+        }
+        PeerCommands::Forget(f) => {
+            let ctx = find_repo()?;
+            let store = PeerStore::repo_local(&ctx.ivaldi_dir);
+            match store.forget(&f.prefix).map_err(|e| e.to_string())? {
+                Some(removed) => {
+                    println!("Forgot {}", removed.pubkey_hex());
+                    Ok(())
+                }
+                None => Err(format!("no trusted peer matches '{}'", f.prefix)),
+            }
+        }
+        PeerCommands::Known(known) => {
+            use crate::known_peers::{fingerprint, KnownPeers};
+            let store = KnownPeers::default_for_user()
+                .ok_or("could not resolve $HOME for ~/.ivaldi/known_peers")?;
+            match known.command {
+                PeerKnownCommands::List => {
+                    let entries = store.list().map_err(|e| e.to_string())?;
+                    if entries.is_empty() {
+                        println!("(no known peers)");
+                    } else {
+                        for (key, pk) in entries {
+                            println!("{}  {}", key, fingerprint(&pk));
+                        }
+                    }
+                    Ok(())
+                }
+                PeerKnownCommands::Forget(f) => {
+                    let (host, port) = match f.host.rsplit_once(':') {
+                        Some((h, p)) => match p.parse::<u16>() {
+                            Ok(n) => (h.to_string(), n),
+                            Err(_) => (f.host.clone(), crate::p2p::DEFAULT_PORT),
+                        },
+                        None => (f.host.clone(), crate::p2p::DEFAULT_PORT),
+                    };
+                    let removed = store.forget(&host, port).map_err(|e| e.to_string())?;
+                    if removed {
+                        println!("Forgot {}:{}", host, port);
+                        Ok(())
+                    } else {
+                        Err(format!("no known peer at {}:{}", host, port))
+                    }
+                }
+            }
         }
     }
 }

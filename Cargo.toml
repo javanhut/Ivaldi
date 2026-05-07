@@ -20,6 +20,8 @@ indicatif = "0.18.4"
 rayon = "1"
 flate2 = "1"
 sha1 = "0.10"
+snow = "0.9"
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [dev-dependencies]
 tempfile = "3"
