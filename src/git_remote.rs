@@ -65,6 +65,11 @@ pub struct ParsedCommit {
     pub author_name: String,
     pub author_email: String,
     pub author_time: i64,
+    pub author_tz: String,
+    pub committer_name: String,
+    pub committer_email: String,
+    pub committer_time: i64,
+    pub committer_tz: String,
     pub message: String,
 }
 
@@ -859,9 +864,8 @@ pub fn parse_commit(data: &[u8]) -> Result<ParsedCommit, GitRemoteError> {
 
     let mut tree = None;
     let mut parents = Vec::new();
-    let mut author_name = String::new();
-    let mut author_email = String::new();
-    let mut author_time = 0i64;
+    let mut author = (String::new(), String::new(), 0i64, String::new());
+    let mut committer = (String::new(), String::new(), 0i64, String::new());
 
     for line in headers.lines() {
         if let Some(value) = line.strip_prefix("tree ") {
@@ -869,26 +873,51 @@ pub fn parse_commit(data: &[u8]) -> Result<ParsedCommit, GitRemoteError> {
         } else if let Some(value) = line.strip_prefix("parent ") {
             parents.push(value.to_string());
         } else if let Some(value) = line.strip_prefix("author ") {
-            if let Some((prefix, _tz)) = value.rsplit_once(' ') {
-                if let Some((identity, timestamp)) = prefix.rsplit_once(' ') {
-                    author_time = timestamp.parse().unwrap_or(0);
-                    if let Some((name, email)) = identity.rsplit_once(" <") {
-                        author_name = name.to_string();
-                        author_email = email.trim_end_matches('>').to_string();
-                    }
-                }
-            }
+            author = parse_identity_line(value);
+        } else if let Some(value) = line.strip_prefix("committer ") {
+            committer = parse_identity_line(value);
         }
+    }
+
+    // If a commit object only has an author line (rare but possible in
+    // hand-crafted fixtures), fall back to mirroring author into committer.
+    if committer.0.is_empty() && committer.1.is_empty() && committer.2 == 0 {
+        committer = author.clone();
     }
 
     Ok(ParsedCommit {
         tree: tree.ok_or_else(|| GitRemoteError::Protocol("commit missing tree".into()))?,
         parents,
-        author_name,
-        author_email,
-        author_time,
+        author_name: author.0,
+        author_email: author.1,
+        author_time: author.2,
+        author_tz: author.3,
+        committer_name: committer.0,
+        committer_email: committer.1,
+        committer_time: committer.2,
+        committer_tz: committer.3,
         message: message.to_string(),
     })
+}
+
+/// Parse the value portion of a Git `author`/`committer` header line
+/// (`Name <email> <unix-seconds> <±HHMM>`).
+fn parse_identity_line(value: &str) -> (String, String, i64, String) {
+    let mut name = String::new();
+    let mut email = String::new();
+    let mut time = 0i64;
+    let mut tz = String::new();
+    if let Some((prefix, tz_part)) = value.rsplit_once(' ') {
+        tz = tz_part.to_string();
+        if let Some((identity, timestamp)) = prefix.rsplit_once(' ') {
+            time = timestamp.parse().unwrap_or(0);
+            if let Some((n, e)) = identity.rsplit_once(" <") {
+                name = n.to_string();
+                email = e.trim_end_matches('>').to_string();
+            }
+        }
+    }
+    (name, email, time, tz)
 }
 
 pub fn parse_tree(data: &[u8]) -> Result<Vec<TreeEntry>, GitRemoteError> {
@@ -1020,6 +1049,10 @@ pub fn import_fetch_result(
     let mut leaf_idx_by_hash: HashMap<B3Hash, u64> = HashMap::new();
     let mut commits_imported = 0usize;
     let mut commits_skipped = 0usize;
+    // Accumulator for submodule (gitlink) entries we couldn't materialize.
+    // Written to `.ivaldi/submodules.skipped` after import.
+    let mut submodules_skipped: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
 
     for idx in 0..repo.commit_count() {
         if let Ok(Some(leaf)) = repo.get_leaf(idx) {
@@ -1067,10 +1100,12 @@ pub fn import_fetch_result(
         let commit = parse_commit(&object.data)?;
         let tree_hash = import_tree(
             &commit.tree,
+            "",
             &fetch.objects,
             &store,
             &mut mapping,
             &mut tree_cache,
+            &mut submodules_skipped,
         )?;
         let author = if commit.author_name.is_empty() || commit.author_email.is_empty() {
             "unknown <unknown>".to_string()
@@ -1099,6 +1134,27 @@ pub fn import_fetch_result(
         );
         leaf.prev_idx = prev_idx;
         leaf.merge_idxs = merge_idxs;
+
+        // Preserve git fidelity that doesn't fit Leaf's typed fields. Stored
+        // under reserved `git.*` meta keys; the canonical leaf encoding
+        // already serializes `meta` so no version bump is needed.
+        if !commit.author_tz.is_empty() {
+            leaf.meta
+                .insert("git.author_tz".into(), commit.author_tz.clone());
+        }
+        if !commit.committer_name.is_empty() || !commit.committer_email.is_empty() {
+            let committer = format!(
+                "{} <{}>",
+                commit.committer_name, commit.committer_email,
+            );
+            leaf.meta.insert("git.committer".into(), committer);
+            leaf.meta
+                .insert("git.committer_time".into(), commit.committer_time.to_string());
+            if !commit.committer_tz.is_empty() {
+                leaf.meta
+                    .insert("git.committer_tz".into(), commit.committer_tz.clone());
+            }
+        }
         let result = repo
             .commit_raw(leaf, &fetch.branch)
             .map_err(|e| GitRemoteError::Io(e.to_string()))?;
@@ -1119,6 +1175,19 @@ pub fn import_fetch_result(
         format!("{} commits imported", commits_imported)
     };
     pb_commits.finish_with_message(commit_msg);
+
+    if !submodules_skipped.is_empty() {
+        crate::logging::warn(&format!(
+            "skipped {} git submodule entr{} (Ivaldi does not yet clone submodules); see .ivaldi/submodules.skipped",
+            submodules_skipped.len(),
+            if submodules_skipped.len() == 1 { "y" } else { "ies" },
+        ));
+        let payload: String = submodules_skipped
+            .iter()
+            .map(|p| format!("{}\n", p))
+            .collect();
+        let _ = std::fs::write(repo.ivaldi_dir.join("submodules.skipped"), payload);
+    }
 
     // Make sure the timeline head + ref file exist for the harvested branch,
     // even if every commit was already present in the repo (e.g. harvesting
@@ -1175,10 +1244,12 @@ fn collect_commit_order(
 
 fn import_tree(
     sha: &str,
+    path_prefix: &str,
     objects: &HashMap<String, GitObject>,
     store: &crate::fsmerkle::FsStore<'_>,
     mapping: &mut crate::remote::HashMapping,
     tree_cache: &mut HashMap<String, B3Hash>,
+    submodules_skipped: &mut std::collections::BTreeSet<String>,
 ) -> Result<B3Hash, GitRemoteError> {
     use crate::fsmerkle::{Entry, MODE_DIR, MODE_FILE, NodeKind};
 
@@ -1218,9 +1289,23 @@ fn import_tree(
 
         let Some(out_name) = mapped_name else { continue };
 
+        let child_path = if path_prefix.is_empty() {
+            out_name.clone()
+        } else {
+            format!("{}/{}", path_prefix, out_name)
+        };
+
         match entry.mode.as_str() {
             "40000" | "040000" => {
-                let hash = import_tree(&entry.sha, objects, store, mapping, tree_cache)?;
+                let hash = import_tree(
+                    &entry.sha,
+                    &child_path,
+                    objects,
+                    store,
+                    mapping,
+                    tree_cache,
+                    submodules_skipped,
+                )?;
                 ivaldi_entries.push(Entry {
                     name: out_name,
                     mode: MODE_DIR,
@@ -1258,7 +1343,13 @@ fn import_tree(
                     hash,
                 });
             }
-            "160000" => {}
+            "160000" => {
+                // Submodule (gitlink). We don't yet clone or track the
+                // submodule's repository; record the path so the user can see
+                // what we skipped. Logged once via crate::logging::warn so a
+                // huge repo doesn't spam the console.
+                submodules_skipped.insert(child_path.clone());
+            }
             other => {
                 return Err(GitRemoteError::Unsupported(format!(
                     "unsupported tree entry mode {}",
@@ -1453,6 +1544,25 @@ mod tests {
         assert_eq!(parsed.author_email, "jane@example.com");
         assert_eq!(parsed.author_time, 1710000000);
         assert_eq!(parsed.message, "hello\n");
+    }
+
+    #[test]
+    fn parse_commit_captures_distinct_committer_and_timezones() {
+        // Distinct author and committer with non-UTC timezones — the parser
+        // must keep both identities and both offsets, not collapse them.
+        let commit = b"tree abcdef\n\
+            author Jane Doe <jane@example.com> 1710000000 -0500\n\
+            committer Bob <bob@example.com> 1710001000 +0100\n\
+            \nhello\n";
+        let parsed = parse_commit(commit).unwrap();
+        assert_eq!(parsed.author_name, "Jane Doe");
+        assert_eq!(parsed.author_email, "jane@example.com");
+        assert_eq!(parsed.author_time, 1710000000);
+        assert_eq!(parsed.author_tz, "-0500");
+        assert_eq!(parsed.committer_name, "Bob");
+        assert_eq!(parsed.committer_email, "bob@example.com");
+        assert_eq!(parsed.committer_time, 1710001000);
+        assert_eq!(parsed.committer_tz, "+0100");
     }
 
     #[test]

@@ -265,8 +265,20 @@ impl GitHubClient {
         message: &str,
         tree_sha: &str,
         parents: &[String],
+        author: Option<&CommitIdentity>,
+        committer: Option<&CommitIdentity>,
     ) -> Result<String, GitHubError> {
-        let body = serde_json::json!({"message": message, "tree": tree_sha, "parents": parents});
+        let mut body = serde_json::json!({
+            "message": message,
+            "tree": tree_sha,
+            "parents": parents,
+        });
+        if let Some(a) = author {
+            body["author"] = serde_json::to_value(a).expect("identity serialization");
+        }
+        if let Some(c) = committer {
+            body["committer"] = serde_json::to_value(c).expect("identity serialization");
+        }
         let resp =
             self.send_json("POST", &format!("/repos/{}/{}/git/commits", owner, repo), body)?;
         let r: ShaResponse = resp.into_body().read_json().map_err(gh_err)?;
@@ -438,6 +450,17 @@ pub struct TreeEntryCreate {
     pub sha: String,
 }
 
+/// Author or committer identity for `create_commit`.
+///
+/// `date` is RFC 3339 (ISO 8601 with timezone), e.g. `2024-01-01T12:00:00+00:00`.
+/// GitHub's Git Data API accepts the same shape for both `author` and `committer`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitIdentity {
+    pub name: String,
+    pub email: String,
+    pub date: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ShaResponse {
     sha: String,
@@ -520,5 +543,18 @@ mod tests {
         let j = r#"{"sha":"abc","commit":{"message":"msg","author":{"name":"A","email":"a@b"},"tree":{"sha":"def"}},"parents":[{"sha":"p1"}]}"#;
         let r: CommitInfo = serde_json::from_str(j).unwrap();
         assert_eq!(r.parents.len(), 1);
+    }
+
+    #[test]
+    fn commit_identity_serializes_with_required_fields() {
+        let id = CommitIdentity {
+            name: "Jane Doe".into(),
+            email: "jane@example.com".into(),
+            date: "2024-01-15T10:30:00+00:00".into(),
+        };
+        let j = serde_json::to_value(&id).unwrap();
+        assert_eq!(j["name"], "Jane Doe");
+        assert_eq!(j["email"], "jane@example.com");
+        assert_eq!(j["date"], "2024-01-15T10:30:00+00:00");
     }
 }
