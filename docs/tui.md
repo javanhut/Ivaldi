@@ -6,45 +6,63 @@ Interactive terminal UI components built with `ratatui` + `crossterm`.
 
 ### Travel (`tui/travel.rs`)
 
-Interactive history browser with arrow key navigation.
+Interactive history browser with arrow key navigation. Walks the
+timeline's full commit DAG (`prev_idx` + `merge_idxs`) by default, so
+merge commits expose all reachable ancestors — not just the
+first-parent chain.
 
 ```bash
-ivaldi travel                    # browse current timeline
-ivaldi travel --search "auth"    # filter by keyword
+ivaldi travel                    # browse current timeline (DAG walk)
+ivaldi travel --search "auth"    # filter by message / author / seal name
+ivaldi travel --all              # browse every leaf in the MMR — useful
+                                 # for finding seals orphaned by `weld`
 ```
 
 **Controls:**
 | Key | Action |
 |-----|--------|
-| ↑/↓ | Navigate through seals |
-| Enter | Select seal → choose action |
-| Home/End | Jump to first/last |
+| ↑/↓ | Navigate one seal at a time |
+| **PgUp / PgDn** | Page up/down by one viewport |
+| Home / End | Jump to first / last |
 | 1-9 | Jump to specific seal |
-| q/Esc | Quit |
+| Enter | Select seal → choose action |
+| q / Esc | Quit |
 
 **Actions after selecting a seal:**
-1. **Diverge** — Create new timeline from this point (non-destructive)
-2. **Overwrite** — Reset current timeline to this seal (destructive, requires "yes")
+1. **Diverge** — Create a new timeline rooted at this seal (non-destructive).
+   This is also how you recover seals that were orphaned by `weld` /
+   destructive history rewrites: `travel --all`, find the seal, Diverge.
+2. **Overwrite** — Reset current timeline to this seal (destructive,
+   requires explicit "yes" confirmation).
 3. **Cancel**
+
+#### Layout & rendering
+
+Each seal renders as a deterministic 3-line slot (header / message /
+author·time) followed by a 1-row gutter. The viewport capacity is
+recomputed every frame from the actual terminal height — no hard-coded
+"~10 entries" assumption — so `↓` always advances by one *visible* seal.
+Resizing the terminal is safe: the offset re-clamps each frame.
+
+The header shows `showing N-M of TOTAL` so it's obvious how much of
+your history is in view at any moment.
 
 ### Shift (`tui/shift.rs`)
 
-Interactive commit range selection for squashing.
+Interactive commit range selection used as the no-args backend for
+[`weld`](weld.md). Kept for backward-compatibility callers; new code
+should invoke `weld` directly.
 
 ```bash
-ivaldi shift                # interactive mode
-ivaldi shift --last 3       # non-interactive, squash last 3
+ivaldi weld                # interactive picker (this TUI)
+ivaldi weld --last 3       # non-interactive, weld last 3
+ivaldi weld START to END   # non-interactive range
 ```
 
 **Interactive two-phase selection:**
-1. Select START commit (oldest in range)
-2. Select END commit (newest in range)
-3. Review commits, enter message, confirm with "yes"
-
-**Non-interactive `--last N`:**
-- Shows commits to squash
-- Creates squashed seal with combined message
-- No TUI needed
+1. Select START seal (oldest in range)
+2. Select END seal (newest in range)
+3. Review seals, enter message, confirm with "yes"
 
 ### Config form (`tui/config_form.rs`)
 

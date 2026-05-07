@@ -17,7 +17,7 @@ Command-line interface for Ivaldi VCS, built with `clap`.
 | `timeline create/switch/list/rename/remove` | `tl` | Manage timelines |
 | `timeline butterfly create/up/down/rm` | `tl bf` | Butterfly timelines |
 | `fuse <src> to <tgt>` | | Merge timelines (auto strategy uses MMR-based merge base) |
-| `travel` | | Interactive history (TUI pending) |
+| `travel [--all] [--search Q]` | | Interactive history browser (DAG walk by default; `--all` shows every MMR leaf) |
 | `weld --last N` / `weld START to END` | `w` | Combine seal range into one (linear history) |
 | `config` | | View/modify settings |
 | `exclude <patterns>` | | Add to .ivaldiignore |
@@ -71,6 +71,11 @@ ivaldi weld --last 5 -m "consolidate"     # combine the last 5 seals
 ivaldi weld bold-tower -m "msg"           # combine bold-tower..HEAD
 ivaldi weld bold-tower to clear-galaxy    # explicit range, auto-summary message
 ivaldi weld                               # interactive picker (TUI)
+
+# Travel — browse history with arrow keys / PgUp / PgDn
+ivaldi travel                              # walks full DAG of current timeline
+ivaldi travel --all                        # every leaf in the MMR (incl. orphans)
+ivaldi travel --search "auth"              # filter by message/author/seal name
 
 # Portals — transport is auto-detected from the URL
 ivaldi portal add owner/repo                                 # GitHub HTTPS shorthand

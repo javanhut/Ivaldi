@@ -77,7 +77,7 @@ ivaldi peer known list             # Servers we trust (TOFU known_peers)
 | `timeline` | `tl` | Manage timelines (create/switch/list/rename/remove) |
 | `butterfly` | `tl bf` | Experimental sandbox timelines |
 | `fuse` | | Merge timelines (auto strategy uses MMR-based merge base) |
-| `travel` | | Interactive history browser |
+| `travel` | | Interactive history browser (full DAG walk; `--all` shows orphaned seals) |
 | `weld` | `w` | Combine a range of seals into one (linear history) |
 | `config` | | View/modify settings |
 | `exclude` | | Add to .ivaldiignore |
