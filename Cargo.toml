@@ -1,6 +1,6 @@
 [package]
 name = "ivaldi"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Ivaldi Version Control System"
 
@@ -11,12 +11,12 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
-redb = "2"
-ureq = { version = "2", features = ["json"] }
+redb = "4.1.0"
+ureq = { version = "3.3.0", features = ["json"] }
 base64 = "0.22"
-ratatui = "0.29"
-crossterm = "0.28"
-indicatif = "0.17"
+ratatui = "0.30"
+crossterm = "0.29"
+indicatif = "0.18.4"
 rayon = "1"
 flate2 = "1"
 

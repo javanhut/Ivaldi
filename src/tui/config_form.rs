@@ -126,7 +126,9 @@ fn event_loop<B: Backend>(
     state: &mut State,
 ) -> io::Result<()> {
     loop {
-        terminal.draw(|frame| draw(frame, state))?;
+        terminal
+            .draw(|frame| draw(frame, state))
+            .map_err(|e| io::Error::other(e.to_string()))?;
         let Event::Key(key) = event::read()? else {
             continue;
         };

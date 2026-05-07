@@ -81,10 +81,12 @@ pub struct SmartHttpClient {
 
 impl SmartHttpClient {
     pub fn new(token: Option<&str>) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(std::time::Duration::from_secs(30))
-            .timeout_read(std::time::Duration::from_secs(120))
-            .build();
+        let agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(std::time::Duration::from_secs(30)))
+            .timeout_recv_response(Some(std::time::Duration::from_secs(120)))
+            .http_status_as_error(false)
+            .build()
+            .new_agent();
         Self {
             token: token.map(str::to_string),
             agent,
@@ -201,42 +203,54 @@ impl SmartHttpClient {
     fn discover_refs(&self, base: &str) -> Result<Discovery, GitRemoteError> {
         let pb = progress::spinner("Discovering remote refs");
         let url = format!("{}/info/refs?service=git-upload-pack", base);
-        let build = |token: Option<&str>| {
+        let do_call = |token: Option<&str>| -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
             let mut r = self
                 .agent
                 .get(&url)
-                .set("Accept", "application/x-git-upload-pack-advertisement")
-                .set("User-Agent", "ivaldi-vcs/0.1.0");
+                .header("Accept", "application/x-git-upload-pack-advertisement")
+                .header("User-Agent", "ivaldi-vcs/0.1.0");
             if let Some(t) = token {
-                r = r.set("Authorization", &basic_auth_header(t));
+                r = r.header("Authorization", basic_auth_header(t));
             }
-            r
+            r.call()
         };
 
-        let resp = match build(self.token.as_deref()).call() {
-            Ok(resp) => resp,
-            Err(err) => {
-                // If we attached a stored token and the server rejected it,
-                // the repo may still be public — retry anonymously once.
-                if self.token.is_some() && is_auth_failure(&err) {
-                    crate::logging::warn(
-                        "GitHub rejected the stored authentication token — retrying anonymously",
-                    );
-                    match build(None).call() {
-                        Ok(resp) => resp,
-                        Err(e2) => {
-                            pb.finish_and_clear();
-                            return Err(token_rejected_or(e2));
+        let resp = match do_call(self.token.as_deref()) {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    if self.token.is_some() && is_auth_failure(&resp) {
+                        crate::logging::warn(
+                            "GitHub rejected the stored authentication token — retrying anonymously",
+                        );
+                        match do_call(None) {
+                            Ok(resp2) => {
+                                if !resp2.status().is_success() {
+                                    pb.finish_and_clear();
+                                    return Err(token_rejected_or(resp2));
+                                }
+                                resp2
+                            }
+                            Err(e2) => {
+                                pb.finish_and_clear();
+                                return Err(map_transport_error(e2));
+                            }
                         }
+                    } else {
+                        pb.finish_and_clear();
+                        return Err(map_response_error(resp));
                     }
                 } else {
-                    pb.finish_and_clear();
-                    return Err(map_http_error(err));
+                    resp
                 }
+            }
+            Err(err) => {
+                pb.finish_and_clear();
+                return Err(map_transport_error(err));
             }
         };
         let mut bytes = Vec::new();
-        resp.into_reader()
+        resp.into_body()
+            .into_reader()
             .read_to_end(&mut bytes)
             .map_err(|e| GitRemoteError::Io(e.to_string()))?;
         pb.finish_with_message("Remote refs discovered");
@@ -252,43 +266,54 @@ impl SmartHttpClient {
         body.extend_from_slice(b"0000");
         body.extend(pkt_line("done\n"));
 
-        let build = |token: Option<&str>| {
+        let do_call = |token: Option<&str>, body: &[u8]| -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
             let mut r = self
                 .agent
                 .post(&url)
-                .set("Content-Type", "application/x-git-upload-pack-request")
-                .set("Accept", "application/x-git-upload-pack-result")
-                .set("User-Agent", "ivaldi-vcs/0.1.0");
+                .header("Content-Type", "application/x-git-upload-pack-request")
+                .header("Accept", "application/x-git-upload-pack-result")
+                .header("User-Agent", "ivaldi-vcs/0.1.0");
             if let Some(t) = token {
-                r = r.set("Authorization", &basic_auth_header(t));
+                r = r.header("Authorization", basic_auth_header(t));
             }
-            r
+            r.send(body)
         };
 
-        let resp = match build(self.token.as_deref()).send_bytes(&body) {
-            Ok(resp) => resp,
-            Err(err) => {
-                if self.token.is_some() && is_auth_failure(&err) {
-                    crate::logging::warn(
-                        "GitHub rejected the stored authentication token — retrying anonymously",
-                    );
-                    match build(None).send_bytes(&body) {
-                        Ok(resp) => resp,
-                        Err(e2) => return Err(token_rejected_or(e2)),
+        let resp = match do_call(self.token.as_deref(), &body) {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    if self.token.is_some() && is_auth_failure(&resp) {
+                        crate::logging::warn(
+                            "GitHub rejected the stored authentication token — retrying anonymously",
+                        );
+                        match do_call(None, &body) {
+                            Ok(resp2) => {
+                                if !resp2.status().is_success() {
+                                    return Err(token_rejected_or(resp2));
+                                }
+                                resp2
+                            }
+                            Err(e2) => return Err(map_transport_error(e2)),
+                        }
+                    } else {
+                        return Err(map_response_error(resp));
                     }
                 } else {
-                    return Err(map_http_error(err));
+                    resp
                 }
             }
+            Err(err) => return Err(map_transport_error(err)),
         };
         let total = resp
-            .header("Content-Length")
+            .headers()
+            .get("Content-Length")
+            .and_then(|h| h.to_str().ok())
             .and_then(|h| h.parse::<u64>().ok());
         let pb = total
             .map(|len| progress::byte_bar(len, "Downloading pack"))
             .unwrap_or_else(|| progress::spinner("Downloading pack"));
         let mut bytes = Vec::new();
-        let mut reader = resp.into_reader();
+        let mut reader = resp.into_body().into_reader();
         let mut chunk = [0u8; 8192];
         loop {
             let n = reader
@@ -315,55 +340,58 @@ struct Discovery {
     default_branch: Option<String>,
 }
 
+fn header_value<'a>(resp: &'a ureq::http::Response<ureq::Body>, name: &str) -> Option<&'a str> {
+    resp.headers().get(name).and_then(|v| v.to_str().ok())
+}
+
 /// True for status codes that suggest the token was the problem, not the repo.
-fn is_auth_failure(err: &ureq::Error) -> bool {
-    match err {
-        ureq::Error::Status(401, _) => true,
-        ureq::Error::Status(403, resp) => {
-            // 403 with rate-limit headers is NOT an auth failure; retrying
-            // anonymously would hit the same (or stricter) limit.
-            resp.header("X-RateLimit-Remaining") != Some("0")
-        }
-        _ => false,
+fn is_auth_failure(resp: &ureq::http::Response<ureq::Body>) -> bool {
+    let status = resp.status().as_u16();
+    if status == 401 {
+        return true;
     }
+    if status == 403 {
+        // 403 with rate-limit headers is NOT an auth failure; retrying
+        // anonymously would hit the same (or stricter) limit.
+        return header_value(resp, "X-RateLimit-Remaining") != Some("0");
+    }
+    false
 }
 
 /// Mapper used after an anonymous retry that followed a stored-token rejection.
 /// A 401 here means the repo also requires auth, so the actionable problem is
 /// the rejected stored token — surface that explicitly instead of the generic
 /// "authentication required" the second 401 would otherwise produce.
-fn token_rejected_or(err: ureq::Error) -> GitRemoteError {
-    if matches!(&err, ureq::Error::Status(401, _)) {
+fn token_rejected_or(resp: ureq::http::Response<ureq::Body>) -> GitRemoteError {
+    if resp.status().as_u16() == 401 {
         return GitRemoteError::TokenRejected;
     }
-    map_http_error(err)
+    map_response_error(resp)
 }
 
-fn map_http_error(err: ureq::Error) -> GitRemoteError {
-    match err {
-        ureq::Error::Status(status, resp) => {
-            // Detect rate-limiting before consuming the body.
-            if status == 403 && resp.header("X-RateLimit-Remaining") == Some("0") {
-                let reset_at = resp
-                    .header("X-RateLimit-Reset")
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0);
-                return GitRemoteError::RateLimited { reset_at };
-            }
-            let mut body = String::new();
-            let mut reader = resp.into_reader();
-            let _ = reader.read_to_string(&mut body);
-            match status {
-                401 => GitRemoteError::AuthRequired,
-                404 => GitRemoteError::RepoUnavailable,
-                _ => GitRemoteError::Http {
-                    status,
-                    message: body.trim().to_string(),
-                },
-            }
-        }
-        ureq::Error::Transport(e) => GitRemoteError::Io(e.to_string()),
+fn map_response_error(resp: ureq::http::Response<ureq::Body>) -> GitRemoteError {
+    let status = resp.status().as_u16();
+    // Detect rate-limiting before consuming the body.
+    if status == 403 && header_value(&resp, "X-RateLimit-Remaining") == Some("0") {
+        let reset_at = header_value(&resp, "X-RateLimit-Reset")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        return GitRemoteError::RateLimited { reset_at };
     }
+    let mut body = String::new();
+    let _ = resp.into_body().into_reader().read_to_string(&mut body);
+    match status {
+        401 => GitRemoteError::AuthRequired,
+        404 => GitRemoteError::RepoUnavailable,
+        _ => GitRemoteError::Http {
+            status,
+            message: body.trim().to_string(),
+        },
+    }
+}
+
+fn map_transport_error(err: ureq::Error) -> GitRemoteError {
+    GitRemoteError::Io(err.to_string())
 }
 
 fn pkt_line(payload: &str) -> Vec<u8> {
