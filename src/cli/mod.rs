@@ -51,6 +51,10 @@ pub enum Commands {
     /// View commit history
     Log(LogArgs),
 
+    /// Show, line-by-line, which seal last touched each line of a file
+    #[command(alias = "blame")]
+    Whodidit(WhodiditArgs),
+
     /// Compare changes
     Diff(DiffArgs),
 
@@ -218,6 +222,17 @@ pub struct LogArgs {
     /// Show commits from all timelines
     #[arg(long)]
     pub all: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct WhodiditArgs {
+    /// File to inspect, relative to the repository root.
+    pub path: String,
+
+    /// Show only the seal/author summary (one line per file region) rather
+    /// than every individual line.
+    #[arg(long)]
+    pub summary: bool,
 }
 
 #[derive(clap::Args, Debug)]

@@ -72,6 +72,7 @@ ivaldi peer known list             # Servers we trust (TOFU known_peers)
 | `status` | | Show workspace state |
 | `whereami` | `wai` | Show current position |
 | `log` | | View commit history |
+| `whodidit <file>` | `blame` | Show which seal last touched each line of a file |
 | `diff` | | Compare changes |
 | `reset` | | Unstage files or hard reset |
 | `timeline` | `tl` | Manage timelines (create/switch/list/rename/remove) |
@@ -121,6 +122,11 @@ ivaldi peer known list             # Servers we trust (TOFU known_peers)
 | Butterfly | Experimental branch |
 | Travel | Interactive log + checkout |
 | Weld | Rebase --squash (range collapse, linear history) |
+| Whodidit | Blame |
+
+> **Coming from git?** [`docs/rosetta.md`](docs/rosetta.md) is the
+> full translation table — every git command you reach for daily,
+> mapped to its Ivaldi equivalent.
 
 ## Architecture
 

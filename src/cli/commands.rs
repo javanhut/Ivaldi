@@ -30,6 +30,7 @@ pub fn run_command(cli: Cli) {
             Commands::Status => cmd_status(),
             Commands::Whereami => cmd_whereami(),
             Commands::Log(args) => cmd_log(args),
+            Commands::Whodidit(args) => cmd_whodidit(args),
             Commands::Diff(args) => cmd_diff(args),
             Commands::Reset(args) => cmd_reset(args, cli.quiet),
             Commands::Timeline(args) => cmd_timeline(args, cli.quiet),
@@ -488,6 +489,176 @@ fn cmd_log(args: LogArgs) -> Result<(), String> {
             println!();
         }
     }
+    Ok(())
+}
+
+/// Read the contents of a file at a given tree root by walking the path.
+/// Returns `Ok(None)` if the path doesn't exist (or isn't a regular file)
+/// in that tree.
+fn read_file_at_tree(
+    store: &crate::fsmerkle::FsStore<'_>,
+    tree_root: crate::hash::B3Hash,
+    path: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let parts: Vec<&str> = path
+        .split('/')
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    if parts.is_empty() {
+        return Ok(None);
+    }
+
+    let mut current_hash = tree_root;
+    for (i, part) in parts.iter().enumerate() {
+        let tree = match store.load_tree(current_hash) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        let entry = match tree.find_entry(part) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        let last = i == parts.len() - 1;
+        match (entry.kind, last) {
+            (crate::fsmerkle::NodeKind::Blob, true) => {
+                let (_, content) = store
+                    .load_blob(entry.hash)
+                    .map_err(|e| format!("read blob: {}", e))?;
+                return Ok(Some(content));
+            }
+            (crate::fsmerkle::NodeKind::Tree, false) => {
+                current_hash = entry.hash;
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// `ivaldi whodidit <file>` — git-blame analogue.
+///
+/// For each line of the file at HEAD, find the oldest seal in which the
+/// line still appears (content-set membership). The next-older seal does
+/// not contain the line, so the oldest-still-present seal is the one that
+/// introduced it. This is a position-independent approximation — it
+/// handles the common cases (added/edited lines) without trying to track
+/// line moves the way more sophisticated blame algorithms do.
+fn cmd_whodidit(args: WhodiditArgs) -> Result<(), String> {
+    use std::collections::HashSet;
+
+    let repo = open_repo()?;
+    let timeline = repo.current_timeline().unwrap_or_else(|_| "main".into());
+    let history = repo.walk_history(&timeline).map_err(|e| e.to_string())?;
+
+    if history.is_empty() {
+        return Err(format!("no commits on timeline '{}'", timeline));
+    }
+
+    let store = crate::fsmerkle::FsStore::new(&repo.cas);
+
+    // File contents at HEAD.
+    let head_leaf = repo
+        .get_leaf(history[0].index)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "HEAD leaf missing".to_string())?;
+    let head_bytes = read_file_at_tree(&store, head_leaf.tree_root, &args.path)?
+        .ok_or_else(|| format!("file not found at HEAD: {}", args.path))?;
+    let head_text = String::from_utf8_lossy(&head_bytes).into_owned();
+    let lines: Vec<&str> = head_text.split_inclusive('\n').collect();
+
+    // Each line starts attributed to HEAD. Walking back, we replace the
+    // attribution with an older seal as long as that seal's version of
+    // the file still contains the line. The first seal that doesn't
+    // contain the line halts further updates for that line.
+    let mut attr: Vec<usize> = vec![0; lines.len()]; // index into history
+    let mut still_open: Vec<bool> = vec![true; lines.len()];
+
+    for (h_idx, entry) in history.iter().enumerate().skip(1) {
+        if !still_open.iter().any(|&b| b) {
+            break;
+        }
+        let leaf = match repo.get_leaf(entry.index).map_err(|e| e.to_string())? {
+            Some(l) => l,
+            None => continue,
+        };
+        let bytes = read_file_at_tree(&store, leaf.tree_root, &args.path)?;
+        let owned_lines: Vec<String> = match bytes {
+            Some(b) => String::from_utf8_lossy(&b)
+                .split_inclusive('\n')
+                .map(|s| s.to_string())
+                .collect(),
+            None => Vec::new(),
+        };
+        let owned_set: HashSet<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
+
+        for (li, line) in lines.iter().enumerate() {
+            if !still_open[li] {
+                continue;
+            }
+            if owned_set.contains(*line) {
+                attr[li] = h_idx;
+            } else {
+                still_open[li] = false;
+            }
+        }
+    }
+
+    // Render
+    let mut prev_attr: Option<usize> = None;
+    let line_no_width = (lines.len().max(1)).to_string().len();
+
+    if args.summary {
+        // Compress contiguous regions sharing the same attribution.
+        let mut start = 0usize;
+        while start < lines.len() {
+            let a = attr[start];
+            let mut end = start + 1;
+            while end < lines.len() && attr[end] == a {
+                end += 1;
+            }
+            let e = &history[a];
+            println!(
+                "{}-{}  {} {} ({})",
+                start + 1,
+                end,
+                color::hash(&e.short_hash),
+                color::seal_name(&e.seal_name),
+                color::author(&e.author),
+            );
+            start = end;
+        }
+        return Ok(());
+    }
+
+    for (li, line) in lines.iter().enumerate() {
+        let a = attr[li];
+        let e = &history[a];
+        let header_changed = prev_attr != Some(a);
+        prev_attr = Some(a);
+
+        let line_text = line.strip_suffix('\n').unwrap_or(line);
+
+        if header_changed {
+            print!(
+                "{} {} ({}) ",
+                color::hash(&e.short_hash),
+                color::seal_name(&e.seal_name),
+                color::author(&e.author),
+            );
+        } else {
+            // Repeat-attribution rows: align with the header above using
+            // a faint placeholder so the line numbers stay in a column.
+            let pad: String = " ".repeat(8 + 1 + e.seal_name.len() + 2 + e.author.len() + 2);
+            print!("{}", pad);
+        }
+        println!(
+            "{:>width$})  {}",
+            li + 1,
+            line_text,
+            width = line_no_width
+        );
+    }
+
     Ok(())
 }
 
