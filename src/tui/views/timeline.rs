@@ -12,25 +12,39 @@ use crate::tui::views::TabView;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DialogMode {
     Create,
+    /// Like `Create` but the new timeline gets butterfly metadata so it can
+    /// `^`/`_` sync with its parent.
+    CreateButterfly,
     Rename,
 }
 
+/// One row in the timelines list.
+struct TimelineRow {
+    name: String,
+    head_idx: u64,
+    is_current: bool,
+    is_butterfly: bool,
+}
+
 pub struct TimelineView {
-    timelines: Vec<(String, u64, bool)>, // name, head_idx, is_current
+    rows: Vec<TimelineRow>,
     cursor: usize,
     dialog: Dialog,
     dialog_mode: Option<DialogMode>,
     confirm_delete: Option<String>,
+    /// Last operation result, shown briefly in the status line.
+    message: Option<(String, bool)>,
 }
 
 impl TimelineView {
     pub fn new() -> Self {
         Self {
-            timelines: Vec::new(),
+            rows: Vec::new(),
             cursor: 0,
             dialog: Dialog::new(""),
             dialog_mode: None,
             confirm_delete: None,
+            message: None,
         }
     }
 }
@@ -76,9 +90,10 @@ impl TabView for TimelineView {
                             }
                             Err(e) => Action::Error(format!("Create failed: {}", e)),
                         },
+                        Some(DialogMode::CreateButterfly) => self.create_butterfly(ctx, &value),
                         Some(DialogMode::Rename) => {
-                            if let Some((old_name, _, _)) = self.timelines.get(self.cursor) {
-                                match ctx.repo.rename_timeline(old_name, &value) {
+                            if let Some(row) = self.rows.get(self.cursor) {
+                                match ctx.repo.rename_timeline(&row.name, &value) {
                                     Ok(()) => Action::Refresh,
                                     Err(e) => Action::Error(format!("Rename failed: {}", e)),
                                 }
@@ -103,7 +118,7 @@ impl TabView for TimelineView {
 
         match event.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                if !self.timelines.is_empty() && self.cursor < self.timelines.len() - 1 {
+                if !self.rows.is_empty() && self.cursor < self.rows.len() - 1 {
                     self.cursor += 1;
                 }
                 Action::Consumed
@@ -115,9 +130,9 @@ impl TabView for TimelineView {
                 Action::Consumed
             }
             KeyCode::Enter => {
-                if let Some((name, _, is_current)) = self.timelines.get(self.cursor) {
-                    if !is_current {
-                        let name = name.clone();
+                if let Some(row) = self.rows.get(self.cursor) {
+                    if !row.is_current {
+                        let name = row.name.clone();
                         match ctx.repo.switch_timeline(&name) {
                             Ok(()) => Action::Refresh,
                             Err(e) => Action::Error(format!("Switch failed: {}", e)),
@@ -134,12 +149,18 @@ impl TabView for TimelineView {
                 self.dialog.show("New Timeline Name");
                 Action::Consumed
             }
+            KeyCode::Char('b') => {
+                self.dialog_mode = Some(DialogMode::CreateButterfly);
+                self.dialog
+                    .show("New Butterfly Name (forks from current timeline)");
+                Action::Consumed
+            }
             KeyCode::Char('d') => {
-                if let Some((name, _, is_current)) = self.timelines.get(self.cursor) {
-                    if *is_current {
+                if let Some(row) = self.rows.get(self.cursor) {
+                    if row.is_current {
                         Action::Error("Cannot delete current timeline".into())
                     } else {
-                        self.confirm_delete = Some(name.clone());
+                        self.confirm_delete = Some(row.name.clone());
                         Action::Consumed
                     }
                 } else {
@@ -147,19 +168,21 @@ impl TabView for TimelineView {
                 }
             }
             KeyCode::Char('R') => {
-                if let Some((name, _, _)) = self.timelines.get(self.cursor) {
+                if let Some(row) = self.rows.get(self.cursor) {
                     self.dialog_mode = Some(DialogMode::Rename);
-                    self.dialog.show_with_value("Rename Timeline", name.clone());
+                    self.dialog.show_with_value("Rename Timeline", row.name.clone());
                 }
                 Action::Consumed
             }
+            KeyCode::Char('^') => self.butterfly_up(ctx),
+            KeyCode::Char('_') => self.butterfly_down(ctx),
             KeyCode::Char('r') => Action::Refresh,
             _ => Action::None,
         }
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        if self.timelines.is_empty() {
+        if self.rows.is_empty() {
             let msg = Paragraph::new(Span::styled("No timelines", theme.dim));
             frame.render_widget(msg, area);
             return;
@@ -168,19 +191,25 @@ impl TabView for TimelineView {
         let inner_height = area.height.saturating_sub(2) as usize;
 
         let items: Vec<ListItem> = self
-            .timelines
+            .rows
             .iter()
             .enumerate()
             .take(inner_height)
-            .map(|(i, (name, head_idx, is_current))| {
+            .map(|(i, row)| {
                 let marker = if i == self.cursor { ">" } else { " " };
-                let current_flag = if *is_current { " *" } else { "" };
-                let text = format!("{} {}{} (head: {})", marker, name, current_flag, head_idx);
+                let current_flag = if row.is_current { " *" } else { "" };
+                let bf_flag = if row.is_butterfly { " [bf]" } else { "" };
+                let text = format!(
+                    "{} {}{}{} (head: {})",
+                    marker, row.name, current_flag, bf_flag, row.head_idx
+                );
 
                 let style = if i == self.cursor {
                     theme.cursor
-                } else if *is_current {
+                } else if row.is_current {
                     theme.brand
+                } else if row.is_butterfly {
+                    theme.warning
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -190,7 +219,7 @@ impl TabView for TimelineView {
             .collect();
 
         let block = Block::default().borders(Borders::ALL).title(Span::styled(
-            format!(" Timelines ({}) ", self.timelines.len()),
+            format!(" Timelines ({}) ", self.rows.len()),
             theme.title,
         ));
 
@@ -212,7 +241,7 @@ impl TabView for TimelineView {
             frame.render_widget(msg, msg_area);
         }
 
-        // Help
+        // Status / help line
         if area.height > 2 && self.confirm_delete.is_none() {
             let help_area = Rect {
                 x: area.x,
@@ -220,11 +249,15 @@ impl TabView for TimelineView {
                 width: area.width,
                 height: 1,
             };
-            let help = Paragraph::new(Span::styled(
-                " Enter:switch c:create d:delete R:rename r:refresh",
-                theme.dim,
-            ));
-            frame.render_widget(help, help_area);
+            let line: Line = match &self.message {
+                Some((msg, true)) => Line::from(Span::styled(format!(" {}", msg), theme.error)),
+                Some((msg, false)) => Line::from(Span::styled(format!(" {}", msg), theme.success)),
+                None => Line::from(Span::styled(
+                    " Enter:switch c:create b:butterfly d:delete R:rename ^:bf-up _:bf-down r:refresh",
+                    theme.dim,
+                )),
+            };
+            frame.render_widget(Paragraph::new(line), help_area);
         }
 
         // Dialog overlay
@@ -233,31 +266,126 @@ impl TabView for TimelineView {
 
     fn load_data(&mut self, ctx: &AppContext) {
         let current = ctx.repo.current_timeline().unwrap_or_default();
-        self.timelines = ctx
+        let butterflies: std::collections::BTreeSet<String> = ctx
+            .repo
+            .store
+            .list_butterflies()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
+        self.rows = ctx
             .repo
             .list_timelines()
             .unwrap_or_default()
             .into_iter()
-            .map(|(name, head)| {
+            .map(|(name, head_idx)| {
+                let is_butterfly = butterflies.contains(&name);
                 let is_current = name == current;
-                (name, head, is_current)
+                TimelineRow {
+                    name,
+                    head_idx,
+                    is_current,
+                    is_butterfly,
+                }
             })
             .collect();
 
-        // Sort: current first, then alphabetical
-        self.timelines
-            .sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        // Current first, then alphabetical
+        self.rows.sort_by(|a, b| {
+            b.is_current
+                .cmp(&a.is_current)
+                .then_with(|| a.name.cmp(&b.name))
+        });
 
-        if self.cursor >= self.timelines.len() && !self.timelines.is_empty() {
-            self.cursor = self.timelines.len() - 1;
+        if self.cursor >= self.rows.len() && !self.rows.is_empty() {
+            self.cursor = self.rows.len() - 1;
         }
     }
 
     fn short_help(&self) -> &str {
-        "Enter:switch c:create d:delete R:rename"
+        "Enter:switch c:create b:butterfly d:delete R:rename ^:bf-up _:bf-down"
     }
 
     fn has_active_input(&self) -> bool {
         self.dialog.visible || self.confirm_delete.is_some()
+    }
+}
+
+impl TimelineView {
+    fn create_butterfly(&mut self, ctx: &mut AppContext, name: &str) -> Action {
+        let parent = match ctx.repo.current_timeline() {
+            Ok(t) => t,
+            Err(e) => return Action::Error(format!("Failed to read HEAD: {}", e)),
+        };
+
+        // Capture the parent's tip hash so the butterfly knows where it
+        // diverged. ZERO is a valid sentinel for "parent has no commits yet".
+        let divergence_hash = match ctx.repo.get_timeline_head(&parent) {
+            Ok(Some(idx)) => match ctx.repo.get_leaf(idx) {
+                Ok(Some(leaf)) => leaf.hash(),
+                _ => crate::hash::B3Hash::ZERO,
+            },
+            _ => crate::hash::B3Hash::ZERO,
+        };
+
+        if let Err(e) = ctx.repo.create_timeline(name, Some(&parent)) {
+            return Action::Error(format!("Create failed: {}", e));
+        }
+        if let Err(e) = ctx.repo.store_butterfly_meta(name, &parent, divergence_hash) {
+            return Action::Error(format!("Butterfly metadata failed: {}", e));
+        }
+        if let Err(e) = ctx.repo.switch_timeline(name) {
+            return Action::Error(format!("Switch failed: {}", e));
+        }
+        self.message = Some((format!("Created butterfly '{}' from '{}'", name, parent), false));
+        Action::Refresh
+    }
+
+    fn butterfly_up(&mut self, ctx: &mut AppContext) -> Action {
+        let row = match self.rows.get(self.cursor) {
+            Some(r) => r,
+            None => return Action::Consumed,
+        };
+        if !row.is_butterfly {
+            self.message = Some(("Selected timeline is not a butterfly".into(), true));
+            return Action::Consumed;
+        }
+        let name = row.name.clone();
+        match ctx.repo.butterfly_sync_up(&name) {
+            Ok(_) => {
+                self.message = Some((format!("Synced butterfly '{}' up to parent", name), false));
+                Action::Refresh
+            }
+            Err(e) => {
+                self.message = Some((format!("Up sync failed: {}", e), true));
+                Action::Consumed
+            }
+        }
+    }
+
+    fn butterfly_down(&mut self, ctx: &mut AppContext) -> Action {
+        let row = match self.rows.get(self.cursor) {
+            Some(r) => r,
+            None => return Action::Consumed,
+        };
+        if !row.is_butterfly {
+            self.message = Some(("Selected timeline is not a butterfly".into(), true));
+            return Action::Consumed;
+        }
+        let name = row.name.clone();
+        match ctx.repo.butterfly_sync_down(&name) {
+            Ok(_) => {
+                self.message = Some((
+                    format!("Synced butterfly '{}' down from parent", name),
+                    false,
+                ));
+                Action::Refresh
+            }
+            Err(e) => {
+                self.message = Some((format!("Down sync failed: {}", e), true));
+                Action::Consumed
+            }
+        }
     }
 }

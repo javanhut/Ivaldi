@@ -6,6 +6,7 @@ pub mod help;
 pub mod log;
 pub mod remote;
 pub mod review;
+pub mod shelves;
 pub mod status;
 pub mod timeline;
 

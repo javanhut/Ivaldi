@@ -20,6 +20,7 @@ use crate::tui::views::fuse::FuseView;
 use crate::tui::views::log::LogView;
 use crate::tui::views::remote::RemoteView;
 use crate::tui::views::review::ReviewView;
+use crate::tui::views::shelves::ShelvesView;
 use crate::tui::views::status::StatusView;
 use crate::tui::views::timeline::TimelineView;
 
@@ -53,6 +54,7 @@ struct App {
     remote_view: RemoteView,
     fuse_view: FuseView,
     review_view: ReviewView,
+    shelves_view: ShelvesView,
 }
 
 impl App {
@@ -73,6 +75,7 @@ impl App {
             remote_view: RemoteView::new(),
             fuse_view: FuseView::new(),
             review_view: ReviewView::new(),
+            shelves_view: ShelvesView::new(),
         }
     }
 
@@ -85,6 +88,7 @@ impl App {
             TabId::Remote => &self.remote_view,
             TabId::Fuse => &self.fuse_view,
             TabId::Review => &self.review_view,
+            TabId::Shelves => &self.shelves_view,
         }
     }
 
@@ -97,6 +101,7 @@ impl App {
             TabId::Remote => self.remote_view.load_data(&self.ctx),
             TabId::Fuse => self.fuse_view.load_data(&self.ctx),
             TabId::Review => self.review_view.load_data(&self.ctx),
+            TabId::Shelves => self.shelves_view.load_data(&self.ctx),
         }
         self.refresh_status();
     }
@@ -159,6 +164,7 @@ impl App {
                             KeyCode::Char('5') => self.switch_tab(TabId::Remote),
                             KeyCode::Char('6') => self.switch_tab(TabId::Fuse),
                             KeyCode::Char('7') => self.switch_tab(TabId::Review),
+                            KeyCode::Char('8') => self.switch_tab(TabId::Shelves),
                             KeyCode::Tab => {
                                 let next = (self.active_tab.index() + 1) % TabId::ALL.len();
                                 if let Some(tab) = TabId::from_index(next) {
@@ -208,6 +214,7 @@ impl App {
                         TabId::Remote => self.remote_view.handle_event(&key, &mut self.ctx),
                         TabId::Fuse => self.fuse_view.handle_event(&key, &mut self.ctx),
                         TabId::Review => self.review_view.handle_event(&key, &mut self.ctx),
+                        TabId::Shelves => self.shelves_view.handle_event(&key, &mut self.ctx),
                     };
 
                     self.handle_action(action);
@@ -296,7 +303,8 @@ impl App {
 
         // Help overlay (on top of everything)
         if self.show_help {
-            render_help(frame, &self.theme);
+            let tab_help = self.active_view().short_help().to_string();
+            render_help(frame, &self.theme, self.active_tab, &tab_help);
         }
     }
 }

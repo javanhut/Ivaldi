@@ -42,10 +42,18 @@ pub struct WorkspaceFile {
 }
 
 /// The staging area tracks files gathered for the next seal.
+///
+/// A staged change is either an addition/modification (a `path → blob hash`
+/// entry in `staged`) or a deletion (a `path` in `deletions`). The two sets
+/// are mutually exclusive — staging a path as one removes it from the other
+/// — so the staging area unambiguously describes the next seal's diff
+/// against the parent tree.
 #[derive(Debug, Clone, Default)]
 pub struct StagingArea {
-    /// Files staged for the next seal: path → content hash.
+    /// Files staged for addition or modification: path → content hash.
     staged: BTreeMap<String, B3Hash>,
+    /// Paths staged for deletion in the next seal.
+    deletions: BTreeSet<String>,
 }
 
 impl StagingArea {
@@ -53,42 +61,71 @@ impl StagingArea {
         Self::default()
     }
 
-    /// Stage a file by path and content hash.
+    /// Stage a file by path and content hash. Cancels any pending deletion
+    /// for the same path.
     pub fn stage(&mut self, path: impl Into<String>, hash: B3Hash) {
-        self.staged.insert(path.into(), hash);
+        let p = path.into();
+        self.deletions.remove(&p);
+        self.staged.insert(p, hash);
     }
 
-    /// Unstage a specific file.
+    /// Stage a path for deletion in the next seal. Cancels any pending
+    /// addition for the same path.
+    pub fn stage_deletion(&mut self, path: impl Into<String>) {
+        let p = path.into();
+        self.staged.remove(&p);
+        self.deletions.insert(p);
+    }
+
+    /// Unstage a specific path (whether it was staged for addition or
+    /// deletion). Returns true if anything was actually removed.
     pub fn unstage(&mut self, path: &str) -> bool {
-        self.staged.remove(path).is_some()
+        let was_staged = self.staged.remove(path).is_some();
+        let was_deletion = self.deletions.remove(path);
+        was_staged || was_deletion
     }
 
-    /// Unstage all files.
+    /// Clear all staged additions and deletions.
     pub fn clear(&mut self) {
         self.staged.clear();
+        self.deletions.clear();
     }
 
-    /// Check if a file is staged.
+    /// Check if a file is staged for addition.
     pub fn is_staged(&self, path: &str) -> bool {
         self.staged.contains_key(path)
     }
 
-    /// Get all staged files.
+    /// Check if a path is staged for deletion.
+    pub fn is_staged_for_deletion(&self, path: &str) -> bool {
+        self.deletions.contains(path)
+    }
+
+    /// Get all files staged for addition.
     pub fn staged_files(&self) -> &BTreeMap<String, B3Hash> {
         &self.staged
     }
 
-    /// Number of staged files.
+    /// Get all paths staged for deletion.
+    pub fn staged_deletions(&self) -> &BTreeSet<String> {
+        &self.deletions
+    }
+
+    /// Number of staged entries (additions + deletions).
     pub fn len(&self) -> usize {
-        self.staged.len()
+        self.staged.len() + self.deletions.len()
     }
 
     /// Check if the staging area is empty.
     pub fn is_empty(&self) -> bool {
-        self.staged.is_empty()
+        self.staged.is_empty() && self.deletions.is_empty()
     }
 
     /// Save staging area to disk.
+    ///
+    /// Format is line-oriented and human-readable:
+    /// - `<hash> <path>` for additions/modifications (existing format)
+    /// - `del <path>` for deletions (new)
     pub fn save(&self, ivaldi_dir: &Path) -> Result<(), std::io::Error> {
         let stage_dir = ivaldi_dir.join("stage");
         fs::create_dir_all(&stage_dir)?;
@@ -98,6 +135,9 @@ impl StagingArea {
 
         for (path, hash) in &self.staged {
             writeln!(file, "{} {}", hash, path)?;
+        }
+        for path in &self.deletions {
+            writeln!(file, "del {}", path)?;
         }
 
         Ok(())
@@ -117,7 +157,9 @@ impl StagingArea {
             if line.is_empty() {
                 continue;
             }
-            if let Some((hash_str, path)) = line.split_once(' ') {
+            if let Some(rest) = line.strip_prefix("del ") {
+                staging.stage_deletion(rest);
+            } else if let Some((hash_str, path)) = line.split_once(' ') {
                 if let Some(hash) = B3Hash::from_hex(hash_str) {
                     staging.stage(path, hash);
                 }
@@ -355,12 +397,17 @@ impl<'a> Workspace<'a> {
     }
 
     /// Build a tree from currently staged files and return the root hash.
+    ///
+    /// Note: this builds a tree from the staging area in isolation, with no
+    /// notion of a parent commit. Callers that want the tree of the *next
+    /// seal* (= parent tree + staged additions − staged deletions) must use
+    /// [`Self::build_seal_tree`] instead. This method remains useful for
+    /// status previews and for tests that work in isolation.
     pub fn build_staged_tree(&self) -> Result<B3Hash, WorkspaceError> {
         let store = FsStore::new(self.cas);
         let mut file_map = BTreeMap::new();
 
         for (path, hash) in self.staging.staged_files() {
-            // Load blob content from CAS
             let (_, content) = store.load_blob(*hash).map_err(WorkspaceError::FsMerkle)?;
             file_map.insert(path.clone(), content);
         }
@@ -368,6 +415,59 @@ impl<'a> Workspace<'a> {
         store
             .build_tree_from_map(&file_map)
             .map_err(WorkspaceError::FsMerkle)
+    }
+
+    /// Build the tree for the next seal: parent tree + staged additions
+    /// minus staged deletions.
+    ///
+    /// Pass `None` for the very first seal in a brand-new repository. For
+    /// every other seal, the parent tree must be supplied so that files not
+    /// touched by the current staging area are inherited from the parent
+    /// rather than silently dropped.
+    pub fn build_seal_tree(
+        &self,
+        parent_tree: Option<B3Hash>,
+    ) -> Result<B3Hash, WorkspaceError> {
+        let store = FsStore::new(self.cas);
+        let mut file_map: BTreeMap<String, B3Hash> = BTreeMap::new();
+
+        if let Some(parent_hash) = parent_tree {
+            if parent_hash != B3Hash::ZERO {
+                self.collect_tree_files(&store, parent_hash, "", &mut file_map)?;
+            }
+        }
+
+        for path in self.staging.staged_deletions() {
+            file_map.remove(path);
+        }
+        for (path, hash) in self.staging.staged_files() {
+            file_map.insert(path.clone(), *hash);
+        }
+
+        store
+            .build_tree_from_hash_map(&file_map)
+            .map_err(WorkspaceError::FsMerkle)
+    }
+
+    /// List all blob paths in a stored tree as a `path → hash` map.
+    ///
+    /// Used by the gather command to detect deletions (paths present in the
+    /// parent tree but missing from the working directory).
+    pub fn list_tree_files(
+        &self,
+        tree_hash: B3Hash,
+    ) -> Result<BTreeMap<String, B3Hash>, WorkspaceError> {
+        let store = FsStore::new(self.cas);
+        let mut files = BTreeMap::new();
+        if tree_hash != B3Hash::ZERO {
+            self.collect_tree_files(&store, tree_hash, "", &mut files)?;
+        }
+        Ok(files)
+    }
+
+    /// Public accessor for the working directory root.
+    pub fn work_dir(&self) -> &Path {
+        &self.work_dir
     }
 
     /// Compute workspace status by comparing working directory against last seal tree.
@@ -431,15 +531,29 @@ impl<'a> Workspace<'a> {
     }
 
     /// Materialize a tree hash to the working directory.
-    /// Only modifies files that differ from current state.
+    ///
+    /// Writes any files in `tree_hash` that differ from disk and removes
+    /// non-ignored files that aren't in the tree. Ignored files (build
+    /// artifacts, editor swap files, etc.) are left untouched so a timeline
+    /// switch doesn't wipe out unrelated working state.
     pub fn materialize(&self, tree_hash: B3Hash) -> Result<(), WorkspaceError> {
+        let ignore = crate::ignore::load_pattern_cache(&self.work_dir);
+        self.materialize_with_ignore(tree_hash, &ignore)
+    }
+
+    /// Like [`Self::materialize`] but with a caller-supplied ignore cache.
+    pub fn materialize_with_ignore(
+        &self,
+        tree_hash: B3Hash,
+        ignore: &PatternCache,
+    ) -> Result<(), WorkspaceError> {
         let store = FsStore::new(self.cas);
         let mut target_files = BTreeMap::new();
         self.collect_tree_files(&store, tree_hash, "", &mut target_files)?;
 
-        // Collect current files
-        let ignore = PatternCache::new(&[]);
-        let current_files = self.scan(&ignore).unwrap_or_default();
+        // Scan the working dir respecting ignores; any file not in this set
+        // is either ignored or absent — either way we won't delete it below.
+        let current_files = self.scan(ignore).unwrap_or_default();
         let current_set: BTreeSet<String> = current_files.into_iter().collect();
 
         // Write/update files
@@ -449,7 +563,6 @@ impl<'a> Workspace<'a> {
                 .load_blob(*blob_hash)
                 .map_err(WorkspaceError::FsMerkle)?;
 
-            // Only write if different
             let should_write = if full_path.exists() {
                 let existing = fs::read(&full_path).map_err(WorkspaceError::Io)?;
                 existing != content
@@ -465,7 +578,7 @@ impl<'a> Workspace<'a> {
             }
         }
 
-        // Remove files not in target tree
+        // Remove non-ignored files not in target tree
         let target_set: BTreeSet<&str> = target_files.keys().map(|s| s.as_str()).collect();
         for path in &current_set {
             if !target_set.contains(path.as_str()) {
@@ -514,6 +627,111 @@ impl<'a> Workspace<'a> {
         self.staging
             .save(&self.ivaldi_dir)
             .map_err(WorkspaceError::Io)
+    }
+
+    /// Capture working-tree changes vs `base_tree` for auto-shelving.
+    ///
+    /// For Modified and Untracked files, the disk content is hashed into the
+    /// CAS so the bytes survive a subsequent `materialize` (which will
+    /// overwrite the working tree). For Deleted files only the path is
+    /// recorded — the original bytes are recoverable from `base_tree` itself.
+    pub fn capture_changes(
+        &self,
+        base_tree: Option<B3Hash>,
+        ignore: &PatternCache,
+    ) -> Result<Vec<crate::shelf::WorkspaceChange>, WorkspaceError> {
+        let store = FsStore::new(self.cas);
+        let mut known_files: BTreeMap<String, B3Hash> = BTreeMap::new();
+        if let Some(tree_hash) = base_tree {
+            if tree_hash != B3Hash::ZERO {
+                self.collect_tree_files(&store, tree_hash, "", &mut known_files)?;
+            }
+        }
+
+        let disk_files = self.scan(ignore)?;
+        let disk_set: BTreeSet<&str> = disk_files.iter().map(|s| s.as_str()).collect();
+
+        let mut changes = Vec::new();
+
+        for path in &disk_files {
+            let full_path = self.work_dir.join(path);
+            let content = fs::read(&full_path).map_err(WorkspaceError::Io)?;
+            let current_hash = BlobNode::hash_content(&content);
+
+            match known_files.get(path.as_str()) {
+                Some(known_hash) if *known_hash == current_hash => {
+                    // Unmodified — nothing to capture.
+                }
+                Some(_) => {
+                    // Modified — store blob in CAS so it survives materialize.
+                    store.put_blob(&content).map_err(WorkspaceError::FsMerkle)?;
+                    changes.push(crate::shelf::WorkspaceChange::Modified {
+                        path: path.clone(),
+                        hash: current_hash,
+                    });
+                }
+                None => {
+                    // Untracked — store blob and record.
+                    store.put_blob(&content).map_err(WorkspaceError::FsMerkle)?;
+                    changes.push(crate::shelf::WorkspaceChange::Untracked {
+                        path: path.clone(),
+                        hash: current_hash,
+                    });
+                }
+            }
+        }
+
+        // Files in the base tree but missing from disk are Deleted.
+        for path in known_files.keys() {
+            if !disk_set.contains(path.as_str()) {
+                changes.push(crate::shelf::WorkspaceChange::Deleted {
+                    path: path.clone(),
+                });
+            }
+        }
+
+        Ok(changes)
+    }
+
+    /// Re-apply previously-captured working-tree changes after switching to
+    /// a timeline. Called after `materialize` has written the target tip
+    /// tree to disk.
+    pub fn apply_changes(
+        &self,
+        changes: &[crate::shelf::WorkspaceChange],
+    ) -> Result<(), WorkspaceError> {
+        let store = FsStore::new(self.cas);
+        for change in changes {
+            match change {
+                crate::shelf::WorkspaceChange::Modified { path, hash }
+                | crate::shelf::WorkspaceChange::Untracked { path, hash } => {
+                    let (_, content) =
+                        store.load_blob(*hash).map_err(WorkspaceError::FsMerkle)?;
+                    let full_path = self.work_dir.join(path);
+                    if let Some(parent) = full_path.parent() {
+                        fs::create_dir_all(parent).map_err(WorkspaceError::Io)?;
+                    }
+                    fs::write(&full_path, &content).map_err(WorkspaceError::Io)?;
+                }
+                crate::shelf::WorkspaceChange::Deleted { path } => {
+                    let full_path = self.work_dir.join(path);
+                    let _ = fs::remove_file(&full_path);
+                    // Best-effort cleanup of empty parents.
+                    if let Some(mut parent) = full_path.parent().map(Path::to_path_buf) {
+                        while parent.starts_with(&self.work_dir) && parent != self.work_dir {
+                            if fs::remove_dir(&parent).is_err() {
+                                break;
+                            }
+                            parent = match parent.parent() {
+                                Some(p) => p.to_path_buf(),
+                                None => break,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -635,6 +853,52 @@ mod tests {
     }
 
     #[test]
+    fn staging_area_deletion_and_addition_are_mutually_exclusive() {
+        let mut staging = StagingArea::new();
+        let h = B3Hash::digest(b"x");
+
+        staging.stage("X", h);
+        assert!(staging.is_staged("X"));
+        assert!(!staging.is_staged_for_deletion("X"));
+
+        staging.stage_deletion("X");
+        assert!(!staging.is_staged("X"));
+        assert!(staging.is_staged_for_deletion("X"));
+
+        staging.stage("X", h);
+        assert!(staging.is_staged("X"));
+        assert!(!staging.is_staged_for_deletion("X"));
+    }
+
+    #[test]
+    fn staging_area_unstage_handles_deletion() {
+        let mut staging = StagingArea::new();
+        staging.stage_deletion("doomed.txt");
+        assert!(staging.is_staged_for_deletion("doomed.txt"));
+        assert!(staging.unstage("doomed.txt"));
+        assert!(staging.is_empty());
+    }
+
+    #[test]
+    fn staging_area_save_load_round_trips_deletions() {
+        let dir = tempfile::tempdir().unwrap();
+        let ivaldi_dir = dir.path().join(".ivaldi");
+        fs::create_dir_all(&ivaldi_dir).unwrap();
+
+        let mut staging = StagingArea::new();
+        staging.stage("file.txt", B3Hash::digest(b"content"));
+        staging.stage_deletion("old.txt");
+        staging.stage_deletion("legacy/dir.json");
+        staging.save(&ivaldi_dir).unwrap();
+
+        let loaded = StagingArea::load(&ivaldi_dir);
+        assert_eq!(loaded.len(), 3);
+        assert!(loaded.is_staged("file.txt"));
+        assert!(loaded.is_staged_for_deletion("old.txt"));
+        assert!(loaded.is_staged_for_deletion("legacy/dir.json"));
+    }
+
+    #[test]
     fn scan_workspace() {
         let (dir, cas) = setup_workspace();
         fs::write(dir.path().join("file.txt"), "hello").unwrap();
@@ -721,10 +985,123 @@ mod tests {
         let tree_hash = ws.build_staged_tree().unwrap();
         assert_ne!(tree_hash, B3Hash::ZERO);
 
-        // Verify tree structure
         let store = FsStore::new(&cas);
         let tree = store.load_tree(tree_hash).unwrap();
-        assert_eq!(tree.entries.len(), 2); // file.txt + src/
+        assert_eq!(tree.entries.len(), 2);
+    }
+
+    #[test]
+    fn build_seal_tree_with_no_parent_matches_staging() {
+        let (dir, cas) = setup_workspace();
+        fs::write(dir.path().join("a.txt"), "aaa").unwrap();
+        fs::write(dir.path().join("b.txt"), "bbb").unwrap();
+
+        let allowlist = empty_allowlist(&dir);
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        ws.gather(&["a.txt", "b.txt"], &allowlist).unwrap();
+
+        let tree_hash = ws.build_seal_tree(None).unwrap();
+        let store = FsStore::new(&cas);
+        let tree = store.load_tree(tree_hash).unwrap();
+        let names: Vec<&str> = tree.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"a.txt"));
+        assert!(names.contains(&"b.txt"));
+    }
+
+    #[test]
+    fn build_seal_tree_inherits_parent_files() {
+        // Parent tree has a, b, c. Stage only d. New tree must have a, b, c, d.
+        let (dir, cas) = setup_workspace();
+        fs::write(dir.path().join("a.txt"), "aaa").unwrap();
+        fs::write(dir.path().join("b.txt"), "bbb").unwrap();
+        fs::write(dir.path().join("c.txt"), "ccc").unwrap();
+
+        let allowlist = empty_allowlist(&dir);
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        ws.gather(&["a.txt", "b.txt", "c.txt"], &allowlist).unwrap();
+        let parent_tree = ws.build_seal_tree(None).unwrap();
+        ws.staging.clear();
+
+        // Now stage only a brand-new file and "seal" with the parent tree.
+        fs::write(dir.path().join("d.txt"), "ddd").unwrap();
+        ws.gather(&["d.txt"], &allowlist).unwrap();
+
+        let new_tree = ws.build_seal_tree(Some(parent_tree)).unwrap();
+        let mut files = BTreeMap::new();
+        ws.collect_tree_files(&FsStore::new(&cas), new_tree, "", &mut files)
+            .unwrap();
+
+        assert!(files.contains_key("a.txt"), "parent file a.txt should survive");
+        assert!(files.contains_key("b.txt"), "parent file b.txt should survive");
+        assert!(files.contains_key("c.txt"), "parent file c.txt should survive");
+        assert!(files.contains_key("d.txt"), "newly staged d.txt should be present");
+    }
+
+    #[test]
+    fn build_seal_tree_modifies_existing_path() {
+        // Parent has X at hash A; stage X at hash B. New tree has X at B.
+        let (dir, cas) = setup_workspace();
+        fs::write(dir.path().join("X"), "old").unwrap();
+        let allowlist = empty_allowlist(&dir);
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        ws.gather(&["X"], &allowlist).unwrap();
+        let parent_tree = ws.build_seal_tree(None).unwrap();
+        ws.staging.clear();
+
+        fs::write(dir.path().join("X"), "new").unwrap();
+        ws.gather(&["X"], &allowlist).unwrap();
+        let new_tree = ws.build_seal_tree(Some(parent_tree)).unwrap();
+
+        let mut files = BTreeMap::new();
+        ws.collect_tree_files(&FsStore::new(&cas), new_tree, "", &mut files)
+            .unwrap();
+        let new_hash = files.get("X").expect("X should exist in new tree");
+        let store = FsStore::new(&cas);
+        let (_, content) = store.load_blob(*new_hash).unwrap();
+        assert_eq!(content, b"new");
+    }
+
+    #[test]
+    fn build_seal_tree_omits_staged_deletions() {
+        // Parent has a, b, c. Stage deletion of b. New tree has a, c only.
+        let (dir, cas) = setup_workspace();
+        fs::write(dir.path().join("a.txt"), "aaa").unwrap();
+        fs::write(dir.path().join("b.txt"), "bbb").unwrap();
+        fs::write(dir.path().join("c.txt"), "ccc").unwrap();
+
+        let allowlist = empty_allowlist(&dir);
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        ws.gather(&["a.txt", "b.txt", "c.txt"], &allowlist).unwrap();
+        let parent_tree = ws.build_seal_tree(None).unwrap();
+        ws.staging.clear();
+
+        ws.staging.stage_deletion("b.txt");
+        let new_tree = ws.build_seal_tree(Some(parent_tree)).unwrap();
+
+        let mut files = BTreeMap::new();
+        ws.collect_tree_files(&FsStore::new(&cas), new_tree, "", &mut files)
+            .unwrap();
+        assert!(files.contains_key("a.txt"));
+        assert!(!files.contains_key("b.txt"), "b.txt should have been removed");
+        assert!(files.contains_key("c.txt"));
+    }
+
+    #[test]
+    fn list_tree_files_returns_full_map() {
+        let (dir, cas) = setup_workspace();
+        fs::write(dir.path().join("a.txt"), "aaa").unwrap();
+        fs::create_dir_all(dir.path().join("nested")).unwrap();
+        fs::write(dir.path().join("nested/b.txt"), "bbb").unwrap();
+
+        let allowlist = empty_allowlist(&dir);
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        ws.gather(&["a.txt", "nested/b.txt"], &allowlist).unwrap();
+        let tree = ws.build_seal_tree(None).unwrap();
+
+        let map = ws.list_tree_files(tree).unwrap();
+        assert!(map.contains_key("a.txt"));
+        assert!(map.contains_key("nested/b.txt"));
+        assert_eq!(map.len(), 2);
     }
 
     #[test]

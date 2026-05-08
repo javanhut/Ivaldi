@@ -9,13 +9,96 @@ use std::path::Path;
 
 use crate::cas::FileCas;
 use crate::fsmerkle::FsStore;
-use crate::git_remote::{self, SmartHttpClient};
-use crate::github::{GitHubClient, GitHubError, TreeEntryCreate, TreeResponse};
+use crate::git_remote::{self, FetchResult, SmartHttpClient};
+use crate::github::{CommitIdentity, GitHubClient, GitHubError, TreeEntryCreate, TreeResponse};
 use crate::hash::B3Hash;
 use crate::ignore;
 use crate::leaf::Leaf;
+use crate::portal::{Portal, Transport};
 use crate::remote::{HashMapping, RemoteBranch};
 use crate::repo::Repo;
+use crate::ssh_transport::SshClient;
+
+/// Read-side dispatch: pick HTTPS or SSH based on a portal's transport, and
+/// expose the small surface that `scout` / `harvest` / `sync` need.
+///
+/// Construct via [`RemoteFetcher::for_portal`]. The HTTPS variant carries an
+/// optional auth token (matching `SmartHttpClient::new`), while the SSH
+/// variant carries the resolved `SshTarget` from `portal.transport()`.
+pub enum RemoteFetcher {
+    Https {
+        token: Option<String>,
+    },
+    Ssh {
+        target: crate::ssh_transport::SshTarget,
+    },
+}
+
+impl RemoteFetcher {
+    /// Build the fetcher matching a portal's transport. The token is used
+    /// only by the HTTPS variant.
+    pub fn for_portal(portal: &Portal, token: Option<&str>) -> Self {
+        match portal.transport() {
+            Transport::Ssh(target) => RemoteFetcher::Ssh { target },
+            // P2P portals can't be served by HTTPS scout/harvest/sync;
+            // those callers should branch on the portal first. Falling
+            // back to HTTPS gives a coherent error path.
+            Transport::Peer(_) | Transport::Https => RemoteFetcher::Https {
+                token: token.map(str::to_string),
+            },
+        }
+    }
+
+    /// List branches of the remote, name-only (no SHAs).
+    pub fn list_branches(
+        &self,
+        owner: &str,
+        repo_name: &str,
+    ) -> Result<Vec<String>, SyncError> {
+        match self {
+            RemoteFetcher::Https { token } => SmartHttpClient::new(token.as_deref())
+                .list_branches(owner, repo_name)
+                .map_err(|e| SyncError::Other(e.to_string())),
+            RemoteFetcher::Ssh { target } => SshClient::new(target.clone())
+                .list_branch_refs()
+                .map(|refs| refs.into_iter().map(|b| b.name).collect())
+                .map_err(|e| SyncError::Other(e.to_string())),
+        }
+    }
+
+    /// List branches with SHAs (for sync-state classification).
+    pub fn list_branch_refs(
+        &self,
+        owner: &str,
+        repo_name: &str,
+    ) -> Result<Vec<RemoteBranch>, SyncError> {
+        match self {
+            RemoteFetcher::Https { token } => SmartHttpClient::new(token.as_deref())
+                .list_branch_refs(owner, repo_name)
+                .map_err(|e| SyncError::Other(e.to_string())),
+            RemoteFetcher::Ssh { target } => SshClient::new(target.clone())
+                .list_branch_refs()
+                .map_err(|e| SyncError::Other(e.to_string())),
+        }
+    }
+
+    /// Fetch a branch's full pack.
+    pub fn fetch_repo(
+        &self,
+        owner: &str,
+        repo_name: &str,
+        branch: Option<&str>,
+    ) -> Result<FetchResult, SyncError> {
+        match self {
+            RemoteFetcher::Https { token } => SmartHttpClient::new(token.as_deref())
+                .fetch_repo(owner, repo_name, branch)
+                .map_err(|e| SyncError::Other(e.to_string())),
+            RemoteFetcher::Ssh { target } => SshClient::new(target.clone())
+                .fetch_repo(branch)
+                .map_err(|e| SyncError::Other(e.to_string())),
+        }
+    }
+}
 
 /// Result of a download (clone) operation.
 #[derive(Debug)]
@@ -56,6 +139,64 @@ pub fn download(
     target_dir: &Path,
     branch: Option<&str>,
 ) -> Result<DownloadResult, SyncError> {
+    download_with_fetch(target_dir, owner, repo_name, |branch| {
+        SmartHttpClient::new(client.token())
+            .fetch_repo(owner, repo_name, branch)
+            .map_err(|e| SyncError::Other(e.to_string()))
+    }, branch)
+}
+
+/// Download a repository from any SSH-reachable Git host into a local
+/// Ivaldi repo. `display_name` is used for "Downloading X..." messaging
+/// and the local portal entry (e.g. `git@github.com:owner/repo.git`).
+pub fn download_ssh(
+    target: &crate::ssh_transport::SshTarget,
+    target_dir: &Path,
+    branch: Option<&str>,
+) -> Result<DownloadResult, SyncError> {
+    let (owner, repo_name) = derive_owner_repo_from_path(&target.repo_path);
+    let target_clone = target.clone();
+    download_with_fetch(target_dir, &owner, &repo_name, move |branch| {
+        crate::ssh_transport::SshClient::new(target_clone.clone())
+            .fetch_repo(branch)
+            .map_err(|e| SyncError::Other(e.to_string()))
+    }, branch)
+}
+
+/// Best-effort split of a remote repo path like `owner/repo.git` into
+/// (owner, repo). For paths that don't fit `owner/repo` (e.g. nested
+/// subgroups like `team/subteam/repo.git` on GitLab), we keep the last two
+/// segments as (owner, repo) and discard the prefix — Ivaldi's local model
+/// is two-level only, and the portal entry will round-trip the original
+/// path.
+fn derive_owner_repo_from_path(path: &str) -> (String, String) {
+    let trimmed = path.trim_start_matches('/').trim_end_matches('/');
+    let stripped = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let parts: Vec<&str> = stripped.split('/').filter(|s| !s.is_empty()).collect();
+    match parts.as_slice() {
+        [] => ("local".to_string(), "repo".to_string()),
+        [single] => ("local".to_string(), (*single).to_string()),
+        many => (
+            many[many.len() - 2].to_string(),
+            many[many.len() - 1].to_string(),
+        ),
+    }
+}
+
+/// Common orchestration: ensure target dir, run the supplied fetch closure,
+/// import the resulting `FetchResult`, materialize, return DownloadResult.
+fn download_with_fetch<F>(
+    target_dir: &Path,
+    owner: &str,
+    repo_name: &str,
+    fetch: F,
+    branch: Option<&str>,
+) -> Result<DownloadResult, SyncError>
+where
+    F: FnOnce(
+        Option<&str>,
+    ) -> Result<crate::git_remote::FetchResult, SyncError>,
+{
     if target_dir.exists()
         && target_dir
             .read_dir()
@@ -71,9 +212,7 @@ pub fn download(
 
     eprintln!("Downloading {}/{}...", owner, repo_name);
     let result = (|| -> Result<DownloadResult, SyncError> {
-        let remote = SmartHttpClient::new(client.token())
-            .fetch_repo(owner, repo_name, branch)
-            .map_err(|e| SyncError::Other(e.to_string()))?;
+        let remote = fetch(branch)?;
 
         crate::forge::forge(target_dir).map_err(|e| SyncError::Other(e.to_string()))?;
         let ivaldi_dir = target_dir.join(".ivaldi");
@@ -89,6 +228,23 @@ pub fn download(
         let mut repo = Repo::open(target_dir).map_err(|e| SyncError::Other(e.to_string()))?;
         let import = git_remote::import_fetch_result(&mut repo, &remote)
             .map_err(|e| SyncError::Other(e.to_string()))?;
+
+        // forge() initialised HEAD to a hardcoded "main"; point it at the
+        // branch we actually fetched so `whereami` and `timeline list` agree
+        // with the working tree. Also materialise the on-disk ref file so the
+        // timeline shows up in tools that scan refs/heads.
+        let ref_path = ivaldi_dir.join("refs/heads").join(&remote.branch);
+        if let Some(parent) = ref_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| SyncError::Other(e.to_string()))?;
+        }
+        if !ref_path.exists() {
+            fs::write(&ref_path, "").map_err(|e| SyncError::Other(e.to_string()))?;
+        }
+        crate::forge::write_head(
+            &ivaldi_dir,
+            &crate::forge::HeadRef::Timeline(remote.branch.clone()),
+        )
+        .map_err(|e| SyncError::Other(e.to_string()))?;
 
         let cas = FileCas::new(ivaldi_dir.join("objects"))
             .map_err(|e| SyncError::Other(e.to_string()))?;
@@ -259,32 +415,42 @@ pub fn upload(
         .map_err(|e| SyncError::Other(e.to_string()))?
         .ok_or_else(|| SyncError::Other("no commits to upload".into()))?;
 
-    let head_leaf = repo
-        .get_leaf(head_idx)
-        .map_err(|e| SyncError::Other(e.to_string()))?
-        .ok_or_else(|| SyncError::Other("corrupt: head leaf not found".into()))?;
-
-    // Build file list from tree
     let cas = FileCas::new(repo.ivaldi_dir.join("objects"))
         .map_err(|e| SyncError::Other(e.to_string()))?;
     let store = FsStore::new(&cas);
 
-    let mut files = BTreeMap::new();
-    collect_tree_files(&store, head_leaf.tree_root, "", &mut files)
-        .map_err(|e| SyncError::Other(e.to_string()))?;
-
     let mut hash_mapping = HashMapping::new(&repo.ivaldi_dir);
-    let total = files.len();
 
-    let tree_entries =
-        upload_blobs_parallel(client, &store, &files, &mut hash_mapping, owner, repo_name)?;
-
-    // Create tree
-    let tree_sha = client
-        .create_tree(owner, repo_name, tree_entries, None)
+    // GitHub's Git Data API returns 409 on every endpoint (blobs included) when
+    // the repo has no initial commit. Detect that up front and seed the repo
+    // via the Contents API so the rest of the upload can proceed.
+    let existing_branches = client
+        .list_branches(owner, repo_name)
         .map_err(SyncError::GitHub)?;
+    let mut bootstrapped = false;
+    if existing_branches.is_empty() {
+        let default_branch = client
+            .get_repo(owner, repo_name)
+            .map(|info| info.default_branch)
+            .unwrap_or_default();
+        let seed_branch = if default_branch.is_empty() {
+            branch_name
+        } else {
+            default_branch.as_str()
+        };
+        client
+            .create_file_contents(
+                owner,
+                repo_name,
+                ".ivaldi-bootstrap",
+                seed_branch,
+                b"Ivaldi bootstrap placeholder. Safe to remove after first upload.\n",
+                "chore: initialize repository for Ivaldi",
+            )
+            .map_err(SyncError::GitHub)?;
+        bootstrapped = true;
+    }
 
-    // Resolve parent commit SHA for the GitHub commit
     let existing_branch_sha = client
         .list_branches(owner, repo_name)
         .ok()
@@ -295,64 +461,305 @@ pub fn upload(
                 .map(|b| b.commit.sha.clone())
         });
 
-    let parents = resolve_github_parent(
-        repo,
-        &head_leaf,
-        &hash_mapping,
-        existing_branch_sha.as_deref(),
-        force,
-    );
+    // After a bootstrap, the seed commit on the branch is not a real ancestor
+    // of our local history, so treat this like a force-push for parent
+    // resolution and ref update to replace the placeholder commit.
+    let effective_force = force || bootstrapped;
     let is_new_branch = existing_branch_sha.is_none();
 
-    // Create commit
-    let commit_sha = client
-        .create_commit(owner, repo_name, &head_leaf.message, &tree_sha, &parents)
-        .map_err(SyncError::GitHub)?;
+    // Walk back from head to the deepest already-mapped ancestor (or root) and
+    // collect the chronological list of unpushed leaves. Each one is replayed
+    // as its own GitHub commit so local history is preserved on the remote.
+    let replay_indices = collect_unpushed_leaves(repo, head_idx, &hash_mapping)
+        .map_err(|e| SyncError::Other(e.to_string()))?;
 
-    // Store mapping: GitHub SHA1 → Ivaldi leaf BLAKE3 hash
-    hash_mapping.insert(&commit_sha, head_leaf.hash());
+    if replay_indices.is_empty() {
+        // Head is already mapped; nothing to push beyond a possible ref move.
+        let head_leaf = repo
+            .get_leaf(head_idx)
+            .map_err(|e| SyncError::Other(e.to_string()))?
+            .ok_or_else(|| SyncError::Other("corrupt: head leaf not found".into()))?;
+        let head_sha = hash_mapping
+            .get_sha1(head_leaf.hash())
+            .map(|s| s.to_string())
+            .ok_or_else(|| SyncError::Other("head leaf unexpectedly unmapped".into()))?;
+        return Ok(UploadResult {
+            files_uploaded: 0,
+            commit_sha: head_sha,
+            branch: branch_name.to_string(),
+        });
+    }
+
+    let mut last_commit_sha = String::new();
+    let mut total_blobs_uploaded = 0usize;
+
+    for (i, &leaf_idx) in replay_indices.iter().enumerate() {
+        let leaf = repo
+            .get_leaf(leaf_idx)
+            .map_err(|e| SyncError::Other(e.to_string()))?
+            .ok_or_else(|| SyncError::Other(format!("corrupt: leaf {} not found", leaf_idx)))?;
+
+        let mut files = BTreeMap::new();
+        collect_tree_files(&store, leaf.tree_root, "", &mut files)
+            .map_err(|e| SyncError::Other(e.to_string()))?;
+
+        let blobs_before = hash_mapping.len();
+        let tree_entries =
+            upload_blobs_parallel(client, &store, &files, &mut hash_mapping, owner, repo_name)?;
+        total_blobs_uploaded += hash_mapping.len().saturating_sub(blobs_before);
+
+        let tree_sha = client
+            .create_tree(owner, repo_name, tree_entries, None)
+            .map_err(SyncError::GitHub)?;
+
+        // Parents: for the first leaf in the chain, defer to existing parent
+        // resolution (existing branch tip / mapped ancestor). For every later
+        // leaf, the parent is whatever we just created in the previous
+        // iteration plus any merge parents already mapped.
+        let parents = if i == 0 {
+            resolve_github_parent(
+                repo,
+                &leaf,
+                &hash_mapping,
+                existing_branch_sha.as_deref(),
+                effective_force,
+            )
+        } else {
+            let mut p = vec![last_commit_sha.clone()];
+            for &midx in &leaf.merge_idxs {
+                if let Ok(Some(merge_leaf)) = repo.get_leaf(midx) {
+                    if let Some(sha) = hash_mapping.get_sha1(merge_leaf.hash()) {
+                        let s = sha.to_string();
+                        if !p.contains(&s) {
+                            p.push(s);
+                        }
+                    }
+                }
+            }
+            p
+        };
+
+        let author_id = identity_for_author(&leaf);
+        let committer_id = identity_for_committer(&leaf);
+
+        let commit_sha = client
+            .create_commit(
+                owner,
+                repo_name,
+                &leaf.message,
+                &tree_sha,
+                &parents,
+                Some(&author_id),
+                Some(&committer_id),
+            )
+            .map_err(SyncError::GitHub)?;
+
+        hash_mapping.insert(&commit_sha, leaf.hash());
+        last_commit_sha = commit_sha;
+    }
+
     hash_mapping
         .save()
         .map_err(|e| SyncError::Other(e.to_string()))?;
 
-    // Update or create branch ref
     if is_new_branch {
         client
-            .create_ref(owner, repo_name, branch_name, &commit_sha)
+            .create_ref(owner, repo_name, branch_name, &last_commit_sha)
             .map_err(SyncError::GitHub)?;
     } else {
         client
-            .update_ref(owner, repo_name, branch_name, &commit_sha, force)
+            .update_ref(
+                owner,
+                repo_name,
+                branch_name,
+                &last_commit_sha,
+                effective_force,
+            )
             .map_err(SyncError::GitHub)?;
     }
 
     Ok(UploadResult {
-        files_uploaded: total,
-        commit_sha,
+        files_uploaded: total_blobs_uploaded,
+        commit_sha: last_commit_sha,
         branch: branch_name.to_string(),
     })
 }
 
-/// Scout — list remote branches without downloading.
+/// Walk from `head_idx` backwards along `prev_idx` and return the chronological
+/// list of leaves whose BLAKE3 is NOT yet in `hash_mapping`. The list is empty
+/// if the head is already mapped.
+fn collect_unpushed_leaves(
+    repo: &Repo,
+    head_idx: u64,
+    hash_mapping: &HashMapping,
+) -> Result<Vec<u64>, crate::repo::RepoError> {
+    let mut chain = Vec::new();
+    let mut cur = Some(head_idx);
+    while let Some(idx) = cur {
+        let leaf = match repo.get_leaf(idx)? {
+            Some(l) => l,
+            None => break,
+        };
+        if hash_mapping.get_sha1(leaf.hash()).is_some() {
+            // First mapped ancestor — stop here.
+            break;
+        }
+        chain.push(idx);
+        cur = if leaf.has_parent() {
+            Some(leaf.prev_idx)
+        } else {
+            None
+        };
+    }
+    chain.reverse();
+    Ok(chain)
+}
+
+/// Build the `author` identity for a GitHub commit from a leaf.
+///
+/// Prefers a per-leaf timezone offset stored in `meta["git.author_tz"]` (set
+/// during import); falls back to UTC.
+fn identity_for_author(leaf: &Leaf) -> CommitIdentity {
+    let (name, email) = split_author(&leaf.author);
+    let tz = leaf
+        .meta
+        .get("git.author_tz")
+        .map(String::as_str)
+        .unwrap_or("+0000");
+    CommitIdentity {
+        name,
+        email,
+        date: format_rfc3339(leaf.time_unix, tz),
+    }
+}
+
+/// Build the `committer` identity for a GitHub commit from a leaf.
+///
+/// Prefers per-leaf committer info stored in `meta` during import; otherwise
+/// reuses the author (matches Git's default when the user only sets one).
+fn identity_for_committer(leaf: &Leaf) -> CommitIdentity {
+    if let (Some(committer), Some(time_str)) = (
+        leaf.meta.get("git.committer"),
+        leaf.meta.get("git.committer_time"),
+    ) {
+        let time = time_str.parse::<i64>().unwrap_or(leaf.time_unix);
+        let tz = leaf
+            .meta
+            .get("git.committer_tz")
+            .map(String::as_str)
+            .unwrap_or("+0000");
+        let (name, email) = split_author(committer);
+        return CommitIdentity {
+            name,
+            email,
+            date: format_rfc3339(time, tz),
+        };
+    }
+    identity_for_author(leaf)
+}
+
+/// Split a `"Name <email>"` string. Tolerates malformed input by returning the
+/// whole string as the name and an empty email.
+fn split_author(s: &str) -> (String, String) {
+    if let Some(open) = s.rfind(" <") {
+        if let Some(close) = s[open..].find('>') {
+            let name = s[..open].trim().to_string();
+            let email = s[open + 2..open + close].to_string();
+            return (name, email);
+        }
+    }
+    (s.to_string(), String::new())
+}
+
+/// Format a unix-second timestamp + git-style timezone offset (e.g. `"+0000"`,
+/// `"-0530"`) as RFC 3339 (`YYYY-MM-DDTHH:MM:SS±HH:MM`).
+///
+/// The offset is applied to the unix instant before splitting into civil
+/// time so `1700000000` + `+0100` formats as `2023-11-14T23:13:20+01:00`.
+fn format_rfc3339(unix_seconds: i64, git_tz: &str) -> String {
+    let (sign, hours, minutes) = parse_git_tz(git_tz);
+    let offset_seconds = sign * (hours as i64 * 3600 + minutes as i64 * 60);
+    let local = unix_seconds + offset_seconds;
+    let (y, mo, d, h, mi, s) = civil_from_unix(local);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
+        y,
+        mo,
+        d,
+        h,
+        mi,
+        s,
+        if sign >= 0 { '+' } else { '-' },
+        hours,
+        minutes,
+    )
+}
+
+/// Parse `"+HHMM"` / `"-HHMM"` into (sign, hours, minutes). Defaults to UTC
+/// (`+0000`) on any parse error.
+fn parse_git_tz(s: &str) -> (i64, u32, u32) {
+    let bytes = s.as_bytes();
+    if bytes.len() != 5 {
+        return (1, 0, 0);
+    }
+    let sign: i64 = match bytes[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return (1, 0, 0),
+    };
+    let h: u32 = std::str::from_utf8(&bytes[1..3])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let m: u32 = std::str::from_utf8(&bytes[3..5])
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (sign, h, m)
+}
+
+/// Convert a unix-second timestamp into civil (year, month, day, hour, min, sec).
+///
+/// Implements Howard Hinnant's days_from_civil inverse for portability without
+/// pulling in a full date crate.
+fn civil_from_unix(unix_seconds: i64) -> (i32, u32, u32, u32, u32, u32) {
+    let days = unix_seconds.div_euclid(86_400);
+    let secs_of_day = unix_seconds.rem_euclid(86_400) as u32;
+    let h = secs_of_day / 3600;
+    let mi = (secs_of_day % 3600) / 60;
+    let s = secs_of_day % 60;
+
+    // Days since 1970-01-01 → civil date (Hinnant).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146_096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let year = (y + if m <= 2 { 1 } else { 0 }) as i32;
+    (year, m, d, h, mi, s)
+}
+
+/// Scout — list remote branches without downloading. Routes through the
+/// portal's transport (HTTPS or SSH).
 pub fn scout(
     client: &GitHubClient,
-    owner: &str,
-    repo_name: &str,
+    portal: &Portal,
 ) -> Result<Vec<String>, SyncError> {
-    SmartHttpClient::new(client.token())
-        .list_branches(owner, repo_name)
-        .map_err(|e| SyncError::Other(e.to_string()))
+    RemoteFetcher::for_portal(portal, client.token())
+        .list_branches(&portal.owner, &portal.repo)
 }
 
 pub fn scout_with_status(
     client: &GitHubClient,
     repo: &Repo,
-    owner: &str,
-    repo_name: &str,
+    portal: &Portal,
 ) -> Result<Vec<RemoteTimelineInfo>, SyncError> {
-    let branches = SmartHttpClient::new(client.token())
-        .list_branch_refs(owner, repo_name)
-        .map_err(|e| SyncError::Other(e.to_string()))?;
+    let branches = RemoteFetcher::for_portal(portal, client.token())
+        .list_branch_refs(&portal.owner, &portal.repo)?;
     let mapping = HashMapping::new(&repo.ivaldi_dir);
 
     Ok(branches
@@ -369,13 +776,11 @@ pub fn scout_with_status(
 pub fn harvest(
     client: &GitHubClient,
     repo: &mut Repo,
-    owner: &str,
-    repo_name: &str,
+    portal: &Portal,
     timeline_names: &[String],
 ) -> Result<Vec<String>, SyncError> {
-    let branches = SmartHttpClient::new(client.token())
-        .list_branch_refs(owner, repo_name)
-        .map_err(|e| SyncError::Other(e.to_string()))?;
+    let fetcher = RemoteFetcher::for_portal(portal, client.token());
+    let branches = fetcher.list_branch_refs(&portal.owner, &portal.repo)?;
     let mapping = HashMapping::new(&repo.ivaldi_dir);
 
     let mut harvested = Vec::new();
@@ -396,15 +801,17 @@ pub fn harvest(
             RemoteTimelineState::LocalOnly => eprintln!("  Local state: local only"),
         }
 
-        let fetch = SmartHttpClient::new(client.token())
-            .fetch_repo(owner, repo_name, Some(target_name))
-            .map_err(|e| SyncError::Other(e.to_string()))?;
+        let fetch = fetcher.fetch_repo(&portal.owner, &portal.repo, Some(target_name))?;
         let import = git_remote::import_fetch_result(repo, &fetch)
             .map_err(|e| SyncError::Other(e.to_string()))?;
-        eprintln!(
-            "  {} commits imported, {} skipped",
-            import.commits_imported, import.commits_skipped
-        );
+        if import.commits_skipped > 0 {
+            eprintln!(
+                "  {} new commits imported ({} already present)",
+                import.commits_imported, import.commits_skipped
+            );
+        } else {
+            eprintln!("  {} commits imported", import.commits_imported);
+        }
 
         harvested.push(target_name.clone());
     }
@@ -2289,5 +2696,176 @@ mod tests {
             err.contains("security-blocked"),
             "expected security-blocked error, got: {err}"
         );
+    }
+
+    // -- Commit fidelity helpers --
+
+    #[test]
+    fn split_author_separates_name_and_email() {
+        let (n, e) = split_author("Jane Doe <jane@example.com>");
+        assert_eq!(n, "Jane Doe");
+        assert_eq!(e, "jane@example.com");
+    }
+
+    #[test]
+    fn split_author_handles_missing_email() {
+        let (n, e) = split_author("Jane Doe");
+        assert_eq!(n, "Jane Doe");
+        assert_eq!(e, "");
+    }
+
+    #[test]
+    fn format_rfc3339_utc() {
+        // 1700000000 → 2023-11-14T22:13:20 UTC
+        assert_eq!(
+            format_rfc3339(1_700_000_000, "+0000"),
+            "2023-11-14T22:13:20+00:00"
+        );
+    }
+
+    #[test]
+    fn format_rfc3339_positive_offset_shifts_civil_time() {
+        // +01:00 shifts the wall clock forward by an hour.
+        assert_eq!(
+            format_rfc3339(1_700_000_000, "+0100"),
+            "2023-11-14T23:13:20+01:00"
+        );
+    }
+
+    #[test]
+    fn format_rfc3339_negative_offset_shifts_civil_time() {
+        // -05:30 shifts the wall clock backwards by 5h30m.
+        assert_eq!(
+            format_rfc3339(1_700_000_000, "-0530"),
+            "2023-11-14T16:43:20-05:30"
+        );
+    }
+
+    #[test]
+    fn format_rfc3339_epoch() {
+        assert_eq!(
+            format_rfc3339(0, "+0000"),
+            "1970-01-01T00:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn identity_for_author_uses_leaf_meta_tz_when_present() {
+        let mut leaf = Leaf::new(
+            B3Hash::digest(b"t"),
+            "main",
+            "Jane Doe <jane@example.com>",
+            1_700_000_000,
+            "msg",
+        );
+        leaf.meta.insert("git.author_tz".into(), "+0530".into());
+        let id = identity_for_author(&leaf);
+        assert_eq!(id.name, "Jane Doe");
+        assert_eq!(id.email, "jane@example.com");
+        assert!(id.date.ends_with("+05:30"), "got: {}", id.date);
+    }
+
+    #[test]
+    fn identity_for_committer_prefers_leaf_meta() {
+        let mut leaf = Leaf::new(
+            B3Hash::digest(b"t"),
+            "main",
+            "Author <a@x.com>",
+            1_700_000_000,
+            "msg",
+        );
+        leaf.meta
+            .insert("git.committer".into(), "Bob <bob@x.com>".into());
+        leaf.meta
+            .insert("git.committer_time".into(), "1700001000".into());
+        leaf.meta.insert("git.committer_tz".into(), "+0100".into());
+
+        let id = identity_for_committer(&leaf);
+        assert_eq!(id.name, "Bob");
+        assert_eq!(id.email, "bob@x.com");
+        assert!(id.date.ends_with("+01:00"), "got: {}", id.date);
+        // 1700001000 = 2023-11-14T22:30:00Z → at +01:00 = 23:30:00
+        assert_eq!(id.date, "2023-11-14T23:30:00+01:00");
+    }
+
+    #[test]
+    fn identity_for_committer_falls_back_to_author_when_meta_missing() {
+        let leaf = Leaf::new(
+            B3Hash::digest(b"t"),
+            "main",
+            "Solo <solo@x.com>",
+            1_700_000_000,
+            "msg",
+        );
+        let id = identity_for_committer(&leaf);
+        assert_eq!(id.name, "Solo");
+        assert_eq!(id.email, "solo@x.com");
+    }
+
+    // -- Multi-commit walk --
+
+    #[test]
+    fn collect_unpushed_leaves_returns_full_chain_when_nothing_mapped() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let mut repo = Repo::open(dir.path()).unwrap();
+
+        let a = repo
+            .commit(B3Hash::digest(b"ta"), "author <a@x>", "A")
+            .unwrap();
+        let b = repo
+            .commit(B3Hash::digest(b"tb"), "author <a@x>", "B")
+            .unwrap();
+        let c = repo
+            .commit(B3Hash::digest(b"tc"), "author <a@x>", "C")
+            .unwrap();
+
+        let mapping = HashMapping::new(&repo.ivaldi_dir);
+        let chain = collect_unpushed_leaves(&repo, c.index, &mapping).unwrap();
+        // Chronological: A, B, C
+        assert_eq!(chain, vec![a.index, b.index, c.index]);
+    }
+
+    #[test]
+    fn collect_unpushed_leaves_stops_at_mapped_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let mut repo = Repo::open(dir.path()).unwrap();
+
+        let a = repo
+            .commit(B3Hash::digest(b"ta"), "author <a@x>", "A")
+            .unwrap();
+        let b = repo
+            .commit(B3Hash::digest(b"tb"), "author <a@x>", "B")
+            .unwrap();
+        let c = repo
+            .commit(B3Hash::digest(b"tc"), "author <a@x>", "C")
+            .unwrap();
+
+        // Pretend A was already pushed to GitHub.
+        let mut mapping = HashMapping::new(&repo.ivaldi_dir);
+        let a_leaf = repo.get_leaf(a.index).unwrap().unwrap();
+        mapping.insert("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", a_leaf.hash());
+
+        let chain = collect_unpushed_leaves(&repo, c.index, &mapping).unwrap();
+        // Replay only the unpushed suffix in chronological order.
+        assert_eq!(chain, vec![b.index, c.index]);
+    }
+
+    #[test]
+    fn collect_unpushed_leaves_empty_when_head_already_mapped() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let mut repo = Repo::open(dir.path()).unwrap();
+
+        let a = repo
+            .commit(B3Hash::digest(b"ta"), "author <a@x>", "A")
+            .unwrap();
+        let mut mapping = HashMapping::new(&repo.ivaldi_dir);
+        let a_leaf = repo.get_leaf(a.index).unwrap().unwrap();
+        mapping.insert("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", a_leaf.hash());
+
+        let chain = collect_unpushed_leaves(&repo, a.index, &mapping).unwrap();
+        assert!(chain.is_empty());
     }
 }

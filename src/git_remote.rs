@@ -6,16 +6,29 @@
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 
+use base64::Engine;
 use flate2::Compression;
 use flate2::bufread::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use indicatif::MultiProgress;
+use rayon::prelude::*;
 
 use crate::hash::B3Hash;
 use crate::progress;
 use crate::remote::RemoteBranch;
 
 const GITHUB_BASE: &str = "https://github.com";
+
+/// Build an HTTP Basic auth header for a GitHub token.
+///
+/// GitHub's smart-HTTP git endpoints (`github.com/.../info/refs`,
+/// `git-upload-pack`) accept tokens via Basic auth with `x-access-token` as the
+/// username. Bearer tokens work for `api.github.com` but are not consistently
+/// accepted on the git endpoints, so we use Basic here.
+fn basic_auth_header(token: &str) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{}", token));
+    format!("Basic {}", encoded)
+}
 
 #[derive(Debug, Clone)]
 pub struct AdvertisedRef {
@@ -52,6 +65,11 @@ pub struct ParsedCommit {
     pub author_name: String,
     pub author_email: String,
     pub author_time: i64,
+    pub author_tz: String,
+    pub committer_name: String,
+    pub committer_email: String,
+    pub committer_time: i64,
+    pub committer_tz: String,
     pub message: String,
 }
 
@@ -69,10 +87,12 @@ pub struct SmartHttpClient {
 
 impl SmartHttpClient {
     pub fn new(token: Option<&str>) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(std::time::Duration::from_secs(30))
-            .timeout_read(std::time::Duration::from_secs(120))
-            .build();
+        let agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(std::time::Duration::from_secs(30)))
+            .timeout_recv_response(Some(std::time::Duration::from_secs(120)))
+            .http_status_as_error(false)
+            .build()
+            .new_agent();
         Self {
             token: token.map(str::to_string),
             agent,
@@ -87,64 +107,7 @@ impl SmartHttpClient {
     ) -> Result<FetchResult, GitRemoteError> {
         let base = format!("{}/{}/{}.git", GITHUB_BASE, owner, repo);
         let discovery = self.discover_refs(&base)?;
-        let explicit_branch = branch.is_some();
-        let requested_branch = branch.map(str::to_string);
-        let wanted_ref = requested_branch
-            .as_deref()
-            .map(|name| {
-                if name.starts_with("refs/") {
-                    name.to_string()
-                } else {
-                    format!("refs/heads/{}", name)
-                }
-            })
-            .or_else(|| {
-                discovery
-                    .default_branch
-                    .as_ref()
-                    .map(|name| format!("refs/heads/{}", name))
-            });
-
-        let head_ref = discovery.refs.iter().find(|r| r.name == "HEAD");
-        let selected = wanted_ref
-            .as_ref()
-            .and_then(|name| discovery.refs.iter().find(|r| r.name == *name))
-            .cloned()
-            .or_else(|| {
-                if explicit_branch {
-                    None
-                } else {
-                    head_ref.cloned()
-                }
-            })
-            .ok_or_else(|| {
-                requested_branch
-                    .clone()
-                    .map(GitRemoteError::BranchNotFound)
-                    .unwrap_or_else(|| {
-                        GitRemoteError::Protocol(
-                            "remote did not advertise a usable default ref".into(),
-                        )
-                    })
-            })?;
-
-        let branch_name = if selected.name == "HEAD" {
-            discovery
-                .refs
-                .iter()
-                .find(|r| r.name.starts_with("refs/heads/") && r.id == selected.id)
-                .and_then(|r| r.name.strip_prefix("refs/heads/"))
-                .unwrap_or("HEAD")
-                .to_string()
-        } else {
-            selected
-                .name
-                .strip_prefix("refs/heads/")
-                .unwrap_or(&selected.name)
-                .to_string()
-        };
-        let head_sha = selected.id.clone();
-
+        let (branch_name, head_sha) = select_branch_from_discovery(&discovery, branch)?;
         let pack = self.fetch_pack(&base, &head_sha)?;
         let objects = parse_packfile(&pack)?;
 
@@ -189,24 +152,54 @@ impl SmartHttpClient {
     fn discover_refs(&self, base: &str) -> Result<Discovery, GitRemoteError> {
         let pb = progress::spinner("Discovering remote refs");
         let url = format!("{}/info/refs?service=git-upload-pack", base);
-        let mut req = self
-            .agent
-            .get(&url)
-            .set("Accept", "application/x-git-upload-pack-advertisement")
-            .set("User-Agent", "ivaldi-vcs/0.1.0");
-        if let Some(token) = &self.token {
-            req = req.set("Authorization", &format!("Bearer {}", token));
-        }
+        let do_call = |token: Option<&str>| -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+            let mut r = self
+                .agent
+                .get(&url)
+                .header("Accept", "application/x-git-upload-pack-advertisement")
+                .header("User-Agent", "ivaldi-vcs/0.1.0");
+            if let Some(t) = token {
+                r = r.header("Authorization", basic_auth_header(t));
+            }
+            r.call()
+        };
 
-        let resp = match req.call() {
-            Ok(resp) => resp,
+        let resp = match do_call(self.token.as_deref()) {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    if self.token.is_some() && is_auth_failure(&resp) {
+                        crate::logging::warn(
+                            "GitHub rejected the stored authentication token — retrying anonymously",
+                        );
+                        match do_call(None) {
+                            Ok(resp2) => {
+                                if !resp2.status().is_success() {
+                                    pb.finish_and_clear();
+                                    return Err(token_rejected_or(resp2));
+                                }
+                                resp2
+                            }
+                            Err(e2) => {
+                                pb.finish_and_clear();
+                                return Err(map_transport_error(e2));
+                            }
+                        }
+                    } else {
+                        pb.finish_and_clear();
+                        return Err(map_response_error(resp));
+                    }
+                } else {
+                    resp
+                }
+            }
             Err(err) => {
                 pb.finish_and_clear();
-                return Err(map_http_error(err));
+                return Err(map_transport_error(err));
             }
         };
         let mut bytes = Vec::new();
-        resp.into_reader()
+        resp.into_body()
+            .into_reader()
             .read_to_end(&mut bytes)
             .map_err(|e| GitRemoteError::Io(e.to_string()))?;
         pb.finish_with_message("Remote refs discovered");
@@ -222,25 +215,54 @@ impl SmartHttpClient {
         body.extend_from_slice(b"0000");
         body.extend(pkt_line("done\n"));
 
-        let mut req = self
-            .agent
-            .post(&url)
-            .set("Content-Type", "application/x-git-upload-pack-request")
-            .set("Accept", "application/x-git-upload-pack-result")
-            .set("User-Agent", "ivaldi-vcs/0.1.0");
-        if let Some(token) = &self.token {
-            req = req.set("Authorization", &format!("Bearer {}", token));
-        }
+        let do_call = |token: Option<&str>, body: &[u8]| -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+            let mut r = self
+                .agent
+                .post(&url)
+                .header("Content-Type", "application/x-git-upload-pack-request")
+                .header("Accept", "application/x-git-upload-pack-result")
+                .header("User-Agent", "ivaldi-vcs/0.1.0");
+            if let Some(t) = token {
+                r = r.header("Authorization", basic_auth_header(t));
+            }
+            r.send(body)
+        };
 
-        let resp = req.send_bytes(&body).map_err(map_http_error)?;
+        let resp = match do_call(self.token.as_deref(), &body) {
+            Ok(resp) => {
+                if !resp.status().is_success() {
+                    if self.token.is_some() && is_auth_failure(&resp) {
+                        crate::logging::warn(
+                            "GitHub rejected the stored authentication token — retrying anonymously",
+                        );
+                        match do_call(None, &body) {
+                            Ok(resp2) => {
+                                if !resp2.status().is_success() {
+                                    return Err(token_rejected_or(resp2));
+                                }
+                                resp2
+                            }
+                            Err(e2) => return Err(map_transport_error(e2)),
+                        }
+                    } else {
+                        return Err(map_response_error(resp));
+                    }
+                } else {
+                    resp
+                }
+            }
+            Err(err) => return Err(map_transport_error(err)),
+        };
         let total = resp
-            .header("Content-Length")
+            .headers()
+            .get("Content-Length")
+            .and_then(|h| h.to_str().ok())
             .and_then(|h| h.parse::<u64>().ok());
         let pb = total
             .map(|len| progress::byte_bar(len, "Downloading pack"))
             .unwrap_or_else(|| progress::spinner("Downloading pack"));
         let mut bytes = Vec::new();
-        let mut reader = resp.into_reader();
+        let mut reader = resp.into_body().into_reader();
         let mut chunk = [0u8; 8192];
         loop {
             let n = reader
@@ -262,38 +284,142 @@ impl SmartHttpClient {
 }
 
 #[derive(Debug)]
-struct Discovery {
-    refs: Vec<AdvertisedRef>,
-    default_branch: Option<String>,
+pub(crate) struct Discovery {
+    pub(crate) refs: Vec<AdvertisedRef>,
+    pub(crate) default_branch: Option<String>,
 }
 
-fn map_http_error(err: ureq::Error) -> GitRemoteError {
-    match err {
-        ureq::Error::Status(status, resp) => {
-            let mut body = String::new();
-            let mut reader = resp.into_reader();
-            let _ = reader.read_to_string(&mut body);
-            match status {
-                401 => GitRemoteError::AuthRequired,
-                404 => GitRemoteError::RepoUnavailable,
-                _ => GitRemoteError::Http {
-                    status,
-                    message: body.trim().to_string(),
-                },
-            }
-        }
-        ureq::Error::Transport(e) => GitRemoteError::Io(e.to_string()),
+fn header_value<'a>(resp: &'a ureq::http::Response<ureq::Body>, name: &str) -> Option<&'a str> {
+    resp.headers().get(name).and_then(|v| v.to_str().ok())
+}
+
+/// True for status codes that suggest the token was the problem, not the repo.
+fn is_auth_failure(resp: &ureq::http::Response<ureq::Body>) -> bool {
+    let status = resp.status().as_u16();
+    if status == 401 {
+        return true;
+    }
+    if status == 403 {
+        // 403 with rate-limit headers is NOT an auth failure; retrying
+        // anonymously would hit the same (or stricter) limit.
+        return header_value(resp, "X-RateLimit-Remaining") != Some("0");
+    }
+    false
+}
+
+/// Mapper used after an anonymous retry that followed a stored-token rejection.
+/// A 401 here means the repo also requires auth, so the actionable problem is
+/// the rejected stored token — surface that explicitly instead of the generic
+/// "authentication required" the second 401 would otherwise produce.
+fn token_rejected_or(resp: ureq::http::Response<ureq::Body>) -> GitRemoteError {
+    if resp.status().as_u16() == 401 {
+        return GitRemoteError::TokenRejected;
+    }
+    map_response_error(resp)
+}
+
+fn map_response_error(resp: ureq::http::Response<ureq::Body>) -> GitRemoteError {
+    let status = resp.status().as_u16();
+    // Detect rate-limiting before consuming the body.
+    if status == 403 && header_value(&resp, "X-RateLimit-Remaining") == Some("0") {
+        let reset_at = header_value(&resp, "X-RateLimit-Reset")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        return GitRemoteError::RateLimited { reset_at };
+    }
+    let mut body = String::new();
+    let _ = resp.into_body().into_reader().read_to_string(&mut body);
+    match status {
+        401 => GitRemoteError::AuthRequired,
+        404 => GitRemoteError::RepoUnavailable,
+        _ => GitRemoteError::Http {
+            status,
+            message: body.trim().to_string(),
+        },
     }
 }
 
-fn pkt_line(payload: &str) -> Vec<u8> {
+fn map_transport_error(err: ureq::Error) -> GitRemoteError {
+    GitRemoteError::Io(err.to_string())
+}
+
+pub(crate) fn pkt_line(payload: &str) -> Vec<u8> {
     let len = payload.len() + 4;
     let mut out = format!("{:04x}", len).into_bytes();
     out.extend_from_slice(payload.as_bytes());
     out
 }
 
-fn parse_discovery(data: &[u8]) -> Result<Discovery, GitRemoteError> {
+/// Pick the (branch_name, head_sha) we want to fetch from a parsed
+/// advertisement. Shared by every transport (HTTPS, SSH, future ivaldi://).
+///
+/// `requested_branch` may be `None` (use the default branch / HEAD), a short
+/// name like `main`, or a full ref like `refs/heads/main`. Returns
+/// `BranchNotFound` if an explicit branch was asked for but isn't advertised.
+pub(crate) fn select_branch_from_discovery(
+    discovery: &Discovery,
+    requested_branch: Option<&str>,
+) -> Result<(String, String), GitRemoteError> {
+    let explicit_branch = requested_branch.is_some();
+    let requested_owned = requested_branch.map(str::to_string);
+    let wanted_ref = requested_owned
+        .as_deref()
+        .map(|name| {
+            if name.starts_with("refs/") {
+                name.to_string()
+            } else {
+                format!("refs/heads/{}", name)
+            }
+        })
+        .or_else(|| {
+            discovery
+                .default_branch
+                .as_ref()
+                .map(|name| format!("refs/heads/{}", name))
+        });
+
+    let head_ref = discovery.refs.iter().find(|r| r.name == "HEAD");
+    let selected = wanted_ref
+        .as_ref()
+        .and_then(|name| discovery.refs.iter().find(|r| r.name == *name))
+        .cloned()
+        .or_else(|| {
+            if explicit_branch {
+                None
+            } else {
+                head_ref.cloned()
+            }
+        })
+        .ok_or_else(|| {
+            requested_owned
+                .clone()
+                .map(GitRemoteError::BranchNotFound)
+                .unwrap_or_else(|| {
+                    GitRemoteError::Protocol(
+                        "remote did not advertise a usable default ref".into(),
+                    )
+                })
+        })?;
+
+    let branch_name = if selected.name == "HEAD" {
+        discovery
+            .refs
+            .iter()
+            .find(|r| r.name.starts_with("refs/heads/") && r.id == selected.id)
+            .and_then(|r| r.name.strip_prefix("refs/heads/"))
+            .unwrap_or("HEAD")
+            .to_string()
+    } else {
+        selected
+            .name
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&selected.name)
+            .to_string()
+    };
+    Ok((branch_name, selected.id.clone()))
+}
+
+pub(crate) fn parse_discovery(data: &[u8]) -> Result<Discovery, GitRemoteError> {
     let lines = parse_pkt_lines(data)?;
     if lines.is_empty() {
         return Err(GitRemoteError::Protocol("empty ref advertisement".into()));
@@ -382,7 +508,7 @@ fn parse_pkt_lines(data: &[u8]) -> Result<Vec<Option<Vec<u8>>>, GitRemoteError> 
     Ok(out)
 }
 
-fn extract_pack_from_upload_pack(data: &[u8]) -> Result<Vec<u8>, GitRemoteError> {
+pub(crate) fn extract_pack_from_upload_pack(data: &[u8]) -> Result<Vec<u8>, GitRemoteError> {
     let mut pack = Vec::new();
     for line in parse_pkt_lines(data)? {
         let Some(line) = line else { continue };
@@ -427,7 +553,9 @@ struct PackedEntry {
     data: Vec<u8>,
 }
 
-fn parse_packfile(data: &[u8]) -> Result<HashMap<String, GitObject>, GitRemoteError> {
+pub(crate) fn parse_packfile(
+    data: &[u8],
+) -> Result<HashMap<String, GitObject>, GitRemoteError> {
     if data.len() < 12 || &data[..4] != b"PACK" {
         return Err(GitRemoteError::Protocol("invalid packfile header".into()));
     }
@@ -482,73 +610,109 @@ fn parse_packfile(data: &[u8]) -> Result<HashMap<String, GitObject>, GitRemoteEr
         });
     }
 
-    let mut by_offset = HashMap::new();
-    for entry in entries {
-        by_offset.insert(entry.offset, entry);
-    }
-
-    let offsets: Vec<usize> = by_offset.keys().copied().collect();
-    let mut resolved = HashMap::new();
-    for offset in offsets {
-        resolve_object(offset, &by_offset, &mut resolved)?;
-    }
-    Ok(resolved)
+    resolve_pack_entries(entries)
 }
 
-fn resolve_object(
-    offset: usize,
-    entries: &HashMap<usize, PackedEntry>,
-    resolved: &mut HashMap<String, GitObject>,
-) -> Result<(String, GitObject), GitRemoteError> {
-    let entry = entries.get(&offset).ok_or_else(|| {
-        GitRemoteError::Protocol(format!("missing pack entry at offset {}", offset))
-    })?;
+/// Resolve all pack entries (bases + delta chains) into a `sha → GitObject`
+/// map using parallel waves. Each wave contains entries whose parent has
+/// already been resolved, so SHA-1 + delta apply run on multiple cores.
+fn resolve_pack_entries(
+    entries: Vec<PackedEntry>,
+) -> Result<HashMap<String, GitObject>, GitRemoteError> {
+    let n = entries.len();
+    let entry_idx_by_offset: HashMap<usize, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.offset, i))
+        .collect();
 
-    match &entry.kind {
-        PackedKind::Base(kind) => {
-            let sha = git_object_id(*kind, &entry.data);
-            if let Some(existing) = resolved.get(&sha) {
-                return Ok((sha, existing.clone()));
-            }
-            let object = GitObject {
-                kind: *kind,
-                data: entry.data.clone(),
+    // Slot per entry, populated as its wave completes.
+    let mut slot: Vec<Option<(Vec<u8>, String, GitObjectKind)>> =
+        (0..n).map(|_| None).collect();
+    let mut sha_to_idx: HashMap<String, usize> = HashMap::with_capacity(n);
+
+    // Wave 0: all base objects, hashed in parallel.
+    let base_indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| matches!(e.kind, PackedKind::Base(_)).then_some(i))
+        .collect();
+
+    let base_outputs: Vec<(usize, String, GitObjectKind)> = base_indices
+        .par_iter()
+        .map(|&i| {
+            let e = &entries[i];
+            let kind = match e.kind {
+                PackedKind::Base(k) => k,
+                _ => unreachable!(),
             };
-            resolved.insert(sha.clone(), object.clone());
-            Ok((sha, object))
-        }
-        PackedKind::OfsDelta { base_offset } => {
-            let (base_sha, base_obj) = resolve_object(*base_offset, entries, resolved)?;
-            let _ = base_sha;
-            let data = apply_delta(&base_obj.data, &entry.data)?;
-            let sha = git_object_id(base_obj.kind, &data);
-            if let Some(existing) = resolved.get(&sha) {
-                return Ok((sha, existing.clone()));
-            }
-            let object = GitObject {
-                kind: base_obj.kind,
-                data,
-            };
-            resolved.insert(sha.clone(), object.clone());
-            Ok((sha, object))
-        }
-        PackedKind::RefDelta { base_sha } => {
-            let base_obj = resolved.get(base_sha).cloned().ok_or_else(|| {
-                GitRemoteError::Protocol(format!("missing ref-delta base {}", base_sha))
-            })?;
-            let data = apply_delta(&base_obj.data, &entry.data)?;
-            let sha = git_object_id(base_obj.kind, &data);
-            if let Some(existing) = resolved.get(&sha) {
-                return Ok((sha, existing.clone()));
-            }
-            let object = GitObject {
-                kind: base_obj.kind,
-                data,
-            };
-            resolved.insert(sha.clone(), object.clone());
-            Ok((sha, object))
-        }
+            let sha = git_object_id(kind, &e.data);
+            (i, sha, kind)
+        })
+        .collect();
+
+    for (i, sha, kind) in base_outputs {
+        sha_to_idx.entry(sha.clone()).or_insert(i);
+        slot[i] = Some((entries[i].data.clone(), sha, kind));
     }
+
+    let mut remaining: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| (!matches!(e.kind, PackedKind::Base(_))).then_some(i))
+        .collect();
+
+    while !remaining.is_empty() {
+        // Partition into entries whose parent is already resolved (ready)
+        // vs. entries that need a later wave (deferred).
+        let (ready, deferred): (Vec<usize>, Vec<usize>) =
+            remaining.iter().copied().partition(|&i| match &entries[i].kind {
+                PackedKind::OfsDelta { base_offset } => entry_idx_by_offset
+                    .get(base_offset)
+                    .is_some_and(|&pi| slot[pi].is_some()),
+                PackedKind::RefDelta { base_sha } => sha_to_idx
+                    .get(base_sha)
+                    .is_some_and(|&pi| slot[pi].is_some()),
+                PackedKind::Base(_) => true,
+            });
+
+        if ready.is_empty() {
+            return Err(GitRemoteError::Protocol(
+                "unresolvable delta chain in packfile".into(),
+            ));
+        }
+
+        let outputs: Result<Vec<(usize, Vec<u8>, String, GitObjectKind)>, GitRemoteError> = ready
+            .par_iter()
+            .map(|&i| {
+                let e = &entries[i];
+                let parent_idx = match &e.kind {
+                    PackedKind::OfsDelta { base_offset } => entry_idx_by_offset[base_offset],
+                    PackedKind::RefDelta { base_sha } => sha_to_idx[base_sha],
+                    PackedKind::Base(_) => unreachable!(),
+                };
+                let (parent_data, _, parent_kind) = slot[parent_idx].as_ref().unwrap();
+                let data = apply_delta(parent_data, &e.data)?;
+                let sha = git_object_id(*parent_kind, &data);
+                Ok((i, data, sha, *parent_kind))
+            })
+            .collect();
+        let outputs = outputs?;
+
+        for (i, data, sha, kind) in outputs {
+            sha_to_idx.entry(sha.clone()).or_insert(i);
+            slot[i] = Some((data, sha, kind));
+        }
+
+        remaining = deferred;
+    }
+
+    let mut out = HashMap::with_capacity(n);
+    for opt in slot.into_iter() {
+        let (data, sha, kind) = opt.expect("every entry resolved");
+        out.entry(sha).or_insert(GitObject { kind, data });
+    }
+    Ok(out)
 }
 
 fn parse_object_header(data: &[u8]) -> Result<(u8, usize, usize), GitRemoteError> {
@@ -607,7 +771,7 @@ fn inflate_from(data: &[u8]) -> Result<(Vec<u8>, usize), GitRemoteError> {
     Ok((out, consumed))
 }
 
-fn git_object_id(kind: GitObjectKind, data: &[u8]) -> String {
+pub(crate) fn git_object_id(kind: GitObjectKind, data: &[u8]) -> String {
     let kind_name = match kind {
         GitObjectKind::Commit => "commit",
         GitObjectKind::Tree => "tree",
@@ -701,64 +865,10 @@ fn read_varint(data: &[u8], cursor: &mut usize) -> Result<usize, GitRemoteError>
 }
 
 fn sha1_digest(data: &[u8]) -> [u8; 20] {
-    let mut h0: u32 = 0x67452301;
-    let mut h1: u32 = 0xefcdab89;
-    let mut h2: u32 = 0x98badcfe;
-    let mut h3: u32 = 0x10325476;
-    let mut h4: u32 = 0xc3d2e1f0;
-
-    let bit_len = (data.len() as u64) * 8;
-    let mut padded = data.to_vec();
-    padded.push(0x80);
-    while (padded.len() % 64) != 56 {
-        padded.push(0);
-    }
-    padded.extend_from_slice(&bit_len.to_be_bytes());
-
-    for chunk in padded.chunks_exact(64) {
-        let mut w = [0u32; 80];
-        for (i, bytes) in chunk.chunks_exact(4).enumerate().take(16) {
-            w[i] = u32::from_be_bytes(bytes.try_into().unwrap());
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-
-        let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
-        for (i, word) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5a827999),
-                20..=39 => (b ^ c ^ d, 0x6ed9eba1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
-                _ => (b ^ c ^ d, 0xca62c1d6),
-            };
-            let temp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(*word);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = temp;
-        }
-
-        h0 = h0.wrapping_add(a);
-        h1 = h1.wrapping_add(b);
-        h2 = h2.wrapping_add(c);
-        h3 = h3.wrapping_add(d);
-        h4 = h4.wrapping_add(e);
-    }
-
-    let mut out = [0u8; 20];
-    out[..4].copy_from_slice(&h0.to_be_bytes());
-    out[4..8].copy_from_slice(&h1.to_be_bytes());
-    out[8..12].copy_from_slice(&h2.to_be_bytes());
-    out[12..16].copy_from_slice(&h3.to_be_bytes());
-    out[16..20].copy_from_slice(&h4.to_be_bytes());
-    out
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(data);
+    hasher.finalize().into()
 }
 
 pub fn parse_commit(data: &[u8]) -> Result<ParsedCommit, GitRemoteError> {
@@ -768,9 +878,8 @@ pub fn parse_commit(data: &[u8]) -> Result<ParsedCommit, GitRemoteError> {
 
     let mut tree = None;
     let mut parents = Vec::new();
-    let mut author_name = String::new();
-    let mut author_email = String::new();
-    let mut author_time = 0i64;
+    let mut author = (String::new(), String::new(), 0i64, String::new());
+    let mut committer = (String::new(), String::new(), 0i64, String::new());
 
     for line in headers.lines() {
         if let Some(value) = line.strip_prefix("tree ") {
@@ -778,26 +887,51 @@ pub fn parse_commit(data: &[u8]) -> Result<ParsedCommit, GitRemoteError> {
         } else if let Some(value) = line.strip_prefix("parent ") {
             parents.push(value.to_string());
         } else if let Some(value) = line.strip_prefix("author ") {
-            if let Some((prefix, _tz)) = value.rsplit_once(' ') {
-                if let Some((identity, timestamp)) = prefix.rsplit_once(' ') {
-                    author_time = timestamp.parse().unwrap_or(0);
-                    if let Some((name, email)) = identity.rsplit_once(" <") {
-                        author_name = name.to_string();
-                        author_email = email.trim_end_matches('>').to_string();
-                    }
-                }
-            }
+            author = parse_identity_line(value);
+        } else if let Some(value) = line.strip_prefix("committer ") {
+            committer = parse_identity_line(value);
         }
+    }
+
+    // If a commit object only has an author line (rare but possible in
+    // hand-crafted fixtures), fall back to mirroring author into committer.
+    if committer.0.is_empty() && committer.1.is_empty() && committer.2 == 0 {
+        committer = author.clone();
     }
 
     Ok(ParsedCommit {
         tree: tree.ok_or_else(|| GitRemoteError::Protocol("commit missing tree".into()))?,
         parents,
-        author_name,
-        author_email,
-        author_time,
+        author_name: author.0,
+        author_email: author.1,
+        author_time: author.2,
+        author_tz: author.3,
+        committer_name: committer.0,
+        committer_email: committer.1,
+        committer_time: committer.2,
+        committer_tz: committer.3,
         message: message.to_string(),
     })
+}
+
+/// Parse the value portion of a Git `author`/`committer` header line
+/// (`Name <email> <unix-seconds> <±HHMM>`).
+fn parse_identity_line(value: &str) -> (String, String, i64, String) {
+    let mut name = String::new();
+    let mut email = String::new();
+    let mut time = 0i64;
+    let mut tz = String::new();
+    if let Some((prefix, tz_part)) = value.rsplit_once(' ') {
+        tz = tz_part.to_string();
+        if let Some((identity, timestamp)) = prefix.rsplit_once(' ') {
+            time = timestamp.parse().unwrap_or(0);
+            if let Some((n, e)) = identity.rsplit_once(" <") {
+                name = n.to_string();
+                email = e.trim_end_matches('>').to_string();
+            }
+        }
+    }
+    (name, email, time, tz)
 }
 
 pub fn parse_tree(data: &[u8]) -> Result<Vec<TreeEntry>, GitRemoteError> {
@@ -877,12 +1011,20 @@ fn encode_object_header(kind: GitObjectKind, size: usize) -> Vec<u8> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum GitRemoteError {
-    #[error("authentication required")]
+    #[error("authentication required — run 'ivaldi auth login' or set GITHUB_TOKEN")]
     AuthRequired,
+    #[error(
+        "GitHub rejected the stored authentication token. Run 'ivaldi auth logout && ivaldi auth login' to re-authenticate."
+    )]
+    TokenRejected,
     #[error("repository not found or requires authentication")]
     RepoUnavailable,
     #[error("branch not found: {0}")]
     BranchNotFound(String),
+    #[error(
+        "GitHub rate limit reached (60/hr unauthenticated). Run 'ivaldi auth login' to raise the limit to 5000/hr."
+    )]
+    RateLimited { reset_at: u64 },
     #[error("HTTP {status}: {message}")]
     Http { status: u16, message: String },
     #[error("{0}")]
@@ -921,8 +1063,10 @@ pub fn import_fetch_result(
     let mut leaf_idx_by_hash: HashMap<B3Hash, u64> = HashMap::new();
     let mut commits_imported = 0usize;
     let mut commits_skipped = 0usize;
-    let mut blobs_downloaded = 0usize;
-    let mut seen_blob_shas = std::collections::HashSet::new();
+    // Accumulator for submodule (gitlink) entries we couldn't materialize.
+    // Written to `.ivaldi/submodules.skipped` after import.
+    let mut submodules_skipped: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
 
     for idx in 0..repo.commit_count() {
         if let Ok(Some(leaf)) = repo.get_leaf(idx) {
@@ -930,13 +1074,28 @@ pub fn import_fetch_result(
         }
     }
 
-    let total_blobs = count_reachable_blobs(&fetch.head_sha, &fetch.objects)?;
+    // Walk every reachable blob once, then write the new ones to CAS in
+    // parallel up front. After this, the per-commit tree import is pure
+    // mapping lookups + tree assembly — no blob I/O on the hot path.
+    let all_blobs = collect_reachable_blobs(&fetch.head_sha, &fetch.objects)?;
+    let pending_count = all_blobs
+        .iter()
+        .filter(|sha| mapping.get_blake3(sha).is_none())
+        .count();
+
     let mp = MultiProgress::new();
-    let pb_blobs = mp.add(progress::file_bar(total_blobs as u64, "Importing blobs"));
+    let pb_blobs = mp.add(progress::file_bar(pending_count as u64, "Importing blobs"));
     let pb_commits = mp.add(progress::file_bar(
         commit_order.len() as u64,
         "Importing commits",
     ));
+
+    let prefetched =
+        prefetch_blobs(&all_blobs, &fetch.objects, &store, &mapping, &pb_blobs)?;
+    let blobs_downloaded = prefetched.len();
+    for (git_sha, hash) in prefetched {
+        mapping.insert(&git_sha, hash);
+    }
 
     for sha in &commit_order {
         if let Some(existing_hash) = mapping.get_blake3(sha) {
@@ -955,13 +1114,12 @@ pub fn import_fetch_result(
         let commit = parse_commit(&object.data)?;
         let tree_hash = import_tree(
             &commit.tree,
+            "",
             &fetch.objects,
             &store,
             &mut mapping,
             &mut tree_cache,
-            &mut blobs_downloaded,
-            &mut seen_blob_shas,
-            &pb_blobs,
+            &mut submodules_skipped,
         )?;
         let author = if commit.author_name.is_empty() || commit.author_email.is_empty() {
             "unknown <unknown>".to_string()
@@ -990,6 +1148,27 @@ pub fn import_fetch_result(
         );
         leaf.prev_idx = prev_idx;
         leaf.merge_idxs = merge_idxs;
+
+        // Preserve git fidelity that doesn't fit Leaf's typed fields. Stored
+        // under reserved `git.*` meta keys; the canonical leaf encoding
+        // already serializes `meta` so no version bump is needed.
+        if !commit.author_tz.is_empty() {
+            leaf.meta
+                .insert("git.author_tz".into(), commit.author_tz.clone());
+        }
+        if !commit.committer_name.is_empty() || !commit.committer_email.is_empty() {
+            let committer = format!(
+                "{} <{}>",
+                commit.committer_name, commit.committer_email,
+            );
+            leaf.meta.insert("git.committer".into(), committer);
+            leaf.meta
+                .insert("git.committer_time".into(), commit.committer_time.to_string());
+            if !commit.committer_tz.is_empty() {
+                leaf.meta
+                    .insert("git.committer_tz".into(), commit.committer_tz.clone());
+            }
+        }
         let result = repo
             .commit_raw(leaf, &fetch.branch)
             .map_err(|e| GitRemoteError::Io(e.to_string()))?;
@@ -1001,13 +1180,54 @@ pub fn import_fetch_result(
     }
 
     pb_blobs.finish_with_message(format!("{} blobs imported", blobs_downloaded));
-    pb_commits.finish_with_message(format!(
-        "{} commits imported, {} skipped",
-        commits_imported, commits_skipped
-    ));
+    let commit_msg = if commits_skipped > 0 {
+        format!(
+            "{} new commits imported ({} already present)",
+            commits_imported, commits_skipped
+        )
+    } else {
+        format!("{} commits imported", commits_imported)
+    };
+    pb_commits.finish_with_message(commit_msg);
+
+    if !submodules_skipped.is_empty() {
+        crate::logging::warn(&format!(
+            "skipped {} git submodule entr{} (Ivaldi does not yet clone submodules); see .ivaldi/submodules.skipped",
+            submodules_skipped.len(),
+            if submodules_skipped.len() == 1 { "y" } else { "ies" },
+        ));
+        let payload: String = submodules_skipped
+            .iter()
+            .map(|p| format!("{}\n", p))
+            .collect();
+        let _ = std::fs::write(repo.ivaldi_dir.join("submodules.skipped"), payload);
+    }
+
+    // Make sure the timeline head + ref file exist for the harvested branch,
+    // even if every commit was already present in the repo (e.g. harvesting
+    // a branch whose tip is an ancestor of an already-imported timeline).
+    // `commit_raw` only updates the head when it actually writes a commit,
+    // so without this the branch silently fails to materialize as a local
+    // timeline.
+    let head_idx = leaf_idx_by_sha
+        .get(&fetch.head_sha)
+        .copied()
+        .or_else(|| {
+            mapping
+                .get_blake3(&fetch.head_sha)
+                .and_then(|b3| leaf_idx_by_hash.get(&b3).copied())
+        });
+    if let Some(idx) = head_idx {
+        repo.set_timeline_head(&fetch.branch, idx)
+            .map_err(|e| GitRemoteError::Io(e.to_string()))?;
+    }
+
     mapping
         .save()
         .map_err(|e| GitRemoteError::Io(e.to_string()))?;
+    // One fsync at the end of the import covers all blobs written without
+    // per-`put` fsync. See `FileCas::flush`.
+    cas.flush().map_err(|e| GitRemoteError::Io(e.to_string()))?;
     Ok(crate::sync::ImportResult {
         commits_imported,
         commits_skipped,
@@ -1038,13 +1258,12 @@ fn collect_commit_order(
 
 fn import_tree(
     sha: &str,
+    path_prefix: &str,
     objects: &HashMap<String, GitObject>,
     store: &crate::fsmerkle::FsStore<'_>,
     mapping: &mut crate::remote::HashMapping,
     tree_cache: &mut HashMap<String, B3Hash>,
-    blob_count: &mut usize,
-    seen_blob_shas: &mut std::collections::HashSet<String>,
-    pb_blobs: &indicatif::ProgressBar,
+    submodules_skipped: &mut std::collections::BTreeSet<String>,
 ) -> Result<B3Hash, GitRemoteError> {
     use crate::fsmerkle::{Entry, MODE_DIR, MODE_FILE, NodeKind};
 
@@ -1056,56 +1275,95 @@ fn import_tree(
         .get(sha)
         .ok_or_else(|| GitRemoteError::Protocol(format!("missing tree object {}", sha)))?;
     let entries = parse_tree(&object.data)?;
-    let mut ivaldi_entries = Vec::new();
+    // Track which output names we've added so duplicates from rename collisions
+    // (`.gitignore` → `.ivaldiignore` when both exist) resolve deterministically:
+    // a real `.ivaldiignore` always wins over a renamed `.gitignore`.
+    let mut ivaldi_entries: Vec<Entry> = Vec::new();
+    let mut seen_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut rename_present: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for entry in entries {
+        // Translate dotfile policy at import time:
+        // - `.gitignore` is renamed to `.ivaldiignore` (same blob, new name).
+        // - `.ivaldiignore` passes through unchanged.
+        // - Every other dotfile is dropped — ivaldi auto-ignores dotfiles
+        //   in the workspace, and importing them would just create phantom
+        //   "deleted" entries in status/auto-shelf.
+        let mapped_name = match entry.name.as_str() {
+            ".ivaldiignore" => Some(entry.name.clone()),
+            ".gitignore" => Some(".ivaldiignore".to_string()),
+            n if n.starts_with('.')
+                && entry.mode != "40000"
+                && entry.mode != "040000" =>
+            {
+                None
+            }
+            _ => Some(entry.name.clone()),
+        };
+
+        let Some(out_name) = mapped_name else { continue };
+
+        let child_path = if path_prefix.is_empty() {
+            out_name.clone()
+        } else {
+            format!("{}/{}", path_prefix, out_name)
+        };
+
         match entry.mode.as_str() {
             "40000" | "040000" => {
                 let hash = import_tree(
                     &entry.sha,
+                    &child_path,
                     objects,
                     store,
                     mapping,
                     tree_cache,
-                    blob_count,
-                    seen_blob_shas,
-                    pb_blobs,
+                    submodules_skipped,
                 )?;
                 ivaldi_entries.push(Entry {
-                    name: entry.name,
+                    name: out_name,
                     mode: MODE_DIR,
                     kind: NodeKind::Tree,
                     hash,
                 });
             }
             "100644" | "100755" | "120000" => {
-                let hash = if let Some(existing) = mapping.get_blake3(&entry.sha) {
-                    if seen_blob_shas.insert(entry.sha.clone()) {
-                        pb_blobs.inc(1);
+                let hash = mapping.get_blake3(&entry.sha).ok_or_else(|| {
+                    GitRemoteError::Protocol(format!(
+                        "blob {} missing from mapping after prefetch",
+                        entry.sha
+                    ))
+                })?;
+                let was_renamed = entry.name == ".gitignore";
+                if was_renamed {
+                    rename_present.insert(out_name.clone());
+                    if seen_names.contains(&out_name) {
+                        // A real `.ivaldiignore` already won this slot; drop
+                        // the renamed `.gitignore`.
+                        continue;
                     }
-                    existing
-                } else {
-                    let blob = objects.get(&entry.sha).ok_or_else(|| {
-                        GitRemoteError::Protocol(format!("missing blob object {}", entry.sha))
-                    })?;
-                    let (hash, _) = store
-                        .put_blob(&blob.data)
-                        .map_err(|e| GitRemoteError::Io(e.to_string()))?;
-                    mapping.insert(&entry.sha, hash);
-                    if seen_blob_shas.insert(entry.sha.clone()) {
-                        *blob_count += 1;
-                        pb_blobs.inc(1);
-                    }
-                    hash
-                };
+                } else if out_name == ".ivaldiignore"
+                    && rename_present.contains(&out_name)
+                {
+                    // We earlier kept a renamed `.gitignore`; replace it now
+                    // that the real `.ivaldiignore` is here.
+                    ivaldi_entries.retain(|e| e.name != out_name);
+                }
+                seen_names.insert(out_name.clone());
                 ivaldi_entries.push(Entry {
-                    name: entry.name,
+                    name: out_name,
                     mode: MODE_FILE,
                     kind: NodeKind::Blob,
                     hash,
                 });
             }
-            "160000" => {}
+            "160000" => {
+                // Submodule (gitlink). We don't yet clone or track the
+                // submodule's repository; record the path so the user can see
+                // what we skipped. Logged once via crate::logging::warn so a
+                // huge repo doesn't spam the console.
+                submodules_skipped.insert(child_path.clone());
+            }
             other => {
                 return Err(GitRemoteError::Unsupported(format!(
                     "unsupported tree entry mode {}",
@@ -1122,29 +1380,32 @@ fn import_tree(
     Ok(hash)
 }
 
-fn count_reachable_blobs(
+fn collect_reachable_blobs(
     head_sha: &str,
     objects: &HashMap<String, GitObject>,
-) -> Result<usize, GitRemoteError> {
+) -> Result<Vec<String>, GitRemoteError> {
     let mut seen_commits = std::collections::HashSet::new();
     let mut seen_trees = std::collections::HashSet::new();
     let mut seen_blobs = std::collections::HashSet::new();
-    count_reachable_blobs_from_commit(
+    let mut order = Vec::new();
+    walk_commit_for_blobs(
         head_sha,
         objects,
         &mut seen_commits,
         &mut seen_trees,
         &mut seen_blobs,
+        &mut order,
     )?;
-    Ok(seen_blobs.len())
+    Ok(order)
 }
 
-fn count_reachable_blobs_from_commit(
+fn walk_commit_for_blobs(
     sha: &str,
     objects: &HashMap<String, GitObject>,
     seen_commits: &mut std::collections::HashSet<String>,
     seen_trees: &mut std::collections::HashSet<String>,
     seen_blobs: &mut std::collections::HashSet<String>,
+    order: &mut Vec<String>,
 ) -> Result<(), GitRemoteError> {
     if !seen_commits.insert(sha.to_string()) {
         return Ok(());
@@ -1153,18 +1414,19 @@ fn count_reachable_blobs_from_commit(
         .get(sha)
         .ok_or_else(|| GitRemoteError::Protocol(format!("missing commit object {}", sha)))?;
     let commit = parse_commit(&object.data)?;
-    count_reachable_blobs_from_tree(&commit.tree, objects, seen_trees, seen_blobs)?;
+    walk_tree_for_blobs(&commit.tree, objects, seen_trees, seen_blobs, order)?;
     for parent in &commit.parents {
-        count_reachable_blobs_from_commit(parent, objects, seen_commits, seen_trees, seen_blobs)?;
+        walk_commit_for_blobs(parent, objects, seen_commits, seen_trees, seen_blobs, order)?;
     }
     Ok(())
 }
 
-fn count_reachable_blobs_from_tree(
+fn walk_tree_for_blobs(
     sha: &str,
     objects: &HashMap<String, GitObject>,
     seen_trees: &mut std::collections::HashSet<String>,
     seen_blobs: &mut std::collections::HashSet<String>,
+    order: &mut Vec<String>,
 ) -> Result<(), GitRemoteError> {
     if !seen_trees.insert(sha.to_string()) {
         return Ok(());
@@ -1175,10 +1437,12 @@ fn count_reachable_blobs_from_tree(
     for entry in parse_tree(&object.data)? {
         match entry.mode.as_str() {
             "40000" | "040000" => {
-                count_reachable_blobs_from_tree(&entry.sha, objects, seen_trees, seen_blobs)?;
+                walk_tree_for_blobs(&entry.sha, objects, seen_trees, seen_blobs, order)?;
             }
             "100644" | "100755" | "120000" => {
-                seen_blobs.insert(entry.sha);
+                if seen_blobs.insert(entry.sha.clone()) {
+                    order.push(entry.sha);
+                }
             }
             "160000" => {}
             other => {
@@ -1190,6 +1454,36 @@ fn count_reachable_blobs_from_tree(
         }
     }
     Ok(())
+}
+
+/// Write every reachable blob to the CAS in parallel and return the
+/// (git_sha → blake3) pairs to merge into `HashMapping`. Skips blobs already
+/// known to the mapping. Drives the blob progress bar.
+fn prefetch_blobs(
+    blob_shas: &[String],
+    objects: &HashMap<String, GitObject>,
+    store: &crate::fsmerkle::FsStore<'_>,
+    mapping: &crate::remote::HashMapping,
+    pb_blobs: &indicatif::ProgressBar,
+) -> Result<Vec<(String, B3Hash)>, GitRemoteError> {
+    let pending: Vec<&String> = blob_shas
+        .iter()
+        .filter(|sha| mapping.get_blake3(sha).is_none())
+        .collect();
+
+    pending
+        .par_iter()
+        .map(|sha| {
+            let blob = objects.get(sha.as_str()).ok_or_else(|| {
+                GitRemoteError::Protocol(format!("missing blob object {}", sha))
+            })?;
+            let (hash, _) = store
+                .put_blob(&blob.data)
+                .map_err(|e| GitRemoteError::Io(e.to_string()))?;
+            pb_blobs.inc(1);
+            Ok(((*sha).clone(), hash))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1264,6 +1558,25 @@ mod tests {
         assert_eq!(parsed.author_email, "jane@example.com");
         assert_eq!(parsed.author_time, 1710000000);
         assert_eq!(parsed.message, "hello\n");
+    }
+
+    #[test]
+    fn parse_commit_captures_distinct_committer_and_timezones() {
+        // Distinct author and committer with non-UTC timezones — the parser
+        // must keep both identities and both offsets, not collapse them.
+        let commit = b"tree abcdef\n\
+            author Jane Doe <jane@example.com> 1710000000 -0500\n\
+            committer Bob <bob@example.com> 1710001000 +0100\n\
+            \nhello\n";
+        let parsed = parse_commit(commit).unwrap();
+        assert_eq!(parsed.author_name, "Jane Doe");
+        assert_eq!(parsed.author_email, "jane@example.com");
+        assert_eq!(parsed.author_time, 1710000000);
+        assert_eq!(parsed.author_tz, "-0500");
+        assert_eq!(parsed.committer_name, "Bob");
+        assert_eq!(parsed.committer_email, "bob@example.com");
+        assert_eq!(parsed.committer_time, 1710001000);
+        assert_eq!(parsed.committer_tz, "+0100");
     }
 
     #[test]

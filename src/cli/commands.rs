@@ -30,12 +30,13 @@ pub fn run_command(cli: Cli) {
             Commands::Status => cmd_status(),
             Commands::Whereami => cmd_whereami(),
             Commands::Log(args) => cmd_log(args),
+            Commands::Whodidit(args) => cmd_whodidit(args),
             Commands::Diff(args) => cmd_diff(args),
             Commands::Reset(args) => cmd_reset(args, cli.quiet),
             Commands::Timeline(args) => cmd_timeline(args, cli.quiet),
             Commands::Fuse(args) => cmd_fuse(args, cli.quiet),
             Commands::Travel(args) => cmd_travel(args),
-            Commands::Shift(args) => cmd_shift(args, cli.quiet),
+            Commands::Weld(args) => cmd_weld(args, cli.quiet),
             Commands::Config(args) => cmd_config(args),
             Commands::Exclude(args) => cmd_exclude(args, cli.quiet),
             Commands::Portal(args) => cmd_portal(args, cli.quiet),
@@ -47,6 +48,8 @@ pub fn run_command(cli: Cli) {
             Commands::Sync(args) => cmd_sync(args, cli.quiet),
             Commands::Review(args) => cmd_review(args, cli.quiet),
             Commands::Tui => cmd_tui(),
+            Commands::Serve(args) => cmd_serve(args, cli.quiet),
+            Commands::Peer(args) => cmd_peer(args, cli.quiet),
         };
         if let Err(e) = result {
             eprintln!("Error: {}", e);
@@ -122,13 +125,40 @@ fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
     let ignore_cache = ignore::load_pattern_cache(&ctx.work_dir);
     let mut allowlist = DotfileAllowlist::load(&ctx.ivaldi_dir);
 
+    // Resolve the current timeline's tip tree so we can detect deletions
+    // (paths in the parent tree that are missing from disk). For a brand-new
+    // timeline with no parent commits the map is simply empty.
+    let parent_tree_files: std::collections::BTreeMap<String, crate::hash::B3Hash> = {
+        let repo = open_repo()?;
+        let timeline = repo.current_timeline().map_err(|e| e.to_string())?;
+        match repo
+            .get_timeline_head(&timeline)
+            .map_err(|e| e.to_string())?
+            .and_then(|idx| repo.get_leaf(idx).ok().flatten())
+            .map(|l| l.tree_root)
+        {
+            Some(root) => ws.list_tree_files(root).map_err(|e| e.to_string())?,
+            None => std::collections::BTreeMap::new(),
+        }
+    };
+
     let mut all_gathered: Vec<String>;
+    let mut all_deleted: Vec<String> = Vec::new();
 
     if args.files.is_empty() || args.files == ["."] {
         let result = ws.gather_all(&ignore_cache).map_err(|e| e.to_string())?;
         all_gathered = result.gathered;
 
-        // Report skipped dotfiles so the user knows they were found but excluded
+        // Anything in the parent tree but missing from disk is a deletion.
+        let on_disk: std::collections::BTreeSet<String> =
+            ws.scan(&ignore_cache).map_err(|e| e.to_string())?.into_iter().collect();
+        for path in parent_tree_files.keys() {
+            if !on_disk.contains(path.as_str()) {
+                ws.staging.stage_deletion(path.clone());
+                all_deleted.push(path.clone());
+            }
+        }
+
         if !quiet && !result.needs_confirmation.is_empty() {
             eprintln!(
                 "Skipped {} hidden (dot) file(s):",
@@ -144,10 +174,23 @@ fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
         let result = ws.gather(&refs, &allowlist).map_err(|e| e.to_string())?;
         all_gathered = result.gathered;
 
-        // Handle dotfiles that need confirmation
+        // For each requested path that wasn't gathered (because it's missing
+        // from disk), record it as a deletion if it was present in the parent
+        // tree. Paths that aren't in the parent tree and aren't on disk are
+        // silently skipped, matching the prior behaviour.
+        for path in &refs {
+            if ws.staging.is_staged(path) {
+                continue;
+            }
+            let full_path = ws.work_dir().join(path);
+            if !full_path.exists() && parent_tree_files.contains_key(*path) {
+                ws.staging.stage_deletion(path.to_string());
+                all_deleted.push(path.to_string());
+            }
+        }
+
         if !result.needs_confirmation.is_empty() {
             if args.allow_all {
-                // --allow-all pre-approves all dotfiles (except security-blocked)
                 let confirmed_refs: Vec<&str> = result
                     .needs_confirmation
                     .iter()
@@ -161,7 +204,6 @@ fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
                 }
                 all_gathered.extend(extra);
             } else {
-                // Prompt for each dotfile individually
                 for dotfile in &result.needs_confirmation {
                     eprint!(
                         "WARNING: '{}' is a hidden (dot) file — stage it? [y/N]: ",
@@ -186,7 +228,6 @@ fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
                 }
             }
 
-            // Persist allowlist so confirmed dotfiles don't prompt again
             allowlist.save().map_err(|e| e.to_string())?;
         }
     }
@@ -197,7 +238,20 @@ fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
         for file in &all_gathered {
             println!("  gathered: {}", file);
         }
-        println!("{} file(s) staged", all_gathered.len());
+        for file in &all_deleted {
+            println!("  removed:  {}", file);
+        }
+        let total = all_gathered.len() + all_deleted.len();
+        if all_deleted.is_empty() {
+            println!("{} file(s) staged", total);
+        } else {
+            println!(
+                "{} file(s) staged ({} added, {} deleted)",
+                total,
+                all_gathered.len(),
+                all_deleted.len()
+            );
+        }
     }
     Ok(())
 }
@@ -216,11 +270,20 @@ fn cmd_seal(args: SealArgs, quiet: bool) -> Result<(), String> {
         return Err("no changes staged for seal. Use 'ivaldi gather' to stage files first.".into());
     }
 
-    // Build tree from staged files
-    let tree_hash = ws.build_staged_tree().map_err(|e| e.to_string())?;
-
-    // Open persistent repo and commit
+    // Open persistent repo first so we can resolve the current timeline's
+    // parent tree, then build the seal tree as parent + staging.
     let mut repo = open_repo()?;
+    let timeline = repo.current_timeline().map_err(|e| e.to_string())?;
+    let parent_tree = repo
+        .get_timeline_head(&timeline)
+        .map_err(|e| e.to_string())?
+        .and_then(|idx| repo.get_leaf(idx).ok().flatten())
+        .map(|l| l.tree_root);
+
+    let tree_hash = ws
+        .build_seal_tree(parent_tree)
+        .map_err(|e| e.to_string())?;
+
     let cfg = repo.config();
     let author = cfg.author()
         .ok_or("user.name and user.email not configured. Run:\n  ivaldi config --set user.name \"Your Name\"\n  ivaldi config --set user.email \"you@example.com\"")?;
@@ -295,14 +358,19 @@ fn cmd_status() -> Result<(), String> {
         .iter()
         .filter(|f| f.state == FileState::Untracked)
         .collect();
+    // Deletions that have been staged for the next seal are shown under the
+    // Staged section, not under unstaged Changes.
+    let staged_deletions: std::collections::BTreeSet<&String> =
+        ws.staging.staged_deletions().iter().collect();
     let deleted: Vec<_> = status
         .iter()
-        .filter(|f| f.state == FileState::Deleted)
+        .filter(|f| f.state == FileState::Deleted && !staged_deletions.contains(&f.path))
         .collect();
 
     let has_changes = !modified.is_empty() || !untracked.is_empty() || !deleted.is_empty();
+    let has_staged = !staged.is_empty() || !staged_deletions.is_empty();
 
-    if !has_changes && staged.is_empty() {
+    if !has_changes && !has_staged {
         println!("\nWorking directory: clean");
         return Ok(());
     }
@@ -320,10 +388,17 @@ fn cmd_status() -> Result<(), String> {
         }
     }
 
-    if !staged.is_empty() {
+    if has_staged {
         println!("\nStaged:");
         for f in &staged {
             println!("  {} {:<30} (staged)", color::bold_green("++"), f.path);
+        }
+        for path in &staged_deletions {
+            println!(
+                "  {} {:<30} (staged for deletion)",
+                color::bold_red("--"),
+                path
+            );
         }
     }
 
@@ -360,7 +435,7 @@ fn cmd_whereami() -> Result<(), String> {
         }
     }
 
-    println!("Commits: {}", repo.commit_count());
+    println!("Commits: {}", repo.timeline_commit_count(&timeline));
     Ok(())
 }
 
@@ -417,6 +492,176 @@ fn cmd_log(args: LogArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// Read the contents of a file at a given tree root by walking the path.
+/// Returns `Ok(None)` if the path doesn't exist (or isn't a regular file)
+/// in that tree.
+fn read_file_at_tree(
+    store: &crate::fsmerkle::FsStore<'_>,
+    tree_root: crate::hash::B3Hash,
+    path: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let parts: Vec<&str> = path
+        .split('/')
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    if parts.is_empty() {
+        return Ok(None);
+    }
+
+    let mut current_hash = tree_root;
+    for (i, part) in parts.iter().enumerate() {
+        let tree = match store.load_tree(current_hash) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        let entry = match tree.find_entry(part) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        let last = i == parts.len() - 1;
+        match (entry.kind, last) {
+            (crate::fsmerkle::NodeKind::Blob, true) => {
+                let (_, content) = store
+                    .load_blob(entry.hash)
+                    .map_err(|e| format!("read blob: {}", e))?;
+                return Ok(Some(content));
+            }
+            (crate::fsmerkle::NodeKind::Tree, false) => {
+                current_hash = entry.hash;
+            }
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+/// `ivaldi whodidit <file>` — git-blame analogue.
+///
+/// For each line of the file at HEAD, find the oldest seal in which the
+/// line still appears (content-set membership). The next-older seal does
+/// not contain the line, so the oldest-still-present seal is the one that
+/// introduced it. This is a position-independent approximation — it
+/// handles the common cases (added/edited lines) without trying to track
+/// line moves the way more sophisticated blame algorithms do.
+fn cmd_whodidit(args: WhodiditArgs) -> Result<(), String> {
+    use std::collections::HashSet;
+
+    let repo = open_repo()?;
+    let timeline = repo.current_timeline().unwrap_or_else(|_| "main".into());
+    let history = repo.walk_history(&timeline).map_err(|e| e.to_string())?;
+
+    if history.is_empty() {
+        return Err(format!("no commits on timeline '{}'", timeline));
+    }
+
+    let store = crate::fsmerkle::FsStore::new(&repo.cas);
+
+    // File contents at HEAD.
+    let head_leaf = repo
+        .get_leaf(history[0].index)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "HEAD leaf missing".to_string())?;
+    let head_bytes = read_file_at_tree(&store, head_leaf.tree_root, &args.path)?
+        .ok_or_else(|| format!("file not found at HEAD: {}", args.path))?;
+    let head_text = String::from_utf8_lossy(&head_bytes).into_owned();
+    let lines: Vec<&str> = head_text.split_inclusive('\n').collect();
+
+    // Each line starts attributed to HEAD. Walking back, we replace the
+    // attribution with an older seal as long as that seal's version of
+    // the file still contains the line. The first seal that doesn't
+    // contain the line halts further updates for that line.
+    let mut attr: Vec<usize> = vec![0; lines.len()]; // index into history
+    let mut still_open: Vec<bool> = vec![true; lines.len()];
+
+    for (h_idx, entry) in history.iter().enumerate().skip(1) {
+        if !still_open.iter().any(|&b| b) {
+            break;
+        }
+        let leaf = match repo.get_leaf(entry.index).map_err(|e| e.to_string())? {
+            Some(l) => l,
+            None => continue,
+        };
+        let bytes = read_file_at_tree(&store, leaf.tree_root, &args.path)?;
+        let owned_lines: Vec<String> = match bytes {
+            Some(b) => String::from_utf8_lossy(&b)
+                .split_inclusive('\n')
+                .map(|s| s.to_string())
+                .collect(),
+            None => Vec::new(),
+        };
+        let owned_set: HashSet<&str> = owned_lines.iter().map(|s| s.as_str()).collect();
+
+        for (li, line) in lines.iter().enumerate() {
+            if !still_open[li] {
+                continue;
+            }
+            if owned_set.contains(*line) {
+                attr[li] = h_idx;
+            } else {
+                still_open[li] = false;
+            }
+        }
+    }
+
+    // Render
+    let mut prev_attr: Option<usize> = None;
+    let line_no_width = (lines.len().max(1)).to_string().len();
+
+    if args.summary {
+        // Compress contiguous regions sharing the same attribution.
+        let mut start = 0usize;
+        while start < lines.len() {
+            let a = attr[start];
+            let mut end = start + 1;
+            while end < lines.len() && attr[end] == a {
+                end += 1;
+            }
+            let e = &history[a];
+            println!(
+                "{}-{}  {} {} ({})",
+                start + 1,
+                end,
+                color::hash(&e.short_hash),
+                color::seal_name(&e.seal_name),
+                color::author(&e.author),
+            );
+            start = end;
+        }
+        return Ok(());
+    }
+
+    for (li, line) in lines.iter().enumerate() {
+        let a = attr[li];
+        let e = &history[a];
+        let header_changed = prev_attr != Some(a);
+        prev_attr = Some(a);
+
+        let line_text = line.strip_suffix('\n').unwrap_or(line);
+
+        if header_changed {
+            print!(
+                "{} {} ({}) ",
+                color::hash(&e.short_hash),
+                color::seal_name(&e.seal_name),
+                color::author(&e.author),
+            );
+        } else {
+            // Repeat-attribution rows: align with the header above using
+            // a faint placeholder so the line numbers stay in a column.
+            let pad: String = " ".repeat(8 + 1 + e.seal_name.len() + 2 + e.author.len() + 2);
+            print!("{}", pad);
+        }
+        println!(
+            "{:>width$})  {}",
+            li + 1,
+            line_text,
+            width = line_no_width
+        );
+    }
+
+    Ok(())
+}
+
 fn cmd_diff(args: DiffArgs) -> Result<(), String> {
     let repo = open_repo()?;
     let ctx = find_repo()?;
@@ -444,22 +689,51 @@ fn cmd_diff(args: DiffArgs) -> Result<(), String> {
                 let mut modified = 0usize;
                 let mut deleted = 0usize;
                 for c in &changes {
-                    let (marker, marker_fn): (&str, fn(&str) -> String) = match c.kind {
-                        crate::fsmerkle::ChangeKind::Added => {
-                            added += 1;
-                            ("++", color::bold_green)
-                        }
-                        crate::fsmerkle::ChangeKind::Deleted => {
-                            deleted += 1;
-                            ("--", color::bold_red)
-                        }
+                    match c.kind {
+                        crate::fsmerkle::ChangeKind::Added => added += 1,
+                        crate::fsmerkle::ChangeKind::Deleted => deleted += 1,
                         crate::fsmerkle::ChangeKind::Modified
-                        | crate::fsmerkle::ChangeKind::TypeChange => {
-                            modified += 1;
-                            ("~~", color::bold_yellow)
+                        | crate::fsmerkle::ChangeKind::TypeChange => modified += 1,
+                    }
+                }
+
+                if args.stat {
+                    // Summary only
+                    for c in &changes {
+                        let marker_fn: fn(&str) -> String = match c.kind {
+                            crate::fsmerkle::ChangeKind::Added => color::bold_green,
+                            crate::fsmerkle::ChangeKind::Deleted => color::bold_red,
+                            _ => color::bold_yellow,
+                        };
+                        let kind = match c.kind {
+                            crate::fsmerkle::ChangeKind::Added => "added",
+                            crate::fsmerkle::ChangeKind::Deleted => "deleted",
+                            crate::fsmerkle::ChangeKind::Modified => "modified",
+                            crate::fsmerkle::ChangeKind::TypeChange => "type-change",
+                        };
+                        println!("  {} {}  ({})", marker_fn("|"), c.path, kind);
+                    }
+                } else {
+                    // Per-file markers + line-level hunks for modified text files
+                    for c in &changes {
+                        match c.kind {
+                            crate::fsmerkle::ChangeKind::Added => {
+                                println!("  {} {}", color::bold_green("++"), c.path);
+                                crate::diff::print_blob_as_added(&store, c.new_hash);
+                            }
+                            crate::fsmerkle::ChangeKind::Deleted => {
+                                println!("  {} {}", color::bold_red("--"), c.path);
+                                crate::diff::print_blob_as_deleted(&store, c.old_hash);
+                            }
+                            crate::fsmerkle::ChangeKind::Modified => {
+                                println!("  {} {}", color::bold_yellow("~~"), c.path);
+                                crate::diff::print_blob_diff(&store, c.old_hash, c.new_hash);
+                            }
+                            crate::fsmerkle::ChangeKind::TypeChange => {
+                                println!("  {} {}", color::bold_yellow("~~"), c.path);
+                            }
                         }
-                    };
-                    println!("  {} {}", marker_fn(marker), c.path);
+                    }
                 }
                 println!(
                     "\n{} change(s): {} added, {} modified, {} deleted",
@@ -510,6 +784,9 @@ fn cmd_diff(args: DiffArgs) -> Result<(), String> {
                     println!("Staged changes:");
                     for (path, _) in ws.staging.staged_files() {
                         println!("  {} {}", color::bold_green("++"), path);
+                    }
+                    for path in ws.staging.staged_deletions() {
+                        println!("  {} {}", color::bold_red("--"), path);
                     }
                 }
             } else {
@@ -675,59 +952,161 @@ fn cmd_timeline(args: TimelineArgs, quiet: bool) -> Result<(), String> {
             let repo = open_repo()?;
             let current = repo.current_timeline().unwrap_or_default();
 
-            // Auto-shelve: save current staging area before switch
+            if current == switch_args.name {
+                if !quiet {
+                    println!("Already on timeline: {}", switch_args.name);
+                }
+                return Ok(());
+            }
+
+            // Verify target exists before any side effects
+            let target_head_idx = repo
+                .get_timeline_head(&switch_args.name)
+                .map_err(|e| e.to_string())?;
+            if target_head_idx.is_none() {
+                let ref_path = ctx.ivaldi_dir.join("refs/heads").join(&switch_args.name);
+                if !ref_path.exists() {
+                    return Err(format!("timeline '{}' not found", switch_args.name));
+                }
+            }
+
             let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
-            let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
-            if !ws.staging.is_empty() {
-                use crate::shelf::{Shelf, ShelfManager};
-                let shelf_mgr = ShelfManager::new(&ctx.ivaldi_dir);
+            let ignore_cache = ignore::load_pattern_cache(&ctx.work_dir);
+
+            // ---- Auto-shelve: capture everything dirty about `current` ----
+            //
+            // We save staging + working-tree changes (Modified, Untracked,
+            // Deleted) into a shelf keyed by `current`. This must happen
+            // BEFORE materialize, since materialize will rewrite the working
+            // tree to look like the target timeline.
+            use crate::shelf::{Shelf, ShelfManager, WorkspaceChange};
+            let shelf_mgr = ShelfManager::new(&ctx.ivaldi_dir);
+            let mut shelved_summary: Vec<String> = Vec::new();
+
+            {
+                let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
+                let current_tree = repo
+                    .get_timeline_head(&current)
+                    .map_err(|e| e.to_string())?
+                    .and_then(|idx| repo.get_leaf(idx).ok().flatten())
+                    .map(|l| l.tree_root);
+                let workspace_changes = ws
+                    .capture_changes(current_tree, &ignore_cache)
+                    .map_err(|e| format!("failed to auto-shelve: {}", e))?;
+
                 let mut staged = std::collections::BTreeMap::new();
                 for (path, hash) in ws.staging.staged_files() {
                     staged.insert(path.clone(), *hash);
                 }
-                let shelf = Shelf {
-                    timeline: current.clone(),
-                    staged_files: staged,
-                    created_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs() as i64,
-                };
-                shelf_mgr.save_shelf(&shelf).map_err(|e| e.to_string())?;
-                if !quiet {
-                    println!("Changes auto-shelved for '{}'", current);
+
+                if !staged.is_empty() || !workspace_changes.is_empty() {
+                    let mut counts = (0usize, 0usize, 0usize, staged.len());
+                    for c in &workspace_changes {
+                        match c {
+                            WorkspaceChange::Modified { .. } => counts.0 += 1,
+                            WorkspaceChange::Untracked { .. } => counts.1 += 1,
+                            WorkspaceChange::Deleted { .. } => counts.2 += 1,
+                        }
+                    }
+                    if counts.0 > 0 {
+                        shelved_summary.push(format!("{} modified", counts.0));
+                    }
+                    if counts.1 > 0 {
+                        shelved_summary.push(format!("{} untracked", counts.1));
+                    }
+                    if counts.2 > 0 {
+                        shelved_summary.push(format!("{} deleted", counts.2));
+                    }
+                    if counts.3 > 0 {
+                        shelved_summary.push(format!("{} staged", counts.3));
+                    }
+
+                    let shelf = Shelf {
+                        timeline: current.clone(),
+                        staged_files: staged,
+                        workspace_changes,
+                        created_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs() as i64,
+                    };
+                    shelf_mgr.save_shelf(&shelf).map_err(|e| e.to_string())?;
+                } else {
+                    // No dirty state — clear any stale shelf so we don't
+                    // reapply stale changes if the user switches back.
+                    shelf_mgr.remove_shelf(&current).ok();
                 }
             }
 
-            // Switch
+            // ---- Update HEAD and materialize target tree ----
             repo.switch_timeline(&switch_args.name)
                 .map_err(|e| e.to_string())?;
 
-            // Auto-restore: load shelf for target timeline
-            {
-                use crate::shelf::ShelfManager;
-                let shelf_mgr = ShelfManager::new(&ctx.ivaldi_dir);
-                if let Ok(Some(shelf)) = shelf_mgr.load_shelf(&switch_args.name) {
-                    let mut ws_mut = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
-                    ws_mut.staging.clear();
-                    for (path, hash) in &shelf.staged_files {
-                        ws_mut.staging.stage(path, *hash);
-                    }
-                    ws_mut.save().map_err(|e| e.to_string())?;
-                    shelf_mgr.remove_shelf(&switch_args.name).ok();
-                    if !quiet {
-                        println!("Restored shelved changes for '{}'", switch_args.name);
-                    }
-                } else {
-                    // Clear staging for clean switch
-                    let mut ws_mut = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
-                    ws_mut.staging.clear();
-                    ws_mut.save().map_err(|e| e.to_string())?;
+            if let Some(idx) = target_head_idx {
+                if let Some(leaf) = repo.get_leaf(idx).map_err(|e| e.to_string())? {
+                    let ws_mat = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
+                    ws_mat
+                        .materialize_with_ignore(leaf.tree_root, &ignore_cache)
+                        .map_err(|e| format!("failed to materialize timeline: {}", e))?;
                 }
             }
 
+            // ---- Restore target's shelf (if any) ----
+            let mut restored_summary: Vec<String> = Vec::new();
+            {
+                let mut ws_mut = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
+                ws_mut.staging.clear();
+
+                if let Ok(Some(shelf)) = shelf_mgr.load_shelf(&switch_args.name) {
+                    if !shelf.workspace_changes.is_empty() {
+                        ws_mut
+                            .apply_changes(&shelf.workspace_changes)
+                            .map_err(|e| format!("failed to restore shelved changes: {}", e))?;
+                    }
+                    for (path, hash) in &shelf.staged_files {
+                        ws_mut.staging.stage(path, *hash);
+                    }
+                    let mut counts = (0usize, 0usize, 0usize, shelf.staged_files.len());
+                    for c in &shelf.workspace_changes {
+                        match c {
+                            WorkspaceChange::Modified { .. } => counts.0 += 1,
+                            WorkspaceChange::Untracked { .. } => counts.1 += 1,
+                            WorkspaceChange::Deleted { .. } => counts.2 += 1,
+                        }
+                    }
+                    if counts.0 > 0 {
+                        restored_summary.push(format!("{} modified", counts.0));
+                    }
+                    if counts.1 > 0 {
+                        restored_summary.push(format!("{} untracked", counts.1));
+                    }
+                    if counts.2 > 0 {
+                        restored_summary.push(format!("{} deleted", counts.2));
+                    }
+                    if counts.3 > 0 {
+                        restored_summary.push(format!("{} staged", counts.3));
+                    }
+                    shelf_mgr.remove_shelf(&switch_args.name).ok();
+                }
+                ws_mut.save().map_err(|e| e.to_string())?;
+            }
+
             if !quiet {
+                if !shelved_summary.is_empty() {
+                    println!(
+                        "Auto-shelved on '{}': {}",
+                        current,
+                        shelved_summary.join(", ")
+                    );
+                }
                 println!("Switched to timeline: {}", switch_args.name);
+                if !restored_summary.is_empty() {
+                    println!(
+                        "Restored shelved changes for '{}': {}",
+                        switch_args.name,
+                        restored_summary.join(", ")
+                    );
+                }
             }
             Ok(())
         }
@@ -758,13 +1137,32 @@ fn cmd_timeline(args: TimelineArgs, quiet: bool) -> Result<(), String> {
         TimelineCommands::Rename(rename_args) => {
             let repo = open_repo()?;
             let current = repo.current_timeline().map_err(|e| e.to_string())?;
-            repo.rename_timeline(&current, &rename_args.new_name)
-                .map_err(|e| e.to_string())?;
+
+            // Accept three forms:
+            //   tl rename NEW              → rename current to NEW
+            //   tl rename OLD NEW          → rename OLD to NEW
+            //   tl rename OLD to NEW       → same as above with `to` connector
+            let (old, new) = match rename_args.names.as_slice() {
+                [new] => (current.clone(), new.clone()),
+                [old, new] => (old.clone(), new.clone()),
+                [old, mid, new] if mid.eq_ignore_ascii_case("to") => {
+                    (old.clone(), new.clone())
+                }
+                [_, mid, _] => {
+                    return Err(format!(
+                        "expected `tl rename OLD to NEW` (got `{}` between names)",
+                        mid
+                    ));
+                }
+                _ => return Err("usage: tl rename [OLD [to]] NEW".into()),
+            };
+
+            repo.rename_timeline(&old, &new).map_err(|e| e.to_string())?;
             if !quiet {
                 println!(
                     "Renamed timeline: {} → {}",
-                    color::dim(&current),
-                    color::timeline(&rename_args.new_name)
+                    color::dim(&old),
+                    color::timeline(&new)
                 );
             }
             Ok(())
@@ -928,12 +1326,19 @@ fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
     let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
     let store = crate::fsmerkle::FsStore::new(&cas);
 
-    let base_files = BTreeMap::new();
+    let mut base_files = BTreeMap::new();
     let mut ours_files = BTreeMap::new();
     let mut theirs_files = BTreeMap::new();
 
-    // For simplicity, use empty base (treat as adding all). LCA-based base is ideal but requires
-    // walking history which we have. For now, use target as "ours" and source as "theirs".
+    // Walk the MMR-backed commit DAG to find the lowest common ancestor of
+    // the two heads, and use its tree as the merge base. This is what makes
+    // the `auto` strategy actually useful — without it, every file differing
+    // between sides would be reported as a conflict.
+    if let Some(base_idx) = repo.merge_base(target_head, source_head).map_err(|e| e.to_string())? {
+        if let Some(base_leaf) = repo.get_leaf(base_idx).map_err(|e| e.to_string())? {
+            collect_blob_hashes(&store, base_leaf.tree_root, "", &mut base_files)?;
+        }
+    }
     collect_blob_hashes(&store, target_leaf.tree_root, "", &mut ours_files)?;
     collect_blob_hashes(&store, source_leaf.tree_root, "", &mut theirs_files)?;
 
@@ -961,6 +1366,13 @@ fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
         let commit_result = repo
             .commit_raw(fuse_leaf, &target)
             .map_err(|e| e.to_string())?;
+
+        // Write the merged tree out to the workspace so the user actually
+        // sees the resolved files. Without this the seal exists in the MMR
+        // but the working tree still shows pre-merge content.
+        let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
+        ws.materialize(merged_tree)
+            .map_err(|e| format!("merge committed but failed to materialize: {}", e))?;
 
         if !quiet {
             println!("[OK] Merge completed successfully!");
@@ -1025,7 +1437,14 @@ fn cmd_travel(args: TravelArgs) -> Result<(), String> {
 
     let repo = open_repo()?;
     let timeline = repo.current_timeline().unwrap_or_else(|_| "main".into());
-    let entries = repo.walk_history(&timeline).map_err(|e| e.to_string())?;
+
+    let entries = if args.all {
+        // Walk every leaf in the MMR — useful when the head was welded
+        // and most seals are orphaned from the current timeline.
+        repo.walk_all_leaves().map_err(|e| e.to_string())?
+    } else {
+        repo.walk_history(&timeline).map_err(|e| e.to_string())?
+    };
 
     if entries.is_empty() {
         return Err(format!("no commits on timeline '{}'", timeline));
@@ -1067,125 +1486,343 @@ fn cmd_travel(args: TravelArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_shift(args: ShiftArgs, quiet: bool) -> Result<(), String> {
+/// `ivaldi weld` — combine a contiguous range of seals on the current
+/// timeline into a single new seal that replaces them in the linear chain.
+///
+/// Three invocation forms:
+///   * `ivaldi weld --last N [-m MSG]`               — last N seals
+///   * `ivaldi weld START [-m MSG]`                  — START..HEAD
+///   * `ivaldi weld START to END [-m MSG]`           — explicit range
+///   * `ivaldi weld START END [-m MSG]`              — same, no connector
+///   * `ivaldi weld` (no args)                       — interactive TUI picker
+///
+/// Semantics: the range is replaced by one new leaf whose `prev_idx` is
+/// the parent of the oldest seal in the range. The original leaves stay
+/// in the MMR for content-addressed integrity but become unreachable
+/// from the timeline head. Tree content matches the newest seal in the
+/// range (no merging — these were already linear).
+fn cmd_weld(args: WeldArgs, quiet: bool) -> Result<(), String> {
+    use crate::leaf::{Leaf, NO_PARENT};
+
     let mut repo = open_repo()?;
     let timeline = repo.current_timeline().unwrap_or_else(|_| "main".into());
+    let history = repo.walk_history(&timeline).map_err(|e| e.to_string())?;
 
-    if let Some(n) = args.last {
+    if history.len() < 2 {
+        return Err("need at least 2 seals to weld".into());
+    }
+
+    // Resolve range: returns (range_indices_newest_first, optional_message).
+    // `range_indices_newest_first[0]` is END (newest), `[len-1]` is START (oldest).
+    let (range, picker_message): (Vec<u64>, Option<String>) = if let Some(n) = args.last {
         if n < 2 {
-            return Err("need at least 2 commits to squash".into());
+            return Err("need at least 2 seals to weld".into());
         }
-
-        let history = repo.walk_history(&timeline).map_err(|e| e.to_string())?;
         if history.len() < n {
             return Err(format!(
-                "only {} commits on '{}', need {}",
+                "only {} seals on '{}', need {}",
                 history.len(),
                 timeline,
                 n
             ));
         }
+        (history.iter().take(n).map(|e| e.index).collect(), None)
+    } else if let Some(start_q) = &args.start {
+        // Normalize the optional `to` connector: accept
+        //   weld START          → END = HEAD
+        //   weld START END
+        //   weld START to END
+        let end_q: Option<&str> = match (&args.second, &args.end) {
+            (None, None) => None,
+            (Some(s), None) => Some(s.as_str()),
+            (Some(mid), Some(e)) if mid.eq_ignore_ascii_case("to") => Some(e.as_str()),
+            (Some(mid), Some(_)) => {
+                return Err(format!(
+                    "expected `weld START to END` (got `{}` between names)",
+                    mid
+                ));
+            }
+            (None, Some(_)) => unreachable!("clap fills `second` before `end`"),
+        };
 
-        if !quiet {
-            println!("Commits to squash:");
-            for entry in history.iter().take(n) {
-                println!("  {} - {}", entry.short_hash, entry.message);
+        let (start_idx, _) = repo
+            .resolve_seal(start_q)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("seal not found: {}", start_q))?;
+        let end_idx = match end_q {
+            Some(q) => {
+                repo.resolve_seal(q)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("seal not found: {}", q))?
+                    .0
+            }
+            None => history[0].index,
+        };
+
+        // Walk from end back along the timeline chain, collecting until we hit start.
+        let mut indices = Vec::new();
+        let mut found_start = false;
+        for entry in &history {
+            indices.push(entry.index);
+            if entry.index == start_idx {
+                found_start = true;
+                break;
+            }
+            if entry.index == end_idx && entry.index != end_idx {
+                break;
             }
         }
-
-        // Use the newest commit's tree and oldest's parent
-        let newest = &history[0];
-        let oldest = &history[n - 1];
-        let tree_root = repo
-            .get_leaf(newest.index)
-            .map_err(|e| e.to_string())?
-            .ok_or("corrupt head")?
-            .tree_root;
-        let _oldest_leaf = repo
-            .get_leaf(oldest.index)
-            .map_err(|e| e.to_string())?
-            .ok_or("corrupt oldest")?;
-
-        let cfg = repo.config();
-        let author = cfg.author().unwrap_or_else(|| newest.author.clone());
-        let message = format!(
-            "Squashed {} commits:\n\n{}",
-            n,
-            history
-                .iter()
-                .take(n)
-                .map(|e| e.message.as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-
-        let result = repo
-            .commit(tree_root, &author, &message)
-            .map_err(|e| e.to_string())?;
-
-        if !quiet {
-            println!(
-                "\n🔨 Created squashed seal: {} ({})",
-                result.seal_name,
-                result.hash.short8()
-            );
-            println!("✓ {} commits squashed into 1", n);
+        // Trim leading entries above `end_idx` if `end_idx` isn't the head.
+        if let Some(end_pos) = indices.iter().position(|i| *i == end_idx) {
+            indices = indices[end_pos..].to_vec();
+            // Re-check: after trimming we still need to find start_idx in what remains.
+            found_start = indices.iter().any(|i| *i == start_idx);
+        } else {
+            return Err(format!(
+                "end seal {} is not reachable from current timeline head",
+                end_q.unwrap_or("HEAD")
+            ));
         }
-    } else if args.start.is_some() || args.end.is_some() {
-        let start_q = args.start.as_deref().ok_or("start seal required")?;
-        let end_q = args.end.as_deref().unwrap_or("HEAD");
-        if !quiet {
-            println!("Squashing from {} to {}", start_q, end_q);
+        if !found_start {
+            return Err(format!(
+                "start seal {} is not an ancestor of {} on '{}'",
+                start_q,
+                end_q.unwrap_or("HEAD"),
+                timeline
+            ));
         }
+        if indices.len() < 2 {
+            return Err("range must contain at least 2 seals to weld".into());
+        }
+        (indices, None)
     } else {
-        // Interactive mode with TUI
+        // Interactive picker.
         use crate::tui::shift::{ShiftAction, run_shift};
-
-        let history = repo.walk_history(&timeline).map_err(|e| e.to_string())?;
-        if history.len() < 2 {
-            return Err("need at least 2 commits to squash".into());
-        }
-
-        let action = run_shift(history).map_err(|e| e.to_string())?;
-
+        let action = run_shift(history.clone()).map_err(|e| e.to_string())?;
         match action {
+            ShiftAction::Cancel => {
+                println!("Cancelled.");
+                return Ok(());
+            }
             ShiftAction::Squash {
-                start_index: _,
+                start_index,
                 end_index,
                 message,
             } => {
-                let newest_leaf = repo
-                    .get_leaf(end_index)
-                    .map_err(|e| e.to_string())?
-                    .ok_or("corrupt")?;
-                let cfg = repo.config();
-                let author = cfg.author().unwrap_or_else(|| newest_leaf.author.clone());
-                let result = repo
-                    .commit(newest_leaf.tree_root, &author, &message)
-                    .map_err(|e| e.to_string())?;
-                println!(
-                    "🔨 Created squashed seal: {} ({})",
-                    result.seal_name,
-                    result.hash.short8()
-                );
+                let mut indices = Vec::new();
+                let mut started = false;
+                for entry in &history {
+                    if entry.index == end_index {
+                        started = true;
+                    }
+                    if started {
+                        indices.push(entry.index);
+                    }
+                    if entry.index == start_index {
+                        break;
+                    }
+                }
+                if indices.len() < 2 {
+                    return Err("interactive picker returned an empty range".into());
+                }
+                (indices, Some(message))
             }
-            ShiftAction::Cancel => println!("Cancelled."),
+        }
+    };
+
+    // `range` is newest-first: [END, ..., START]. Validate contiguity on the
+    // timeline chain — each entry's prev_idx must equal the next entry's idx.
+    for w in range.windows(2) {
+        let leaf = repo
+            .get_leaf(w[0])
+            .map_err(|e| e.to_string())?
+            .ok_or("corrupt leaf in range")?;
+        if leaf.prev_idx != w[1] {
+            return Err(format!(
+                "range is not contiguous on '{}' (seal at idx {} does not parent {})",
+                timeline, w[1], w[0]
+            ));
+        }
+    }
+
+    let end_idx = range[0];
+    let start_idx = *range.last().unwrap();
+
+    let end_leaf = repo
+        .get_leaf(end_idx)
+        .map_err(|e| e.to_string())?
+        .ok_or("corrupt end leaf")?;
+    let start_leaf = repo
+        .get_leaf(start_idx)
+        .map_err(|e| e.to_string())?
+        .ok_or("corrupt start leaf")?;
+
+    // The new welded seal takes the parent of the oldest seal in the range.
+    let welded_prev = if start_leaf.has_parent() {
+        start_leaf.prev_idx
+    } else {
+        NO_PARENT
+    };
+
+    // Compose the message.
+    let cfg = repo.config();
+    let author = cfg.author().unwrap_or_else(|| end_leaf.author.clone());
+    let message = if let Some(m) = args.m {
+        m
+    } else if let Some(m) = picker_message {
+        m
+    } else {
+        // Oldest → newest summary so the welded message reads in chronological order.
+        let mut bullets: Vec<String> = Vec::new();
+        for idx in range.iter().rev() {
+            if let Some(leaf) = repo.get_leaf(*idx).map_err(|e| e.to_string())? {
+                let first_line = leaf.message.lines().next().unwrap_or("").trim().to_string();
+                bullets.push(format!("- {}", first_line));
+            }
+        }
+        format!("Welded {} seals:\n\n{}", range.len(), bullets.join("\n"))
+    };
+
+    if !quiet {
+        println!("Welding {} seals on '{}':", range.len(), timeline);
+        for idx in range.iter().rev() {
+            if let Some(leaf) = repo.get_leaf(*idx).map_err(|e| e.to_string())? {
+                let short = leaf.hash().short8();
+                let first_line = leaf.message.lines().next().unwrap_or("").trim();
+                println!("  {} {}", short, first_line);
+            }
+        }
+    }
+
+    // Trailing seals = anything between END (exclusive) and the timeline head
+    // (inclusive). They must be replayed on top of the welded seal so the
+    // linear chain stays intact. With `--last N` the END is always the head,
+    // so this list is empty; with a middle-range weld it isn't.
+    // `history` is newest-first, so trailing seals appear before END.
+    let trailing: Vec<u64> = history
+        .iter()
+        .map(|e| e.index)
+        .take_while(|idx| *idx != end_idx)
+        .collect();
+
+    // Build the welded leaf and append on the current timeline. `commit_raw`
+    // assigns a fresh MMR index, parents at our chosen `prev_idx`, and updates
+    // the timeline head to point at the new seal.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let mut welded_leaf = Leaf::new(end_leaf.tree_root, &timeline, &author, now, &message);
+    welded_leaf.prev_idx = welded_prev;
+
+    let welded_result = repo
+        .commit_raw(welded_leaf, &timeline)
+        .map_err(|e| e.to_string())?;
+
+    // Replay trailing seals on top of the welded seal, oldest-first, each
+    // parented on the previous replay (or on the welded seal itself for the
+    // first one). Tree, author, message, and timestamp are preserved; only
+    // `prev_idx` changes, which produces a new hash — there is no way to
+    // keep the original seal hashes when their parent linkage changes.
+    let mut prev_for_next = welded_result.index;
+    for trailing_idx in trailing.iter().rev() {
+        let original = repo
+            .get_leaf(*trailing_idx)
+            .map_err(|e| e.to_string())?
+            .ok_or("corrupt trailing leaf")?;
+        let mut replayed = Leaf::new(
+            original.tree_root,
+            &timeline,
+            &original.author,
+            original.time_unix,
+            &original.message,
+        );
+        replayed.prev_idx = prev_for_next;
+        replayed.merge_idxs = original.merge_idxs.clone();
+        let r = repo
+            .commit_raw(replayed, &timeline)
+            .map_err(|e| e.to_string())?;
+        prev_for_next = r.index;
+    }
+
+    if !quiet {
+        println!(
+            "\nCreated welded seal: {} ({})",
+            welded_result.seal_name,
+            welded_result.hash.short8()
+        );
+        if trailing.is_empty() {
+            println!(
+                "{} seals welded into 1 on '{}'",
+                range.len(),
+                color::timeline(&timeline)
+            );
+        } else {
+            println!(
+                "{} seals welded into 1; {} trailing seal(s) replayed on top of '{}'",
+                range.len(),
+                trailing.len(),
+                color::timeline(&timeline)
+            );
         }
     }
     Ok(())
 }
 
 fn cmd_config(args: ConfigArgs) -> Result<(), String> {
-    let ctx = find_repo()?;
-    let cfg = config::load_config(&ctx.ivaldi_dir);
+    // Resolve which config file to target and whether we're in a repo.
+    let repo_ctx = find_repo().ok();
+    let use_global = args.global || repo_ctx.is_none();
+    let target_path = if use_global {
+        let path = config::global_config_path()
+            .ok_or("cannot locate global config: $HOME is not set")?;
+        if !args.global && args.set.is_some() {
+            // Auto-fallback: the user didn't pass --global but we're outside a repo.
+            eprintln!(
+                "{}",
+                color::dim(&format!(
+                    "not in an Ivaldi repo — using global config at {}",
+                    path.display()
+                ))
+            );
+        }
+        path
+    } else {
+        // Safe unwrap: repo_ctx is Some when use_global is false.
+        repo_ctx.as_ref().unwrap().ivaldi_dir.join("config")
+    };
 
     if args.list {
-        for (key, value) in cfg.list() {
-            println!("{}={}", color::dim(key), value);
+        // Merged view when inside a repo; annotate provenance.
+        let global = config::load_global();
+        let local = repo_ctx
+            .as_ref()
+            .filter(|_| !args.global)
+            .map(|ctx| Config::load(&ctx.ivaldi_dir.join("config")).unwrap_or_else(|_| Config::new()));
+
+        let mut merged = Config::new();
+        merged.merge(&global);
+        if let Some(l) = &local {
+            merged.merge(l);
+        }
+
+        for (key, value) in merged.list() {
+            let provenance = match (&local, global.get(key)) {
+                (Some(l), _) if l.get(key).is_some() => "local",
+                (_, Some(_)) => "global",
+                _ => "default",
+            };
+            println!("{} = {} {}", color::cyan(key), value, color::dim(&format!("({})", provenance)));
         }
         return Ok(());
     }
     if let Some(key) = &args.get {
+        let cfg = if use_global {
+            config::load_global()
+        } else {
+            // Safe unwrap: repo_ctx is Some when use_global is false.
+            config::load_config(&repo_ctx.as_ref().unwrap().ivaldi_dir)
+        };
         match cfg.get(key) {
             Some(value) => println!("{}", value),
             None => return Err(format!("config key not found: {}", key)),
@@ -1194,91 +1831,18 @@ fn cmd_config(args: ConfigArgs) -> Result<(), String> {
     }
     if let Some(key) = &args.set {
         let value = args.value.as_deref().ok_or("value required for --set")?;
-        let mut repo_cfg =
-            Config::load(&ctx.ivaldi_dir.join("config")).unwrap_or_else(|_| Config::new());
-        repo_cfg.set(key, value);
-        repo_cfg
-            .save(&ctx.ivaldi_dir.join("config"))
-            .map_err(|e| e.to_string())?;
-        println!("{}={}", key, value);
+        let mut cfg = Config::load(&target_path).unwrap_or_else(|_| Config::new());
+        cfg.set(key, value);
+        cfg.save(&target_path).map_err(|e| e.to_string())?;
+        let scope = if use_global { "global" } else { "local" };
+        println!("{}={} ({})", key, value, scope);
         return Ok(());
     }
 
-    // No flags — interactive mode
-    interactive_config(&ctx.ivaldi_dir)?;
+    // No flags — launch the interactive form.
+    let inside_repo = repo_ctx.is_some() && !args.global;
+    crate::tui::config_form::run(&target_path, inside_repo).map_err(|e| e.to_string())?;
     Ok(())
-}
-
-fn interactive_config(ivaldi_dir: &std::path::Path) -> Result<(), String> {
-    let mut cfg = Config::load(&ivaldi_dir.join("config")).unwrap_or_else(|_| Config::new());
-
-    println!("{}", color::bold("Ivaldi Configuration"));
-    println!(
-        "{}\n",
-        color::dim("Press Enter to keep current value, or type a new one.")
-    );
-
-    // user.name
-    let current_name = cfg.get("user.name").unwrap_or("").to_string();
-    let name = prompt_with_default("user.name", &current_name)?;
-    if !name.is_empty() {
-        cfg.set("user.name", &name);
-    }
-
-    // user.email
-    let current_email = cfg.get("user.email").unwrap_or("").to_string();
-    let email = prompt_with_default("user.email", &current_email)?;
-    if !email.is_empty() {
-        cfg.set("user.email", &email);
-    }
-
-    // color.ui
-    let current_color = cfg.get("color.ui").unwrap_or("true").to_string();
-    let color_ui = prompt_with_default("color.ui", &current_color)?;
-    if !color_ui.is_empty() {
-        cfg.set("color.ui", &color_ui);
-    }
-
-    // core.autoshelf
-    let current_shelf = cfg.get("core.autoshelf").unwrap_or("true").to_string();
-    let autoshelf = prompt_with_default("core.autoshelf", &current_shelf)?;
-    if !autoshelf.is_empty() {
-        cfg.set("core.autoshelf", &autoshelf);
-    }
-
-    cfg.save(&ivaldi_dir.join("config"))
-        .map_err(|e| e.to_string())?;
-
-    println!("\n{} Configuration saved.", color::green("✓"));
-
-    if let Some(author) = cfg.author() {
-        println!("Author: {}", color::author(&author));
-    }
-
-    Ok(())
-}
-
-fn prompt_with_default(key: &str, default: &str) -> Result<String, String> {
-    use std::io::Write;
-
-    if default.is_empty() {
-        print!("  {} = ", color::cyan(key));
-    } else {
-        print!("  {} [{}] = ", color::cyan(key), color::dim(default));
-    }
-    std::io::stdout().flush().map_err(|e| e.to_string())?;
-
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .map_err(|e| e.to_string())?;
-    let input = input.trim();
-
-    if input.is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(input.to_string())
-    }
 }
 
 fn cmd_exclude(args: ExcludeArgs, quiet: bool) -> Result<(), String> {
@@ -1306,10 +1870,31 @@ fn cmd_portal(args: PortalArgs, quiet: bool) -> Result<(), String> {
     let mgr = PortalManager::new(&ctx.ivaldi_dir);
     match args.command {
         PortalCommands::Add(add_args) => {
-            let mut portal = Portal::parse(&add_args.repo).ok_or(format!(
-                "invalid portal format: {}. Expected: owner/repo",
-                add_args.repo
-            ))?;
+            // `ivaldi://` URLs synthesize a portal directly (P2P has no
+            // owner/repo). Other inputs go through the parse_repo_spec
+            // pipeline and preserve SSH origin in base_url for transport
+            // dispatch.
+            let mut portal = if let Some(p) = Portal::parse(&add_args.repo) {
+                if p.base_url.is_some() {
+                    p
+                } else {
+                    let spec = parse_repo_arg(&add_args.repo)?;
+                    Portal {
+                        owner: spec.owner,
+                        repo: spec.repo,
+                        platform: spec.platform,
+                        base_url: None,
+                    }
+                }
+            } else {
+                let spec = parse_repo_arg(&add_args.repo)?;
+                Portal {
+                    owner: spec.owner,
+                    repo: spec.repo,
+                    platform: spec.platform,
+                    base_url: None,
+                }
+            };
             if add_args.gitlab {
                 portal.platform = Platform::GitLab;
             }
@@ -1358,16 +1943,70 @@ fn cmd_portal(args: PortalArgs, quiet: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Try to open `url` in the user's default browser. Best-effort: returns
+/// false when no opener exists, the environment is headless, or the user
+/// opted out via IVALDI_NO_BROWSER. The caller still prints the URL so the
+/// user can fall back to copy/paste.
+fn open_in_browser(url: &str) -> bool {
+    if std::env::var_os("IVALDI_NO_BROWSER").is_some() {
+        return false;
+    }
+    use std::process::{Command, Stdio};
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = Command::new("open");
+        c.arg(url);
+        c
+    } else if cfg!(target_os = "windows") {
+        let mut c = Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    } else {
+        let mut c = Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    cmd.stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
 fn cmd_auth(args: AuthArgs) -> Result<(), String> {
     match args.command {
         AuthCommands::Login(login_args) => {
             use crate::auth::TokenStore;
             use crate::github::GitHubClient;
+            use crate::gitlab;
 
             if login_args.gitlab {
+                let host = gitlab::resolve_host(login_args.gitlab_host.as_deref());
+                println!("Initiating GitLab authentication against {}...", host);
+                let device_code = gitlab::request_device_code(&host)
+                    .map_err(|e| e.to_string())?;
                 println!(
-                    "GitLab OAuth not yet implemented. Set GITLAB_TOKEN environment variable."
+                    "\nFirst, copy your one-time code: {}",
+                    device_code.user_code
                 );
+                let url = device_code.browser_url();
+                if open_in_browser(url) {
+                    println!("Opened {} in your browser.", url);
+                    println!("(If nothing opened, visit the URL above manually.)");
+                } else {
+                    println!("Then visit: {}", url);
+                }
+                println!("\nWaiting for authentication...");
+                let token = gitlab::poll_for_token(
+                    &host,
+                    &device_code.device_code,
+                    device_code.interval,
+                )
+                .map_err(|e| e.to_string())?;
+                let store = TokenStore::new().map_err(|e| e.to_string())?;
+                store
+                    .save_token(Platform::GitLab, token)
+                    .map_err(|e| e.to_string())?;
+                println!("\nAuthentication successful!");
                 return Ok(());
             }
 
@@ -1378,7 +2017,15 @@ fn cmd_auth(args: AuthArgs) -> Result<(), String> {
                 "\nFirst, copy your one-time code: {}",
                 device_code.user_code
             );
-            println!("Then visit: {}", device_code.verification_uri);
+            if open_in_browser(&device_code.verification_uri) {
+                println!(
+                    "Opened {} in your browser.",
+                    device_code.verification_uri
+                );
+                println!("(If nothing opened, visit the URL above manually.)");
+            } else {
+                println!("Then visit: {}", device_code.verification_uri);
+            }
             println!("\nWaiting for authentication...");
 
             let token =
@@ -1422,18 +2069,92 @@ fn cmd_auth(args: AuthArgs) -> Result<(), String> {
 
 fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<(), String> {
     use crate::github::GitHubClient;
+    use crate::ssh_transport::SshTarget;
     use crate::sync;
 
-    let (owner, repo_name) = parse_repo_arg(&args.repo)?;
+    // `ivaldi://host[:port][/timeline]` — peer-to-peer transport, no
+    // GitHub / GitLab in the loop.
+    if let Some(url) = crate::p2p::PeerUrl::parse(&args.repo) {
+        use crate::identity;
+        use crate::known_peers::TofuPolicy;
+        let id_path = identity::default_path()
+            .ok_or("could not resolve $HOME for ~/.ivaldi/identity")?;
+        let id =
+            identity::Identity::load_or_create(&id_path).map_err(|e| e.to_string())?;
+        let default_dir = url
+            .timeline
+            .clone()
+            .unwrap_or_else(|| url.host.clone());
+        let target_dir =
+            std::path::PathBuf::from(args.directory.as_deref().unwrap_or(&default_dir));
+        let policy = if args.accept_new_peer {
+            TofuPolicy::AcceptAll
+        } else if args.strict_peer {
+            TofuPolicy::StrictKnown
+        } else {
+            TofuPolicy::Prompt
+        };
+        let summary = crate::p2p::fetch_into_with_policy(&url, &target_dir, &id, policy)
+            .map_err(|e| e.to_string())?;
+        if !quiet {
+            println!(
+                "Cloned ivaldi://{}:{} → {}",
+                url.host,
+                url.port,
+                target_dir.display()
+            );
+            println!(
+                "  timeline: {}, {} leaves, {} objects",
+                summary.timeline, summary.leaves_imported, summary.blobs_imported
+            );
+        }
+        return Ok(());
+    }
+
+    // Try SSH next — `git@host:owner/repo.git` and `ssh://...` go straight
+    // to the SSH transport. Anything that doesn't parse as SSH falls
+    // through to the existing HTTPS / GitHub flow.
+    if let Some(target) = SshTarget::parse(&args.repo) {
+        let default_dir = target
+            .repo_path
+            .trim_end_matches('/')
+            .trim_end_matches(".git")
+            .rsplit('/')
+            .next()
+            .unwrap_or("repo")
+            .to_string();
+        let target_dir =
+            std::path::PathBuf::from(args.directory.as_deref().unwrap_or(&default_dir));
+        let result = sync::download_ssh(&target, &target_dir, None).map_err(|e| e.to_string())?;
+        if !quiet {
+            println!(
+                "Cloned {}@{}:{} → {}",
+                target.user,
+                target.host,
+                target.repo_path,
+                target_dir.display()
+            );
+            println!("  {} files downloaded", result.files_downloaded);
+        }
+        return Ok(());
+    }
+
+    let spec = parse_repo_arg(&args.repo)?;
     let client = GitHubClient::new();
 
-    let target_dir = std::path::PathBuf::from(args.directory.as_deref().unwrap_or(&repo_name));
+    let target_dir = std::path::PathBuf::from(args.directory.as_deref().unwrap_or(&spec.repo));
+    let branch = spec.branch_hint.as_deref();
 
-    let result = sync::download(&client, &owner, &repo_name, &target_dir, None)
+    let result = sync::download(&client, &spec.owner, &spec.repo, &target_dir, branch)
         .map_err(|e| e.to_string())?;
 
     if !quiet {
-        println!("Cloned {}/{} → {}", owner, repo_name, target_dir.display());
+        println!(
+            "Cloned {}/{} → {}",
+            spec.owner,
+            spec.repo,
+            target_dir.display()
+        );
         println!("  {} files downloaded", result.files_downloaded);
     }
     Ok(())
@@ -1441,21 +2162,100 @@ fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<(), String> {
 
 fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
     use crate::github::GitHubClient;
+    use crate::portal::Transport;
     use crate::sync;
 
-    let repo = open_repo()?;
-    let client = GitHubClient::new();
+    let mut repo = open_repo()?;
 
-    if !client.is_authenticated() {
-        return Err("not authenticated. Run 'ivaldi auth login' or set GITHUB_TOKEN.".into());
-    }
-
-    // Get portal
     let portal_mgr = PortalManager::new(&repo.ivaldi_dir);
     let portal = portal_mgr
         .get_default()
         .map_err(|e| e.to_string())?
         .ok_or("no portal configured. Run 'ivaldi portal add owner/repo'.")?;
+
+    // SSH push — bypass the GitHub auth check entirely.
+    if let Transport::Ssh(target) = portal.transport() {
+        let timeline = args
+            .branch
+            .clone()
+            .unwrap_or_else(|| repo.current_timeline().unwrap_or_else(|_| "main".into()));
+        if args.force {
+            print!("WARNING: Force push will OVERWRITE remote history! Type 'force push' to confirm: ");
+            std::io::stdout().flush().map_err(|e| e.to_string())?;
+            let mut input = String::new();
+            std::io::stdin()
+                .read_line(&mut input)
+                .map_err(|e| e.to_string())?;
+            if input.trim() != "force push" {
+                println!("Aborted.");
+                return Ok(());
+            }
+        }
+        let report = crate::ssh_transport::SshClient::new(target)
+            .push_repo(&mut repo, &timeline, args.force)
+            .map_err(|e| e.to_string())?;
+
+        if !report.unpack_ok {
+            return Err(format!(
+                "remote rejected pack: {}",
+                report.unpack_error.unwrap_or_else(|| "unknown".into())
+            ));
+        }
+        let mut had_failure = false;
+        for r in &report.refs {
+            match &r.error {
+                Some(reason) => {
+                    println!("  {} REJECTED: {}", r.name, reason);
+                    had_failure = true;
+                }
+                None => {
+                    if !quiet {
+                        println!("  {} updated", r.name);
+                    }
+                }
+            }
+        }
+        if had_failure {
+            return Err("one or more refs were rejected".into());
+        }
+        if !quiet {
+            println!("Pushed timeline '{}' over SSH.", timeline);
+        }
+        return Ok(());
+    }
+
+    // Peer-to-peer push — branch out before the GitHub auth check.
+    if let Transport::Peer(peer_url) = portal.transport() {
+        use crate::identity;
+        use crate::known_peers::TofuPolicy;
+
+        let id_path = identity::default_path()
+            .ok_or("could not resolve $HOME for ~/.ivaldi/identity")?;
+        let id =
+            identity::Identity::load_or_create(&id_path).map_err(|e| e.to_string())?;
+        let timeline = args
+            .branch
+            .clone()
+            .unwrap_or_else(|| repo.current_timeline().unwrap_or_else(|_| "main".into()));
+        let summary = crate::p2p::push_to(&peer_url, &mut repo, &id, &timeline, TofuPolicy::Prompt)
+            .map_err(|e| e.to_string())?;
+        if !quiet {
+            println!(
+                "Pushed timeline '{}' to ivaldi://{}:{}",
+                timeline, peer_url.host, peer_url.port
+            );
+            println!(
+                "  landed as: {} ({} leaves, {} objects)",
+                summary.landed_as, summary.leaves_sent, summary.objects_sent
+            );
+        }
+        return Ok(());
+    }
+
+    let client = GitHubClient::new();
+    if !client.is_authenticated() {
+        return Err("not authenticated. Run 'ivaldi auth login' or set GITHUB_TOKEN.".into());
+    }
 
     if args.force {
         print!("WARNING: Force push will OVERWRITE remote history! Type 'force push' to confirm: ");
@@ -1503,7 +2303,7 @@ fn cmd_scout(_args: ScoutArgs) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .ok_or("no portal configured. Run 'ivaldi portal add owner/repo'.")?;
 
-    let branches = sync::scout_with_status(&client, &repo, &portal.owner, &portal.repo)
+    let branches = sync::scout_with_status(&client, &repo, &portal)
         .map_err(|e| e.to_string())?;
 
     println!("Remote timelines available:");
@@ -1534,8 +2334,7 @@ fn cmd_harvest(args: HarvestArgs, quiet: bool) -> Result<(), String> {
 
     if args.timelines.is_empty() {
         // List available and prompt
-        let branches =
-            sync::scout(&client, &portal.owner, &portal.repo).map_err(|e| e.to_string())?;
+        let branches = sync::scout(&client, &portal).map_err(|e| e.to_string())?;
         println!("Available remote timelines:");
         for b in &branches {
             println!("  {}", b);
@@ -1544,14 +2343,8 @@ fn cmd_harvest(args: HarvestArgs, quiet: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    let harvested = sync::harvest(
-        &client,
-        &mut repo,
-        &portal.owner,
-        &portal.repo,
-        &args.timelines,
-    )
-    .map_err(|e| e.to_string())?;
+    let harvested =
+        sync::harvest(&client, &mut repo, &portal, &args.timelines).map_err(|e| e.to_string())?;
 
     if !quiet {
         for name in &harvested {
@@ -1658,18 +2451,15 @@ pub(crate) fn state_marker(state: FileState) -> (&'static str, fn(&str) -> Strin
     }
 }
 
-// Helper: parse "owner/repo" from CLI arg
-fn parse_repo_arg(arg: &str) -> Result<(String, String), String> {
-    // Handle "owner/repo" format
-    if let Some((owner, repo)) = arg.split_once('/') {
-        if !owner.is_empty() && !repo.is_empty() {
-            return Ok((owner.to_string(), repo.to_string()));
-        }
-    }
-    Err(format!(
-        "invalid repository format: '{}'. Expected: owner/repo",
-        arg
-    ))
+// Helper: parse a repo identifier from a CLI arg.
+// Accepts owner/repo, full URLs, SSH URLs, github:/gitlab: shorthand.
+fn parse_repo_arg(arg: &str) -> Result<crate::portal::RepoSpec, String> {
+    crate::portal::parse_repo_spec(arg).map_err(|e| {
+        format!(
+            "invalid repository: '{}' ({})\n  accepted formats:\n    owner/repo\n    https://github.com/owner/repo\n    git@github.com:owner/repo.git\n    github:owner/repo",
+            arg, e
+        )
+    })
 }
 
 fn cmd_review(args: ReviewArgs, quiet: bool) -> Result<(), String> {
@@ -1936,8 +2726,155 @@ fn cmd_review(args: ReviewArgs, quiet: bool) -> Result<(), String> {
 }
 
 fn cmd_tui() -> Result<(), String> {
+    if let Ok(ctx) = find_repo() {
+        return crate::tui::app::run(&ctx.work_dir, &ctx.ivaldi_dir);
+    }
+
+    // No repository here — drop the user into the launcher so they can
+    // download, forge, or open one without going back to the CLI.
+    use crate::tui::launcher::{self, LauncherChoice};
+    let choice = launcher::run().map_err(|e| format!("Launcher error: {}", e))?;
+
+    match choice {
+        LauncherChoice::Quit => Ok(()),
+        LauncherChoice::Download {
+            repo_arg,
+            target_dir,
+        } => {
+            // Same path the CLI's `cmd_download` takes, just inlined so we can
+            // chain into the dashboard on success.
+            let spec = parse_repo_arg(&repo_arg)?;
+            let client = crate::github::GitHubClient::new();
+            let branch = spec.branch_hint.as_deref();
+            crate::sync::download(&client, &spec.owner, &spec.repo, &target_dir, branch)
+                .map_err(|e| e.to_string())?;
+            crate::tui::app::run(&target_dir, &target_dir.join(".ivaldi"))
+        }
+        LauncherChoice::Forge { target_dir } => {
+            std::fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
+            forge::forge(&target_dir).map_err(|e| e.to_string())?;
+            crate::tui::app::run(&target_dir, &target_dir.join(".ivaldi"))
+        }
+        LauncherChoice::Open { target_dir } => {
+            let ivaldi_dir = target_dir.join(".ivaldi");
+            if !ivaldi_dir.join("HEAD").exists() {
+                return Err(format!(
+                    "{} is not an Ivaldi repository",
+                    target_dir.display()
+                ));
+            }
+            crate::tui::app::run(&target_dir, &ivaldi_dir)
+        }
+    }
+}
+
+fn cmd_serve(args: ServeArgs, _quiet: bool) -> Result<(), String> {
+    use crate::identity;
+    use crate::p2p;
+
     let ctx = find_repo()?;
-    crate::tui::app::run(&ctx.work_dir, &ctx.ivaldi_dir)
+
+    let id_path = identity::default_path()
+        .ok_or("could not resolve $HOME for ~/.ivaldi/identity")?;
+    let id = identity::Identity::load_or_create(&id_path).map_err(|e| e.to_string())?;
+    let peer_store_path = ctx.ivaldi_dir.join("authorized_peers");
+    p2p::serve(&args.bind, ctx.work_dir.clone(), &id, peer_store_path)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn cmd_peer(args: PeerArgs, _quiet: bool) -> Result<(), String> {
+    use crate::identity;
+    use crate::peers::{decode_pubkey, PeerStore};
+
+    match args.command {
+        PeerCommands::Whoami => {
+            let id_path = identity::default_path()
+                .ok_or("could not resolve $HOME for ~/.ivaldi/identity")?;
+            let id = identity::Identity::load_or_create(&id_path).map_err(|e| e.to_string())?;
+            println!("{}", id.pubkey_hex());
+            Ok(())
+        }
+        PeerCommands::Trust(t) => {
+            let ctx = find_repo()?;
+            let pubkey = decode_pubkey(&t.pubkey).map_err(|e| e)?;
+            let store = PeerStore::repo_local(&ctx.ivaldi_dir);
+            store
+                .trust(pubkey, t.name.as_deref())
+                .map_err(|e| e.to_string())?;
+            println!(
+                "Trusted peer {}{}",
+                t.pubkey,
+                t.name
+                    .as_ref()
+                    .map(|n| format!(" ({})", n))
+                    .unwrap_or_default()
+            );
+            Ok(())
+        }
+        PeerCommands::List => {
+            let ctx = find_repo()?;
+            let store = PeerStore::repo_local(&ctx.ivaldi_dir);
+            let entries = store.list().map_err(|e| e.to_string())?;
+            if entries.is_empty() {
+                println!("(no trusted peers)");
+            } else {
+                for e in entries {
+                    let key = e.pubkey_hex();
+                    match e.name {
+                        Some(n) => println!("{}  {}", key, n),
+                        None => println!("{}", key),
+                    }
+                }
+            }
+            Ok(())
+        }
+        PeerCommands::Forget(f) => {
+            let ctx = find_repo()?;
+            let store = PeerStore::repo_local(&ctx.ivaldi_dir);
+            match store.forget(&f.prefix).map_err(|e| e.to_string())? {
+                Some(removed) => {
+                    println!("Forgot {}", removed.pubkey_hex());
+                    Ok(())
+                }
+                None => Err(format!("no trusted peer matches '{}'", f.prefix)),
+            }
+        }
+        PeerCommands::Known(known) => {
+            use crate::known_peers::{fingerprint, KnownPeers};
+            let store = KnownPeers::default_for_user()
+                .ok_or("could not resolve $HOME for ~/.ivaldi/known_peers")?;
+            match known.command {
+                PeerKnownCommands::List => {
+                    let entries = store.list().map_err(|e| e.to_string())?;
+                    if entries.is_empty() {
+                        println!("(no known peers)");
+                    } else {
+                        for (key, pk) in entries {
+                            println!("{}  {}", key, fingerprint(&pk));
+                        }
+                    }
+                    Ok(())
+                }
+                PeerKnownCommands::Forget(f) => {
+                    let (host, port) = match f.host.rsplit_once(':') {
+                        Some((h, p)) => match p.parse::<u16>() {
+                            Ok(n) => (h.to_string(), n),
+                            Err(_) => (f.host.clone(), crate::p2p::DEFAULT_PORT),
+                        },
+                        None => (f.host.clone(), crate::p2p::DEFAULT_PORT),
+                    };
+                    let removed = store.forget(&host, port).map_err(|e| e.to_string())?;
+                    if removed {
+                        println!("Forgot {}:{}", host, port);
+                        Ok(())
+                    } else {
+                        Err(format!("no known peer at {}:{}", host, port))
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

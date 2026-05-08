@@ -1,10 +1,21 @@
 # Auth Module (`auth.rs`)
 
-Authentication management for Ivaldi VCS.
+OAuth token storage and credential resolution for HTTPS-based remote
+operations (GitHub + GitLab REST APIs).
 
 ## Overview
 
-Handles OAuth token storage and multi-source credential resolution for GitHub and GitLab.
+Tokens for GitHub and GitLab live side-by-side at
+`~/.config/ivaldi/auth.json` (mode 0600). Auth is resolved through a
+priority chain so existing `gh` / `glab` users don't have to re-login.
+
+**Auth is only needed for HTTPS upload / sync.** Public-repo download /
+scout / harvest work anonymously. SSH transport uses the system SSH
+agent (no Ivaldi-side auth). Peer-to-peer uses each user's long-lived
+ed25519 identity at `~/.ivaldi/identity` — see [`identity.md`](identity.md)
+and [`p2p.md`](p2p.md).
+
+For the GitLab device flow specifically, see [`gitlab.md`](gitlab.md).
 
 ## Token Priority
 

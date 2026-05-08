@@ -22,10 +22,30 @@ pub struct GitHubClient {
 }
 
 fn make_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(30))
-        .timeout_read(std::time::Duration::from_secs(60))
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(30)))
+        .timeout_recv_response(Some(std::time::Duration::from_secs(60)))
+        .http_status_as_error(false)
         .build()
+        .new_agent()
+}
+
+fn header_str<'a>(resp: &'a ureq::http::Response<ureq::Body>, name: &str) -> Option<&'a str> {
+    resp.headers().get(name).and_then(|v| v.to_str().ok())
+}
+
+fn check_status(resp: ureq::http::Response<ureq::Body>) -> Result<ureq::http::Response<ureq::Body>, GitHubError> {
+    let status = resp.status().as_u16();
+    if (200..300).contains(&status) {
+        return Ok(resp);
+    }
+    if status == 401 {
+        return Err(GitHubError::AuthRequired);
+    }
+    if status == 403 && header_str(&resp, "X-RateLimit-Remaining") == Some("0") {
+        return Err(GitHubError::RateLimited);
+    }
+    Err(GitHubError::Http(format!("HTTP {}", status)))
 }
 
 impl GitHubClient {
@@ -52,102 +72,65 @@ impl GitHubClient {
         self.token.as_deref()
     }
 
-    fn req(&self, method: &str, path: &str) -> ureq::Request {
-        let url = if path.starts_with("https://") {
+    fn url(&self, path: &str) -> String {
+        if path.starts_with("https://") {
             path.to_string()
         } else {
             format!("{}{}", GITHUB_API, path)
-        };
-        let mut r = self
-            .agent
-            .request(method, &url)
-            .set("Accept", ACCEPT)
-            .set("User-Agent", "ivaldi-vcs/0.1.0");
-        if let Some(ref t) = self.token {
-            r = r.set("Authorization", &format!("Bearer {}", t));
         }
-        r
     }
 
-    /// Make a request with automatic rate limit retry.
-    #[allow(dead_code)]
-    fn call_with_retry(&self, req: ureq::Request) -> Result<ureq::Response, GitHubError> {
-        match req.call() {
-            Ok(resp) => {
-                // Check remaining rate limit from headers
-                if let Some(remaining) = resp.header("X-RateLimit-Remaining") {
-                    if remaining == "0" {
-                        if let Some(reset) = resp.header("X-RateLimit-Reset") {
-                            if let Ok(ts) = reset.parse::<u64>() {
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs();
-                                if ts > now {
-                                    let wait = ts - now;
-                                    crate::logging::warn(&format!(
-                                        "Rate limited. Waiting {} seconds...",
-                                        wait
-                                    ));
-                                    thread::sleep(Duration::from_secs(wait.min(60)));
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(resp)
-            }
-            Err(ureq::Error::Status(403, resp)) => {
-                // Check if rate limited
-                if let Some(remaining) = resp.header("X-RateLimit-Remaining") {
-                    if remaining == "0" {
-                        if let Some(reset) = resp.header("X-RateLimit-Reset") {
-                            if let Ok(ts) = reset.parse::<u64>() {
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap()
-                                    .as_secs();
-                                let wait = if ts > now { ts - now } else { 60 };
-                                let wait = wait.min(120);
-                                crate::logging::warn(&format!(
-                                    "Rate limited. Waiting {} seconds...",
-                                    wait
-                                ));
-                                thread::sleep(Duration::from_secs(wait));
-                                // Retry not implemented for simplicity — return error
-                            }
-                        }
-                    }
-                }
-                Err(GitHubError::RateLimited)
-            }
-            Err(e) => Err(gh_err(e)),
+    fn get(&self, path: &str) -> Result<ureq::http::Response<ureq::Body>, GitHubError> {
+        let url = self.url(path);
+        let mut r = self
+            .agent
+            .get(&url)
+            .header("Accept", ACCEPT)
+            .header("User-Agent", "ivaldi-vcs/0.1.0");
+        if let Some(ref t) = self.token {
+            r = r.header("Authorization", &format!("Bearer {}", t));
         }
+        let resp = r.call().map_err(gh_err)?;
+        check_status(resp)
+    }
+
+    fn send_json<T: serde::Serialize>(
+        &self,
+        method: &str,
+        path: &str,
+        body: T,
+    ) -> Result<ureq::http::Response<ureq::Body>, GitHubError> {
+        let url = self.url(path);
+        let mut r = match method {
+            "POST" => self.agent.post(&url),
+            "PUT" => self.agent.put(&url),
+            "PATCH" => self.agent.patch(&url),
+            _ => panic!("unsupported method {}", method),
+        };
+        r = r
+            .header("Accept", ACCEPT)
+            .header("User-Agent", "ivaldi-vcs/0.1.0");
+        if let Some(ref t) = self.token {
+            r = r.header("Authorization", &format!("Bearer {}", t));
+        }
+        let resp = r.send_json(body).map_err(gh_err)?;
+        check_status(resp)
     }
 
     pub fn get_repo(&self, owner: &str, repo: &str) -> Result<RepoInfo, GitHubError> {
-        let resp = self
-            .req("GET", &format!("/repos/{}/{}", owner, repo))
-            .call()
-            .map_err(gh_err)?;
-        resp.into_json().map_err(gh_err)
+        let resp = self.get(&format!("/repos/{}/{}", owner, repo))?;
+        resp.into_body().read_json().map_err(gh_err)
     }
 
     pub fn list_branches(&self, owner: &str, repo: &str) -> Result<Vec<BranchInfo>, GitHubError> {
         let mut all = Vec::new();
         let mut page = 1u32;
         loop {
-            let resp = self
-                .req(
-                    "GET",
-                    &format!(
-                        "/repos/{}/{}/branches?per_page=100&page={}",
-                        owner, repo, page
-                    ),
-                )
-                .call()
-                .map_err(gh_err)?;
-            let batch: Vec<BranchInfo> = resp.into_json().map_err(gh_err)?;
+            let resp = self.get(&format!(
+                "/repos/{}/{}/branches?per_page=100&page={}",
+                owner, repo, page
+            ))?;
+            let batch: Vec<BranchInfo> = resp.into_body().read_json().map_err(gh_err)?;
             let n = batch.len();
             all.extend(batch);
             if n < 100 {
@@ -164,14 +147,11 @@ impl GitHubClient {
         repo: &str,
         sha: &str,
     ) -> Result<TreeResponse, GitHubError> {
-        let resp = self
-            .req(
-                "GET",
-                &format!("/repos/{}/{}/git/trees/{}?recursive=1", owner, repo, sha),
-            )
-            .call()
-            .map_err(gh_err)?;
-        resp.into_json().map_err(gh_err)
+        let resp = self.get(&format!(
+            "/repos/{}/{}/git/trees/{}?recursive=1",
+            owner, repo, sha
+        ))?;
+        resp.into_body().read_json().map_err(gh_err)
     }
 
     pub fn list_commits(
@@ -184,17 +164,11 @@ impl GitHubClient {
         let mut all = Vec::new();
         let mut page = 1u32;
         loop {
-            let resp = self
-                .req(
-                    "GET",
-                    &format!(
-                        "/repos/{}/{}/commits?sha={}&per_page=100&page={}",
-                        owner, repo, branch, page
-                    ),
-                )
-                .call()
-                .map_err(gh_err)?;
-            let batch: Vec<CommitInfo> = resp.into_json().map_err(gh_err)?;
+            let resp = self.get(&format!(
+                "/repos/{}/{}/commits?sha={}&per_page=100&page={}",
+                owner, repo, branch, page
+            ))?;
+            let batch: Vec<CommitInfo> = resp.into_body().read_json().map_err(gh_err)?;
             let n = batch.len();
             all.extend(batch);
             if depth > 0 && all.len() >= depth {
@@ -220,9 +194,10 @@ impl GitHubClient {
             "https://raw.githubusercontent.com/{}/{}/{}/{}",
             owner, repo, git_ref, path
         );
-        let resp = self.req("GET", &url).call().map_err(gh_err)?;
+        let resp = self.get(&url)?;
         let mut buf = Vec::new();
-        resp.into_reader()
+        resp.into_body()
+            .into_reader()
             .read_to_end(&mut buf)
             .map_err(|e| GitHubError::Other(e.to_string()))?;
         Ok(buf)
@@ -236,12 +211,35 @@ impl GitHubClient {
     ) -> Result<String, GitHubError> {
         let encoded = base64::engine::general_purpose::STANDARD.encode(content);
         let body = serde_json::json!({"content": encoded, "encoding": "base64"});
-        let resp = self
-            .req("POST", &format!("/repos/{}/{}/git/blobs", owner, repo))
-            .send_json(body)
-            .map_err(gh_err)?;
-        let r: ShaResponse = resp.into_json().map_err(gh_err)?;
+        let resp = self.send_json("POST", &format!("/repos/{}/{}/git/blobs", owner, repo), body)?;
+        let r: ShaResponse = resp.into_body().read_json().map_err(gh_err)?;
         Ok(r.sha)
+    }
+
+    /// Create a file via the Contents API. Used to bootstrap an empty
+    /// repository — GitHub's Git Data API returns 409 on empty repos, but the
+    /// Contents API accepts a PUT and creates the initial commit/branch.
+    pub fn create_file_contents(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        branch: &str,
+        content: &[u8],
+        message: &str,
+    ) -> Result<(), GitHubError> {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(content);
+        let body = serde_json::json!({
+            "message": message,
+            "content": encoded,
+            "branch": branch,
+        });
+        self.send_json(
+            "PUT",
+            &format!("/repos/{}/{}/contents/{}", owner, repo, path),
+            body,
+        )?;
+        Ok(())
     }
 
     pub fn create_tree(
@@ -255,11 +253,8 @@ impl GitHubClient {
         if let Some(b) = base_tree {
             body["base_tree"] = serde_json::Value::String(b.into());
         }
-        let resp = self
-            .req("POST", &format!("/repos/{}/{}/git/trees", owner, repo))
-            .send_json(body)
-            .map_err(gh_err)?;
-        let r: ShaResponse = resp.into_json().map_err(gh_err)?;
+        let resp = self.send_json("POST", &format!("/repos/{}/{}/git/trees", owner, repo), body)?;
+        let r: ShaResponse = resp.into_body().read_json().map_err(gh_err)?;
         Ok(r.sha)
     }
 
@@ -270,13 +265,23 @@ impl GitHubClient {
         message: &str,
         tree_sha: &str,
         parents: &[String],
+        author: Option<&CommitIdentity>,
+        committer: Option<&CommitIdentity>,
     ) -> Result<String, GitHubError> {
-        let body = serde_json::json!({"message": message, "tree": tree_sha, "parents": parents});
-        let resp = self
-            .req("POST", &format!("/repos/{}/{}/git/commits", owner, repo))
-            .send_json(body)
-            .map_err(gh_err)?;
-        let r: ShaResponse = resp.into_json().map_err(gh_err)?;
+        let mut body = serde_json::json!({
+            "message": message,
+            "tree": tree_sha,
+            "parents": parents,
+        });
+        if let Some(a) = author {
+            body["author"] = serde_json::to_value(a).expect("identity serialization");
+        }
+        if let Some(c) = committer {
+            body["committer"] = serde_json::to_value(c).expect("identity serialization");
+        }
+        let resp =
+            self.send_json("POST", &format!("/repos/{}/{}/git/commits", owner, repo), body)?;
+        let r: ShaResponse = resp.into_body().read_json().map_err(gh_err)?;
         Ok(r.sha)
     }
 
@@ -289,12 +294,11 @@ impl GitHubClient {
         force: bool,
     ) -> Result<(), GitHubError> {
         let body = serde_json::json!({"sha": sha, "force": force});
-        self.req(
+        self.send_json(
             "PATCH",
             &format!("/repos/{}/{}/git/refs/heads/{}", owner, repo, branch),
-        )
-        .send_json(body)
-        .map_err(gh_err)?;
+            body,
+        )?;
         Ok(())
     }
 
@@ -306,9 +310,7 @@ impl GitHubClient {
         sha: &str,
     ) -> Result<(), GitHubError> {
         let body = serde_json::json!({"ref": format!("refs/heads/{}", branch), "sha": sha});
-        self.req("POST", &format!("/repos/{}/{}/git/refs", owner, repo))
-            .send_json(body)
-            .map_err(gh_err)?;
+        self.send_json("POST", &format!("/repos/{}/{}/git/refs", owner, repo), body)?;
         Ok(())
     }
 
@@ -318,11 +320,11 @@ impl GitHubClient {
         let scopes = std::env::var("IVALDI_GITHUB_SCOPES").unwrap_or(auth::GITHUB_SCOPES.into());
         let body = format!("client_id={}&scope={}", client_id, scopes);
         let resp = ureq::post(auth::GITHUB_DEVICE_CODE_URL)
-            .set("Accept", "application/json")
-            .set("Content-Type", "application/x-www-form-urlencoded")
-            .send_string(&body)
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .send(body.as_bytes())
             .map_err(gh_err)?;
-        resp.into_json().map_err(gh_err)
+        resp.into_body().read_json().map_err(gh_err)
     }
 
     pub fn poll_for_token(device_code: &str, interval: u64) -> Result<Token, GitHubError> {
@@ -335,23 +337,21 @@ impl GitHubClient {
                 client_id, device_code
             );
             let resp = ureq::post(auth::GITHUB_ACCESS_TOKEN_URL)
-                .set("Accept", "application/json")
-                .set("Content-Type", "application/x-www-form-urlencoded")
-                .send_string(&body)
+                .header("Accept", "application/json")
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .send(body.as_bytes())
                 .map_err(gh_err)?;
-            let r: TokenPollResponse = resp.into_json().map_err(gh_err)?;
-            if let Some(token) = r.access_token {
-                if !token.is_empty() {
-                    return Ok(Token {
-                        access_token: token,
-                        token_type: r.token_type.unwrap_or_default(),
-                        scope: r.scope.unwrap_or_default(),
-                        created_at: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs() as i64,
-                    });
-                }
+            let r: TokenPollResponse = resp.into_body().read_json().map_err(gh_err)?;
+            if r.access_token.as_deref().is_some_and(|s| !s.is_empty()) {
+                return Ok(Token {
+                    access_token: r.access_token.unwrap_or_default(),
+                    token_type: r.token_type.unwrap_or_default(),
+                    scope: r.scope.unwrap_or_default(),
+                    created_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64,
+                });
             }
             match r.error.as_deref() {
                 Some("authorization_pending") => continue,
@@ -450,6 +450,17 @@ pub struct TreeEntryCreate {
     pub sha: String,
 }
 
+/// Author or committer identity for `create_commit`.
+///
+/// `date` is RFC 3339 (ISO 8601 with timezone), e.g. `2024-01-01T12:00:00+00:00`.
+/// GitHub's Git Data API accepts the same shape for both `author` and `committer`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitIdentity {
+    pub name: String,
+    pub email: String,
+    pub date: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct ShaResponse {
     sha: String,
@@ -532,5 +543,18 @@ mod tests {
         let j = r#"{"sha":"abc","commit":{"message":"msg","author":{"name":"A","email":"a@b"},"tree":{"sha":"def"}},"parents":[{"sha":"p1"}]}"#;
         let r: CommitInfo = serde_json::from_str(j).unwrap();
         assert_eq!(r.parents.len(), 1);
+    }
+
+    #[test]
+    fn commit_identity_serializes_with_required_fields() {
+        let id = CommitIdentity {
+            name: "Jane Doe".into(),
+            email: "jane@example.com".into(),
+            date: "2024-01-15T10:30:00+00:00".into(),
+        };
+        let j = serde_json::to_value(&id).unwrap();
+        assert_eq!(j["name"], "Jane Doe");
+        assert_eq!(j["email"], "jane@example.com");
+        assert_eq!(j["date"], "2024-01-15T10:30:00+00:00");
     }
 }

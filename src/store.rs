@@ -9,7 +9,7 @@
 
 use std::path::Path;
 
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::hash::B3Hash;
 
@@ -266,6 +266,35 @@ impl Store {
         let w = self.db.begin_write()?;
         {
             w.open_table(META)?.insert(key, value)?;
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    /// Persist a single commit's leaf, timeline head, seal mapping, and
+    /// `mmr.size` meta in one redb write transaction (one fsync) instead of
+    /// four. Hot path during bulk import.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_leaf_atomic(
+        &self,
+        idx: u64,
+        canonical: &[u8],
+        timeline: &str,
+        timeline_head: u64,
+        seal_name: &str,
+        seal_hash: B3Hash,
+        mmr_size: u64,
+    ) -> Result<(), StoreError> {
+        let w = self.db.begin_write()?;
+        {
+            w.open_table(LEAVES)?.insert(idx, canonical)?;
+            w.open_table(TIMELINE_HEADS)?.insert(timeline, timeline_head)?;
+            w.open_table(SEAL_NAME_TO_HASH)?
+                .insert(seal_name, seal_hash.as_bytes().as_slice())?;
+            w.open_table(HASH_TO_SEAL_NAME)?
+                .insert(seal_hash.as_bytes().as_slice(), seal_name)?;
+            w.open_table(META)?
+                .insert("mmr.size", mmr_size.to_string().as_str())?;
         }
         w.commit()?;
         Ok(())

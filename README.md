@@ -12,7 +12,8 @@ Ivaldi uses BLAKE3 hashing, Merkle Mountain Ranges, and human-readable seal name
 - **Clean Merges** — No conflict markers in your files, ever
 - **Butterfly Timelines** — Experimental sandboxes with bidirectional parent sync
 - **Selective Sync** — Download only the branches you need
-- **GitHub Integration** — Full download/upload/scout/harvest with OAuth
+- **Three Transports** — GitHub/GitLab over HTTPS, any git host over SSH, or peer-to-peer over `ivaldi://` — same commands, picked automatically from the portal URL
+- **Bidirectional Git Fidelity** — Round-tripping a git repo through Ivaldi (download → upload) preserves commit SHA-1s byte-for-byte, including author, committer, and timezone
 
 ## Quick Start
 
@@ -39,14 +40,26 @@ ivaldi timeline switch feature     # Switch (auto-shelves changes)
 ivaldi timeline list               # List all timelines
 ivaldi fuse feature to main        # Merge
 
-# Remote operations
-ivaldi portal add owner/repo       # Connect to GitHub
-ivaldi auth login                  # Authenticate via OAuth
-ivaldi upload                      # Push to GitHub
-ivaldi download owner/repo         # Clone a repository
+# Remote operations — transport is picked automatically from the URL
+ivaldi portal add owner/repo                          # GitHub HTTPS shorthand
+ivaldi portal add git@host.example.com:team/repo.git  # SSH (any host: github, gitlab, gitea, …)
+ivaldi portal add ivaldi://10.0.0.5:9418              # Peer-to-peer (no third-party host)
+
+ivaldi auth login                  # GitHub OAuth (HTTPS upload/sync only)
+ivaldi auth login --gitlab         # GitLab OAuth (HTTPS upload/sync only)
+ivaldi upload                      # Push (auto-routes via SSH / GitHub REST / ivaldi://)
+ivaldi download owner/repo         # Clone via HTTPS (no auth needed for public repos)
+ivaldi download git@example.com:team/repo.git          # Clone via SSH
+ivaldi download ivaldi://10.0.0.5:9418/main            # Clone via P2P
 ivaldi scout                       # List remote branches
 ivaldi harvest feature-branch      # Fetch specific branch
 ivaldi sync                        # Pull remote changes (delta only)
+
+# Peer-to-peer (no GitHub / GitLab in the loop)
+ivaldi serve                       # Listen on tcp/9418, accept trusted peers
+ivaldi peer whoami                 # Print this machine's pubkey
+ivaldi peer trust <pubkey> alice   # Authorize a peer for inbound connections
+ivaldi peer known list             # Servers we trust (TOFU known_peers)
 ```
 
 ## Command Reference
@@ -59,22 +72,25 @@ ivaldi sync                        # Pull remote changes (delta only)
 | `status` | | Show workspace state |
 | `whereami` | `wai` | Show current position |
 | `log` | | View commit history |
+| `whodidit <file>` | `blame` | Show which seal last touched each line of a file |
 | `diff` | | Compare changes |
 | `reset` | | Unstage files or hard reset |
-| `timeline` | `tl` | Manage timelines (create/switch/list/remove) |
+| `timeline` | `tl` | Manage timelines (create/switch/list/rename/remove) |
 | `butterfly` | `tl bf` | Experimental sandbox timelines |
-| `fuse` | | Merge timelines |
-| `travel` | | Interactive history browser |
-| `shift` | | Squash commits |
+| `fuse` | | Merge timelines (auto strategy uses MMR-based merge base) |
+| `travel` | | Interactive history browser (full DAG walk; `--all` shows orphaned seals) |
+| `weld` | `w` | Combine a range of seals into one (linear history) |
 | `config` | | View/modify settings |
 | `exclude` | | Add to .ivaldiignore |
 | `portal` | | Manage remote connections |
 | `auth` | | GitHub/GitLab authentication |
-| `download` | | Clone a repository |
-| `upload` | | Push to remote |
-| `scout` | | Discover remote branches |
-| `harvest` | | Fetch specific branches |
+| `download` | | Clone a repository (HTTPS / SSH / `ivaldi://`) |
+| `upload` | | Push to remote (HTTPS / SSH / `ivaldi://`) |
+| `scout` | | Discover remote branches (HTTPS / SSH) |
+| `harvest` | | Fetch specific branches (HTTPS / SSH) |
 | `sync` | | Pull remote changes (delta only) |
+| `serve` | | Run an `ivaldi://` peer server for trusted users |
+| `peer` | | Manage trusted peers + known servers (`trust` / `list` / `forget` / `whoami` / `known`) |
 
 ## Ivaldi vs Git
 
@@ -105,7 +121,12 @@ ivaldi sync                        # Pull remote changes (delta only)
 | Shelf | Stash (automatic) |
 | Butterfly | Experimental branch |
 | Travel | Interactive log + checkout |
-| Shift | Rebase --squash |
+| Weld | Rebase --squash (range collapse, linear history) |
+| Whodidit | Blame |
+
+> **Coming from git?** [`docs/rosetta.md`](docs/rosetta.md) is the
+> full translation table — every git command you reach for daily,
+> mapped to its Ivaldi equivalent.
 
 ## Architecture
 
@@ -168,37 +189,78 @@ make clean
 ## Configuration
 
 ```bash
-# Required
-ivaldi config --set user.name "Your Name"
-ivaldi config --set user.email "you@example.com"
+# Required — set globally once, works across all repos
+ivaldi config --global --set user.name "Your Name"
+ivaldi config --global --set user.email "you@example.com"
 
-# Optional
+# Inside a repo, --set writes to the repo-local config by default
 ivaldi config --set color.ui true
 ivaldi config --set core.autoshelf true
 
-# View all
+# View all (annotated with global / local / default provenance)
 ivaldi config --list
+
+# Interactive form (ratatui — works inside or outside a repo)
+ivaldi config
 ```
+
+`ivaldi config` runs fine outside a repo — it automatically targets the
+global config at `~/.ivaldi/config`.
 
 Config files:
 - User: `~/.ivaldi/config`
 - Repository: `.ivaldi/config` (overrides user)
 
+## Transports
+
+Ivaldi picks the right transport automatically from the URL on each
+command — there is no `--protocol` flag. The same `download` / `upload` /
+`scout` / `harvest` / `sync` invocations work for all three:
+
+| URL form | Transport | What runs |
+|---|---|---|
+| `owner/repo` · `https://github.com/owner/repo.git` · `github:owner/repo` | HTTPS | GitHub Smart-HTTP + REST API |
+| `git@host:owner/repo.git` · `ssh://git@host:port/owner/repo.git` | SSH | `ssh ... git-upload-pack/git-receive-pack`, identical wire to plain git |
+| `ivaldi://host:port[/timeline]` | Peer-to-peer | Ivaldi-native protocol over Noise XX (mutual ed25519 auth, ChaCha20-Poly1305) |
+
+**HTTPS** uses GitHub/GitLab's REST APIs for write paths (creates commits via
+`/git/commits` so author/committer round-trip exactly). **SSH** spawns the
+system `ssh` binary as a subprocess — your existing keys, agent, and
+`known_hosts` keep working — and speaks the standard git pack protocol.
+**P2P** lets two people share code with zero third party: see [`docs/p2p.md`](docs/p2p.md).
+
+Round-tripping a git repo through Ivaldi (download → upload) preserves
+commit SHA-1s byte-for-byte. Confirmed live against `octocat/Hello-World` —
+the merge commit `7fd1a60b…` lands at the exact same hash on the other side.
+
 ## Authentication
 
+Authentication is **optional** for read-only operations on public
+repositories — `download`, `scout`, and `harvest` work anonymously. Only
+HTTPS `upload` / `sync` require a token. SSH uses your local SSH agent /
+keys (no `auth login` needed). P2P uses the user's long-lived ed25519
+identity at `~/.ivaldi/identity` (auto-generated on first need).
+
 ```bash
-# OAuth (recommended — works like gh auth login)
+# GitHub OAuth (HTTPS only — works like gh auth login)
 ivaldi auth login
 
-# Environment variable
+# GitLab OAuth — supports gitlab.com and self-hosted
+ivaldi auth login --gitlab
+ivaldi auth login --gitlab --gitlab-host https://gitlab.example.com
+
+# Environment variables
 export GITHUB_TOKEN=ghp_...
+export GITLAB_TOKEN=glpat-...
 
-# Check status
+# Check / logout
 ivaldi auth status
-
-# Logout
 ivaldi auth logout
+ivaldi auth logout --gitlab
 ```
+
+For peer-to-peer auth see [`docs/p2p.md`](docs/p2p.md) and
+[`docs/identity.md`](docs/identity.md).
 
 ## Merge Strategies
 
@@ -211,6 +273,38 @@ ivaldi fuse --strategy=base feature to main    # Revert to ancestor
 ivaldi fuse --abort                            # Cancel merge
 ivaldi fuse --continue                         # Resume after conflict resolution
 ```
+
+## Peer-to-Peer (`ivaldi://`)
+
+Two users can exchange code directly over TCP — no GitHub, no GitLab,
+no third party. Each side has a long-lived ed25519 identity at
+`~/.ivaldi/identity` (auto-minted on first use); the serving side
+maintains an `authorized_peers` allowlist (per repo). Connections are
+encrypted + mutually authenticated with the Noise XX handshake.
+
+```bash
+# On Alice's machine (the serving side)
+ivaldi peer whoami                                 # prints alice's pubkey
+ivaldi peer trust <bob-pubkey> bob                 # whitelist bob
+ivaldi serve --bind 0.0.0.0:9418                   # blocks; Ctrl-C to stop
+
+# On Bob's machine
+ivaldi download ivaldi://alice.example.com:9418/main bob-clone   # clone alice's main
+echo edit >> file.txt && ivaldi gather . && ivaldi seal -m "edit"
+ivaldi portal add ivaldi://alice.example.com:9418  # so `upload` knows where to go
+ivaldi upload                                      # push back to alice
+
+# On Alice's machine — bob's seals land at peers/bob/main; alice fuses
+# manually rather than alice's `main` advancing under her feet
+ivaldi timeline list             # peers/bob/main visible
+ivaldi fuse peers/bob/main       # integrate
+```
+
+First connection prompts a TOFU fingerprint check (mirrors `~/.ssh/known_hosts`);
+use `--accept-new-peer` for non-interactive scripts or `--strict-peer` to
+refuse anything not already in `~/.ivaldi/known_peers`.
+
+Deep dive in [`docs/p2p.md`](docs/p2p.md).
 
 ## Butterfly Timelines
 

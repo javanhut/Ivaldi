@@ -10,7 +10,7 @@ pub use commands::run_command;
 
 /// Ivaldi Version Control System
 #[derive(Parser, Debug)]
-#[command(name = "ivaldi", version = "0.1.0")]
+#[command(name = "ivaldi", version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "Ivaldi is a Version Control System")]
 #[command(
     long_about = "Ivaldi is a VCS used to control repositories that can replace Git in your normal workflow"
@@ -51,6 +51,10 @@ pub enum Commands {
     /// View commit history
     Log(LogArgs),
 
+    /// Show, line-by-line, which seal last touched each line of a file
+    #[command(alias = "blame")]
+    Whodidit(WhodiditArgs),
+
     /// Compare changes
     Diff(DiffArgs),
 
@@ -67,8 +71,9 @@ pub enum Commands {
     /// Interactive time travel through history
     Travel(TravelArgs),
 
-    /// Squash commits interactively
-    Shift(ShiftArgs),
+    /// Combine a range of seals into a single seal (linear history)
+    #[command(alias = "w")]
+    Weld(WeldArgs),
 
     /// View and modify configuration
     Config(ConfigArgs),
@@ -103,6 +108,73 @@ pub enum Commands {
 
     /// Open interactive TUI dashboard
     Tui,
+
+    /// Serve the current repo to authorized peers over `ivaldi://`
+    Serve(ServeArgs),
+
+    /// Manage authorized peers for `ivaldi serve`
+    Peer(PeerArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ServeArgs {
+    /// Address to bind (default 0.0.0.0:9418)
+    #[arg(long, default_value = "0.0.0.0:9418")]
+    pub bind: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct PeerArgs {
+    #[command(subcommand)]
+    pub command: PeerCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PeerCommands {
+    /// Trust a peer's pubkey for incoming `ivaldi serve` connections
+    Trust(PeerTrustArgs),
+    /// List trusted peers
+    List,
+    /// Remove a trusted peer by pubkey-hex prefix
+    Forget(PeerForgetArgs),
+    /// Print this user's own pubkey
+    Whoami,
+    /// Manage TOFU `~/.ivaldi/known_peers` (servers we connect to)
+    Known(PeerKnownArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct PeerKnownArgs {
+    #[command(subcommand)]
+    pub command: PeerKnownCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PeerKnownCommands {
+    /// List known peers (host:port → pubkey)
+    List,
+    /// Forget a known peer by host[:port]
+    Forget(PeerKnownForgetArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct PeerKnownForgetArgs {
+    /// Host or host:port to forget. Defaults to the ivaldi default port.
+    pub host: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct PeerTrustArgs {
+    /// Hex-encoded 32-byte X25519 pubkey
+    pub pubkey: String,
+    /// Optional friendly name
+    pub name: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct PeerForgetArgs {
+    /// Pubkey or unique hex prefix
+    pub prefix: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +222,17 @@ pub struct LogArgs {
     /// Show commits from all timelines
     #[arg(long)]
     pub all: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct WhodiditArgs {
+    /// File to inspect, relative to the repository root.
+    pub path: String,
+
+    /// Show only the seal/author summary (one line per file region) rather
+    /// than every individual line.
+    #[arg(long)]
+    pub summary: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -233,8 +316,13 @@ pub struct TimelineRemoveArgs {
 
 #[derive(clap::Args, Debug)]
 pub struct TimelineRenameArgs {
-    /// New name for the current timeline
-    pub new_name: String,
+    /// One of three forms:
+    ///
+    ///   `tl rename NEW`             — rename the current timeline to NEW
+    ///   `tl rename OLD NEW`         — rename OLD to NEW
+    ///   `tl rename OLD to NEW`      — same as above with `to` as a connector
+    #[arg(num_args = 1..=3)]
+    pub names: Vec<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -309,19 +397,36 @@ pub struct TravelArgs {
     /// Filter seals by message, author, or name
     #[arg(short, long)]
     pub search: Option<String>,
+
+    /// Browse every seal in the MMR — including ones orphaned from the
+    /// current timeline head (e.g., commits welded out of the chain).
+    /// Without this flag, travel only shows seals reachable from HEAD.
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(clap::Args, Debug)]
-pub struct ShiftArgs {
-    /// Squash last N commits
+pub struct WeldArgs {
+    /// Combine the last N seals on the current timeline.
     #[arg(long)]
     pub last: Option<usize>,
 
-    /// Start seal name or hash
+    /// Range start: first seal to include (oldest). Seal name or hash prefix.
+    /// Optional connector `to` is accepted between START and END for ergonomics:
+    ///   `ivaldi weld bold-tower to clear-galaxy`
     pub start: Option<String>,
 
-    /// End seal name or hash
+    /// Either the literal `to` (connector) or the END seal of the range.
+    pub second: Option<String>,
+
+    /// Range end: last seal to include (newest, defaults to current head).
+    /// Only used when the connector form `START to END` is given.
     pub end: Option<String>,
+
+    /// Message for the welded seal. If omitted, a summary of the welded
+    /// seals' messages is generated.
+    #[arg(short)]
+    pub m: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -337,6 +442,10 @@ pub struct ConfigArgs {
     /// Get a configuration value
     #[arg(long)]
     pub get: Option<String>,
+
+    /// Operate on the global config (~/.ivaldi/config) instead of repo-local
+    #[arg(long)]
+    pub global: bool,
 
     /// Value for --set
     pub value: Option<String>,
@@ -410,6 +519,11 @@ pub struct AuthLoginArgs {
     /// Authenticate with GitLab instead of GitHub
     #[arg(long)]
     pub gitlab: bool,
+
+    /// GitLab base URL (defaults to https://gitlab.com or `IVALDI_GITLAB_HOST`).
+    /// Only meaningful with `--gitlab`.
+    #[arg(long)]
+    pub gitlab_host: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -434,6 +548,16 @@ pub struct DownloadArgs {
     /// Skip history, download only latest snapshot
     #[arg(long)]
     pub skip_history: bool,
+
+    /// (ivaldi:// only) Auto-trust the server's pubkey on first connect
+    /// instead of prompting. Useful for scripts/CI.
+    #[arg(long)]
+    pub accept_new_peer: bool,
+
+    /// (ivaldi:// only) Refuse to connect to any pubkey not already in
+    /// `~/.ivaldi/known_peers`. Mutually exclusive with `--accept-new-peer`.
+    #[arg(long, conflicts_with = "accept_new_peer")]
+    pub strict_peer: bool,
 
     /// Include tags and releases
     #[arg(long)]
@@ -706,11 +830,38 @@ mod tests {
     }
 
     #[test]
-    fn parse_timeline_rename() {
+    fn parse_timeline_rename_one_arg() {
         let cli = Cli::try_parse_from(["ivaldi", "tl", "rename", "new-name"]).unwrap();
         match cli.command.unwrap() {
             Commands::Timeline(args) => match args.command {
-                TimelineCommands::Rename(r) => assert_eq!(r.new_name, "new-name"),
+                TimelineCommands::Rename(r) => assert_eq!(r.names, vec!["new-name"]),
+                _ => panic!("expected Rename"),
+            },
+            _ => panic!("expected Timeline"),
+        }
+    }
+
+    #[test]
+    fn parse_timeline_rename_two_args() {
+        let cli = Cli::try_parse_from(["ivaldi", "tl", "rename", "master", "main"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Timeline(args) => match args.command {
+                TimelineCommands::Rename(r) => assert_eq!(r.names, vec!["master", "main"]),
+                _ => panic!("expected Rename"),
+            },
+            _ => panic!("expected Timeline"),
+        }
+    }
+
+    #[test]
+    fn parse_timeline_rename_with_to_connector() {
+        let cli =
+            Cli::try_parse_from(["ivaldi", "tl", "rename", "master", "to", "main"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Timeline(args) => match args.command {
+                TimelineCommands::Rename(r) => {
+                    assert_eq!(r.names, vec!["master", "to", "main"])
+                }
                 _ => panic!("expected Rename"),
             },
             _ => panic!("expected Timeline"),
@@ -722,7 +873,7 @@ mod tests {
         let cli = Cli::try_parse_from(["ivaldi", "tl", "rn", "new-name"]).unwrap();
         match cli.command.unwrap() {
             Commands::Timeline(args) => match args.command {
-                TimelineCommands::Rename(r) => assert_eq!(r.new_name, "new-name"),
+                TimelineCommands::Rename(r) => assert_eq!(r.names, vec!["new-name"]),
                 _ => panic!("expected Rename via rn alias"),
             },
             _ => panic!("expected Timeline"),
