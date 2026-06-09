@@ -325,7 +325,7 @@ pub fn merge_review(repo: &mut Repo, review_id: u64) -> Result<Review, RepoError
     collect_blob_hashes(&store, target_leaf.tree_root, "", &mut ours_files)?;
     collect_blob_hashes(&store, source_leaf.tree_root, "", &mut theirs_files)?;
 
-    let result = FuseEngine::fuse(&base_files, &ours_files, &theirs_files, strategy);
+    let result = FuseEngine::fuse(&store, &base_files, &ours_files, &theirs_files, strategy);
 
     if !result.success {
         let conflict_paths: Vec<String> = result.conflicts.iter().map(|c| c.path.clone()).collect();

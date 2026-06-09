@@ -36,6 +36,8 @@ impl fmt::Display for NodeKind {
 
 /// File mode constants.
 pub const MODE_FILE: u32 = 0o100644;
+pub const MODE_EXEC: u32 = 0o100755;
+pub const MODE_SYMLINK: u32 = 0o120000;
 pub const MODE_DIR: u32 = 0o040000;
 
 /// A single entry in a directory tree.
@@ -570,11 +572,15 @@ fn validate_name(name: &str) -> Result<(), FsMerkleError> {
 
 fn validate_mode(mode: u32, kind: NodeKind) -> Result<(), FsMerkleError> {
     match kind {
-        NodeKind::Blob if mode != MODE_FILE => Err(FsMerkleError::InvalidMode {
-            mode,
-            kind,
-            expected: MODE_FILE,
-        }),
+        NodeKind::Blob
+            if mode != MODE_FILE && mode != MODE_EXEC && mode != MODE_SYMLINK =>
+        {
+            Err(FsMerkleError::InvalidMode {
+                mode,
+                kind,
+                expected: MODE_FILE,
+            })
+        }
         NodeKind::Tree if mode != MODE_DIR => Err(FsMerkleError::InvalidMode {
             mode,
             kind,

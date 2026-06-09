@@ -1585,6 +1585,7 @@ pub fn sync_timeline(
 
     // Auto-fuse
     let fuse_result = crate::fuse::FuseEngine::fuse(
+        &store,
         &base_files,
         &our_files,
         &their_files,

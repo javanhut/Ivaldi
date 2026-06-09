@@ -1265,7 +1265,7 @@ fn import_tree(
     tree_cache: &mut HashMap<String, B3Hash>,
     submodules_skipped: &mut std::collections::BTreeSet<String>,
 ) -> Result<B3Hash, GitRemoteError> {
-    use crate::fsmerkle::{Entry, MODE_DIR, MODE_FILE, NodeKind};
+    use crate::fsmerkle::{Entry, MODE_DIR, MODE_EXEC, MODE_FILE, MODE_SYMLINK, NodeKind};
 
     if let Some(hash) = tree_cache.get(sha).copied() {
         return Ok(hash);
@@ -1350,9 +1350,17 @@ fn import_tree(
                     ivaldi_entries.retain(|e| e.name != out_name);
                 }
                 seen_names.insert(out_name.clone());
+                // Preserve the original git file mode so the round-trip stays
+                // byte-for-byte: executable bit (100755) and symlinks (120000)
+                // must not collapse to a plain file (100644).
+                let mode = match entry.mode.as_str() {
+                    "100755" => MODE_EXEC,
+                    "120000" => MODE_SYMLINK,
+                    _ => MODE_FILE,
+                };
                 ivaldi_entries.push(Entry {
                     name: out_name,
-                    mode: MODE_FILE,
+                    mode,
                     kind: NodeKind::Blob,
                     hash,
                 });

@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::fsmerkle::{FsMerkleError, FsStore};
 use crate::hash::B3Hash;
 
 /// Merge strategy type.
@@ -88,10 +89,13 @@ pub struct FuseEngine;
 impl FuseEngine {
     /// Perform a three-way merge with the given strategy.
     ///
+    /// - `store`: blob store, used by the `Union` strategy to materialize
+    ///   concatenated blobs for genuine conflicts
     /// - `base`: common ancestor file set
     /// - `ours`: target timeline (left) file set
     /// - `theirs`: source timeline (right) file set
     pub fn fuse(
+        store: &FsStore<'_>,
         base: &BTreeMap<String, B3Hash>,
         ours: &BTreeMap<String, B3Hash>,
         theirs: &BTreeMap<String, B3Hash>,
@@ -130,6 +134,10 @@ impl FuseEngine {
                                 theirs: t.copied(),
                             });
                         }
+                        // Auto never concatenates; it surfaces conflicts instead.
+                        MergeDecision::Concat(..) => unreachable!(
+                            "auto strategy does not produce Concat decisions"
+                        ),
                     }
                 }
                 Strategy::Ours => {
@@ -149,8 +157,15 @@ impl FuseEngine {
                             merged.insert(path.to_string(), hash);
                         }
                         MergeDecision::Delete => {}
+                        MergeDecision::Concat(o_h, t_h) => {
+                            // Genuine conflict: combine both versions (ours then
+                            // theirs) into a single blob. Fall back to theirs
+                            // only if the blobs can't be read (CAS corruption).
+                            let hash = concat_blobs(store, &o_h, &t_h).unwrap_or(t_h);
+                            merged.insert(path.to_string(), hash);
+                        }
                         MergeDecision::Conflict => {
-                            // Union shouldn't produce conflicts — prefer theirs for tie-breaking
+                            // Union shouldn't produce bare conflicts — prefer theirs.
                             if let Some(&hash) = t {
                                 merged.insert(path.to_string(), hash);
                             } else if let Some(&hash) = o {
@@ -191,8 +206,25 @@ enum MergeDecision {
     Take(B3Hash),
     /// Delete the file.
     Delete,
+    /// Combine both versions: concatenate ours (first) then theirs (second)
+    /// into a new blob. Used by the union strategy on genuine conflicts.
+    Concat(B3Hash, B3Hash),
     /// Conflict — cannot auto-resolve.
     Conflict,
+}
+
+/// Concatenate two blobs (ours first, then theirs, no separator) into a new
+/// blob and return its hash. Deterministic and order-fixed so the result is
+/// reproducible. Shared by the union strategy and the TUI "Keep BOTH" resolver.
+pub(crate) fn concat_blobs(
+    store: &FsStore<'_>,
+    ours: &B3Hash,
+    theirs: &B3Hash,
+) -> Result<B3Hash, FsMerkleError> {
+    let (_, mut combined) = store.load_blob(*ours)?;
+    let (_, theirs_bytes) = store.load_blob(*theirs)?;
+    combined.extend_from_slice(&theirs_bytes);
+    Ok(store.put_blob(&combined)?.0)
 }
 
 /// Three-way merge logic for a single file (auto strategy).
@@ -267,7 +299,7 @@ fn merge_file_union(
             if o == t {
                 MergeDecision::Take(o)
             } else {
-                MergeDecision::Take(t) // Union prefers theirs for new files
+                MergeDecision::Concat(o, t) // Both added differently: combine
             }
         }
         (Some(_), None, None) => MergeDecision::Delete,
@@ -277,11 +309,11 @@ fn merge_file_union(
             if o == t {
                 MergeDecision::Take(o)
             } else if b == o {
-                MergeDecision::Take(t)
+                MergeDecision::Take(t) // Only theirs changed
             } else if b == t {
-                MergeDecision::Take(o)
+                MergeDecision::Take(o) // Only ours changed
             } else {
-                MergeDecision::Take(t) // Union prefers theirs for tie-breaking
+                MergeDecision::Concat(o, t) // Both changed differently: combine
             }
         }
     }
@@ -312,6 +344,25 @@ mod tests {
         B3Hash::digest(s.as_bytes())
     }
 
+    fn tmp_cas() -> (tempfile::TempDir, crate::cas::FileCas) {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = crate::cas::FileCas::new(dir.path().join("objects")).unwrap();
+        (dir, cas)
+    }
+
+    /// Run a fuse against a throwaway store. Adequate for strategies that never
+    /// load blob content (auto/ours/theirs/base, and union without conflicts).
+    fn fuse_t(
+        base: &BTreeMap<String, B3Hash>,
+        ours: &BTreeMap<String, B3Hash>,
+        theirs: &BTreeMap<String, B3Hash>,
+        strategy: Strategy,
+    ) -> FuseResult {
+        let (_dir, cas) = tmp_cas();
+        let store = FsStore::new(&cas);
+        FuseEngine::fuse(&store, base, ours, theirs, strategy)
+    }
+
     // ---- Auto strategy ----
 
     #[test]
@@ -320,7 +371,7 @@ mod tests {
         let ours = files(&[("a.txt", "hello")]);
         let theirs = files(&[("a.txt", "hello")]);
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Auto);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Auto);
         assert!(result.success);
         assert_eq!(result.merged_files.len(), 1);
         assert_eq!(result.merged_files["a.txt"], hash("hello"));
@@ -332,7 +383,7 @@ mod tests {
         let ours = files(&[("a.txt", "modified")]);
         let theirs = files(&[("a.txt", "base")]);
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Auto);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Auto);
         assert!(result.success);
         assert_eq!(result.merged_files["a.txt"], hash("modified"));
     }
@@ -343,7 +394,7 @@ mod tests {
         let ours = files(&[("a.txt", "base")]);
         let theirs = files(&[("a.txt", "modified")]);
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Auto);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Auto);
         assert!(result.success);
         assert_eq!(result.merged_files["a.txt"], hash("modified"));
     }
@@ -354,7 +405,7 @@ mod tests {
         let ours = files(&[("a.txt", "same")]);
         let theirs = files(&[("a.txt", "same")]);
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Auto);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Auto);
         assert!(result.success);
         assert_eq!(result.merged_files["a.txt"], hash("same"));
     }
@@ -365,7 +416,7 @@ mod tests {
         let ours = files(&[("a.txt", "our change")]);
         let theirs = files(&[("a.txt", "their change")]);
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Auto);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Auto);
         assert!(!result.success);
         assert_eq!(result.conflicts.len(), 1);
         assert_eq!(result.conflicts[0].path, "a.txt");
@@ -377,7 +428,7 @@ mod tests {
         let ours = files(&[("new.txt", "content")]);
         let theirs = files(&[]);
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Auto);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Auto);
         assert!(result.success);
         assert_eq!(result.merged_files["new.txt"], hash("content"));
     }
@@ -388,7 +439,7 @@ mod tests {
         let ours = files(&[]);
         let theirs = files(&[("new.txt", "content")]);
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Auto);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Auto);
         assert!(result.success);
         assert_eq!(result.merged_files["new.txt"], hash("content"));
     }
@@ -399,7 +450,7 @@ mod tests {
         let ours = files(&[("new.txt", "same")]);
         let theirs = files(&[("new.txt", "same")]);
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Auto);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Auto);
         assert!(result.success);
         assert_eq!(result.merged_files.len(), 1);
     }
@@ -410,7 +461,7 @@ mod tests {
         let ours = files(&[("new.txt", "our version")]);
         let theirs = files(&[("new.txt", "their version")]);
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Auto);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Auto);
         assert!(!result.success);
         assert_eq!(result.conflicts.len(), 1);
     }
@@ -421,7 +472,7 @@ mod tests {
         let ours = files(&[]);
         let theirs = files(&[]);
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Auto);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Auto);
         assert!(result.success);
         assert!(result.merged_files.is_empty());
     }
@@ -432,7 +483,7 @@ mod tests {
         let ours = files(&[]); // deleted
         let theirs = files(&[("a.txt", "content")]); // unchanged
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Auto);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Auto);
         assert!(result.success);
         assert!(result.merged_files.is_empty()); // accept deletion
     }
@@ -443,7 +494,7 @@ mod tests {
         let ours = files(&[]); // deleted
         let theirs = files(&[("a.txt", "modified")]); // modified
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Auto);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Auto);
         assert!(!result.success);
         assert_eq!(result.conflicts.len(), 1);
     }
@@ -467,7 +518,7 @@ mod tests {
             ("new.txt", "added"),
         ]);
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Auto);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Auto);
         assert!(result.success);
         assert_eq!(result.merged_files.len(), 3); // keep + modify(changed) + new
         assert_eq!(result.merged_files["modify.txt"], hash("changed"));
@@ -483,7 +534,7 @@ mod tests {
         let ours = files(&[("a.txt", "our version")]);
         let theirs = files(&[("a.txt", "their version")]);
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Ours);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Ours);
         assert!(result.success);
         assert_eq!(result.merged_files["a.txt"], hash("our version"));
     }
@@ -494,7 +545,7 @@ mod tests {
         let ours = files(&[]);
         let theirs = files(&[("a.txt", "modified")]);
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Ours);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Ours);
         assert!(result.success);
         assert!(result.merged_files.is_empty());
     }
@@ -507,23 +558,85 @@ mod tests {
         let ours = files(&[("a.txt", "our version")]);
         let theirs = files(&[("a.txt", "their version")]);
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Theirs);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Theirs);
         assert!(result.success);
         assert_eq!(result.merged_files["a.txt"], hash("their version"));
     }
 
     // ---- Union strategy ----
 
-    #[test]
-    fn union_no_conflicts() {
-        let base = files(&[("a.txt", "base")]);
-        let ours = files(&[("a.txt", "our change")]);
-        let theirs = files(&[("a.txt", "their change")]);
+    /// Build a `path -> hash` map by storing each content in `store`, so the
+    /// union strategy can actually load the blobs to concatenate them.
+    fn stored(
+        store: &FsStore<'_>,
+        entries: &[(&str, &[u8])],
+    ) -> BTreeMap<String, B3Hash> {
+        entries
+            .iter()
+            .map(|(path, content)| {
+                let (h, _) = store.put_blob(content).unwrap();
+                (path.to_string(), h)
+            })
+            .collect()
+    }
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Union);
+    #[test]
+    fn union_concatenates_all_three_differ() {
+        let (_dir, cas) = tmp_cas();
+        let store = FsStore::new(&cas);
+        let base = stored(&store, &[("a.txt", b"BASE")]);
+        let ours = stored(&store, &[("a.txt", b"AAA")]);
+        let theirs = stored(&store, &[("a.txt", b"BBB")]);
+
+        let result = FuseEngine::fuse(&store, &base, &ours, &theirs, Strategy::Union);
         assert!(result.success);
-        // Union takes theirs for tie-breaking
-        assert!(result.merged_files.contains_key("a.txt"));
+        let (_, bytes) = store.load_blob(result.merged_files["a.txt"]).unwrap();
+        assert_eq!(bytes, b"AAABBB", "ours then theirs, no separator");
+    }
+
+    #[test]
+    fn union_concatenates_both_added_no_base() {
+        let (_dir, cas) = tmp_cas();
+        let store = FsStore::new(&cas);
+        let base = BTreeMap::new();
+        let ours = stored(&store, &[("a.txt", b"AAA")]);
+        let theirs = stored(&store, &[("a.txt", b"BBB")]);
+
+        let result = FuseEngine::fuse(&store, &base, &ours, &theirs, Strategy::Union);
+        assert!(result.success);
+        let (_, bytes) = store.load_blob(result.merged_files["a.txt"]).unwrap();
+        assert_eq!(bytes, b"AAABBB");
+    }
+
+    #[test]
+    fn union_clean_resolves_do_not_concat() {
+        let (_dir, cas) = tmp_cas();
+        let store = FsStore::new(&cas);
+        let base = stored(&store, &[("only_ours.txt", b"O0"), ("only_theirs.txt", b"T0")]);
+        // only_ours changed on our side; only_theirs changed on theirs.
+        let ours = stored(&store, &[("only_ours.txt", b"O1"), ("only_theirs.txt", b"T0")]);
+        let theirs = stored(&store, &[("only_ours.txt", b"O0"), ("only_theirs.txt", b"T1")]);
+
+        let result = FuseEngine::fuse(&store, &base, &ours, &theirs, Strategy::Union);
+        assert!(result.success);
+        // Single-sided changes take the changed version verbatim, NOT a concat.
+        let (_, a) = store.load_blob(result.merged_files["only_ours.txt"]).unwrap();
+        let (_, b) = store.load_blob(result.merged_files["only_theirs.txt"]).unwrap();
+        assert_eq!(a, b"O1");
+        assert_eq!(b, b"T1");
+    }
+
+    #[test]
+    fn union_concat_order_is_ours_then_theirs() {
+        let (_dir, cas) = tmp_cas();
+        let store = FsStore::new(&cas);
+        let base = stored(&store, &[("a.txt", b"x")]);
+        let ours = stored(&store, &[("a.txt", b"<<OURS>>")]);
+        let theirs = stored(&store, &[("a.txt", b"<<THEIRS>>")]);
+
+        let result = FuseEngine::fuse(&store, &base, &ours, &theirs, Strategy::Union);
+        let (_, bytes) = store.load_blob(result.merged_files["a.txt"]).unwrap();
+        assert_eq!(bytes, b"<<OURS>><<THEIRS>>");
     }
 
     #[test]
@@ -532,7 +645,7 @@ mod tests {
         let ours = files(&[("a.txt", "modified")]);
         let theirs = files(&[]);
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Union);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Union);
         assert!(result.success);
         assert_eq!(result.merged_files["a.txt"], hash("modified"));
     }
@@ -545,7 +658,7 @@ mod tests {
         let ours = files(&[("a.txt", "our change")]);
         let theirs = files(&[("a.txt", "their change")]);
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Base);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Base);
         assert!(result.success);
         assert_eq!(result.merged_files["a.txt"], hash("original"));
     }
@@ -556,7 +669,7 @@ mod tests {
         let ours = files(&[("new.txt", "added")]);
         let theirs = files(&[("other.txt", "also added")]);
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Base);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Base);
         assert!(result.success);
         assert!(result.merged_files.is_empty());
     }
@@ -604,7 +717,7 @@ mod tests {
     #[test]
     fn empty_merge() {
         let empty = BTreeMap::new();
-        let result = FuseEngine::fuse(&empty, &empty, &empty, Strategy::Auto);
+        let result = fuse_t(&empty, &empty, &empty, Strategy::Auto);
         assert!(result.success);
         assert!(result.merged_files.is_empty());
         assert!(result.conflicts.is_empty());
@@ -637,7 +750,7 @@ mod tests {
             theirs.insert(path, hash(&format!("their change {}", i)));
         }
 
-        let result = FuseEngine::fuse(&base, &ours, &theirs, Strategy::Auto);
+        let result = fuse_t(&base, &ours, &theirs, Strategy::Auto);
         assert!(result.success);
         assert_eq!(result.merged_files.len(), 100);
     }

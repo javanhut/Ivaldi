@@ -15,7 +15,7 @@ The fuse engine merges file sets from two divergent timelines using a common anc
 | `Auto` | Intelligent three-way merge (default). Auto-resolves non-conflicting changes. Only flags truly conflicting files. |
 | `Ours` | Keep all target timeline (left) versions. No conflicts possible. |
 | `Theirs` | Accept all source timeline (right) versions. No conflicts possible. |
-| `Union` | Combine both versions. For tie-breaking, prefers theirs. No conflicts. |
+| `Union` | Combine both versions: clean changes auto-resolve; a genuine conflict concatenates ours then theirs into one blob. No conflicts surfaced. |
 | `Base` | Revert to common ancestor. Discards all changes. |
 
 ## Usage
@@ -73,4 +73,6 @@ A fast-forward occurs when the target timeline hasn't changed since the divergen
 - **No conflict markers**: Conflicts are tracked as data structures, never written to files.
 - **Strategy as parameter**: Same engine handles all strategies, simplifying the API.
 - **BTreeMap for file sets**: Deterministic ordering, efficient lookup.
-- **Union tie-breaking**: Prefers `theirs` to match the "accept incoming" mental model.
+- **Union concatenation**: On a genuine conflict, union combines both versions by
+  concatenating ours then theirs (deterministic, no separator) into a single blob,
+  so no side is silently dropped. Intended for append-only files.

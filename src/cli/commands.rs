@@ -1342,7 +1342,7 @@ fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
     collect_blob_hashes(&store, target_leaf.tree_root, "", &mut ours_files)?;
     collect_blob_hashes(&store, source_leaf.tree_root, "", &mut theirs_files)?;
 
-    let result = FuseEngine::fuse(&base_files, &ours_files, &theirs_files, strategy);
+    let result = FuseEngine::fuse(&store, &base_files, &ours_files, &theirs_files, strategy);
 
     if result.success {
         // Build merged tree (blobs already in CAS, just build tree structure)

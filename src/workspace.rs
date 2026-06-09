@@ -548,8 +548,8 @@ impl<'a> Workspace<'a> {
         ignore: &PatternCache,
     ) -> Result<(), WorkspaceError> {
         let store = FsStore::new(self.cas);
-        let mut target_files = BTreeMap::new();
-        self.collect_tree_files(&store, tree_hash, "", &mut target_files)?;
+        let mut target_files: BTreeMap<String, (B3Hash, u32)> = BTreeMap::new();
+        self.collect_tree_blobs(&store, tree_hash, "", &mut target_files)?;
 
         // Scan the working dir respecting ignores; any file not in this set
         // is either ignored or absent — either way we won't delete it below.
@@ -557,25 +557,17 @@ impl<'a> Workspace<'a> {
         let current_set: BTreeSet<String> = current_files.into_iter().collect();
 
         // Write/update files
-        for (path, blob_hash) in &target_files {
+        for (path, (blob_hash, mode)) in &target_files {
             let full_path = self.work_dir.join(path);
             let (_, content) = store
                 .load_blob(*blob_hash)
                 .map_err(WorkspaceError::FsMerkle)?;
 
-            let should_write = if full_path.exists() {
-                let existing = fs::read(&full_path).map_err(WorkspaceError::Io)?;
-                existing != content
-            } else {
-                true
-            };
-
-            if should_write {
-                if let Some(parent) = full_path.parent() {
-                    fs::create_dir_all(parent).map_err(WorkspaceError::Io)?;
-                }
-                fs::write(&full_path, &content).map_err(WorkspaceError::Io)?;
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent).map_err(WorkspaceError::Io)?;
             }
+
+            self.write_entry(&full_path, &content, *mode)?;
         }
 
         // Remove non-ignored files not in target tree
@@ -620,6 +612,99 @@ impl<'a> Workspace<'a> {
         }
 
         Ok(())
+    }
+
+    /// Collect all blob file paths with their hash and mode, recursively.
+    fn collect_tree_blobs(
+        &self,
+        store: &FsStore<'_>,
+        tree_hash: B3Hash,
+        prefix: &str,
+        files: &mut BTreeMap<String, (B3Hash, u32)>,
+    ) -> Result<(), WorkspaceError> {
+        let tree = store
+            .load_tree(tree_hash)
+            .map_err(WorkspaceError::FsMerkle)?;
+
+        for entry in &tree.entries {
+            let path = if prefix.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{}/{}", prefix, entry.name)
+            };
+
+            match entry.kind {
+                NodeKind::Blob => {
+                    files.insert(path, (entry.hash, entry.mode));
+                }
+                NodeKind::Tree => {
+                    self.collect_tree_blobs(store, entry.hash, &path, files)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Write a single materialized entry to disk, honoring its file mode:
+    /// symlinks become real symlinks, executables get the exec bit set.
+    /// On non-unix platforms the content is written as a plain file.
+    fn write_entry(
+        &self,
+        full_path: &std::path::Path,
+        content: &[u8],
+        mode: u32,
+    ) -> Result<(), WorkspaceError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            if mode == crate::fsmerkle::MODE_SYMLINK {
+                // Blob content is the link target. Recreate unconditionally so a
+                // changed target is reflected (fs::read would follow the link).
+                let target = String::from_utf8_lossy(content).into_owned();
+                if full_path.symlink_metadata().is_ok() {
+                    let _ = fs::remove_file(full_path);
+                }
+                std::os::unix::fs::symlink(&target, full_path).map_err(WorkspaceError::Io)?;
+                return Ok(());
+            }
+
+            // Regular or executable file: skip the write if content already matches.
+            let needs_write = match fs::read(full_path) {
+                Ok(existing) => existing != content,
+                Err(_) => true,
+            };
+            if needs_write {
+                // If a symlink currently occupies this path, drop it first.
+                if full_path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false)
+                {
+                    let _ = fs::remove_file(full_path);
+                }
+                fs::write(full_path, content).map_err(WorkspaceError::Io)?;
+            }
+            let perm = if mode == crate::fsmerkle::MODE_EXEC {
+                0o755
+            } else {
+                0o644
+            };
+            fs::set_permissions(full_path, fs::Permissions::from_mode(perm))
+                .map_err(WorkspaceError::Io)?;
+            Ok(())
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = mode;
+            let needs_write = match fs::read(full_path) {
+                Ok(existing) => existing != content,
+                Err(_) => true,
+            };
+            if needs_write {
+                fs::write(full_path, content).map_err(WorkspaceError::Io)?;
+            }
+            Ok(())
+        }
     }
 
     /// Save workspace state to disk.
@@ -1102,6 +1187,61 @@ mod tests {
         assert!(map.contains_key("a.txt"));
         assert!(map.contains_key("nested/b.txt"));
         assert_eq!(map.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_applies_exec_bit_and_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, cas) = setup_workspace();
+        let store = FsStore::new(&cas);
+        let (regular, _) = store.put_blob(b"plain\n").unwrap();
+        let (script, _) = store.put_blob(b"#!/bin/sh\n").unwrap();
+        let (link, _) = store.put_blob(b"regular.txt").unwrap();
+
+        let tree = store
+            .put_tree(vec![
+                Entry {
+                    name: "regular.txt".into(),
+                    mode: MODE_FILE,
+                    kind: NodeKind::Blob,
+                    hash: regular,
+                },
+                Entry {
+                    name: "run.sh".into(),
+                    mode: crate::fsmerkle::MODE_EXEC,
+                    kind: NodeKind::Blob,
+                    hash: script,
+                },
+                Entry {
+                    name: "link".into(),
+                    mode: crate::fsmerkle::MODE_SYMLINK,
+                    kind: NodeKind::Blob,
+                    hash: link,
+                },
+            ])
+            .unwrap();
+
+        let ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        ws.materialize_with_ignore(tree, &PatternCache::new(&[]))
+            .unwrap();
+
+        // Executable bit set on the script.
+        let exec = fs::metadata(dir.path().join("run.sh")).unwrap();
+        assert!(exec.permissions().mode() & 0o111 != 0, "exec bit set");
+
+        // Symlink created pointing at its target (not a regular file).
+        let lmeta = fs::symlink_metadata(dir.path().join("link")).unwrap();
+        assert!(lmeta.file_type().is_symlink(), "link is a real symlink");
+        assert_eq!(
+            fs::read_link(dir.path().join("link")).unwrap().to_str().unwrap(),
+            "regular.txt"
+        );
+
+        // Regular file is not executable.
+        let reg = fs::metadata(dir.path().join("regular.txt")).unwrap();
+        assert!(reg.permissions().mode() & 0o111 == 0, "regular not exec");
     }
 
     #[test]

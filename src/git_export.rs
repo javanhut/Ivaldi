@@ -228,12 +228,13 @@ fn translate_tree(
     for entry in &entries {
         let (mode_str, child_sha1) = match entry.kind {
             NodeKind::Blob => {
-                let mode = if entry.mode == fsmerkle::MODE_FILE {
-                    "100644"
-                } else {
-                    // Ivaldi only carries MODE_FILE / MODE_DIR — preserve as
-                    // 100644 for any other blob mode.
-                    "100644"
+                // Emit the git mode that matches the stored Ivaldi mode so the
+                // round-trip preserves executable bits and symlinks (which are
+                // part of the git tree object and therefore its SHA-1).
+                let mode = match entry.mode {
+                    fsmerkle::MODE_EXEC => "100755",
+                    fsmerkle::MODE_SYMLINK => "120000",
+                    _ => "100644",
                 };
                 let sha = translate_blob(store, entry.hash, objects)?;
                 (mode, sha)
@@ -483,5 +484,54 @@ mod tests {
         // 20-byte SHA-1 immediately after the NUL.
         let nul = tree_body.iter().position(|&b| b == 0).unwrap();
         assert_eq!(tree_body[nul + 1..nul + 21], blob_obj.sha1);
+    }
+
+    #[test]
+    fn translate_tree_preserves_exec_and_symlink_modes() {
+        // Executable bit and symlinks are part of the git tree object (and thus
+        // its SHA-1). Export must emit 100755 / 120000, not collapse to 100644.
+        let dir = tempfile::tempdir().unwrap();
+        let cas = FileCas::new(dir.path().join("objects")).unwrap();
+        let store = FsStore::new(&cas);
+
+        let (regular, _) = store.put_blob(b"plain").unwrap();
+        let (script, _) = store.put_blob(b"#!/bin/sh\n").unwrap();
+        // A symlink blob's content is the link target path.
+        let (link, _) = store.put_blob(b"regular.txt").unwrap();
+
+        let tree_hash = store
+            .put_tree(vec![
+                fsmerkle::Entry {
+                    name: "link".into(),
+                    mode: fsmerkle::MODE_SYMLINK,
+                    kind: NodeKind::Blob,
+                    hash: link,
+                },
+                fsmerkle::Entry {
+                    name: "regular.txt".into(),
+                    mode: fsmerkle::MODE_FILE,
+                    kind: NodeKind::Blob,
+                    hash: regular,
+                },
+                fsmerkle::Entry {
+                    name: "run.sh".into(),
+                    mode: fsmerkle::MODE_EXEC,
+                    kind: NodeKind::Blob,
+                    hash: script,
+                },
+            ])
+            .unwrap();
+
+        let mut cache = BTreeMap::new();
+        let mut objects: BTreeMap<[u8; 20], GitObject> = BTreeMap::new();
+        let tree_sha = translate_tree(&store, tree_hash, &mut cache, &mut objects).unwrap();
+        let body = &objects.get(&tree_sha).unwrap().body;
+
+        let contains = |needle: &[u8]| {
+            body.windows(needle.len()).any(|w| w == needle)
+        };
+        assert!(contains(b"100755 run.sh\0"), "executable mode preserved");
+        assert!(contains(b"120000 link\0"), "symlink mode preserved");
+        assert!(contains(b"100644 regular.txt\0"), "regular mode preserved");
     }
 }
