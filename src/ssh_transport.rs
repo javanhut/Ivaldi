@@ -22,8 +22,8 @@ use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use crate::git_remote::{
-    extract_pack_from_upload_pack, parse_discovery, parse_packfile,
-    select_branch_from_discovery, FetchResult, GitRemoteError,
+    FetchResult, GitRemoteError, extract_pack_from_upload_pack, parse_discovery, parse_packfile,
+    select_branch_from_discovery,
 };
 use crate::progress;
 use crate::remote::RemoteBranch;
@@ -70,22 +70,22 @@ impl SshTarget {
         // to disambiguate from `host:port/path`-style URLs that don't carry
         // a scheme. Within the scp form the path may be absolute
         // (`git@host:/abs/path`) — that's still scp, not host:port.
-        if !url.contains("://") {
-            if let Some((userhost, path)) = url.split_once(':') {
-                let (user, host) = match userhost.split_once('@') {
-                    Some((u, h)) => (u.to_string(), h.to_string()),
-                    None => return None, // bare `host:path` is ambiguous; require user@.
-                };
-                if host.is_empty() || path.is_empty() {
-                    return None;
-                }
-                return Some(SshTarget {
-                    user,
-                    host,
-                    port: None,
-                    repo_path: path.to_string(),
-                });
+        if !url.contains("://")
+            && let Some((userhost, path)) = url.split_once(':')
+        {
+            let (user, host) = match userhost.split_once('@') {
+                Some((u, h)) => (u.to_string(), h.to_string()),
+                None => return None, // bare `host:path` is ambiguous; require user@.
+            };
+            if host.is_empty() || path.is_empty() {
+                return None;
             }
+            return Some(SshTarget {
+                user,
+                host,
+                port: None,
+                repo_path: path.to_string(),
+            });
         }
         None
     }
@@ -258,10 +258,8 @@ impl SshClient {
                 return Err(GitRemoteError::Io(format!("ssh: {}", stderr_text)));
             }
         };
-        let discovery =
-            crate::git_remote::parse_discovery(&adv_bytes).map_err(|e| {
-                GitRemoteError::Protocol(format!("receive-pack advertisement: {}", e))
-            })?;
+        let discovery = crate::git_remote::parse_discovery(&adv_bytes)
+            .map_err(|e| GitRemoteError::Protocol(format!("receive-pack advertisement: {}", e)))?;
 
         let target_ref = format!("refs/heads/{}", branch);
         let old_sha1 = discovery
@@ -343,8 +341,7 @@ impl SshClient {
             .write_all(b"0000")
             .map_err(|e| GitRemoteError::Io(e.to_string()))?;
 
-        let mut object_refs: Vec<&crate::git_export::GitObject> =
-            export.objects.values().collect();
+        let mut object_refs: Vec<&crate::git_export::GitObject> = export.objects.values().collect();
         // Stable order — receivers don't care, but determinism helps debugging.
         object_refs.sort_by_key(|o| o.sha1);
         let pack = git_pack_writer::write_pack(&object_refs)

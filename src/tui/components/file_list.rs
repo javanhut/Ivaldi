@@ -33,6 +33,12 @@ pub struct FileListWidget {
     pub offset: usize,
 }
 
+impl Default for FileListWidget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FileListWidget {
     pub fn new() -> Self {
         Self {

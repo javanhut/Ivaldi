@@ -160,12 +160,12 @@ impl ButterflyManager {
         }
 
         // Remove from parent's children list
-        if !bf.is_orphaned {
-            if let Some(siblings) = self.children.get_mut(&bf.parent_name) {
-                siblings.retain(|c| c != name);
-                if siblings.is_empty() {
-                    self.children.remove(&bf.parent_name);
-                }
+        if !bf.is_orphaned
+            && let Some(siblings) = self.children.get_mut(&bf.parent_name)
+        {
+            siblings.retain(|c| c != name);
+            if siblings.is_empty() {
+                self.children.remove(&bf.parent_name);
             }
         }
 

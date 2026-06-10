@@ -138,87 +138,87 @@ impl App {
             terminal.draw(|frame| self.render(frame))?;
 
             // Poll for events with timeout (for background task polling)
-            if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
-                    }
+            if event::poll(Duration::from_millis(100))?
+                && let Event::Key(key) = event::read()?
+            {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
 
-                    let has_input = self.active_view().has_active_input();
+                let has_input = self.active_view().has_active_input();
 
-                    // Global keys (only when no active input)
-                    if !has_input {
-                        let mut handled = true;
-                        match key.code {
-                            KeyCode::Char('q') => break,
-                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                break;
-                            }
-                            KeyCode::Char('?') => {
-                                self.show_help = !self.show_help;
-                            }
-                            KeyCode::Char('1') => self.switch_tab(TabId::Status),
-                            KeyCode::Char('2') => self.switch_tab(TabId::Log),
-                            KeyCode::Char('3') => self.switch_tab(TabId::Diff),
-                            KeyCode::Char('4') => self.switch_tab(TabId::Timelines),
-                            KeyCode::Char('5') => self.switch_tab(TabId::Remote),
-                            KeyCode::Char('6') => self.switch_tab(TabId::Fuse),
-                            KeyCode::Char('7') => self.switch_tab(TabId::Review),
-                            KeyCode::Char('8') => self.switch_tab(TabId::Shelves),
-                            KeyCode::Tab => {
-                                let next = (self.active_tab.index() + 1) % TabId::ALL.len();
-                                if let Some(tab) = TabId::from_index(next) {
-                                    self.switch_tab(tab);
-                                }
-                            }
-                            KeyCode::BackTab => {
-                                let prev = if self.active_tab.index() == 0 {
-                                    TabId::ALL.len() - 1
-                                } else {
-                                    self.active_tab.index() - 1
-                                };
-                                if let Some(tab) = TabId::from_index(prev) {
-                                    self.switch_tab(tab);
-                                }
-                            }
-                            KeyCode::Esc => {
-                                if self.show_help {
-                                    self.show_help = false;
-                                }
-                                // Esc falls through to view if help not showing
-                                else {
-                                    handled = false;
-                                }
-                            }
-                            _ => handled = false,
-                        }
-
-                        if handled {
-                            continue;
-                        }
-                    } else {
-                        // When input is active, only handle Ctrl+C globally
-                        if key.code == KeyCode::Char('c')
-                            && key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
+                // Global keys (only when no active input)
+                if !has_input {
+                    let mut handled = true;
+                    match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             break;
                         }
+                        KeyCode::Char('?') => {
+                            self.show_help = !self.show_help;
+                        }
+                        KeyCode::Char('1') => self.switch_tab(TabId::Status),
+                        KeyCode::Char('2') => self.switch_tab(TabId::Log),
+                        KeyCode::Char('3') => self.switch_tab(TabId::Diff),
+                        KeyCode::Char('4') => self.switch_tab(TabId::Timelines),
+                        KeyCode::Char('5') => self.switch_tab(TabId::Remote),
+                        KeyCode::Char('6') => self.switch_tab(TabId::Fuse),
+                        KeyCode::Char('7') => self.switch_tab(TabId::Review),
+                        KeyCode::Char('8') => self.switch_tab(TabId::Shelves),
+                        KeyCode::Tab => {
+                            let next = (self.active_tab.index() + 1) % TabId::ALL.len();
+                            if let Some(tab) = TabId::from_index(next) {
+                                self.switch_tab(tab);
+                            }
+                        }
+                        KeyCode::BackTab => {
+                            let prev = if self.active_tab.index() == 0 {
+                                TabId::ALL.len() - 1
+                            } else {
+                                self.active_tab.index() - 1
+                            };
+                            if let Some(tab) = TabId::from_index(prev) {
+                                self.switch_tab(tab);
+                            }
+                        }
+                        KeyCode::Esc => {
+                            if self.show_help {
+                                self.show_help = false;
+                            }
+                            // Esc falls through to view if help not showing
+                            else {
+                                handled = false;
+                            }
+                        }
+                        _ => handled = false,
                     }
 
-                    // Dispatch to active view
-                    let action = match self.active_tab {
-                        TabId::Status => self.status_view.handle_event(&key, &mut self.ctx),
-                        TabId::Log => self.log_view.handle_event(&key, &mut self.ctx),
-                        TabId::Diff => self.diff_view.handle_event(&key, &mut self.ctx),
-                        TabId::Timelines => self.timeline_view.handle_event(&key, &mut self.ctx),
-                        TabId::Remote => self.remote_view.handle_event(&key, &mut self.ctx),
-                        TabId::Fuse => self.fuse_view.handle_event(&key, &mut self.ctx),
-                        TabId::Review => self.review_view.handle_event(&key, &mut self.ctx),
-                        TabId::Shelves => self.shelves_view.handle_event(&key, &mut self.ctx),
-                    };
-
-                    self.handle_action(action);
+                    if handled {
+                        continue;
+                    }
+                } else {
+                    // When input is active, only handle Ctrl+C globally
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        break;
+                    }
                 }
+
+                // Dispatch to active view
+                let action = match self.active_tab {
+                    TabId::Status => self.status_view.handle_event(&key, &mut self.ctx),
+                    TabId::Log => self.log_view.handle_event(&key, &mut self.ctx),
+                    TabId::Diff => self.diff_view.handle_event(&key, &mut self.ctx),
+                    TabId::Timelines => self.timeline_view.handle_event(&key, &mut self.ctx),
+                    TabId::Remote => self.remote_view.handle_event(&key, &mut self.ctx),
+                    TabId::Fuse => self.fuse_view.handle_event(&key, &mut self.ctx),
+                    TabId::Review => self.review_view.handle_event(&key, &mut self.ctx),
+                    TabId::Shelves => self.shelves_view.handle_event(&key, &mut self.ctx),
+                };
+
+                self.handle_action(action);
             }
 
             // Poll background operations (remote tab)

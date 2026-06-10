@@ -186,9 +186,7 @@ fn draw_travel(frame: &mut Frame, state: &mut TravelState) {
     };
     let list_area = Rect {
         y: area.y + header_height,
-        height: area
-            .height
-            .saturating_sub(header_height + footer_height),
+        height: area.height.saturating_sub(header_height + footer_height),
         ..area
     };
     let footer_area = Rect {
@@ -278,7 +276,9 @@ fn draw_travel(frame: &mut Frame, state: &mut TravelState) {
         let marker = if is_cursor { "→" } else { " " };
         let head_tag = if i == 0 { " [HEAD]" } else { "" };
         let style = if is_cursor {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -294,8 +294,7 @@ fn draw_travel(frame: &mut Frame, state: &mut TravelState) {
             ))
             .style(style),
             Line::from(format!("     {}", first_line(&entry.message))).style(style),
-            Line::from(format!("     {} · {}", entry.author, entry.time_unix))
-                .style(style),
+            Line::from(format!("     {} · {}", entry.author, entry.time_unix)).style(style),
         ];
         let para = Paragraph::new(lines);
         frame.render_widget(para, entry_area);
@@ -322,11 +321,57 @@ fn first_line(s: &str) -> &str {
 /// Compute how many entries fit in `inner_rows` of vertical space, given
 /// each entry slot is `ENTRY_LINES` content + `ENTRY_SPACING` gutter.
 /// Pulled out as a free function so the math is testable without a Frame.
+#[cfg(test)]
 fn viewport_entries(inner_rows: usize) -> usize {
     if inner_rows >= ENTRY_LINES {
         ((inner_rows + ENTRY_SPACING) / ENTRY_SLOT).max(1)
     } else {
         1
+    }
+}
+
+fn prompt_travel_action(seal_index: u64) -> std::io::Result<TravelAction> {
+    println!("\nSelected seal at index {}", seal_index);
+    println!("\n? What would you like to do?");
+    println!("  1. Diverge - Create new timeline from this seal");
+    println!("  2. Overwrite - Reset current timeline");
+    println!("  3. Cancel");
+    print!("\nChoice: ");
+    use std::io::Write;
+    std::io::stdout().flush()?;
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+
+    match input.trim() {
+        "1" => {
+            print!("Enter new timeline name: ");
+            std::io::stdout().flush()?;
+            let mut name = String::new();
+            std::io::stdin().read_line(&mut name)?;
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                Ok(TravelAction::Cancel)
+            } else {
+                Ok(TravelAction::Diverge {
+                    seal_index,
+                    new_timeline: name,
+                })
+            }
+        }
+        "2" => {
+            print!("WARNING: This will remove commits. Type 'yes' to confirm: ");
+            std::io::stdout().flush()?;
+            let mut confirm = String::new();
+            std::io::stdin().read_line(&mut confirm)?;
+            if confirm.trim() == "yes" {
+                Ok(TravelAction::Overwrite { seal_index })
+            } else {
+                println!("Aborted.");
+                Ok(TravelAction::Cancel)
+            }
+        }
+        _ => Ok(TravelAction::Cancel),
     }
 }
 
@@ -386,12 +431,14 @@ mod tests {
         // Step the cursor through the first viewport — offset stays 0.
         for _ in 0..6 {
             s.cursor += 1;
-            let v = s.viewport; adjust_offset(&mut s, v);
+            let v = s.viewport;
+            adjust_offset(&mut s, v);
             assert_eq!(s.offset, 0, "cursor still in viewport");
         }
         // 7th press scrolls by 1 (cursor=7, offset becomes 1).
         s.cursor += 1;
-        let v = s.viewport; adjust_offset(&mut s, v);
+        let v = s.viewport;
+        adjust_offset(&mut s, v);
         assert_eq!(s.cursor, 7);
         assert_eq!(s.offset, 1);
 
@@ -407,7 +454,8 @@ mod tests {
         s.viewport = 1;
         for expected in 1..10 {
             s.cursor += 1;
-            let v = s.viewport; adjust_offset(&mut s, v);
+            let v = s.viewport;
+            adjust_offset(&mut s, v);
             assert_eq!(s.cursor, expected);
             assert_eq!(s.offset, expected, "viewport=1 → offset tracks cursor");
         }
@@ -421,52 +469,8 @@ mod tests {
         s.cursor = 30;
         s.offset = 24;
         s.cursor = 0;
-        let v = s.viewport; adjust_offset(&mut s, v);
+        let v = s.viewport;
+        adjust_offset(&mut s, v);
         assert_eq!(s.offset, 0);
-    }
-}
-
-fn prompt_travel_action(seal_index: u64) -> std::io::Result<TravelAction> {
-    println!("\nSelected seal at index {}", seal_index);
-    println!("\n? What would you like to do?");
-    println!("  1. Diverge - Create new timeline from this seal");
-    println!("  2. Overwrite - Reset current timeline");
-    println!("  3. Cancel");
-    print!("\nChoice: ");
-    use std::io::Write;
-    std::io::stdout().flush()?;
-
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-
-    match input.trim() {
-        "1" => {
-            print!("Enter new timeline name: ");
-            std::io::stdout().flush()?;
-            let mut name = String::new();
-            std::io::stdin().read_line(&mut name)?;
-            let name = name.trim().to_string();
-            if name.is_empty() {
-                Ok(TravelAction::Cancel)
-            } else {
-                Ok(TravelAction::Diverge {
-                    seal_index,
-                    new_timeline: name,
-                })
-            }
-        }
-        "2" => {
-            print!("WARNING: This will remove commits. Type 'yes' to confirm: ");
-            std::io::stdout().flush()?;
-            let mut confirm = String::new();
-            std::io::stdin().read_line(&mut confirm)?;
-            if confirm.trim() == "yes" {
-                Ok(TravelAction::Overwrite { seal_index })
-            } else {
-                println!("Aborted.");
-                Ok(TravelAction::Cancel)
-            }
-        }
-        _ => Ok(TravelAction::Cancel),
     }
 }

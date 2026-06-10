@@ -101,6 +101,12 @@ pub struct ShelvesView {
     message: Option<(String, bool)>,
 }
 
+impl Default for ShelvesView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ShelvesView {
     pub fn new() -> Self {
         Self {
@@ -240,7 +246,7 @@ impl TabView for ShelvesView {
                 theme.title,
             )));
             lines.push(Line::from(""));
-            for (path, _) in &shelf.staged_files {
+            for path in shelf.staged_files.keys() {
                 lines.push(Line::from(vec![
                     Span::styled(" S ", theme.help_key),
                     Span::raw(path.clone()),
@@ -276,10 +282,7 @@ impl TabView for ShelvesView {
             let msg = match &self.message {
                 Some((m, true)) => Span::styled(format!(" {}", m), theme.error),
                 Some((m, false)) => Span::styled(format!(" {}", m), theme.success),
-                None => Span::styled(
-                    " Enter:expand  d:drop  r:refresh",
-                    theme.dim,
-                ),
+                None => Span::styled(" Enter:expand  d:drop  r:refresh", theme.dim),
             };
             frame.render_widget(Paragraph::new(msg), help_area);
         }
@@ -287,10 +290,7 @@ impl TabView for ShelvesView {
 
     fn load_data(&mut self, ctx: &AppContext) {
         let mgr = ShelfManager::new(&ctx.ivaldi_dir);
-        let names = match mgr.list_shelves() {
-            Ok(n) => n,
-            Err(_) => Vec::new(),
-        };
+        let names = mgr.list_shelves().unwrap_or_default();
 
         let mut summaries: Vec<ShelfSummary> = Vec::new();
         for name in names {
@@ -299,7 +299,7 @@ impl TabView for ShelvesView {
             }
         }
         // Most recently modified first.
-        summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        summaries.sort_by_key(|s| std::cmp::Reverse(s.created_at));
 
         self.summaries = summaries;
         if self.cursor >= self.summaries.len() {

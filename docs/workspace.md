@@ -55,6 +55,10 @@ ws.gather(&["src/main.rs", "README.md"])?;
 // Gather everything
 ws.gather_all(&ignore_cache)?;
 
+// Progress-reporting variants (the CLI uses these to drive its
+// spinner/progress bar; the plain forms delegate with a no-op callback)
+ws.gather_all_with_progress(&ignore_cache, &mut |path| eprintln!("{path}"))?;
+
 // Build tree from staged files
 let tree_hash = ws.build_staged_tree()?;
 

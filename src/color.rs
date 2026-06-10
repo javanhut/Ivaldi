@@ -77,6 +77,11 @@ pub fn cyan(text: &str) -> String {
     wrap(CYAN, text)
 }
 
+/// Render a CLI error line with a consistent red `error:` prefix.
+pub fn error(msg: &str) -> String {
+    format!("{} {}", bold_red("error:"), msg)
+}
+
 pub fn bold_green(text: &str) -> String {
     if is_enabled() {
         format!("{}{}{}{}", BOLD, GREEN, text, RESET)

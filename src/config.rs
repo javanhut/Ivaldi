@@ -10,6 +10,103 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// A documented configuration key: (key, what it does, example value).
+pub const KNOWN_KEYS: &[(&str, &str, &str)] = &[
+    (
+        "user.name",
+        "Your name, recorded as the author of every seal",
+        "\"Ada Lovelace\"",
+    ),
+    (
+        "user.email",
+        "Your email, recorded alongside the author name",
+        "ada@example.com",
+    ),
+    ("color.ui", "Colored CLI output (true/false)", "true"),
+    (
+        "core.autoshelf",
+        "Auto-shelve uncommitted changes on timeline switch (true/false)",
+        "true",
+    ),
+    (
+        "portal.default",
+        "Default remote for upload/sync when several portals are configured",
+        "owner/repo",
+    ),
+];
+
+/// One line per known key, used in `config --help` and error hints.
+pub fn known_keys_help() -> String {
+    KNOWN_KEYS
+        .iter()
+        .map(|(key, desc, example)| format!("  {:<16} {} (e.g. {})", key, desc, example))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Loose email shape check: `local@domain.tld`.
+pub fn is_email_like(s: &str) -> bool {
+    let (local, rest) = match s.split_once('@') {
+        Some(p) => p,
+        None => return false,
+    };
+    if local.is_empty() {
+        return false;
+    }
+    rest.contains('.') && !rest.starts_with('.') && !rest.ends_with('.')
+}
+
+/// Validate a `--set` request. `Err` blocks the write (malformed key or
+/// value); `Ok(Some(warning))` allows it with a caveat (unknown key).
+pub fn validate_set(key: &str, value: &str) -> Result<Option<String>, String> {
+    if !key.contains('.') {
+        return Err(format!(
+            "config keys use the form 'section.field' (got '{}').\nKnown keys:\n{}",
+            key,
+            known_keys_help()
+        ));
+    }
+    match key {
+        "user.name" => {
+            if value.trim().is_empty() {
+                return Err("user.name cannot be empty".into());
+            }
+        }
+        "user.email" => {
+            if !is_email_like(value) {
+                return Err(format!(
+                    "'{}' doesn't look like an email address (expected name@domain.tld)",
+                    value
+                ));
+            }
+        }
+        "color.ui" | "core.autoshelf" => {
+            if value != "true" && value != "false" {
+                return Err(format!(
+                    "{} must be 'true' or 'false' (got '{}')",
+                    key, value
+                ));
+            }
+        }
+        "portal.default" => {
+            if crate::portal::parse_repo_spec(value).is_err() {
+                return Err(format!(
+                    "'{}' is not a valid repo spec (expected owner/repo or a full URL)",
+                    value
+                ));
+            }
+        }
+        unknown => {
+            return Ok(Some(format!(
+                "'{}' is not a key ivaldi reads — saving it anyway.\nKnown keys:\n{}",
+                unknown,
+                known_keys_help()
+            )));
+        }
+    }
+    Ok(None)
+}
+
 /// Ivaldi configuration.
 #[derive(Debug, Clone, Default)]
 pub struct Config {
@@ -120,7 +217,8 @@ impl Config {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(ConfigError::Io)?;
         }
-        fs::write(path, self.to_string_repr()).map_err(ConfigError::Io)
+        crate::atomic_io::atomic_write(path, self.to_string_repr().as_bytes())
+            .map_err(ConfigError::Io)
     }
 
     /// Load from a file.
@@ -164,10 +262,10 @@ pub fn global_config_path() -> Option<PathBuf> {
 /// Load only the global config (ignoring any repo config).
 pub fn load_global() -> Config {
     let mut cfg = Config::new();
-    if let Some(path) = global_config_path() {
-        if let Ok(user_cfg) = Config::load(&path) {
-            cfg.merge(&user_cfg);
-        }
+    if let Some(path) = global_config_path()
+        && let Ok(user_cfg) = Config::load(&path)
+    {
+        cfg.merge(&user_cfg);
     }
     cfg
 }
@@ -191,6 +289,54 @@ mod tests {
         let cfg = Config::new();
         assert_eq!(cfg.get("color.ui"), Some("true"));
         assert_eq!(cfg.get("core.autoshelf"), Some("true"));
+    }
+
+    #[test]
+    fn validate_set_accepts_good_values() {
+        assert_eq!(validate_set("user.name", "Ada Lovelace"), Ok(None));
+        assert_eq!(validate_set("user.email", "ada@example.com"), Ok(None));
+        assert_eq!(validate_set("color.ui", "false"), Ok(None));
+        assert_eq!(validate_set("core.autoshelf", "true"), Ok(None));
+        assert_eq!(validate_set("portal.default", "owner/repo"), Ok(None));
+    }
+
+    #[test]
+    fn validate_set_rejects_bad_values() {
+        // Dotless keys would be silently dropped by the serializer — hard error.
+        let err = validate_set("username", "Ada").unwrap_err();
+        assert!(err.contains("section.field"));
+        assert!(err.contains("user.name")); // hint lists known keys
+
+        assert!(validate_set("user.name", "  ").is_err());
+        assert!(validate_set("user.email", "not-an-email").is_err());
+        assert!(validate_set("user.email", "a@b").is_err());
+        assert!(validate_set("color.ui", "yes").is_err());
+        assert!(validate_set("core.autoshelf", "1").is_err());
+        assert!(validate_set("portal.default", "not a spec").is_err());
+    }
+
+    #[test]
+    fn validate_set_warns_on_unknown_dotted_key() {
+        let warning = validate_set("custom.thing", "anything").unwrap();
+        assert!(warning.unwrap().contains("not a key ivaldi reads"));
+    }
+
+    #[test]
+    fn known_keys_help_mentions_every_key() {
+        let help = known_keys_help();
+        for (key, _, _) in KNOWN_KEYS {
+            assert!(help.contains(key), "help missing {}", key);
+        }
+    }
+
+    #[test]
+    fn email_shape_check() {
+        assert!(is_email_like("ada@example.com"));
+        assert!(is_email_like("a.b+c@sub.domain.io"));
+        assert!(!is_email_like("ada"));
+        assert!(!is_email_like("@example.com"));
+        assert!(!is_email_like("ada@example"));
+        assert!(!is_email_like("ada@.com"));
     }
 
     #[test]

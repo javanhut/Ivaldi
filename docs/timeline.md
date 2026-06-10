@@ -11,6 +11,11 @@ The `HistoryManager` orchestrates:
 - Creating/switching/removing timelines
 - LCA (Lowest Common Ancestor) computation for merges
 
+CLI timeline switches are crash-recoverable: the switch sequence is
+journaled to `.ivaldi/SWITCH_IN_PROGRESS` so an interrupted switch can be
+completed or rolled back instead of leaving the working tree half
+transitioned — see [switch_journal.md](switch_journal.md).
+
 ## Usage
 
 ```rust

@@ -24,6 +24,25 @@ Always excluded regardless of `.ivaldiignore`:
 - `.env`, `.env.*` — environment variable files
 - `.venv`, `.venv/` — Python virtual environments
 
+## Dotfiles and Security Blocks
+
+Dotfile handling is separate from `.ivaldiignore` patterns and often
+surprises users coming from git:
+
+- **Dotfiles are skipped by `gather .`** even when no ignore pattern
+  matches them. The skipped paths are reported on stderr so they are not
+  silently lost.
+- **Explicitly gathering a dotfile** (`ivaldi gather .editorconfig`)
+  prompts `y/N` per file. Confirmed paths are remembered in
+  `.ivaldi/dotfile-allowlist`, so each dotfile is asked about only once.
+- **`ivaldi gather --allow-all`** confirms all pending dotfiles in one go.
+- **Security-blocked files cannot be staged at all.** `.env`, `.env.*`,
+  and `.venv` are hard-blocked; neither the allowlist nor `--allow-all`
+  overrides this. Staging one is an error, not a prompt.
+- Adding `.*` to `.ivaldiignore` is unnecessary — the dotfile gate already
+  covers hidden files; the ignore file is for non-hidden paths like
+  `build/` or `*.log` (managed with `ivaldi exclude <pattern>`).
+
 ## Built-In Defaults
 
 Always excluded (VCS/tool directories):

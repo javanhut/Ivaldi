@@ -1,9 +1,24 @@
-# Sync Module (`sync.rs`)
+# Sync Module (`sync/`)
 
 Download, upload, scout, and harvest operations for Ivaldi VCS. The
 transport-agnostic orchestration layer; the actual wire work lives in
 `git_remote` (HTTPS Smart), `ssh_transport` (SSH), or `p2p` (Ivaldi
 peer-to-peer).
+
+## Module layout
+
+| File | Contents |
+|------|----------|
+| `sync/mod.rs` | `SyncError`, `RemoteFetcher`, download/scout/harvest, shared helpers, re-exports |
+| `sync/upload.rs` | `upload` and its per-step helpers |
+| `sync/import.rs` | `import_full_history(_into)` and its phase helpers |
+| `sync/timeline_sync.rs` | `sync_timeline` (fast-forward and diverged-merge paths) |
+
+All public paths are re-exported from `mod.rs`, so callers still use
+`crate::sync::upload(...)` etc. `SyncError` carries typed `#[from]`
+variants (`Repo`, `Forge`, `GitRemote`, `Cas`, `FsMerkle`, `Remote`,
+`Store`, `Io`, `GitHub`); `Other(String)` is reserved for genuinely
+ad-hoc messages.
 
 ## Overview
 

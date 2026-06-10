@@ -34,6 +34,22 @@ const OP_INSERT: u8 = 1;
 /// Minimum savings ratio to use delta (25% savings required).
 const DELTA_MIN_SAVINGS: f64 = 0.25;
 
+/// Read a 32-byte BLAKE3 hash at `off`, failing with `Corrupt` on short reads.
+fn read_hash(data: &[u8], off: usize) -> Result<B3Hash, PackError> {
+    data.get(off..off + 32)
+        .and_then(B3Hash::from_slice)
+        .ok_or(PackError::Corrupt)
+}
+
+/// Read a little-endian u64 at `off`, failing with `Corrupt` on short reads.
+fn read_u64_le(data: &[u8], off: usize) -> Result<u64, PackError> {
+    let bytes: [u8; 8] = data
+        .get(off..off + 8)
+        .and_then(|s| s.try_into().ok())
+        .ok_or(PackError::Corrupt)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
 /// A pack file containing multiple objects.
 pub struct PackWriter {
     entries: BTreeMap<B3Hash, Vec<u8>>,
@@ -226,11 +242,12 @@ impl PackReader {
     pub fn total_objects(&self) -> usize {
         let mut count = 0;
         for pack_name in self.list_packs() {
-            if let Ok(data) = fs::read(self.pack_dir.join(&pack_name)) {
-                if data.len() >= 13 && &data[0..4] == PACK_MAGIC {
-                    let entry_count = u64::from_le_bytes(data[5..13].try_into().unwrap_or([0; 8]));
-                    count += entry_count as usize;
-                }
+            if let Ok(data) = fs::read(self.pack_dir.join(&pack_name))
+                && data.len() >= 13
+                && &data[0..4] == PACK_MAGIC
+            {
+                let entry_count = u64::from_le_bytes(data[5..13].try_into().unwrap_or([0; 8]));
+                count += entry_count as usize;
             }
         }
         count
@@ -258,7 +275,7 @@ impl PackReader {
                 continue;
             }
             let version = data[4];
-            let entry_count = u64::from_le_bytes(data[5..13].try_into().unwrap_or([0; 8])) as usize;
+            let entry_count = read_u64_le(&data, 5)? as usize;
 
             match version {
                 PACK_VERSION => {
@@ -269,16 +286,9 @@ impl PackReader {
 
                     for i in 0..entry_count {
                         let idx_off = index_start + i * 48;
-                        if idx_off + 48 > data.len() {
-                            break;
-                        }
-                        let hash = B3Hash::from_slice(&data[idx_off..idx_off + 32]).unwrap();
-                        let offset = u64::from_le_bytes(
-                            data[idx_off + 32..idx_off + 40].try_into().unwrap(),
-                        ) as usize;
-                        let size = u64::from_le_bytes(
-                            data[idx_off + 40..idx_off + 48].try_into().unwrap(),
-                        ) as usize;
+                        let hash = read_hash(&data, idx_off)?;
+                        let offset = read_u64_le(&data, idx_off + 32)? as usize;
+                        let size = read_u64_le(&data, idx_off + 40)? as usize;
 
                         let abs_offset = data_start + offset;
                         if abs_offset + size <= data.len() {
@@ -300,17 +310,10 @@ impl PackReader {
                         Vec::with_capacity(entry_count);
                     for i in 0..entry_count {
                         let idx_off = index_start + i * 49;
-                        if idx_off + 49 > data.len() {
-                            break;
-                        }
-                        let hash = B3Hash::from_slice(&data[idx_off..idx_off + 32]).unwrap();
-                        let offset = u64::from_le_bytes(
-                            data[idx_off + 32..idx_off + 40].try_into().unwrap(),
-                        ) as usize;
-                        let size = u64::from_le_bytes(
-                            data[idx_off + 40..idx_off + 48].try_into().unwrap(),
-                        ) as usize;
-                        let etype = data[idx_off + 48];
+                        let hash = read_hash(&data, idx_off)?;
+                        let offset = read_u64_le(&data, idx_off + 32)? as usize;
+                        let size = read_u64_le(&data, idx_off + 40)? as usize;
+                        let etype = *data.get(idx_off + 48).ok_or(PackError::Corrupt)?;
                         entries.push((hash, offset, size, etype));
                     }
 
@@ -361,7 +364,7 @@ impl PackReader {
             return Ok(None);
         }
         let version = data[4];
-        let entry_count = u64::from_le_bytes(data[5..13].try_into().unwrap_or([0; 8])) as usize;
+        let entry_count = read_u64_le(data, 5)? as usize;
 
         match version {
             PACK_VERSION => {
@@ -370,20 +373,13 @@ impl PackReader {
 
                 for i in 0..entry_count {
                     let idx_off = index_start + i * 48;
-                    if idx_off + 48 > data.len() {
-                        break;
-                    }
-                    let hash = B3Hash::from_slice(&data[idx_off..idx_off + 32]).unwrap();
+                    let hash = read_hash(data, idx_off)?;
                     if hash != target_hash {
                         continue;
                     }
 
-                    let offset =
-                        u64::from_le_bytes(data[idx_off + 32..idx_off + 40].try_into().unwrap())
-                            as usize;
-                    let size =
-                        u64::from_le_bytes(data[idx_off + 40..idx_off + 48].try_into().unwrap())
-                            as usize;
+                    let offset = read_u64_le(data, idx_off + 32)? as usize;
+                    let size = read_u64_le(data, idx_off + 40)? as usize;
                     let abs_offset = data_start + offset;
                     if abs_offset + size > data.len() {
                         return Err(PackError::Corrupt);
@@ -399,17 +395,10 @@ impl PackReader {
                 let mut entries: Vec<(B3Hash, usize, usize, u8)> = Vec::with_capacity(entry_count);
                 for i in 0..entry_count {
                     let idx_off = index_start + i * 49;
-                    if idx_off + 49 > data.len() {
-                        break;
-                    }
-                    let hash = B3Hash::from_slice(&data[idx_off..idx_off + 32]).unwrap();
-                    let offset =
-                        u64::from_le_bytes(data[idx_off + 32..idx_off + 40].try_into().unwrap())
-                            as usize;
-                    let size =
-                        u64::from_le_bytes(data[idx_off + 40..idx_off + 48].try_into().unwrap())
-                            as usize;
-                    let etype = data[idx_off + 48];
+                    let hash = read_hash(data, idx_off)?;
+                    let offset = read_u64_le(data, idx_off + 32)? as usize;
+                    let size = read_u64_le(data, idx_off + 40)? as usize;
+                    let etype = *data.get(idx_off + 48).ok_or(PackError::Corrupt)?;
                     entries.push((hash, offset, size, etype));
                 }
 
@@ -456,7 +445,7 @@ impl PackReader {
         if raw.len() < 32 {
             return Err(PackError::Corrupt);
         }
-        let base_hash = B3Hash::from_slice(&raw[..32]).unwrap();
+        let base_hash = read_hash(raw, 0)?;
         let delta_bytes = &raw[32..];
 
         // Find base object
@@ -506,21 +495,21 @@ pub fn compute_delta(base: &[u8], target: &[u8]) -> Vec<u8> {
         let mut best_len = 0usize;
 
         // Try to find a match in base
-        if ti + 4 <= target.len() {
-            if let Some(positions) = base_index.get(&target[ti..ti + 4]) {
-                for &pos in positions {
-                    // Extend match as far as possible
-                    let mut len = 0;
-                    while pos + len < base.len()
-                        && ti + len < target.len()
-                        && base[pos + len] == target[ti + len]
-                    {
-                        len += 1;
-                    }
-                    if len > best_len {
-                        best_len = len;
-                        best_offset = pos;
-                    }
+        if ti + 4 <= target.len()
+            && let Some(positions) = base_index.get(&target[ti..ti + 4])
+        {
+            for &pos in positions {
+                // Extend match as far as possible
+                let mut len = 0;
+                while pos + len < base.len()
+                    && ti + len < target.len()
+                    && base[pos + len] == target[ti + len]
+                {
+                    len += 1;
+                }
+                if len > best_len {
+                    best_len = len;
+                    best_offset = pos;
                 }
             }
         }
@@ -914,5 +903,46 @@ mod tests {
         let reader = PackReader::new(&pack_dir);
         let result = reader.get_object(B3Hash::digest(b"nonexistent"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn truncated_pack_index_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack_dir = dir.path().join("packs");
+
+        let data1 = b"truncation test object";
+        let hash1 = B3Hash::digest(data1);
+        let mut writer = PackWriter::new();
+        writer.add(hash1, data1.to_vec());
+        writer.write(&pack_dir).unwrap();
+
+        let reader = PackReader::new(&pack_dir);
+        let pack_name = reader.list_packs().remove(0);
+        let full = fs::read(pack_dir.join(&pack_name)).unwrap();
+
+        // Cut the buffer in the middle of the index region (after the
+        // 13-byte header but before the first 48-byte index entry ends).
+        let truncated = &full[..13 + 20];
+        let result = reader.get_from_pack_data(truncated, hash1);
+        assert!(matches!(result, Err(PackError::Corrupt)));
+    }
+
+    #[test]
+    fn untruncated_pack_data_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack_dir = dir.path().join("packs");
+
+        let data1 = b"roundtrip test object";
+        let hash1 = B3Hash::digest(data1);
+        let mut writer = PackWriter::new();
+        writer.add(hash1, data1.to_vec());
+        writer.write(&pack_dir).unwrap();
+
+        let reader = PackReader::new(&pack_dir);
+        let pack_name = reader.list_packs().remove(0);
+        let full = fs::read(pack_dir.join(&pack_name)).unwrap();
+
+        let obj = reader.get_from_pack_data(&full, hash1).unwrap();
+        assert_eq!(obj.as_deref(), Some(data1.as_slice()));
     }
 }

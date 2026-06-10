@@ -93,42 +93,47 @@ impl Repo {
         let mut new_leaf = Leaf::new(tree_root, &timeline, author, now, message);
         new_leaf.prev_idx = prev_idx;
 
-        // Compute hash and seal name
-        let leaf_hash = new_leaf.hash();
-        let seal_name = seal::generate_seal_name(leaf_hash);
+        // Delegate to commit_raw so all store writes (leaf, timeline head,
+        // seal mapping, mmr size) land in one transaction — a crash can never
+        // leave a leaf without its head pointer. Note commit_raw appends to
+        // the in-memory MMR before the store transaction; if the transaction
+        // fails the in-memory MMR is one leaf ahead, which is fine because
+        // every caller propagates the error and the process exits.
+        self.commit_raw(new_leaf, &timeline)
+    }
 
-        // Persist leaf canonical bytes
-        let canonical = new_leaf.canonical_bytes();
-        let idx = self.mmr.size();
-        self.store
-            .put_leaf(idx, &canonical)
-            .map_err(RepoError::Store)?;
+    /// Replace the head seal of the current timeline (`reseal`).
+    ///
+    /// Appends a new leaf whose `prev_idx` is the old head's parent (so the
+    /// old head drops out of the chain) and moves the timeline head to it —
+    /// the same orphaning mechanism `weld` uses; the old leaf stays
+    /// recoverable via `travel --all`. `merge_idxs` are copied from the old
+    /// head so resealing a merge seal preserves merge topology.
+    pub fn reseal_head(
+        &mut self,
+        tree_root: B3Hash,
+        author: &str,
+        message: &str,
+    ) -> Result<CommitResult, RepoError> {
+        let timeline = self.current_timeline()?;
+        let head_idx = self
+            .store
+            .get_timeline_head(&timeline)
+            .map_err(RepoError::Store)?
+            .ok_or_else(|| RepoError::Other("nothing to reseal: timeline has no seals".into()))?;
+        let old_leaf = self
+            .get_leaf(head_idx)?
+            .ok_or_else(|| RepoError::Other(format!("corrupt head: leaf {} missing", head_idx)))?;
 
-        // Append to in-memory MMR
-        let (leaf_idx, root) = self.mmr.append_leaf(new_leaf);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
 
-        // Update timeline head
-        self.store
-            .set_timeline_head(&timeline, leaf_idx)
-            .map_err(RepoError::Store)?;
-
-        // Store seal name mapping
-        self.store
-            .put_seal_name(&seal_name, leaf_hash)
-            .map_err(RepoError::Store)?;
-
-        // Store MMR size
-        self.store
-            .set_meta("mmr.size", &self.mmr.size().to_string())
-            .map_err(RepoError::Store)?;
-
-        Ok(CommitResult {
-            index: leaf_idx,
-            hash: leaf_hash,
-            seal_name,
-            root,
-            timeline,
-        })
+        let mut new_leaf = Leaf::new(tree_root, &timeline, author, now, message);
+        new_leaf.prev_idx = old_leaf.prev_idx;
+        new_leaf.merge_idxs = old_leaf.merge_idxs.clone();
+        self.commit_raw(new_leaf, &timeline)
     }
 
     /// Create a raw commit (seal) with a pre-built Leaf on a specific timeline.
@@ -342,10 +347,8 @@ impl Repo {
     /// Walk commit history from a timeline head backwards.
     /// Walk the timeline's history along `prev_idx` only (first-parent
     /// view). Used internally by `walk_history` and `walk_history_dag`.
-    fn walk_history_first_parent(
-        &self,
-        timeline: &str,
-    ) -> Result<Vec<HistoryEntry>, RepoError> {
+    #[cfg(test)]
+    fn walk_history_first_parent(&self, timeline: &str) -> Result<Vec<HistoryEntry>, RepoError> {
         let head_idx = match self.get_timeline_head(timeline)? {
             Some(idx) => idx,
             None => return Ok(Vec::new()),
@@ -424,16 +427,13 @@ impl Repo {
             }
         }
         // Newest-first to match walk_history.
-        entries.sort_by(|a, b| b.index.cmp(&a.index));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.index));
         Ok(entries)
     }
 
     /// Full-DAG walk reachable from a timeline's head, sorted newest-first
     /// by MMR index (which is monotonic in commit creation order).
-    pub fn walk_history_dag(
-        &self,
-        timeline: &str,
-    ) -> Result<Vec<HistoryEntry>, RepoError> {
+    pub fn walk_history_dag(&self, timeline: &str) -> Result<Vec<HistoryEntry>, RepoError> {
         use std::collections::{BTreeSet, VecDeque};
 
         let head_idx = match self.get_timeline_head(timeline)? {
@@ -472,7 +472,7 @@ impl Repo {
             }
         }
         // Newest-first: higher MMR index = newer commit.
-        entries.sort_by(|a, b| b.index.cmp(&a.index));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.index));
         Ok(entries)
     }
 
@@ -529,6 +529,31 @@ impl Repo {
         Ok(best)
     }
 
+    /// True if `ancestor_idx` is reachable from `head_idx` (inclusive),
+    /// following both chain parents and merge parents.
+    pub fn is_ancestor(&self, ancestor_idx: u64, head_idx: u64) -> Result<bool, RepoError> {
+        use std::collections::{BTreeSet, VecDeque};
+        let mut visited: BTreeSet<u64> = BTreeSet::new();
+        let mut q: VecDeque<u64> = VecDeque::new();
+        q.push_back(head_idx);
+        while let Some(idx) = q.pop_front() {
+            if !visited.insert(idx) {
+                continue;
+            }
+            if idx == ancestor_idx {
+                return Ok(true);
+            }
+            if let Some(leaf) = self.get_leaf(idx)? {
+                for p in leaf.all_parents() {
+                    if !visited.contains(&p) {
+                        q.push_back(p);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Get the seal name for a hash.
     pub fn get_seal_name(&self, hash: B3Hash) -> Result<Option<String>, RepoError> {
         self.store
@@ -537,6 +562,9 @@ impl Repo {
     }
 
     /// Resolve a seal name or hash prefix to a leaf index.
+    ///
+    /// An ambiguous name prefix (multiple seal names match) is an error
+    /// listing the candidates, not a silent fall-through.
     pub fn resolve_seal(&self, query: &str) -> Result<Option<(u64, Leaf)>, RepoError> {
         // Try seal name prefix match
         let matches = self
@@ -544,14 +572,25 @@ impl Repo {
             .find_seal_names_by_prefix(query)
             .map_err(RepoError::Store)?;
 
-        if matches.len() == 1 {
-            if let Some(hash) = self
+        if matches.len() > 1 {
+            let mut shown: Vec<String> = matches.iter().take(5).cloned().collect();
+            if matches.len() > shown.len() {
+                shown.push(format!("... ({} total)", matches.len()));
+            }
+            return Err(RepoError::Other(format!(
+                "ambiguous seal name '{}': matches {}",
+                query,
+                shown.join(", ")
+            )));
+        }
+
+        if matches.len() == 1
+            && let Some(hash) = self
                 .store
                 .get_hash_by_seal_name(&matches[0])
                 .map_err(RepoError::Store)?
-            {
-                return self.find_leaf_by_hash(hash);
-            }
+        {
+            return self.find_leaf_by_hash(hash);
         }
 
         // Try hash prefix match
@@ -571,10 +610,10 @@ impl Repo {
     fn find_leaf_by_hash(&self, hash: B3Hash) -> Result<Option<(u64, Leaf)>, RepoError> {
         let count = self.mmr.size();
         for idx in 0..count {
-            if let Some(leaf) = self.get_leaf(idx)? {
-                if leaf.hash() == hash {
-                    return Ok(Some((idx, leaf)));
-                }
+            if let Some(leaf) = self.get_leaf(idx)?
+                && leaf.hash() == hash
+            {
+                return Ok(Some((idx, leaf)));
             }
         }
         Ok(None)
@@ -648,7 +687,8 @@ impl Repo {
         let path = self.ivaldi_dir.join("MERGE_STATE");
         let data =
             serde_json::to_string_pretty(state).map_err(|e| RepoError::Other(e.to_string()))?;
-        std::fs::write(&path, data).map_err(|e| RepoError::Other(e.to_string()))?;
+        crate::atomic_io::atomic_write(&path, data.as_bytes())
+            .map_err(|e| RepoError::Other(e.to_string()))?;
         Ok(())
     }
 
@@ -709,7 +749,8 @@ impl Repo {
         let path = dir.join(format!("{}.json", review.id));
         let data =
             serde_json::to_string_pretty(review).map_err(|e| RepoError::Other(e.to_string()))?;
-        std::fs::write(&path, data).map_err(|e| RepoError::Other(e.to_string()))?;
+        crate::atomic_io::atomic_write(&path, data.as_bytes())
+            .map_err(|e| RepoError::Other(e.to_string()))?;
         Ok(())
     }
 
@@ -915,6 +956,169 @@ mod tests {
         assert_eq!(leaf.message, "First commit");
         assert_eq!(leaf.timeline_id, "main");
         assert_eq!(leaf.prev_idx, NO_PARENT);
+    }
+
+    #[test]
+    fn load_merge_state_rejects_corrupt_json() {
+        let (dir, repo) = setup_repo();
+        std::fs::write(dir.path().join(".ivaldi/MERGE_STATE"), "{not json").unwrap();
+        assert!(repo.load_merge_state().is_err());
+    }
+
+    #[test]
+    fn resolve_seal_ambiguous_prefix_errors() {
+        let (_dir, mut repo) = setup_repo();
+        let mut names = Vec::new();
+        // Commit until two seal names share a first letter (names are
+        // generated from hashes, so a handful of commits suffices).
+        for i in 0..30 {
+            let r = repo
+                .commit(B3Hash::digest(format!("t{}", i).as_bytes()), "A", "c")
+                .unwrap();
+            names.push(r.seal_name);
+            let mut counts = std::collections::BTreeMap::new();
+            for n in &names {
+                *counts.entry(n.chars().next().unwrap()).or_insert(0) += 1;
+            }
+            if let Some((c, _)) = counts.iter().find(|(_, v)| **v > 1) {
+                let err = repo.resolve_seal(&c.to_string()).unwrap_err();
+                assert!(err.to_string().contains("ambiguous seal name"));
+                return;
+            }
+        }
+        panic!("no ambiguous prefix arose in 30 commits");
+    }
+
+    #[test]
+    fn is_ancestor_follows_chain_and_merges() {
+        let (_dir, mut repo) = setup_repo();
+        let r1 = repo.commit(B3Hash::digest(b"t1"), "A", "C1").unwrap();
+        let r2 = repo.commit(B3Hash::digest(b"t2"), "A", "C2").unwrap();
+        let r3 = repo.commit(B3Hash::digest(b"t3"), "A", "C3").unwrap();
+
+        assert!(repo.is_ancestor(r1.index, r3.index).unwrap());
+        assert!(repo.is_ancestor(r3.index, r3.index).unwrap());
+        assert!(!repo.is_ancestor(r3.index, r1.index).unwrap());
+        assert!(!repo.is_ancestor(r2.index, r1.index).unwrap());
+    }
+
+    #[test]
+    fn head_can_move_backwards_for_reset() {
+        let (_dir, mut repo) = setup_repo();
+        let r1 = repo.commit(B3Hash::digest(b"t1"), "A", "C1").unwrap();
+        repo.commit(B3Hash::digest(b"t2"), "A", "C2").unwrap();
+        let r3 = repo.commit(B3Hash::digest(b"t3"), "A", "C3").unwrap();
+
+        repo.set_timeline_head("main", r1.index).unwrap();
+        assert_eq!(repo.walk_history("main").unwrap().len(), 1);
+        // Orphaned seals remain present in the MMR.
+        assert!(repo.get_leaf(r3.index).unwrap().is_some());
+    }
+
+    #[test]
+    fn reseal_head_message_only_preserves_tree_and_parent() {
+        let (_dir, mut repo) = setup_repo();
+        let tree = B3Hash::digest(b"t1");
+        repo.commit(tree, "A", "First").unwrap();
+        let r2 = repo.commit(B3Hash::digest(b"t2"), "A", "Second").unwrap();
+
+        let amended = repo
+            .reseal_head(B3Hash::digest(b"t2"), "A", "Better msg")
+            .unwrap();
+        assert_ne!(amended.hash, r2.hash);
+
+        let head_idx = repo.get_timeline_head("main").unwrap().unwrap();
+        assert_eq!(head_idx, amended.index);
+        let leaf = repo.get_leaf(head_idx).unwrap().unwrap();
+        assert_eq!(leaf.message, "Better msg");
+        assert_eq!(leaf.tree_root, B3Hash::digest(b"t2"));
+        // Parent skips the replaced seal and points at "First".
+        assert_eq!(leaf.prev_idx, 0);
+        // Old leaf is orphaned but still present.
+        assert!(repo.get_leaf(r2.index).unwrap().is_some());
+        // History shows exactly two seals.
+        assert_eq!(repo.walk_history("main").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn amend_first_seal_keeps_no_parent() {
+        let (_dir, mut repo) = setup_repo();
+        repo.commit(B3Hash::digest(b"t1"), "A", "First").unwrap();
+        let amended = repo
+            .reseal_head(B3Hash::digest(b"t1b"), "A", "First v2")
+            .unwrap();
+        let leaf = repo.get_leaf(amended.index).unwrap().unwrap();
+        assert_eq!(leaf.prev_idx, NO_PARENT);
+        assert_eq!(repo.walk_history("main").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn amend_merge_head_preserves_merge_idxs() {
+        let (_dir, mut repo) = setup_repo();
+        repo.commit(B3Hash::digest(b"base"), "A", "Base").unwrap();
+        let side = repo.commit(B3Hash::digest(b"side"), "A", "Side").unwrap();
+
+        let mut merge_leaf = Leaf::new(B3Hash::digest(b"merged"), "main", "A", 1, "Merge");
+        merge_leaf.prev_idx = 0;
+        merge_leaf.merge_idxs = vec![side.index];
+        repo.commit_raw(merge_leaf, "main").unwrap();
+
+        let amended = repo
+            .reseal_head(B3Hash::digest(b"merged2"), "A", "Merge v2")
+            .unwrap();
+        let leaf = repo.get_leaf(amended.index).unwrap().unwrap();
+        assert_eq!(leaf.merge_idxs, vec![side.index]);
+        assert_eq!(leaf.prev_idx, 0);
+    }
+
+    #[test]
+    fn amend_empty_timeline_errors() {
+        let (_dir, mut repo) = setup_repo();
+        let err = repo
+            .reseal_head(B3Hash::digest(b"t"), "A", "msg")
+            .unwrap_err();
+        assert!(err.to_string().contains("nothing to reseal"));
+    }
+
+    #[test]
+    fn commit_equivalent_to_commit_raw() {
+        // commit() delegates to commit_raw(); the persisted store state must
+        // be identical to a hand-built leaf committed via commit_raw().
+        let (_dir, mut repo_a) = setup_repo();
+        let (_dir_b, mut repo_b) = setup_repo();
+
+        let tree = B3Hash::digest(b"equiv tree");
+        let ra = repo_a
+            .commit(tree, "Alice <a@b.com>", "Equiv test")
+            .unwrap();
+
+        let leaf_a = repo_a.get_leaf(ra.index).unwrap().unwrap();
+        let mut leaf = Leaf::new(
+            tree,
+            "main",
+            "Alice <a@b.com>",
+            leaf_a.time_unix,
+            "Equiv test",
+        );
+        leaf.prev_idx = NO_PARENT;
+        let rb = repo_b.commit_raw(leaf, "main").unwrap();
+
+        assert_eq!(ra.index, rb.index);
+        assert_eq!(ra.hash, rb.hash);
+        assert_eq!(ra.seal_name, rb.seal_name);
+        assert_eq!(ra.timeline, rb.timeline);
+        assert_eq!(
+            repo_a.store.get_timeline_head("main").unwrap(),
+            repo_b.store.get_timeline_head("main").unwrap()
+        );
+        assert_eq!(
+            repo_a.store.get_meta("mmr.size").unwrap(),
+            repo_b.store.get_meta("mmr.size").unwrap()
+        );
+        assert_eq!(
+            repo_a.store.get_leaf(ra.index).unwrap(),
+            repo_b.store.get_leaf(rb.index).unwrap()
+        );
     }
 
     #[test]
@@ -1229,24 +1433,13 @@ mod tests {
         let _ = a;
 
         // b is a sibling of a — give it `prev_idx = r` directly via commit_raw.
-        let mut b_leaf = crate::leaf::Leaf::new(
-            B3Hash::digest(b"b"),
-            "main",
-            "A",
-            42,
-            "b (sibling)",
-        );
+        let mut b_leaf =
+            crate::leaf::Leaf::new(B3Hash::digest(b"b"), "main", "A", 42, "b (sibling)");
         b_leaf.prev_idx = r.index;
         let b = repo.commit_raw(b_leaf, "main").unwrap();
 
         // m is a merge: prev = current head (b), merge parent = a.
-        let mut m_leaf = crate::leaf::Leaf::new(
-            B3Hash::digest(b"m"),
-            "main",
-            "A",
-            43,
-            "merge",
-        );
+        let mut m_leaf = crate::leaf::Leaf::new(B3Hash::digest(b"m"), "main", "A", 43, "merge");
         m_leaf.prev_idx = b.index;
         m_leaf.merge_idxs = vec![a.index];
         let m = repo.commit_raw(m_leaf, "main").unwrap();

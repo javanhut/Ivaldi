@@ -3,6 +3,7 @@
 //! All commands are defined using `clap` with 1:1 parity to the Go Cobra implementation.
 
 mod commands;
+mod json;
 
 use clap::{Parser, Subcommand};
 
@@ -41,8 +42,11 @@ pub enum Commands {
     /// Create a sealed commit from staged files
     Seal(SealArgs),
 
+    /// Redo the most recent seal, folding in staged changes and/or a new message
+    Reseal(ResealArgs),
+
     /// Show repository status
-    Status,
+    Status(StatusArgs),
 
     /// Show current timeline and position
     #[command(alias = "wai")]
@@ -61,6 +65,16 @@ pub enum Commands {
     /// Unstage files or reset changes
     Reset(ResetArgs),
 
+    /// Move the timeline head back to an earlier seal
+    Rewind(RewindArgs),
+
+    /// Create a seal that undoes an earlier seal's changes
+    Undo(UndoArgs),
+
+    /// Apply another seal's changes to the current timeline
+    #[command(alias = "cherry-pick")]
+    Pluck(PluckArgs),
+
     /// Manage timelines (branches)
     #[command(alias = "tl")]
     Timeline(TimelineArgs),
@@ -75,7 +89,8 @@ pub enum Commands {
     #[command(alias = "w")]
     Weld(WeldArgs),
 
-    /// View and modify configuration
+    /// View and modify configuration (bare `config` opens an interactive form)
+    #[command(alias = "configure")]
     Config(ConfigArgs),
 
     /// Add patterns to .ivaldiignore
@@ -114,6 +129,46 @@ pub enum Commands {
 
     /// Manage authorized peers for `ivaldi serve`
     Peer(PeerArgs),
+
+    /// Generate shell completion script to stdout
+    Completions(CompletionsArgs),
+
+    /// Generate man pages into a directory
+    #[command(hide = true)]
+    Man(ManArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct UndoArgs {
+    /// Seal to undo (name or hash prefix)
+    pub seal: String,
+
+    /// Custom message (default: Undo "<original first line>")
+    #[arg(short)]
+    pub m: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct PluckArgs {
+    /// Seal to apply (name or hash prefix)
+    pub seal: String,
+
+    /// Custom message (default: original message with a "plucked from" trailer)
+    #[arg(short)]
+    pub m: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct CompletionsArgs {
+    /// Shell to generate completions for
+    pub shell: clap_complete::Shell,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ManArgs {
+    /// Output directory for the generated man pages
+    #[arg(long, default_value = "man")]
+    pub out: std::path::PathBuf,
 }
 
 #[derive(clap::Args, Debug)]
@@ -190,6 +245,10 @@ pub struct GatherArgs {
     /// Skip interactive prompts for hidden files
     #[arg(long)]
     pub allow_all: bool,
+
+    /// Interactively choose which hunks of each changed file to stage
+    #[arg(short = 'p', long, conflicts_with = "allow_all")]
+    pub patch: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -203,6 +262,23 @@ pub struct SealArgs {
     pub m: Option<String>,
 }
 
+#[derive(clap::Args, Debug)]
+pub struct ResealArgs {
+    /// New message (without one, the old message is kept)
+    #[arg()]
+    pub message: Option<String>,
+
+    /// New message (alternative flag)
+    #[arg(short)]
+    pub m: Option<String>,
+}
+
+impl ResealArgs {
+    pub fn get_message(&self) -> Option<&str> {
+        self.message.as_deref().or(self.m.as_deref())
+    }
+}
+
 impl SealArgs {
     pub fn get_message(&self) -> Option<&str> {
         self.message.as_deref().or(self.m.as_deref())
@@ -210,10 +286,34 @@ impl SealArgs {
 }
 
 #[derive(clap::Args, Debug)]
+pub struct StatusArgs {
+    /// Emit machine-readable JSON instead of human-readable output
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Output format for `ivaldi log`.
+#[derive(Clone, Copy, Debug, PartialEq, clap::ValueEnum)]
+pub enum LogFormat {
+    /// One line per seal (same as --oneline)
+    Short,
+    /// Default multi-line format
+    Medium,
+    /// Medium plus absolute date, tree root, and merge parents
+    Full,
+    /// Machine-readable JSON array
+    Json,
+}
+
+#[derive(clap::Args, Debug)]
 pub struct LogArgs {
     /// Show concise one-line format
     #[arg(long)]
     pub oneline: bool,
+
+    /// Output format (short, medium, full, json)
+    #[arg(long, value_enum, conflicts_with = "oneline")]
+    pub format: Option<LogFormat>,
 
     /// Limit number of commits shown
     #[arg(long)]
@@ -262,6 +362,17 @@ pub struct ResetArgs {
 }
 
 #[derive(clap::Args, Debug)]
+pub struct RewindArgs {
+    /// Seal to rewind the timeline head to (name or hash prefix)
+    pub seal: String,
+
+    /// Also rewrite the working directory to match that seal (destructive!).
+    /// Without this flag your files are left exactly as they are.
+    #[arg(long)]
+    pub discard: bool,
+}
+
+#[derive(clap::Args, Debug)]
 pub struct TimelineArgs {
     #[command(subcommand)]
     pub command: TimelineCommands,
@@ -279,7 +390,7 @@ pub enum TimelineCommands {
 
     /// List all timelines
     #[command(alias = "ls")]
-    List,
+    List(TimelineListArgs),
 
     /// Remove a timeline
     #[command(alias = "rm")]
@@ -292,6 +403,13 @@ pub enum TimelineCommands {
     /// Manage butterfly (experimental) timelines
     #[command(alias = "bf")]
     Butterfly(ButterflyArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct TimelineListArgs {
+    /// Emit machine-readable JSON instead of human-readable output
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -430,17 +548,21 @@ pub struct WeldArgs {
 }
 
 #[derive(clap::Args, Debug)]
+#[command(after_help = format!(
+    "Known keys:\n{}\n\nExamples:\n  ivaldi config --set user.name \"Ada Lovelace\"\n  ivaldi config --set user.email ada@example.com\n  ivaldi config --global --set color.ui false\n  ivaldi config --list\n  ivaldi config            (interactive form with local/global selector)",
+    crate::config::known_keys_help()
+))]
 pub struct ConfigArgs {
     /// List all configuration values
     #[arg(long)]
     pub list: bool,
 
-    /// Set a configuration value
-    #[arg(long)]
+    /// Set a configuration value (key as argument, value positional)
+    #[arg(long, value_name = "KEY")]
     pub set: Option<String>,
 
     /// Get a configuration value
-    #[arg(long)]
+    #[arg(long, value_name = "KEY")]
     pub get: Option<String>,
 
     /// Operate on the global config (~/.ivaldi/config) instead of repo-local
@@ -470,10 +592,17 @@ pub enum PortalCommands {
     Add(PortalAddArgs),
 
     /// List configured portals
-    List,
+    List(PortalListArgs),
 
     /// Remove a portal
     Remove(PortalRemoveArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct PortalListArgs {
+    /// Emit machine-readable JSON instead of human-readable output
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -767,6 +896,91 @@ mod tests {
     use clap::Parser;
 
     #[test]
+    fn parse_configure_alias() {
+        let cli = Cli::try_parse_from(["ivaldi", "configure"]).unwrap();
+        assert!(matches!(cli.command.unwrap(), Commands::Config(_)));
+    }
+
+    #[test]
+    fn parse_reseal() {
+        let cli = Cli::try_parse_from(["ivaldi", "reseal"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Reseal(args) => assert!(args.get_message().is_none()),
+            _ => panic!("expected Reseal"),
+        }
+
+        let cli = Cli::try_parse_from(["ivaldi", "reseal", "new msg"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Reseal(args) => assert_eq!(args.get_message(), Some("new msg")),
+            _ => panic!("expected Reseal"),
+        }
+
+        let cli = Cli::try_parse_from(["ivaldi", "reseal", "-m", "flag msg"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Reseal(args) => assert_eq!(args.get_message(), Some("flag msg")),
+            _ => panic!("expected Reseal"),
+        }
+    }
+
+    #[test]
+    fn parse_undo_and_pluck() {
+        let cli = Cli::try_parse_from(["ivaldi", "undo", "swift-eagle"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Undo(args) => {
+                assert_eq!(args.seal, "swift-eagle");
+                assert!(args.m.is_none());
+            }
+            _ => panic!("expected Undo"),
+        }
+
+        let cli = Cli::try_parse_from(["ivaldi", "pluck", "abc123", "-m", "msg"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Pluck(args) => {
+                assert_eq!(args.seal, "abc123");
+                assert_eq!(args.m.as_deref(), Some("msg"));
+            }
+            _ => panic!("expected Pluck"),
+        }
+
+        // git muscle memory works.
+        let cli = Cli::try_parse_from(["ivaldi", "cherry-pick", "abc123"]).unwrap();
+        assert!(matches!(cli.command.unwrap(), Commands::Pluck(_)));
+    }
+
+    #[test]
+    fn parse_rewind_and_reset() {
+        let cli = Cli::try_parse_from(["ivaldi", "rewind", "swift-eagle"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Rewind(args) => {
+                assert_eq!(args.seal, "swift-eagle");
+                assert!(!args.discard);
+            }
+            _ => panic!("expected Rewind"),
+        }
+
+        let cli = Cli::try_parse_from(["ivaldi", "rewind", "abc123", "--discard"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Rewind(args) => assert!(args.discard),
+            _ => panic!("expected Rewind"),
+        }
+
+        // Rewind requires a seal.
+        assert!(Cli::try_parse_from(["ivaldi", "rewind"]).is_err());
+
+        // Reset keeps its original shape: files + bare --hard.
+        let cli = Cli::try_parse_from(["ivaldi", "reset", "--hard"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Reset(args) => assert!(args.hard),
+            _ => panic!("expected Reset"),
+        }
+        let cli = Cli::try_parse_from(["ivaldi", "reset", "file.txt"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Reset(args) => assert_eq!(args.files, vec!["file.txt"]),
+            _ => panic!("expected Reset"),
+        }
+    }
+
+    #[test]
     fn parse_timeline_create() {
         let cli = Cli::try_parse_from(["ivaldi", "timeline", "create", "feature"]).unwrap();
         match cli.command.unwrap() {
@@ -855,8 +1069,7 @@ mod tests {
 
     #[test]
     fn parse_timeline_rename_with_to_connector() {
-        let cli =
-            Cli::try_parse_from(["ivaldi", "tl", "rename", "master", "to", "main"]).unwrap();
+        let cli = Cli::try_parse_from(["ivaldi", "tl", "rename", "master", "to", "main"]).unwrap();
         match cli.command.unwrap() {
             Commands::Timeline(args) => match args.command {
                 TimelineCommands::Rename(r) => {
@@ -1167,6 +1380,88 @@ mod tests {
             },
             _ => panic!("expected Review"),
         }
+    }
+
+    #[test]
+    fn parse_status_json() {
+        let cli = Cli::try_parse_from(["ivaldi", "status", "--json"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Status(args) => assert!(args.json),
+            _ => panic!("expected Status"),
+        }
+
+        // Bare status still parses with json off.
+        let cli = Cli::try_parse_from(["ivaldi", "status"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Status(args) => assert!(!args.json),
+            _ => panic!("expected Status"),
+        }
+    }
+
+    #[test]
+    fn parse_log_format_json() {
+        let cli = Cli::try_parse_from(["ivaldi", "log", "--format", "json"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Log(args) => {
+                assert_eq!(args.format, Some(LogFormat::Json));
+                assert!(!args.oneline);
+            }
+            _ => panic!("expected Log"),
+        }
+    }
+
+    #[test]
+    fn parse_log_oneline_still_works() {
+        let cli = Cli::try_parse_from(["ivaldi", "log", "--oneline"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Log(args) => {
+                assert!(args.oneline);
+                assert!(args.format.is_none());
+            }
+            _ => panic!("expected Log"),
+        }
+    }
+
+    #[test]
+    fn parse_log_oneline_conflicts_with_format() {
+        assert!(Cli::try_parse_from(["ivaldi", "log", "--oneline", "--format", "json"]).is_err());
+    }
+
+    #[test]
+    fn parse_timeline_list_json() {
+        let cli = Cli::try_parse_from(["ivaldi", "timeline", "list", "--json"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Timeline(args) => match args.command {
+                TimelineCommands::List(l) => assert!(l.json),
+                _ => panic!("expected List"),
+            },
+            _ => panic!("expected Timeline"),
+        }
+    }
+
+    #[test]
+    fn parse_completions_fish() {
+        let cli = Cli::try_parse_from(["ivaldi", "completions", "fish"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Completions(args) => {
+                assert_eq!(args.shell, clap_complete::Shell::Fish);
+            }
+            _ => panic!("expected Completions"),
+        }
+    }
+
+    #[test]
+    fn completions_fish_generates_nonempty_output() {
+        let mut buf = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Fish,
+            &mut <Cli as clap::CommandFactory>::command(),
+            "ivaldi",
+            &mut buf,
+        );
+        assert!(!buf.is_empty());
+        let script = String::from_utf8(buf).unwrap();
+        assert!(script.contains("ivaldi"));
     }
 
     #[test]

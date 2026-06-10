@@ -9,7 +9,6 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cas::FileCas;
 use crate::config;
 use crate::fsmerkle::{self, FsStore, NodeKind};
 use crate::fuse::{FuseEngine, Strategy};
@@ -38,18 +37,22 @@ impl std::fmt::Display for ReviewStatus {
     }
 }
 
-impl ReviewStatus {
-    pub fn from_str(s: &str) -> Option<Self> {
+impl std::str::FromStr for ReviewStatus {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "open" => Some(Self::Open),
-            "approved" => Some(Self::Approved),
-            "changes-requested" => Some(Self::ChangesRequested),
-            "merged" => Some(Self::Merged),
-            "closed" => Some(Self::Closed),
-            _ => None,
+            "open" => Ok(Self::Open),
+            "approved" => Ok(Self::Approved),
+            "changes-requested" => Ok(Self::ChangesRequested),
+            "merged" => Ok(Self::Merged),
+            "closed" => Ok(Self::Closed),
+            _ => Err(()),
         }
     }
+}
 
+impl ReviewStatus {
     pub fn symbol(self) -> &'static str {
         match self {
             ReviewStatus::Open => "O",
@@ -184,7 +187,7 @@ pub fn list_reviews(repo: &Repo, filter: &ReviewFilter) -> Result<Vec<Review>, R
     if let Some(status) = filter.status {
         reviews.retain(|r| r.status == status);
     }
-    reviews.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    reviews.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
     Ok(reviews)
 }
 
@@ -290,7 +293,10 @@ pub fn merge_review(repo: &mut Repo, review_id: u64) -> Result<Review, RepoError
         )));
     }
 
-    let strategy = Strategy::from_str(&review.fuse_strategy).unwrap_or(Strategy::Auto);
+    let strategy = review
+        .fuse_strategy
+        .parse::<Strategy>()
+        .unwrap_or(Strategy::Auto);
 
     // Get current head trees for both timelines
     let source_head = repo
@@ -325,7 +331,7 @@ pub fn merge_review(repo: &mut Repo, review_id: u64) -> Result<Review, RepoError
     collect_blob_hashes(&store, target_leaf.tree_root, "", &mut ours_files)?;
     collect_blob_hashes(&store, source_leaf.tree_root, "", &mut theirs_files)?;
 
-    let result = FuseEngine::fuse(&base_files, &ours_files, &theirs_files, strategy);
+    let result = FuseEngine::fuse(&store, &base_files, &ours_files, &theirs_files, strategy);
 
     if !result.success {
         let conflict_paths: Vec<String> = result.conflicts.iter().map(|c| c.path.clone()).collect();
@@ -533,18 +539,27 @@ mod tests {
 
     #[test]
     fn review_status_from_str() {
-        assert_eq!(ReviewStatus::from_str("open"), Some(ReviewStatus::Open));
         assert_eq!(
-            ReviewStatus::from_str("approved"),
+            "open".parse::<ReviewStatus>().ok(),
+            Some(ReviewStatus::Open)
+        );
+        assert_eq!(
+            "approved".parse::<ReviewStatus>().ok(),
             Some(ReviewStatus::Approved)
         );
         assert_eq!(
-            ReviewStatus::from_str("changes-requested"),
+            "changes-requested".parse::<ReviewStatus>().ok(),
             Some(ReviewStatus::ChangesRequested)
         );
-        assert_eq!(ReviewStatus::from_str("merged"), Some(ReviewStatus::Merged));
-        assert_eq!(ReviewStatus::from_str("closed"), Some(ReviewStatus::Closed));
-        assert_eq!(ReviewStatus::from_str("invalid"), None);
+        assert_eq!(
+            "merged".parse::<ReviewStatus>().ok(),
+            Some(ReviewStatus::Merged)
+        );
+        assert_eq!(
+            "closed".parse::<ReviewStatus>().ok(),
+            Some(ReviewStatus::Closed)
+        );
+        assert_eq!("invalid".parse::<ReviewStatus>().ok(), None);
     }
 
     #[test]

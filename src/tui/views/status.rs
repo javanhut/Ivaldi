@@ -32,6 +32,12 @@ pub struct StatusView {
     message: Option<String>,
 }
 
+impl Default for StatusView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StatusView {
     pub fn new() -> Self {
         Self {
@@ -54,11 +60,11 @@ impl StatusView {
 
         if paths.is_empty() {
             // If nothing selected, gather current item
-            if let Some(item) = self.file_list.current_item() {
-                if !matches!(item.state, FileState::Staged) {
-                    let path = item.path.clone();
-                    return self.do_gather(ctx, &[path]);
-                }
+            if let Some(item) = self.file_list.current_item()
+                && !matches!(item.state, FileState::Staged)
+            {
+                let path = item.path.clone();
+                return self.do_gather(ctx, &[path]);
             }
             return Action::Consumed;
         }
@@ -98,11 +104,11 @@ impl StatusView {
 
         if paths.is_empty() {
             // Ungather current
-            if let Some(item) = self.file_list.current_item() {
-                if matches!(item.state, FileState::Staged) {
-                    staging.unstage(&item.path);
-                    count = 1;
-                }
+            if let Some(item) = self.file_list.current_item()
+                && matches!(item.state, FileState::Staged)
+            {
+                staging.unstage(&item.path);
+                count = 1;
             }
         } else {
             for path in &paths {

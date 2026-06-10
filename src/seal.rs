@@ -218,7 +218,7 @@ pub fn matches_seal_name(full_name: &str, query: &str) -> bool {
         return true;
     }
     // Match partial name (prefix of the word portion)
-    let word_part = full_name.rsplitn(2, '-').nth(1).unwrap_or("");
+    let word_part = full_name.rsplit_once('-').map(|x| x.0).unwrap_or("");
     word_part.starts_with(query) || full_name.starts_with(query)
 }
 

@@ -81,12 +81,9 @@ pub fn forge(work_dir: &Path) -> Result<ForgeResult, ForgeError> {
 
     // Create default config
     let config = Config::new();
-    config.save(&ivaldi_dir.join("config")).map_err(|e| {
-        ForgeError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))
-    })?;
+    config
+        .save(&ivaldi_dir.join("config"))
+        .map_err(|e| ForgeError::Io(std::io::Error::other(e.to_string())))?;
 
     // Detect and import from existing .git/ if present
     let git_imported = detect_and_import_git(work_dir, &ivaldi_dir);
@@ -159,7 +156,7 @@ pub fn write_head(ivaldi_dir: &Path, head: &HeadRef) -> Result<(), ForgeError> {
         HeadRef::Timeline(name) => format!("ref: refs/heads/{}\n", name),
         HeadRef::Detached(hash) => format!("{}\n", hash),
     };
-    fs::write(&head_path, content).map_err(ForgeError::Io)
+    crate::atomic_io::atomic_write(&head_path, content.as_bytes()).map_err(ForgeError::Io)
 }
 
 /// What HEAD points to.

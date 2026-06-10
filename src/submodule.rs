@@ -46,16 +46,16 @@ pub fn parse_gitmodules(work_dir: &Path) -> Vec<Submodule> {
                 url: String::new(),
                 branch: None,
             });
-        } else if let Some(ref mut m) = current {
-            if let Some((key, value)) = line.split_once('=') {
-                let key = key.trim();
-                let value = value.trim();
-                match key {
-                    "path" => m.path = value.to_string(),
-                    "url" => m.url = value.to_string(),
-                    "branch" => m.branch = Some(value.to_string()),
-                    _ => {}
-                }
+        } else if let Some(ref mut m) = current
+            && let Some((key, value)) = line.split_once('=')
+        {
+            let key = key.trim();
+            let value = value.trim();
+            match key {
+                "path" => m.path = value.to_string(),
+                "url" => m.url = value.to_string(),
+                "branch" => m.branch = Some(value.to_string()),
+                _ => {}
             }
         }
     }

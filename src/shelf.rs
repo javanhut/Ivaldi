@@ -92,7 +92,8 @@ impl ShelfManager {
             }
         }
 
-        fs::write(&path, lines.join("\n")).map_err(ShelfError::Io)?;
+        crate::atomic_io::atomic_write(&path, lines.join("\n").as_bytes())
+            .map_err(ShelfError::Io)?;
         Ok(())
     }
 
@@ -119,28 +120,28 @@ impl ShelfManager {
             } else if let Some(rest) = line.strip_prefix("created_at ") {
                 shelf.created_at = rest.parse().unwrap_or(0);
             } else if let Some(rest) = line.strip_prefix("staged ") {
-                if let Some((hash_str, path)) = rest.split_once(' ') {
-                    if let Some(hash) = B3Hash::from_hex(hash_str) {
-                        shelf.staged_files.insert(path.to_string(), hash);
-                    }
+                if let Some((hash_str, path)) = rest.split_once(' ')
+                    && let Some(hash) = B3Hash::from_hex(hash_str)
+                {
+                    shelf.staged_files.insert(path.to_string(), hash);
                 }
             } else if let Some(rest) = line.strip_prefix("modified ") {
-                if let Some((hash_str, path)) = rest.split_once(' ') {
-                    if let Some(hash) = B3Hash::from_hex(hash_str) {
-                        shelf.workspace_changes.push(WorkspaceChange::Modified {
-                            path: path.to_string(),
-                            hash,
-                        });
-                    }
+                if let Some((hash_str, path)) = rest.split_once(' ')
+                    && let Some(hash) = B3Hash::from_hex(hash_str)
+                {
+                    shelf.workspace_changes.push(WorkspaceChange::Modified {
+                        path: path.to_string(),
+                        hash,
+                    });
                 }
             } else if let Some(rest) = line.strip_prefix("untracked ") {
-                if let Some((hash_str, path)) = rest.split_once(' ') {
-                    if let Some(hash) = B3Hash::from_hex(hash_str) {
-                        shelf.workspace_changes.push(WorkspaceChange::Untracked {
-                            path: path.to_string(),
-                            hash,
-                        });
-                    }
+                if let Some((hash_str, path)) = rest.split_once(' ')
+                    && let Some(hash) = B3Hash::from_hex(hash_str)
+                {
+                    shelf.workspace_changes.push(WorkspaceChange::Untracked {
+                        path: path.to_string(),
+                        hash,
+                    });
                 }
             } else if let Some(rest) = line.strip_prefix("deleted ") {
                 shelf.workspace_changes.push(WorkspaceChange::Deleted {
@@ -211,6 +212,23 @@ mod tests {
     }
 
     #[test]
+    fn load_tolerates_truncated_file() {
+        // A truncated shelf file (crash mid-write, pre-atomic-write era)
+        // must parse the intact lines without panicking.
+        let (_dir, mgr) = setup();
+        let hash = B3Hash::digest(b"content");
+        let content = format!(
+            "timeline feature\ncreated_at 1700000000\nstaged {} file.txt\nmodified abc1",
+            hash
+        );
+        fs::write(mgr.shelf_path("feature"), content).unwrap();
+
+        let loaded = mgr.load_shelf("feature").unwrap().unwrap();
+        assert_eq!(loaded.timeline, "feature");
+        assert!(loaded.staged_files.contains_key("file.txt"));
+    }
+
+    #[test]
     fn save_and_load() {
         let (_dir, mgr) = setup();
 
@@ -274,10 +292,12 @@ mod tests {
             .workspace_changes
             .iter()
             .any(|c| matches!(c, WorkspaceChange::Untracked { path, hash } if path == "scratch/notes.md" && *hash == h_unt)));
-        assert!(loaded
-            .workspace_changes
-            .iter()
-            .any(|c| matches!(c, WorkspaceChange::Deleted { path } if path == ".gitignore")));
+        assert!(
+            loaded
+                .workspace_changes
+                .iter()
+                .any(|c| matches!(c, WorkspaceChange::Deleted { path } if path == ".gitignore"))
+        );
     }
 
     #[test]

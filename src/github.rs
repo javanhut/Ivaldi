@@ -4,13 +4,12 @@
 //! commit, blob operations, and OAuth device flow.
 
 use std::io::Read;
-use std::thread;
-use std::time::Duration;
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, Token};
+use crate::oauth_device;
 use crate::portal::Platform;
 
 const GITHUB_API: &str = "https://api.github.com";
@@ -34,7 +33,9 @@ fn header_str<'a>(resp: &'a ureq::http::Response<ureq::Body>, name: &str) -> Opt
     resp.headers().get(name).and_then(|v| v.to_str().ok())
 }
 
-fn check_status(resp: ureq::http::Response<ureq::Body>) -> Result<ureq::http::Response<ureq::Body>, GitHubError> {
+fn check_status(
+    resp: ureq::http::Response<ureq::Body>,
+) -> Result<ureq::http::Response<ureq::Body>, GitHubError> {
     let status = resp.status().as_u16();
     if (200..300).contains(&status) {
         return Ok(resp);
@@ -46,6 +47,12 @@ fn check_status(resp: ureq::http::Response<ureq::Body>) -> Result<ureq::http::Re
         return Err(GitHubError::RateLimited);
     }
     Err(GitHubError::Http(format!("HTTP {}", status)))
+}
+
+impl Default for GitHubClient {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GitHubClient {
@@ -211,7 +218,11 @@ impl GitHubClient {
     ) -> Result<String, GitHubError> {
         let encoded = base64::engine::general_purpose::STANDARD.encode(content);
         let body = serde_json::json!({"content": encoded, "encoding": "base64"});
-        let resp = self.send_json("POST", &format!("/repos/{}/{}/git/blobs", owner, repo), body)?;
+        let resp = self.send_json(
+            "POST",
+            &format!("/repos/{}/{}/git/blobs", owner, repo),
+            body,
+        )?;
         let r: ShaResponse = resp.into_body().read_json().map_err(gh_err)?;
         Ok(r.sha)
     }
@@ -253,11 +264,16 @@ impl GitHubClient {
         if let Some(b) = base_tree {
             body["base_tree"] = serde_json::Value::String(b.into());
         }
-        let resp = self.send_json("POST", &format!("/repos/{}/{}/git/trees", owner, repo), body)?;
+        let resp = self.send_json(
+            "POST",
+            &format!("/repos/{}/{}/git/trees", owner, repo),
+            body,
+        )?;
         let r: ShaResponse = resp.into_body().read_json().map_err(gh_err)?;
         Ok(r.sha)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_commit(
         &self,
         owner: &str,
@@ -279,8 +295,11 @@ impl GitHubClient {
         if let Some(c) = committer {
             body["committer"] = serde_json::to_value(c).expect("identity serialization");
         }
-        let resp =
-            self.send_json("POST", &format!("/repos/{}/{}/git/commits", owner, repo), body)?;
+        let resp = self.send_json(
+            "POST",
+            &format!("/repos/{}/{}/git/commits", owner, repo),
+            body,
+        )?;
         let r: ShaResponse = resp.into_body().read_json().map_err(gh_err)?;
         Ok(r.sha)
     }
@@ -315,60 +334,27 @@ impl GitHubClient {
     }
 
     pub fn request_device_code() -> Result<DeviceCodeResponse, GitHubError> {
-        let client_id =
-            std::env::var("IVALDI_GITHUB_CLIENT_ID").unwrap_or(auth::GITHUB_CLIENT_ID.into());
-        let scopes = std::env::var("IVALDI_GITHUB_SCOPES").unwrap_or(auth::GITHUB_SCOPES.into());
-        let body = format!("client_id={}&scope={}", client_id, scopes);
-        let resp = ureq::post(auth::GITHUB_DEVICE_CODE_URL)
-            .header("Accept", "application/json")
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .send(body.as_bytes())
-            .map_err(gh_err)?;
-        resp.into_body().read_json().map_err(gh_err)
+        Ok(oauth_device::request_device_code(&device_flow_config())?)
     }
 
     pub fn poll_for_token(device_code: &str, interval: u64) -> Result<Token, GitHubError> {
-        let client_id =
-            std::env::var("IVALDI_GITHUB_CLIENT_ID").unwrap_or(auth::GITHUB_CLIENT_ID.into());
-        loop {
-            thread::sleep(Duration::from_secs(interval));
-            let body = format!(
-                "client_id={}&device_code={}&grant_type=urn:ietf:params:oauth:grant-type:device_code",
-                client_id, device_code
-            );
-            let resp = ureq::post(auth::GITHUB_ACCESS_TOKEN_URL)
-                .header("Accept", "application/json")
-                .header("Content-Type", "application/x-www-form-urlencoded")
-                .send(body.as_bytes())
-                .map_err(gh_err)?;
-            let r: TokenPollResponse = resp.into_body().read_json().map_err(gh_err)?;
-            if r.access_token.as_deref().is_some_and(|s| !s.is_empty()) {
-                return Ok(Token {
-                    access_token: r.access_token.unwrap_or_default(),
-                    token_type: r.token_type.unwrap_or_default(),
-                    scope: r.scope.unwrap_or_default(),
-                    created_at: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs() as i64,
-                });
-            }
-            match r.error.as_deref() {
-                Some("authorization_pending") => continue,
-                Some("slow_down") => {
-                    thread::sleep(Duration::from_secs(5));
-                    continue;
-                }
-                Some(e) => {
-                    return Err(GitHubError::Other(format!(
-                        "{}: {}",
-                        e,
-                        r.error_description.unwrap_or_default()
-                    )));
-                }
-                None => continue,
-            }
-        }
+        Ok(oauth_device::poll_for_token(
+            &device_flow_config(),
+            device_code,
+            interval,
+        )?)
+    }
+}
+
+/// Build the shared device-flow configuration from GitHub's constants
+/// (overridable via `IVALDI_GITHUB_CLIENT_ID` / `IVALDI_GITHUB_SCOPES`).
+fn device_flow_config() -> oauth_device::DeviceFlowConfig {
+    oauth_device::DeviceFlowConfig {
+        device_code_url: auth::GITHUB_DEVICE_CODE_URL.to_string(),
+        token_url: auth::GITHUB_ACCESS_TOKEN_URL.to_string(),
+        client_id: std::env::var("IVALDI_GITHUB_CLIENT_ID")
+            .unwrap_or(auth::GITHUB_CLIENT_ID.into()),
+        scopes: std::env::var("IVALDI_GITHUB_SCOPES").unwrap_or(auth::GITHUB_SCOPES.into()),
     }
 }
 
@@ -466,23 +452,7 @@ struct ShaResponse {
     sha: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct DeviceCodeResponse {
-    pub device_code: String,
-    pub user_code: String,
-    pub verification_uri: String,
-    pub expires_in: u64,
-    pub interval: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct TokenPollResponse {
-    access_token: Option<String>,
-    token_type: Option<String>,
-    scope: Option<String>,
-    error: Option<String>,
-    error_description: Option<String>,
-}
+pub use crate::oauth_device::DeviceCodeResponse;
 
 // --- Errors ---
 
@@ -506,6 +476,19 @@ fn gh_err(e: impl std::fmt::Display) -> GitHubError {
         GitHubError::RateLimited
     } else {
         GitHubError::Http(m)
+    }
+}
+
+impl From<oauth_device::DeviceFlowError> for GitHubError {
+    fn from(e: oauth_device::DeviceFlowError) -> Self {
+        use oauth_device::DeviceFlowError;
+        match e {
+            DeviceFlowError::Http(m) => GitHubError::Http(m),
+            DeviceFlowError::Other(m) => GitHubError::Other(m),
+            other @ (DeviceFlowError::Expired | DeviceFlowError::Denied) => {
+                GitHubError::Other(other.to_string())
+            }
+        }
     }
 }
 

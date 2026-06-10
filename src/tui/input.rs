@@ -10,6 +10,12 @@ pub struct TextInput {
     pub cursor: usize,
 }
 
+impl Default for TextInput {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TextInput {
     pub fn new() -> Self {
         Self {

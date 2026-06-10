@@ -26,7 +26,8 @@ const GITHUB_BASE: &str = "https://github.com";
 /// username. Bearer tokens work for `api.github.com` but are not consistently
 /// accepted on the git endpoints, so we use Basic here.
 fn basic_auth_header(token: &str) -> String {
-    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{}", token));
+    let encoded =
+        base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{}", token));
     format!("Basic {}", encoded)
 }
 
@@ -152,17 +153,18 @@ impl SmartHttpClient {
     fn discover_refs(&self, base: &str) -> Result<Discovery, GitRemoteError> {
         let pb = progress::spinner("Discovering remote refs");
         let url = format!("{}/info/refs?service=git-upload-pack", base);
-        let do_call = |token: Option<&str>| -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
-            let mut r = self
-                .agent
-                .get(&url)
-                .header("Accept", "application/x-git-upload-pack-advertisement")
-                .header("User-Agent", "ivaldi-vcs/0.1.0");
-            if let Some(t) = token {
-                r = r.header("Authorization", basic_auth_header(t));
-            }
-            r.call()
-        };
+        let do_call =
+            |token: Option<&str>| -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+                let mut r = self
+                    .agent
+                    .get(&url)
+                    .header("Accept", "application/x-git-upload-pack-advertisement")
+                    .header("User-Agent", "ivaldi-vcs/0.1.0");
+                if let Some(t) = token {
+                    r = r.header("Authorization", basic_auth_header(t));
+                }
+                r.call()
+            };
 
         let resp = match do_call(self.token.as_deref()) {
             Ok(resp) => {
@@ -215,7 +217,9 @@ impl SmartHttpClient {
         body.extend_from_slice(b"0000");
         body.extend(pkt_line("done\n"));
 
-        let do_call = |token: Option<&str>, body: &[u8]| -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        let do_call = |token: Option<&str>,
+                       body: &[u8]|
+         -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
             let mut r = self
                 .agent
                 .post(&url)
@@ -395,9 +399,7 @@ pub(crate) fn select_branch_from_discovery(
                 .clone()
                 .map(GitRemoteError::BranchNotFound)
                 .unwrap_or_else(|| {
-                    GitRemoteError::Protocol(
-                        "remote did not advertise a usable default ref".into(),
-                    )
+                    GitRemoteError::Protocol("remote did not advertise a usable default ref".into())
                 })
         })?;
 
@@ -464,15 +466,13 @@ pub(crate) fn parse_discovery(data: &[u8]) -> Result<Discovery, GitRemoteError> 
         }
     }
 
-    if default_branch.is_none() {
-        if let Some(head) = refs.iter().find(|r| r.name == "HEAD") {
-            if let Some(target) = refs
-                .iter()
-                .find(|r| r.name.starts_with("refs/heads/") && r.id == head.id)
-            {
-                default_branch = target.name.strip_prefix("refs/heads/").map(str::to_string);
-            }
-        }
+    if default_branch.is_none()
+        && let Some(head) = refs.iter().find(|r| r.name == "HEAD")
+        && let Some(target) = refs
+            .iter()
+            .find(|r| r.name.starts_with("refs/heads/") && r.id == head.id)
+    {
+        default_branch = target.name.strip_prefix("refs/heads/").map(str::to_string);
     }
 
     Ok(Discovery {
@@ -553,20 +553,29 @@ struct PackedEntry {
     data: Vec<u8>,
 }
 
-pub(crate) fn parse_packfile(
-    data: &[u8],
-) -> Result<HashMap<String, GitObject>, GitRemoteError> {
+/// One resolved delta entry: `(entry index, object data, sha1, object kind)`.
+type ResolvedDelta = (usize, Vec<u8>, String, GitObjectKind);
+
+pub(crate) fn parse_packfile(data: &[u8]) -> Result<HashMap<String, GitObject>, GitRemoteError> {
     if data.len() < 12 || &data[..4] != b"PACK" {
         return Err(GitRemoteError::Protocol("invalid packfile header".into()));
     }
-    let version = u32::from_be_bytes(data[4..8].try_into().unwrap());
+    let version = u32::from_be_bytes(
+        data[4..8]
+            .try_into()
+            .map_err(|_| GitRemoteError::Protocol("truncated packfile header".into()))?,
+    );
     if !(2..=3).contains(&version) {
         return Err(GitRemoteError::Unsupported(format!(
             "unsupported pack version {}",
             version
         )));
     }
-    let count = u32::from_be_bytes(data[8..12].try_into().unwrap()) as usize;
+    let count = u32::from_be_bytes(
+        data[8..12]
+            .try_into()
+            .map_err(|_| GitRemoteError::Protocol("truncated packfile header".into()))?,
+    ) as usize;
 
     let mut idx = 12usize;
     let mut entries = Vec::with_capacity(count);
@@ -627,8 +636,7 @@ fn resolve_pack_entries(
         .collect();
 
     // Slot per entry, populated as its wave completes.
-    let mut slot: Vec<Option<(Vec<u8>, String, GitObjectKind)>> =
-        (0..n).map(|_| None).collect();
+    let mut slot: Vec<Option<(Vec<u8>, String, GitObjectKind)>> = (0..n).map(|_| None).collect();
     let mut sha_to_idx: HashMap<String, usize> = HashMap::with_capacity(n);
 
     // Wave 0: all base objects, hashed in parallel.
@@ -666,15 +674,18 @@ fn resolve_pack_entries(
         // Partition into entries whose parent is already resolved (ready)
         // vs. entries that need a later wave (deferred).
         let (ready, deferred): (Vec<usize>, Vec<usize>) =
-            remaining.iter().copied().partition(|&i| match &entries[i].kind {
-                PackedKind::OfsDelta { base_offset } => entry_idx_by_offset
-                    .get(base_offset)
-                    .is_some_and(|&pi| slot[pi].is_some()),
-                PackedKind::RefDelta { base_sha } => sha_to_idx
-                    .get(base_sha)
-                    .is_some_and(|&pi| slot[pi].is_some()),
-                PackedKind::Base(_) => true,
-            });
+            remaining
+                .iter()
+                .copied()
+                .partition(|&i| match &entries[i].kind {
+                    PackedKind::OfsDelta { base_offset } => entry_idx_by_offset
+                        .get(base_offset)
+                        .is_some_and(|&pi| slot[pi].is_some()),
+                    PackedKind::RefDelta { base_sha } => sha_to_idx
+                        .get(base_sha)
+                        .is_some_and(|&pi| slot[pi].is_some()),
+                    PackedKind::Base(_) => true,
+                });
 
         if ready.is_empty() {
             return Err(GitRemoteError::Protocol(
@@ -682,7 +693,7 @@ fn resolve_pack_entries(
             ));
         }
 
-        let outputs: Result<Vec<(usize, Vec<u8>, String, GitObjectKind)>, GitRemoteError> = ready
+        let outputs: Result<Vec<ResolvedDelta>, GitRemoteError> = ready
             .par_iter()
             .map(|&i| {
                 let e = &entries[i];
@@ -1090,8 +1101,7 @@ pub fn import_fetch_result(
         "Importing commits",
     ));
 
-    let prefetched =
-        prefetch_blobs(&all_blobs, &fetch.objects, &store, &mapping, &pb_blobs)?;
+    let prefetched = prefetch_blobs(&all_blobs, &fetch.objects, &store, &mapping, &pb_blobs)?;
     let blobs_downloaded = prefetched.len();
     for (git_sha, hash) in prefetched {
         mapping.insert(&git_sha, hash);
@@ -1157,13 +1167,12 @@ pub fn import_fetch_result(
                 .insert("git.author_tz".into(), commit.author_tz.clone());
         }
         if !commit.committer_name.is_empty() || !commit.committer_email.is_empty() {
-            let committer = format!(
-                "{} <{}>",
-                commit.committer_name, commit.committer_email,
-            );
+            let committer = format!("{} <{}>", commit.committer_name, commit.committer_email,);
             leaf.meta.insert("git.committer".into(), committer);
-            leaf.meta
-                .insert("git.committer_time".into(), commit.committer_time.to_string());
+            leaf.meta.insert(
+                "git.committer_time".into(),
+                commit.committer_time.to_string(),
+            );
             if !commit.committer_tz.is_empty() {
                 leaf.meta
                     .insert("git.committer_tz".into(), commit.committer_tz.clone());
@@ -1194,7 +1203,11 @@ pub fn import_fetch_result(
         crate::logging::warn(&format!(
             "skipped {} git submodule entr{} (Ivaldi does not yet clone submodules); see .ivaldi/submodules.skipped",
             submodules_skipped.len(),
-            if submodules_skipped.len() == 1 { "y" } else { "ies" },
+            if submodules_skipped.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
         ));
         let payload: String = submodules_skipped
             .iter()
@@ -1209,14 +1222,11 @@ pub fn import_fetch_result(
     // `commit_raw` only updates the head when it actually writes a commit,
     // so without this the branch silently fails to materialize as a local
     // timeline.
-    let head_idx = leaf_idx_by_sha
-        .get(&fetch.head_sha)
-        .copied()
-        .or_else(|| {
-            mapping
-                .get_blake3(&fetch.head_sha)
-                .and_then(|b3| leaf_idx_by_hash.get(&b3).copied())
-        });
+    let head_idx = leaf_idx_by_sha.get(&fetch.head_sha).copied().or_else(|| {
+        mapping
+            .get_blake3(&fetch.head_sha)
+            .and_then(|b3| leaf_idx_by_hash.get(&b3).copied())
+    });
     if let Some(idx) = head_idx {
         repo.set_timeline_head(&fetch.branch, idx)
             .map_err(|e| GitRemoteError::Io(e.to_string()))?;
@@ -1265,7 +1275,7 @@ fn import_tree(
     tree_cache: &mut HashMap<String, B3Hash>,
     submodules_skipped: &mut std::collections::BTreeSet<String>,
 ) -> Result<B3Hash, GitRemoteError> {
-    use crate::fsmerkle::{Entry, MODE_DIR, MODE_FILE, NodeKind};
+    use crate::fsmerkle::{Entry, MODE_DIR, MODE_EXEC, MODE_FILE, MODE_SYMLINK, NodeKind};
 
     if let Some(hash) = tree_cache.get(sha).copied() {
         return Ok(hash);
@@ -1292,16 +1302,13 @@ fn import_tree(
         let mapped_name = match entry.name.as_str() {
             ".ivaldiignore" => Some(entry.name.clone()),
             ".gitignore" => Some(".ivaldiignore".to_string()),
-            n if n.starts_with('.')
-                && entry.mode != "40000"
-                && entry.mode != "040000" =>
-            {
-                None
-            }
+            n if n.starts_with('.') && entry.mode != "40000" && entry.mode != "040000" => None,
             _ => Some(entry.name.clone()),
         };
 
-        let Some(out_name) = mapped_name else { continue };
+        let Some(out_name) = mapped_name else {
+            continue;
+        };
 
         let child_path = if path_prefix.is_empty() {
             out_name.clone()
@@ -1342,17 +1349,23 @@ fn import_tree(
                         // the renamed `.gitignore`.
                         continue;
                     }
-                } else if out_name == ".ivaldiignore"
-                    && rename_present.contains(&out_name)
-                {
+                } else if out_name == ".ivaldiignore" && rename_present.contains(&out_name) {
                     // We earlier kept a renamed `.gitignore`; replace it now
                     // that the real `.ivaldiignore` is here.
                     ivaldi_entries.retain(|e| e.name != out_name);
                 }
                 seen_names.insert(out_name.clone());
+                // Preserve the original git file mode so the round-trip stays
+                // byte-for-byte: executable bit (100755) and symlinks (120000)
+                // must not collapse to a plain file (100644).
+                let mode = match entry.mode.as_str() {
+                    "100755" => MODE_EXEC,
+                    "120000" => MODE_SYMLINK,
+                    _ => MODE_FILE,
+                };
                 ivaldi_entries.push(Entry {
                     name: out_name,
-                    mode: MODE_FILE,
+                    mode,
                     kind: NodeKind::Blob,
                     hash,
                 });
@@ -1474,9 +1487,9 @@ fn prefetch_blobs(
     pending
         .par_iter()
         .map(|sha| {
-            let blob = objects.get(sha.as_str()).ok_or_else(|| {
-                GitRemoteError::Protocol(format!("missing blob object {}", sha))
-            })?;
+            let blob = objects
+                .get(sha.as_str())
+                .ok_or_else(|| GitRemoteError::Protocol(format!("missing blob object {}", sha)))?;
             let (hash, _) = store
                 .put_blob(&blob.data)
                 .map_err(|e| GitRemoteError::Io(e.to_string()))?;

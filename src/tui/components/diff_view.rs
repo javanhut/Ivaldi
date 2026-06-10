@@ -28,6 +28,12 @@ pub struct DiffViewWidget {
     pub file_boundaries: Vec<usize>,
 }
 
+impl Default for DiffViewWidget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DiffViewWidget {
     pub fn new() -> Self {
         Self {

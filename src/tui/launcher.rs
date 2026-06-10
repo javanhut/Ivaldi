@@ -312,7 +312,9 @@ fn render(frame: &mut Frame, stage: &Stage, theme: &Theme) {
             dir_input,
             focus,
             error,
-        } => render_download_form(frame, body_area, repo_input, dir_input, *focus, error, theme),
+        } => render_download_form(
+            frame, body_area, repo_input, dir_input, *focus, error, theme,
+        ),
         Stage::PathForm {
             title,
             input,
@@ -411,7 +413,10 @@ fn render_download_form(
     y += 2;
 
     frame.render_widget(
-        label("Target dir (blank = derive from repo):", focus == FormFocus::Dir),
+        label(
+            "Target dir (blank = derive from repo):",
+            focus == FormFocus::Dir,
+        ),
         Rect {
             x: inner_x,
             y,

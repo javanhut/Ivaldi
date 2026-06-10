@@ -68,16 +68,21 @@ impl PeerStore {
                 continue;
             }
             let mut parts = trimmed.split_whitespace();
-            let key_hex = parts.next().ok_or_else(|| {
-                PeerError::Other(format!("line {}: missing pubkey", lineno + 1))
-            })?;
-            let pubkey = decode_pubkey(key_hex).map_err(|e| {
-                PeerError::Other(format!("line {}: {}", lineno + 1, e))
-            })?;
+            let key_hex = parts
+                .next()
+                .ok_or_else(|| PeerError::Other(format!("line {}: missing pubkey", lineno + 1)))?;
+            let pubkey = decode_pubkey(key_hex)
+                .map_err(|e| PeerError::Other(format!("line {}: {}", lineno + 1, e)))?;
             let name = parts.next().map(str::to_string);
             // Last entry for a given key wins, but preserve insertion order
             // for display.
-            by_key.insert(pubkey, PeerEntry { pubkey, name: name.clone() });
+            by_key.insert(
+                pubkey,
+                PeerEntry {
+                    pubkey,
+                    name: name.clone(),
+                },
+            );
             out.push(PeerEntry { pubkey, name });
         }
         // Dedup keeping the latest entry for each pubkey.

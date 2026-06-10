@@ -96,8 +96,8 @@ impl Identity {
             secret_hex: hex::encode(self.secret),
             public_hex: hex::encode(self.public),
         };
-        let json = serde_json::to_vec_pretty(&stored)
-            .map_err(|e| IdentityError::Other(e.to_string()))?;
+        let json =
+            serde_json::to_vec_pretty(&stored).map_err(|e| IdentityError::Other(e.to_string()))?;
         // Atomic-ish write: temp file + rename, then chmod 0600 on Unix.
         let tmp = path.with_extension("tmp");
         fs::write(&tmp, &json).map_err(IdentityError::Io)?;

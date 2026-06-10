@@ -19,8 +19,8 @@
 
 use std::io::Write;
 
-use flate2::write::ZlibEncoder;
 use flate2::Compression;
+use flate2::write::ZlibEncoder;
 use sha1::{Digest, Sha1};
 
 use crate::git_export::GitObject;

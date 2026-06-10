@@ -140,7 +140,7 @@ impl Mmr {
         let mut pos_in_tree = leaf_idx;
 
         for sibling in &proof.siblings {
-            if pos_in_tree % 2 == 0 {
+            if pos_in_tree.is_multiple_of(2) {
                 // current is left child
                 current = compute_internal_hash(current, *sibling);
             } else {

@@ -217,9 +217,7 @@ fn extract_host_and_path(raw: &str) -> Result<(Option<String>, String), RepoSpec
     // ssh://git@host/owner/repo
     if let Some(rest) = raw.strip_prefix("ssh://") {
         let after_user = rest.splitn(2, '@').last().unwrap_or(rest);
-        let (host, path) = after_user
-            .split_once('/')
-            .ok_or(RepoSpecError::Invalid)?;
+        let (host, path) = after_user.split_once('/').ok_or(RepoSpecError::Invalid)?;
         return Ok((Some(host.to_string()), path.to_string()));
     }
     // git@host:owner/repo
