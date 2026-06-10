@@ -32,6 +32,6 @@ let _lock = RepoLock::acquire(&ivaldi_dir)?;  // released on drop / process deat
 ## Which commands lock
 
 See `command_mutates()` in `cli/commands.rs`: gather, seal, reseal,
-reset, rewind, undo, pluck, fuse, travel, weld, harvest, sync, upload,
+discard, reverse, rewind, undo, pluck, fuse, travel, weld, harvest, sync, upload,
 exclude, and the mutating timeline/review subcommands. `download` is
 excluded because it may target a fresh clone outside any repository.

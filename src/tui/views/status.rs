@@ -19,7 +19,7 @@ use crate::workspace::{DotfileAllowlist, FileState, StagingArea, Workspace};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DialogPurpose {
     Seal,
-    ConfirmResetHard,
+    ConfirmReverseAll,
     /// Add a glob pattern to .ivaldiignore. Same logic as `ivaldi exclude`.
     AddIgnorePattern,
 }
@@ -223,11 +223,11 @@ impl StatusView {
         Action::Refresh
     }
 
-    fn do_reset_hard(&mut self, ctx: &mut AppContext) -> Action {
+    fn do_reverse_all(&mut self, ctx: &mut AppContext) -> Action {
         let confirmation = self.dialog.value().trim().to_string();
         self.dialog.hide();
         if !confirmation.eq_ignore_ascii_case("yes") {
-            self.message = Some("Reset cancelled".into());
+            self.message = Some("Reverse cancelled".into());
             return Action::Consumed;
         }
 
@@ -248,14 +248,14 @@ impl StatusView {
 
         let ws = Workspace::new(&ctx.repo.cas, &ctx.work_dir, &ctx.ivaldi_dir);
         if let Err(e) = ws.materialize(tree_root) {
-            return Action::Error(format!("Reset failed: {}", e));
+            return Action::Error(format!("Reverse failed: {}", e));
         }
 
-        // Clear staging too — `reset --hard` discards everything.
+        // Clear staging too — `reverse --all` throws away everything.
         let empty = StagingArea::new();
         let _ = empty.save(&ctx.ivaldi_dir);
 
-        self.message = Some("Reset to tip".into());
+        self.message = Some("Reversed all changes; restored to tip".into());
         Action::Refresh
     }
 }
@@ -267,7 +267,7 @@ impl TabView for StatusView {
             match event.code {
                 KeyCode::Enter => match self.dialog_purpose {
                     DialogPurpose::Seal => return self.do_seal(ctx),
-                    DialogPurpose::ConfirmResetHard => return self.do_reset_hard(ctx),
+                    DialogPurpose::ConfirmReverseAll => return self.do_reverse_all(ctx),
                     DialogPurpose::AddIgnorePattern => return self.do_add_ignore_pattern(ctx),
                 },
                 KeyCode::Esc => {
@@ -307,9 +307,9 @@ impl TabView for StatusView {
                 Action::Consumed
             }
             KeyCode::Char('R') => {
-                self.dialog_purpose = DialogPurpose::ConfirmResetHard;
+                self.dialog_purpose = DialogPurpose::ConfirmReverseAll;
                 self.dialog
-                    .show("Reset --hard? Type 'yes' to discard all working-tree changes");
+                    .show("Reverse all? Type 'yes' to throw away all working-tree changes");
                 Action::Consumed
             }
             KeyCode::Char('E') => {
@@ -355,7 +355,7 @@ impl TabView for StatusView {
                 height: 1,
             };
             let help = Paragraph::new(Span::styled(
-                " Space:gather  u:ungather  a:all  s:seal  R:reset-hard  E:exclude  i:ignored  r:refresh",
+                " Space:gather  u:ungather  a:all  s:seal  R:reverse-all  E:exclude  i:ignored  r:refresh",
                 theme.dim,
             ));
             frame.render_widget(help, help_area);
@@ -416,7 +416,7 @@ impl TabView for StatusView {
     }
 
     fn short_help(&self) -> &str {
-        "Space:gather u:ungather a:all s:seal R:reset-hard E:exclude i:ignored"
+        "Space:gather u:ungather a:all s:seal R:reverse-all E:exclude i:ignored"
     }
 
     fn has_active_input(&self) -> bool {

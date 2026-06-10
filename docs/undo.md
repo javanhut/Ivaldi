@@ -54,7 +54,7 @@ Resolve by editing the files manually and sealing, nothing was changed.
 
 ## Restrictions
 
-- The staging area must be clean (seal or `ivaldi reset` first) so the
+- The staging area must be clean (seal or `ivaldi discard` first) so the
   materialized result can't clobber staged work.
 - No merge may be in progress (`ivaldi fuse --continue` / `--abort` first).
 - Merge seals cannot be undone or plucked yet (there is no way to choose

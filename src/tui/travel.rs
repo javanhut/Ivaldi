@@ -334,7 +334,7 @@ fn prompt_travel_action(seal_index: u64) -> std::io::Result<TravelAction> {
     println!("\nSelected seal at index {}", seal_index);
     println!("\n? What would you like to do?");
     println!("  1. Diverge - Create new timeline from this seal");
-    println!("  2. Overwrite - Reset current timeline");
+    println!("  2. Overwrite - Move current timeline back to this seal");
     println!("  3. Cancel");
     print!("\nChoice: ");
     use std::io::Write;

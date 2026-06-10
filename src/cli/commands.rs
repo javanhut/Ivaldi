@@ -30,7 +30,8 @@ fn command_mutates(cmd: &Commands) -> bool {
         Commands::Gather(_)
         | Commands::Seal(_)
         | Commands::Reseal(_)
-        | Commands::Reset(_)
+        | Commands::Discard(_)
+        | Commands::Reverse(_)
         | Commands::Rewind(_)
         | Commands::Undo(_)
         | Commands::Pluck(_)
@@ -90,7 +91,8 @@ pub fn run_command(cli: Cli) {
             Commands::Log(args) => cmd_log(args),
             Commands::Whodidit(args) => cmd_whodidit(args),
             Commands::Diff(args) => cmd_diff(args),
-            Commands::Reset(args) => cmd_reset(args, cli.quiet),
+            Commands::Discard(args) => cmd_discard(args, cli.quiet),
+            Commands::Reverse(args) => cmd_reverse(args, cli.quiet),
             Commands::Rewind(args) => cmd_rewind(args, cli.quiet),
             Commands::Undo(args) => cmd_undo(args, cli.quiet),
             Commands::Pluck(args) => cmd_pluck(args, cli.quiet),
@@ -1468,32 +1470,34 @@ fn cmd_rewind(args: RewindArgs, quiet: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_reset(args: ResetArgs, quiet: bool) -> Result<(), String> {
+fn cmd_reverse(_args: ReverseArgs, quiet: bool) -> Result<(), String> {
     let ctx = find_repo()?;
 
-    if args.hard {
-        // Materialize workspace from last seal tree.
-        let repo = open_repo()?;
-        let timeline = repo.current_timeline().unwrap_or_else(|_| "main".into());
-        if let Some(head_idx) = repo
-            .get_timeline_head(&timeline)
-            .map_err(|e| e.to_string())?
-            && let Some(leaf) = repo.get_leaf(head_idx).map_err(|e| e.to_string())?
-        {
-            let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
-            let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
-            ws.materialize(leaf.tree_root).map_err(|e| e.to_string())?;
-            // Clear staging
-            let mut ws_mut = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
-            ws_mut.staging.clear();
-            ws_mut.save().map_err(|e| e.to_string())?;
-            if !quiet {
-                println!("Reset to last seal. Working directory restored.");
-            }
-            return Ok(());
+    // Materialize workspace from last seal tree.
+    let repo = open_repo()?;
+    let timeline = repo.current_timeline().unwrap_or_else(|_| "main".into());
+    if let Some(head_idx) = repo
+        .get_timeline_head(&timeline)
+        .map_err(|e| e.to_string())?
+        && let Some(leaf) = repo.get_leaf(head_idx).map_err(|e| e.to_string())?
+    {
+        let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
+        let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
+        ws.materialize(leaf.tree_root).map_err(|e| e.to_string())?;
+        // Clear staging
+        let mut ws_mut = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
+        ws_mut.staging.clear();
+        ws_mut.save().map_err(|e| e.to_string())?;
+        if !quiet {
+            println!("Reversed all changes. Working directory restored to last seal.");
         }
-        return Err("no commits to reset to".into());
+        return Ok(());
     }
+    Err("no seals to restore the working directory from".into())
+}
+
+fn cmd_discard(args: DiscardArgs, quiet: bool) -> Result<(), String> {
+    let ctx = find_repo()?;
 
     let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
     let mut ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
@@ -1501,12 +1505,12 @@ fn cmd_reset(args: ResetArgs, quiet: bool) -> Result<(), String> {
     if args.files.is_empty() {
         ws.staging.clear();
         if !quiet {
-            println!("All files unstaged");
+            println!("All files ungathered");
         }
     } else {
         for file in &args.files {
             if ws.staging.unstage(file) && !quiet {
-                println!("  unstaged: {}", file);
+                println!("  ungathered: {}", file);
             }
         }
     }
@@ -1531,7 +1535,7 @@ fn resolve_for_pick(
     }
     if !ws.staging.is_empty() {
         return Err(format!(
-            "cannot {} with staged changes. Seal them first or unstage with 'ivaldi reset'.",
+            "cannot {} with staged changes. Seal them first or unstage with 'ivaldi discard'.",
             verb
         ));
     }
@@ -2346,7 +2350,7 @@ fn cmd_travel(args: TravelArgs) -> Result<(), String> {
                     .set_timeline_head(&timeline, seal_index)
                     .map_err(|e| e.to_string())?;
                 println!(
-                    "Timeline '{}' reset to seal at index {}",
+                    "Timeline '{}' moved back to seal at index {}",
                     timeline, seal_index
                 );
             }

@@ -37,8 +37,8 @@ in Ivaldi the same afternoon.
 | See file diff | `git diff` | `ivaldi diff` |
 | See staged diff | `git diff --staged` | `ivaldi diff --staged` |
 | Diff between two refs | `git diff A B` | `ivaldi diff A B` |
-| Unstage a file | `git restore --staged f.txt` | `ivaldi reset f.txt` |
-| Discard local changes | `git reset --hard` | `ivaldi reset --hard` |
+| Unstage a file | `git restore --staged f.txt` | `ivaldi discard f.txt` |
+| Discard local changes | `git reset --hard` | `ivaldi reverse --all` |
 | Stage parts of a file | `git add -p` | `ivaldi gather -p` |
 | Fix the last commit | `git commit --amend` | `ivaldi reseal` |
 | Undo a commit safely | `git revert <sha>` | `ivaldi undo <seal>` |
@@ -132,8 +132,8 @@ There's nothing to stash because nothing is at risk.
 
 **One verb per intent.** `git reset` is `--soft`, `--mixed`, `--hard`,
 each doing wildly different things. Ivaldi splits these:
-- Unstage a file: `ivaldi reset f.txt`
-- Throw away local changes: `ivaldi reset --hard`
+- Ungather a file: `ivaldi discard f.txt`
+- Throw away local changes: `ivaldi reverse --all`
 - Move the timeline head back: `ivaldi rewind <seal>` (add `--discard` to also rewrite your files)
 - Redo the last seal: `ivaldi reseal`
 - Combine commits: `ivaldi weld`

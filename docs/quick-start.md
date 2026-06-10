@@ -111,8 +111,9 @@ ivaldi undo swift-eagle            # New seal that removes swift-eagle's changes
 ivaldi pluck gentle-otter          # New seal that applies gentle-otter's changes
 ivaldi rewind calm-river           # Move the head back; your files stay as-is
 ivaldi rewind calm-river --discard # Move the head back AND rewrite the files
-ivaldi reset file.txt              # Unstage a file
-ivaldi reset --hard                # Discard local changes
+ivaldi discard file.txt            # Remove a file from the gathered set
+ivaldi discard                     # Ungather everything
+ivaldi reverse --all               # Throw away all uncommitted changes (destructive!)
 ivaldi weld --last 3               # Combine the last 3 seals into one
 ivaldi travel                      # Interactive history browser
 ivaldi travel --all                # Include orphaned seals (like git reflog)
@@ -293,7 +294,8 @@ Deep dive: [p2p.md](p2p.md).
 | `whodidit <file>` | `blame` | Show which seal last touched each line of a file |
 | `diff` | | Compare changes |
 | `reseal` | | Redo the most recent seal (new message and/or staged changes) |
-| `reset` | | Unstage files or discard local changes |
+| `discard [files]` | | Remove files from the gathered set (none = everything) |
+| `reverse --all` | | Throw away all uncommitted changes, restore from last seal |
 | `rewind <seal>` | | Move the timeline head back (`--discard` to also rewrite files) |
 | `undo <seal>` | | New seal that removes an earlier seal's changes |
 | `pluck <seal>` | `cherry-pick` | New seal that applies another seal's changes |

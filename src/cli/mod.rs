@@ -62,8 +62,12 @@ pub enum Commands {
     /// Compare changes
     Diff(DiffArgs),
 
-    /// Unstage files or reset changes
-    Reset(ResetArgs),
+    /// Remove files from the gathered set (unstage)
+    Discard(DiscardArgs),
+
+    /// Throw away all uncommitted changes and restore the working
+    /// directory from the last seal (destructive!)
+    Reverse(ReverseArgs),
 
     /// Move the timeline head back to an earlier seal
     Rewind(RewindArgs),
@@ -351,14 +355,17 @@ pub struct DiffArgs {
 }
 
 #[derive(clap::Args, Debug)]
-pub struct ResetArgs {
-    /// Files to unstage
+pub struct DiscardArgs {
+    /// Files to remove from the gathered set (none = everything)
     #[arg(num_args = 0..)]
     pub files: Vec<String>,
+}
 
-    /// Discard all uncommitted changes (destructive!)
-    #[arg(long)]
-    pub hard: bool,
+#[derive(clap::Args, Debug)]
+pub struct ReverseArgs {
+    /// Required confirmation that every uncommitted change should go
+    #[arg(long, required = true)]
+    pub all: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -948,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_rewind_and_reset() {
+    fn parse_rewind_and_discard() {
         let cli = Cli::try_parse_from(["ivaldi", "rewind", "swift-eagle"]).unwrap();
         match cli.command.unwrap() {
             Commands::Rewind(args) => {
@@ -967,17 +974,25 @@ mod tests {
         // Rewind requires a seal.
         assert!(Cli::try_parse_from(["ivaldi", "rewind"]).is_err());
 
-        // Reset keeps its original shape: files + bare --hard.
-        let cli = Cli::try_parse_from(["ivaldi", "reset", "--hard"]).unwrap();
+        // Discard only ungathers: files, or nothing for everything.
+        let cli = Cli::try_parse_from(["ivaldi", "discard", "file.txt"]).unwrap();
         match cli.command.unwrap() {
-            Commands::Reset(args) => assert!(args.hard),
-            _ => panic!("expected Reset"),
+            Commands::Discard(args) => assert_eq!(args.files, vec!["file.txt"]),
+            _ => panic!("expected Discard"),
         }
-        let cli = Cli::try_parse_from(["ivaldi", "reset", "file.txt"]).unwrap();
+        let cli = Cli::try_parse_from(["ivaldi", "discard"]).unwrap();
         match cli.command.unwrap() {
-            Commands::Reset(args) => assert_eq!(args.files, vec!["file.txt"]),
-            _ => panic!("expected Reset"),
+            Commands::Discard(args) => assert!(args.files.is_empty()),
+            _ => panic!("expected Discard"),
         }
+
+        // Reverse demands the explicit --all confirmation.
+        let cli = Cli::try_parse_from(["ivaldi", "reverse", "--all"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Reverse(args) => assert!(args.all),
+            _ => panic!("expected Reverse"),
+        }
+        assert!(Cli::try_parse_from(["ivaldi", "reverse"]).is_err());
     }
 
     #[test]

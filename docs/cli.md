@@ -15,7 +15,8 @@ Command-line interface for Ivaldi VCS, built with `clap`.
 | `log [--format short\|medium\|full\|json]` | | View commit history |
 | `whodidit <file> [--summary]` | `blame` | Line-by-line seal attribution |
 | `diff` | | Compare changes |
-| `reset [files]` / `reset --hard` | | Unstage files / discard local changes |
+| `discard [files]` | | Remove files from the gathered set (none = everything) |
+| `reverse --all` | | Throw away all uncommitted changes, restore from last seal (destructive!) |
 | `rewind <seal> [--discard]` | | Move the timeline head back to an earlier seal (`--discard` also rewrites files) |
 | `undo <seal>` | | New seal that removes an earlier seal's changes |
 | `pluck <seal>` | `cherry-pick` | New seal that applies another seal's changes |
