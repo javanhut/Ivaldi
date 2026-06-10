@@ -148,7 +148,10 @@ ivaldi exclude "*.log" "build/" "node_modules/"
 | `--global` | Target `~/.ivaldi/config` instead of repo-local |
 | (no flag) | Launch the interactive ratatui form |
 
-`configure` is an alias for `config`.
+`configure` is an alias for `config`. `ivaldi config --help` lists every
+known key with a description and example; `--set` validates values per
+key (email shape, true/false toggles, repo specs) and rejects dotless
+keys. See [config.md](config.md) for the full key reference.
 
 The interactive form's first field is the **scope** — toggle between
 repo-local and global with ←/→ or Enter; the form reloads from (and saves

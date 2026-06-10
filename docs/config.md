@@ -8,6 +8,23 @@ Two-level configuration with repository overriding user settings:
 - **User (global) config**: `~/.ivaldi/config` (applies to all repos)
 - **Repo (local) config**: `.ivaldi/config` (per-repository overrides)
 
+## Known keys
+
+These are the keys ivaldi reads (also shown by `ivaldi config --help`):
+
+| Key | Meaning | Valid values |
+|-----|---------|--------------|
+| `user.name` | Author name recorded in every seal | non-empty string |
+| `user.email` | Author email recorded alongside the name | `name@domain.tld` |
+| `color.ui` | Colored CLI output | `true` / `false` |
+| `core.autoshelf` | Auto-shelve uncommitted changes on timeline switch | `true` / `false` |
+| `portal.default` | Default remote for upload/sync with several portals | repo spec (`owner/repo` or URL) |
+
+`--set` validates values per key (bad emails, non-boolean toggles, and
+malformed repo specs are rejected). Keys must use the `section.field`
+form — a dotless key is an error. Unknown dotted keys are saved with a
+warning, so forward-compatible/custom keys still work.
+
 ## Format
 
 INI-style with sections:

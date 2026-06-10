@@ -292,16 +292,7 @@ fn event_loop<B: Backend>(terminal: &mut Terminal<B>, state: &mut State) -> io::
     }
 }
 
-fn is_email_like(s: &str) -> bool {
-    let (local, rest) = match s.split_once('@') {
-        Some(p) => p,
-        None => return false,
-    };
-    if local.is_empty() {
-        return false;
-    }
-    rest.contains('.') && !rest.starts_with('.') && !rest.ends_with('.')
-}
+use crate::config::is_email_like;
 
 fn draw(frame: &mut Frame, state: &State) {
     let area = frame.area();

@@ -2707,12 +2707,26 @@ fn cmd_config(args: ConfigArgs) -> Result<(), String> {
         };
         match cfg.get(key) {
             Some(value) => println!("{}", value),
-            None => return Err(format!("config key not found: {}", key)),
+            None => {
+                return Err(format!(
+                    "config key not found: {}\nKnown keys:\n{}",
+                    key,
+                    config::known_keys_help()
+                ));
+            }
         }
         return Ok(());
     }
     if let Some(key) = &args.set {
-        let value = args.value.as_deref().ok_or("value required for --set")?;
+        let value = args.value.as_deref().ok_or_else(|| {
+            format!(
+                "value required for --set. Usage: ivaldi config --set <key> <value>\nKnown keys:\n{}",
+                config::known_keys_help()
+            )
+        })?;
+        if let Some(warning) = config::validate_set(key, value)? {
+            eprintln!("{}", color::dim(&format!("warning: {}", warning)));
+        }
         let mut cfg = Config::load(&target_path).unwrap_or_else(|_| Config::new());
         cfg.set(key, value);
         cfg.save(&target_path).map_err(|e| e.to_string())?;

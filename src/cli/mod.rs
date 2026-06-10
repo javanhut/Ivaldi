@@ -548,17 +548,21 @@ pub struct WeldArgs {
 }
 
 #[derive(clap::Args, Debug)]
+#[command(after_help = format!(
+    "Known keys:\n{}\n\nExamples:\n  ivaldi config --set user.name \"Ada Lovelace\"\n  ivaldi config --set user.email ada@example.com\n  ivaldi config --global --set color.ui false\n  ivaldi config --list\n  ivaldi config            (interactive form with local/global selector)",
+    crate::config::known_keys_help()
+))]
 pub struct ConfigArgs {
     /// List all configuration values
     #[arg(long)]
     pub list: bool,
 
-    /// Set a configuration value
-    #[arg(long)]
+    /// Set a configuration value (key as argument, value positional)
+    #[arg(long, value_name = "KEY")]
     pub set: Option<String>,
 
     /// Get a configuration value
-    #[arg(long)]
+    #[arg(long, value_name = "KEY")]
     pub get: Option<String>,
 
     /// Operate on the global config (~/.ivaldi/config) instead of repo-local
