@@ -48,7 +48,14 @@ impl_from_redb!(
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let db = Database::create(path)?;
+        let db = Database::create(path).map_err(|e| match e {
+            redb::DatabaseError::DatabaseAlreadyOpen => StoreError(
+                "repository store is in use by another ivaldi process; \
+                 retry when it finishes"
+                    .into(),
+            ),
+            other => StoreError::from(other),
+        })?;
         let w = db.begin_write()?;
         {
             let _ = w.open_table(LEAVES)?;
@@ -288,7 +295,8 @@ impl Store {
         let w = self.db.begin_write()?;
         {
             w.open_table(LEAVES)?.insert(idx, canonical)?;
-            w.open_table(TIMELINE_HEADS)?.insert(timeline, timeline_head)?;
+            w.open_table(TIMELINE_HEADS)?
+                .insert(timeline, timeline_head)?;
             w.open_table(SEAL_NAME_TO_HASH)?
                 .insert(seal_name, seal_hash.as_bytes().as_slice())?;
             w.open_table(HASH_TO_SEAL_NAME)?

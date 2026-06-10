@@ -17,6 +17,12 @@ pub struct LogView {
     all_timelines: bool,
 }
 
+impl Default for LogView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LogView {
     pub fn new() -> Self {
         Self {
@@ -233,7 +239,7 @@ impl TabView for LogView {
                     }
                 }
             }
-            all_entries.sort_by(|a, b| b.time_unix.cmp(&a.time_unix));
+            all_entries.sort_by_key(|e| std::cmp::Reverse(e.time_unix));
             self.entries = all_entries;
         } else {
             self.entries = ctx.repo.walk_history(&timeline).unwrap_or_default();

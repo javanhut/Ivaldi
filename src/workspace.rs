@@ -8,7 +8,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::cas::{Cas, CasError};
@@ -131,16 +130,16 @@ impl StagingArea {
         fs::create_dir_all(&stage_dir)?;
 
         let stage_file = stage_dir.join("files");
-        let mut file = fs::File::create(&stage_file)?;
+        let mut content = String::new();
 
         for (path, hash) in &self.staged {
-            writeln!(file, "{} {}", hash, path)?;
+            content.push_str(&format!("{} {}\n", hash, path));
         }
         for path in &self.deletions {
-            writeln!(file, "del {}", path)?;
+            content.push_str(&format!("del {}\n", path));
         }
 
-        Ok(())
+        crate::atomic_io::atomic_write(&stage_file, content.as_bytes())
     }
 
     /// Load staging area from disk.
@@ -159,10 +158,10 @@ impl StagingArea {
             }
             if let Some(rest) = line.strip_prefix("del ") {
                 staging.stage_deletion(rest);
-            } else if let Some((hash_str, path)) = line.split_once(' ') {
-                if let Some(hash) = B3Hash::from_hex(hash_str) {
-                    staging.stage(path, hash);
-                }
+            } else if let Some((hash_str, path)) = line.split_once(' ')
+                && let Some(hash) = B3Hash::from_hex(hash_str)
+            {
+                staging.stage(path, hash);
             }
         }
         staging
@@ -228,10 +227,8 @@ impl<'a> Workspace<'a> {
                     continue;
                 }
                 self.scan_dir(&entry.path(), &rel_path, ignore, files)?;
-            } else if file_type.is_file() {
-                if !ignore.is_ignored(&rel_path) {
-                    files.push(rel_path);
-                }
+            } else if file_type.is_file() && !ignore.is_ignored(&rel_path) {
+                files.push(rel_path);
             }
         }
 
@@ -249,6 +246,18 @@ impl<'a> Workspace<'a> {
         &mut self,
         paths: &[&str],
         allowlist: &DotfileAllowlist,
+    ) -> Result<GatherResult, WorkspaceError> {
+        self.gather_with_progress(paths, allowlist, &mut |_| {})
+    }
+
+    /// Like [`Workspace::gather`], but invokes `on` with each gathered path
+    /// right after its content is stored in the CAS. Used by the CLI to drive
+    /// a progress bar during hashing.
+    pub fn gather_with_progress(
+        &mut self,
+        paths: &[&str],
+        allowlist: &DotfileAllowlist,
+        on: &mut dyn FnMut(&str),
     ) -> Result<GatherResult, WorkspaceError> {
         let mut gathered = Vec::new();
         let mut needs_confirmation = Vec::new();
@@ -280,6 +289,7 @@ impl<'a> Workspace<'a> {
             self.cas
                 .put(hash, &canonical)
                 .map_err(WorkspaceError::Cas)?;
+            on(path);
 
             self.staging.stage(path, hash);
             gathered.push(path.to_string());
@@ -323,12 +333,23 @@ impl<'a> Workspace<'a> {
     /// Returns a `GatherResult` with skipped dotfiles in `needs_confirmation`
     /// so the caller can report them to the user.
     pub fn gather_all(&mut self, ignore: &PatternCache) -> Result<GatherResult, WorkspaceError> {
+        self.gather_all_with_progress(ignore, &mut |_| {})
+    }
+
+    /// Like [`Workspace::gather_all`], but invokes `on` with each gathered
+    /// path right after its content is stored in the CAS.
+    pub fn gather_all_with_progress(
+        &mut self,
+        ignore: &PatternCache,
+        on: &mut dyn FnMut(&str),
+    ) -> Result<GatherResult, WorkspaceError> {
         let files = self.scan(ignore)?;
         // scan() already excludes dotfiles via is_ignored(), so no allowlist needed
         let allowlist = DotfileAllowlist::load(&self.ivaldi_dir);
-        let result = self.gather(
+        let result = self.gather_with_progress(
             &files.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             &allowlist,
+            on,
         )?;
 
         // Discover dotfiles that were skipped so the caller can report them
@@ -424,17 +445,14 @@ impl<'a> Workspace<'a> {
     /// every other seal, the parent tree must be supplied so that files not
     /// touched by the current staging area are inherited from the parent
     /// rather than silently dropped.
-    pub fn build_seal_tree(
-        &self,
-        parent_tree: Option<B3Hash>,
-    ) -> Result<B3Hash, WorkspaceError> {
+    pub fn build_seal_tree(&self, parent_tree: Option<B3Hash>) -> Result<B3Hash, WorkspaceError> {
         let store = FsStore::new(self.cas);
         let mut file_map: BTreeMap<String, B3Hash> = BTreeMap::new();
 
-        if let Some(parent_hash) = parent_tree {
-            if parent_hash != B3Hash::ZERO {
-                self.collect_tree_files(&store, parent_hash, "", &mut file_map)?;
-            }
+        if let Some(parent_hash) = parent_tree
+            && parent_hash != B3Hash::ZERO
+        {
+            self.collect_tree_files(&store, parent_hash, "", &mut file_map)?;
         }
 
         for path in self.staging.staged_deletions() {
@@ -481,11 +499,11 @@ impl<'a> Workspace<'a> {
 
         // Build set of known files from last seal
         let mut known_files: BTreeMap<String, B3Hash> = BTreeMap::new();
-        if let Some(tree_hash) = last_tree {
-            if tree_hash != B3Hash::ZERO {
-                let store = FsStore::new(self.cas);
-                self.collect_tree_files(&store, tree_hash, "", &mut known_files)?;
-            }
+        if let Some(tree_hash) = last_tree
+            && tree_hash != B3Hash::ZERO
+        {
+            let store = FsStore::new(self.cas);
+            self.collect_tree_files(&store, tree_hash, "", &mut known_files)?;
         }
 
         let disk_set: BTreeSet<&str> = disk_files.iter().map(|s| s.as_str()).collect();
@@ -677,7 +695,10 @@ impl<'a> Workspace<'a> {
             };
             if needs_write {
                 // If a symlink currently occupies this path, drop it first.
-                if full_path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(false)
+                if full_path
+                    .symlink_metadata()
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false)
                 {
                     let _ = fs::remove_file(full_path);
                 }
@@ -727,10 +748,10 @@ impl<'a> Workspace<'a> {
     ) -> Result<Vec<crate::shelf::WorkspaceChange>, WorkspaceError> {
         let store = FsStore::new(self.cas);
         let mut known_files: BTreeMap<String, B3Hash> = BTreeMap::new();
-        if let Some(tree_hash) = base_tree {
-            if tree_hash != B3Hash::ZERO {
-                self.collect_tree_files(&store, tree_hash, "", &mut known_files)?;
-            }
+        if let Some(tree_hash) = base_tree
+            && tree_hash != B3Hash::ZERO
+        {
+            self.collect_tree_files(&store, tree_hash, "", &mut known_files)?;
         }
 
         let disk_files = self.scan(ignore)?;
@@ -769,9 +790,7 @@ impl<'a> Workspace<'a> {
         // Files in the base tree but missing from disk are Deleted.
         for path in known_files.keys() {
             if !disk_set.contains(path.as_str()) {
-                changes.push(crate::shelf::WorkspaceChange::Deleted {
-                    path: path.clone(),
-                });
+                changes.push(crate::shelf::WorkspaceChange::Deleted { path: path.clone() });
             }
         }
 
@@ -790,8 +809,7 @@ impl<'a> Workspace<'a> {
             match change {
                 crate::shelf::WorkspaceChange::Modified { path, hash }
                 | crate::shelf::WorkspaceChange::Untracked { path, hash } => {
-                    let (_, content) =
-                        store.load_blob(*hash).map_err(WorkspaceError::FsMerkle)?;
+                    let (_, content) = store.load_blob(*hash).map_err(WorkspaceError::FsMerkle)?;
                     let full_path = self.work_dir.join(path);
                     if let Some(parent) = full_path.parent() {
                         fs::create_dir_all(parent).map_err(WorkspaceError::Io)?;
@@ -861,7 +879,7 @@ impl DotfileAllowlist {
 
     pub fn save(&self) -> Result<(), std::io::Error> {
         let content: String = self.allowed.iter().map(|s| format!("{}\n", s)).collect();
-        fs::write(&self.path, content)
+        crate::atomic_io::atomic_write(&self.path, content.as_bytes())
     }
 }
 
@@ -935,6 +953,24 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert!(loaded.is_staged("file.txt"));
         assert!(loaded.is_staged("src/main.rs"));
+    }
+
+    #[test]
+    fn staging_area_load_tolerates_truncated_file() {
+        // A crash mid-write could historically truncate the stage file.
+        // load() must skip bad lines without panicking.
+        let dir = tempfile::tempdir().unwrap();
+        let ivaldi_dir = dir.path().join(".ivaldi");
+        fs::create_dir_all(ivaldi_dir.join("stage")).unwrap();
+
+        let good_hash = B3Hash::digest(b"content");
+        let content = format!("{} file.txt\ndel old.txt\nabc12", good_hash);
+        fs::write(ivaldi_dir.join("stage/files"), content).unwrap();
+
+        let loaded = StagingArea::load(&ivaldi_dir);
+        assert!(loaded.is_staged("file.txt"));
+        assert!(loaded.is_staged_for_deletion("old.txt"));
+        assert_eq!(loaded.len(), 2);
     }
 
     #[test]
@@ -1042,6 +1078,31 @@ mod tests {
     }
 
     #[test]
+    fn gather_with_progress_fires_callback_per_file() {
+        let (dir, cas) = setup_workspace();
+        fs::write(dir.path().join("a.txt"), "aaa").unwrap();
+        fs::write(dir.path().join("b.txt"), "bbb").unwrap();
+        fs::write(dir.path().join("c.txt"), "ccc").unwrap();
+
+        let allowlist = empty_allowlist(&dir);
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+
+        let mut seen = Vec::new();
+        let result = ws
+            .gather_with_progress(
+                &["a.txt", "b.txt", "c.txt", "missing.txt"],
+                &allowlist,
+                &mut |p| seen.push(p.to_string()),
+            )
+            .unwrap();
+
+        // Callback fires exactly once per gathered file; missing files are
+        // skipped without a callback.
+        assert_eq!(seen, vec!["a.txt", "b.txt", "c.txt"]);
+        assert_eq!(result.gathered, seen);
+    }
+
+    #[test]
     fn gather_all() {
         let (dir, cas) = setup_workspace();
         fs::write(dir.path().join("a.txt"), "aaa").unwrap();
@@ -1116,10 +1177,22 @@ mod tests {
         ws.collect_tree_files(&FsStore::new(&cas), new_tree, "", &mut files)
             .unwrap();
 
-        assert!(files.contains_key("a.txt"), "parent file a.txt should survive");
-        assert!(files.contains_key("b.txt"), "parent file b.txt should survive");
-        assert!(files.contains_key("c.txt"), "parent file c.txt should survive");
-        assert!(files.contains_key("d.txt"), "newly staged d.txt should be present");
+        assert!(
+            files.contains_key("a.txt"),
+            "parent file a.txt should survive"
+        );
+        assert!(
+            files.contains_key("b.txt"),
+            "parent file b.txt should survive"
+        );
+        assert!(
+            files.contains_key("c.txt"),
+            "parent file c.txt should survive"
+        );
+        assert!(
+            files.contains_key("d.txt"),
+            "newly staged d.txt should be present"
+        );
     }
 
     #[test]
@@ -1167,7 +1240,10 @@ mod tests {
         ws.collect_tree_files(&FsStore::new(&cas), new_tree, "", &mut files)
             .unwrap();
         assert!(files.contains_key("a.txt"));
-        assert!(!files.contains_key("b.txt"), "b.txt should have been removed");
+        assert!(
+            !files.contains_key("b.txt"),
+            "b.txt should have been removed"
+        );
         assert!(files.contains_key("c.txt"));
     }
 
@@ -1235,7 +1311,10 @@ mod tests {
         let lmeta = fs::symlink_metadata(dir.path().join("link")).unwrap();
         assert!(lmeta.file_type().is_symlink(), "link is a real symlink");
         assert_eq!(
-            fs::read_link(dir.path().join("link")).unwrap().to_str().unwrap(),
+            fs::read_link(dir.path().join("link"))
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "regular.txt"
         );
 

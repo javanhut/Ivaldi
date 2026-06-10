@@ -3,6 +3,7 @@
 //! Two-phase selection:
 //! 1. Select START commit (oldest)
 //! 2. Select END commit (newest)
+//!
 //! Then review, enter message, confirm.
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -61,15 +62,11 @@ pub fn run_shift(entries: Vec<HistoryEntry>) -> std::io::Result<ShiftAction> {
             }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break ShiftAction::Cancel,
-                KeyCode::Up => {
-                    if state.cursor > 0 {
-                        state.cursor -= 1;
-                    }
+                KeyCode::Up if state.cursor > 0 => {
+                    state.cursor -= 1;
                 }
-                KeyCode::Down => {
-                    if state.cursor + 1 < state.entries.len() {
-                        state.cursor += 1;
-                    }
+                KeyCode::Down if state.cursor + 1 < state.entries.len() => {
+                    state.cursor += 1;
                 }
                 KeyCode::Enter => {
                     match state.phase {

@@ -31,7 +31,8 @@ pub const GITHUB_SCOPES: &str = "repo,read:user,user:email";
 /// `IVALDI_GITLAB_CLIENT_ID`. The default client id below is glab CLI's
 /// public OAuth application; replace via env if you ship your own.
 pub const GITLAB_HOST: &str = "https://gitlab.com";
-pub const GITLAB_CLIENT_ID: &str = "41d48f9422ebd655ee3b6e85a7b8f7560bb0b50ad08522bb720e15f93a072039"; // glab CLI public OAuth app
+pub const GITLAB_CLIENT_ID: &str =
+    "41d48f9422ebd655ee3b6e85a7b8f7560bb0b50ad08522bb720e15f93a072039"; // glab CLI public OAuth app
 pub const GITLAB_DEVICE_AUTH_PATH: &str = "/oauth/authorize_device";
 pub const GITLAB_TOKEN_PATH: &str = "/oauth/token";
 pub const GITLAB_SCOPES: &str = "read_user read_api write_repository";
@@ -211,23 +212,19 @@ pub struct AuthMethod {
 /// Checks multiple sources in priority order.
 pub fn resolve_auth(platform: Platform) -> Option<AuthMethod> {
     // 1. Ivaldi OAuth token (highest priority)
-    if let Ok(store) = TokenStore::new() {
-        if let Ok(Some(token)) = store.load_token(platform) {
-            if !token.access_token.is_empty() {
-                let platform_name = match platform {
-                    Platform::GitHub => "github",
-                    Platform::GitLab => "gitlab",
-                };
-                return Some(AuthMethod {
-                    name: "ivaldi".to_string(),
-                    description: format!(
-                        "Authenticated via 'ivaldi auth login --{}'",
-                        platform_name
-                    ),
-                    token: token.access_token,
-                });
-            }
-        }
+    if let Ok(store) = TokenStore::new()
+        && let Ok(Some(token)) = store.load_token(platform)
+        && !token.access_token.is_empty()
+    {
+        let platform_name = match platform {
+            Platform::GitHub => "github",
+            Platform::GitLab => "gitlab",
+        };
+        return Some(AuthMethod {
+            name: "ivaldi".to_string(),
+            description: format!("Authenticated via 'ivaldi auth login --{}'", platform_name),
+            token: token.access_token,
+        });
     }
 
     // 2. Environment variable
@@ -235,14 +232,14 @@ pub fn resolve_auth(platform: Platform) -> Option<AuthMethod> {
         Platform::GitHub => "GITHUB_TOKEN",
         Platform::GitLab => "GITLAB_TOKEN",
     };
-    if let Ok(token) = std::env::var(env_var) {
-        if !token.is_empty() {
-            return Some(AuthMethod {
-                name: "env".to_string(),
-                description: format!("Authenticated via {} environment variable", env_var),
-                token,
-            });
-        }
+    if let Ok(token) = std::env::var(env_var)
+        && !token.is_empty()
+    {
+        return Some(AuthMethod {
+            name: "env".to_string(),
+            description: format!("Authenticated via {} environment variable", env_var),
+            token,
+        });
     }
 
     // 3. .netrc file

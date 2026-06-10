@@ -120,6 +120,10 @@ impl Cas for MemoryCas {
 /// Storage layout: `<root>/<first2hex>/<remaining_hex>`
 pub struct FileCas {
     root: PathBuf,
+    /// Shard directories written to since the last `flush()`. Lets flush
+    /// fsync only what this process touched instead of all 256 shards
+    /// (each `sync_all` is an F_FULLFSYNC on macOS).
+    dirty_shards: std::sync::Mutex<std::collections::BTreeSet<PathBuf>>,
 }
 
 impl FileCas {
@@ -127,7 +131,10 @@ impl FileCas {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, CasError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            dirty_shards: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+        })
     }
 
     /// Get the file path for a given hash.
@@ -141,23 +148,33 @@ impl FileCas {
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl FileCas {
-    /// Flush directory metadata to disk for all touched shards. Call once at
-    /// the end of a bulk import. Per-`put` fsyncs are intentionally skipped to
-    /// keep the hot path fast — content-addressed blobs are re-fetchable, so
-    /// losing the tail of an import on crash is harmless.
+    /// Flush directory metadata to disk for shards written since the last
+    /// flush. Call after a seal, bulk import, or shelf capture — anywhere the
+    /// CAS holds the only copy of data before a commit record references it.
+    /// Per-`put` fsyncs are intentionally skipped to keep the hot path fast.
+    /// No-op when nothing was written.
     pub fn flush(&self) -> Result<(), CasError> {
-        for entry in fs::read_dir(&self.root)? {
-            let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                if let Ok(dir) = fs::File::open(entry.path()) {
-                    let _ = dir.sync_all();
-                }
+        let shards: Vec<PathBuf> = {
+            let mut dirty = self.dirty_shards.lock().unwrap();
+            std::mem::take(&mut *dirty).into_iter().collect()
+        };
+        if shards.is_empty() {
+            return Ok(());
+        }
+        for shard in shards {
+            if let Ok(dir) = fs::File::open(&shard) {
+                let _ = dir.sync_all();
             }
         }
         if let Ok(root) = fs::File::open(&self.root) {
             let _ = root.sync_all();
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn dirty_shard_count(&self) -> usize {
+        self.dirty_shards.lock().unwrap().len()
     }
 }
 
@@ -202,6 +219,13 @@ impl Cas for FileCas {
             if !path.exists() {
                 return Err(CasError::Io(e));
             }
+        }
+
+        if let Some(parent) = path.parent() {
+            self.dirty_shards
+                .lock()
+                .unwrap()
+                .insert(parent.to_path_buf());
         }
 
         Ok(())
@@ -362,6 +386,50 @@ mod tests {
         assert!(!cas.has(hash).unwrap());
         cas.put(hash, data).unwrap();
         assert!(cas.has(hash).unwrap());
+    }
+
+    #[test]
+    fn flush_tracks_dirty_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = FileCas::new(dir.path()).unwrap();
+
+        // Fresh CAS: nothing dirty, flush is a no-op.
+        assert_eq!(cas.dirty_shard_count(), 0);
+        cas.flush().unwrap();
+
+        let a = b"shard data a";
+        let b = b"shard data b";
+        cas.put(B3Hash::digest(a), a).unwrap();
+        cas.put(B3Hash::digest(b), b).unwrap();
+        assert!(cas.dirty_shard_count() >= 1);
+
+        cas.flush().unwrap();
+        assert_eq!(cas.dirty_shard_count(), 0);
+
+        // Re-putting existing content writes nothing → stays clean.
+        cas.put(B3Hash::digest(a), a).unwrap();
+        assert_eq!(cas.dirty_shard_count(), 0);
+    }
+
+    #[test]
+    fn concurrent_puts_do_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = std::sync::Arc::new(FileCas::new(dir.path()).unwrap());
+
+        let handles: Vec<_> = (0..8u8)
+            .map(|i| {
+                let cas = cas.clone();
+                std::thread::spawn(move || {
+                    let data = vec![i; 64];
+                    cas.put(B3Hash::digest(&data), &data).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        cas.flush().unwrap();
+        assert_eq!(cas.dirty_shard_count(), 0);
     }
 
     #[test]

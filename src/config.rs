@@ -120,7 +120,8 @@ impl Config {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(ConfigError::Io)?;
         }
-        fs::write(path, self.to_string_repr()).map_err(ConfigError::Io)
+        crate::atomic_io::atomic_write(path, self.to_string_repr().as_bytes())
+            .map_err(ConfigError::Io)
     }
 
     /// Load from a file.
@@ -164,10 +165,10 @@ pub fn global_config_path() -> Option<PathBuf> {
 /// Load only the global config (ignoring any repo config).
 pub fn load_global() -> Config {
     let mut cfg = Config::new();
-    if let Some(path) = global_config_path() {
-        if let Ok(user_cfg) = Config::load(&path) {
-            cfg.merge(&user_cfg);
-        }
+    if let Some(path) = global_config_path()
+        && let Ok(user_cfg) = Config::load(&path)
+    {
+        cfg.merge(&user_cfg);
     }
     cfg
 }

@@ -66,16 +66,20 @@ Pass `--global` explicitly to write globally even when inside a repo.
 
 ### Interactive form
 
-Invoking `ivaldi config` without `--list`/`--get`/`--set` opens a ratatui form:
+Invoking `ivaldi config` (or its alias `ivaldi configure`) without
+`--list`/`--get`/`--set` opens a ratatui form:
 
 ```
 ┌─ Config ───────────────────────────────────┐
-│ Ivaldi Configuration (repo-local)          │
+│ Ivaldi Configuration (local)               │
 │ /home/alice/project/.ivaldi/config         │
 └────────────────────────────────────────────┘
 ┌────────────────────────────────────────────┐
+│  Scope                                     │
+│   ▸ save to          (●) local  ( ) global │
+│                                            │
 │  User                                      │
-│   ▸ name             [Alice           ]    │
+│     name             [Alice           ]    │
 │     email            [alice@example.com]   │
 │                                            │
 │  Appearance                                │
@@ -90,13 +94,19 @@ Invoking `ivaldi config` without `--list`/`--get`/`--set` opens a ratatui form:
  [↑↓] Navigate  [Enter] Edit  [←→] Toggle  [s] Save  [q] Quit
 ```
 
+The first field selects the **scope**: repo-local (`.ivaldi/config`) or
+global (`~/.ivaldi/config`). Toggling it reloads the form from the newly
+selected file — and `s` saves to that file. Unsaved edits are discarded on
+a scope switch (a notice says so). Outside a repository the selector is
+locked to global. Passing `--global` just picks the starting scope.
+
 Controls:
 
 | Key | Action |
 |-----|--------|
 | ↑/↓ or j/k | Navigate fields |
-| Enter | Edit text field (or toggle bool) |
-| ←/→ or h/l | Toggle bool fields |
+| Enter | Edit text field (or toggle scope/bool) |
+| ←/→ or h/l | Toggle scope and bool fields |
 | Esc | Cancel edit / exit without saving |
 | `s` | Save and exit |
 | `q` | Quit (prompts if modified) |
@@ -105,7 +115,8 @@ Validation:
 - `user.email` must match `x@y.z`
 - `portal.default` must parse as a valid repo spec (see [portal](portal.md))
 
-The **Remote** section only appears when run inside an Ivaldi repo.
+The **Remote** section only appears in local scope (it's a per-repo
+setting).
 
 ## Library Usage
 

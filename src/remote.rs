@@ -130,11 +130,11 @@ impl HashMapping {
             if line.is_empty() {
                 continue;
             }
-            if let Some((sha1, blake3_hex)) = line.split_once(' ') {
-                if let Some(blake3) = B3Hash::from_hex(blake3_hex) {
-                    self.sha1_to_blake3.insert(sha1.to_string(), blake3);
-                    self.blake3_to_sha1.insert(blake3, sha1.to_string());
-                }
+            if let Some((sha1, blake3_hex)) = line.split_once(' ')
+                && let Some(blake3) = B3Hash::from_hex(blake3_hex)
+            {
+                self.sha1_to_blake3.insert(sha1.to_string(), blake3);
+                self.blake3_to_sha1.insert(blake3, sha1.to_string());
             }
         }
     }

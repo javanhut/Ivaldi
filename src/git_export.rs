@@ -35,9 +35,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::cas::{Cas, FileCas};
+use crate::cas::FileCas;
 use crate::fsmerkle::{self, FsStore, NodeKind};
-use crate::git_remote::{git_object_id, GitObjectKind};
+use crate::git_remote::{GitObjectKind, git_object_id};
 use crate::hash::B3Hash;
 use crate::leaf::{Leaf, NO_PARENT};
 use crate::repo::Repo;
@@ -96,12 +96,11 @@ pub fn export_chain(
     // Seed leaf_to_git with already-mapped ancestors so parent lookups
     // resolve without re-translating.
     for idx in 0..repo.commit_count() {
-        if let Ok(Some(leaf)) = repo.get_leaf(idx) {
-            if let Some(sha_str) = known_mapping.get_sha1(leaf.hash()) {
-                if let Some(b) = sha1_hex_to_bytes(&sha_str) {
-                    leaf_to_git.insert(idx, b);
-                }
-            }
+        if let Ok(Some(leaf)) = repo.get_leaf(idx)
+            && let Some(sha_str) = known_mapping.get_sha1(leaf.hash())
+            && let Some(b) = sha1_hex_to_bytes(sha_str)
+        {
+            leaf_to_git.insert(idx, b);
         }
     }
 
@@ -123,16 +122,16 @@ pub fn export_chain(
 
         // Resolve parent SHA-1s from already-translated map.
         let mut parents: Vec<[u8; 20]> = Vec::new();
-        if leaf.has_parent() {
-            if let Some(p) = leaf_to_git.get(&leaf.prev_idx).copied() {
-                parents.push(p);
-            }
+        if leaf.has_parent()
+            && let Some(p) = leaf_to_git.get(&leaf.prev_idx).copied()
+        {
+            parents.push(p);
         }
         for &midx in &leaf.merge_idxs {
-            if let Some(p) = leaf_to_git.get(&midx).copied() {
-                if !parents.contains(&p) {
-                    parents.push(p);
-                }
+            if let Some(p) = leaf_to_git.get(&midx).copied()
+                && !parents.contains(&p)
+            {
+                parents.push(p);
             }
         }
 
@@ -184,12 +183,11 @@ fn collect_topological(
         // Stop descending only when this leaf's mapped git SHA-1 is in
         // the *server's* advertised set — i.e. the server already has
         // this exact commit + everything it transitively references.
-        if let Some(sha_str) = known_mapping.get_sha1(leaf.hash()) {
-            if let Some(b) = sha1_hex_to_bytes(&sha_str) {
-                if server_has_sha1.contains(&b) {
-                    continue;
-                }
-            }
+        if let Some(sha_str) = known_mapping.get_sha1(leaf.hash())
+            && let Some(b) = sha1_hex_to_bytes(sha_str)
+            && server_has_sha1.contains(&b)
+        {
+            continue;
         }
         chain.push(idx);
         for p in leaf.all_parents() {
@@ -278,16 +276,11 @@ fn translate_blob(
         .map_err(|e| ExportError::Other(e.to_string()))?;
     let sha1 = sha1_hex_to_bytes(git_object_id(GitObjectKind::Blob, &content).as_str())
         .expect("git_object_id always returns 40 hex chars");
-    if !objects.contains_key(&sha1) {
-        objects.insert(
-            sha1,
-            GitObject {
-                sha1,
-                kind: GitObjectKind::Blob,
-                body: content,
-            },
-        );
-    }
+    objects.entry(sha1).or_insert(GitObject {
+        sha1,
+        kind: GitObjectKind::Blob,
+        body: content,
+    });
     Ok(sha1)
 }
 
@@ -308,11 +301,7 @@ fn mint_git_commit_body(leaf: &Leaf, tree_sha1: &[u8; 20], parents: &[[u8; 20]])
         .get("git.author_tz")
         .map(String::as_str)
         .unwrap_or("+0000");
-    let _ = writeln!(
-        s,
-        "author {} {} {}",
-        leaf.author, leaf.time_unix, author_tz
-    );
+    let _ = writeln!(s, "author {} {} {}", leaf.author, leaf.time_unix, author_tz);
 
     let (committer_line, committer_time, committer_tz) = match (
         leaf.meta.get("git.committer"),
@@ -391,8 +380,7 @@ mod tests {
             1_700_000_000,
             "first commit",
         );
-        leaf.meta
-            .insert("git.author_tz".into(), "+0530".into());
+        leaf.meta.insert("git.author_tz".into(), "+0530".into());
         leaf.meta
             .insert("git.committer".into(), "Bob <bob@example.com>".into());
         leaf.meta
@@ -527,9 +515,7 @@ mod tests {
         let tree_sha = translate_tree(&store, tree_hash, &mut cache, &mut objects).unwrap();
         let body = &objects.get(&tree_sha).unwrap().body;
 
-        let contains = |needle: &[u8]| {
-            body.windows(needle.len()).any(|w| w == needle)
-        };
+        let contains = |needle: &[u8]| body.windows(needle.len()).any(|w| w == needle);
         assert!(contains(b"100755 run.sh\0"), "executable mode preserved");
         assert!(contains(b"120000 link\0"), "symlink mode preserved");
         assert!(contains(b"100644 regular.txt\0"), "regular mode preserved");

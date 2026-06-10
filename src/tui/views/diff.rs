@@ -19,6 +19,12 @@ pub struct DiffTabView {
     show_staged: bool,
 }
 
+impl Default for DiffTabView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DiffTabView {
     pub fn new() -> Self {
         Self {
@@ -171,16 +177,15 @@ impl TabView for DiffTabView {
                         text: format!("=== deleted: {}", file_path),
                     });
                     // Try to read from CAS using last known hash
-                    if let Some(hash) = file.hash {
-                        if let Ok(data) = ctx.repo.cas.get(hash) {
-                            if let Ok(content) = String::from_utf8(data) {
-                                for line in content.lines() {
-                                    diff_lines.push(DiffLine {
-                                        kind: DiffLineKind::Remove,
-                                        text: format!("-{}", line),
-                                    });
-                                }
-                            }
+                    if let Some(hash) = file.hash
+                        && let Ok(data) = ctx.repo.cas.get(hash)
+                        && let Ok(content) = String::from_utf8(data)
+                    {
+                        for line in content.lines() {
+                            diff_lines.push(DiffLine {
+                                kind: DiffLineKind::Remove,
+                                text: format!("-{}", line),
+                            });
                         }
                     }
                 }

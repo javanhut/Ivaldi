@@ -67,6 +67,14 @@ let cas = FileCas::new(".ivaldi/objects")?;
 
 **Idempotent:** Writing the same content twice is a no-op (skips if file exists).
 
+**Durability — `flush()`:** `put` skips fsync on the hot path for speed.
+`FileCas` tracks which shard directories were written since the last
+flush, and `flush()` fsyncs exactly those (a no-op when nothing was
+written). Callers flush at the points where the CAS holds the only copy
+of data before a commit record references it: after building a seal tree
+(`seal`/`reseal`), after the shelf capture during a timeline switch, and
+at the end of bulk imports (`git_remote`, `p2p`) and `gather --patch`.
+
 ## Error Types
 
 ```rust

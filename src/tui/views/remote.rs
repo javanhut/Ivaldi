@@ -51,6 +51,12 @@ pub struct RemoteView {
     pub bg_receiver: Option<mpsc::Receiver<BgResult>>,
 }
 
+impl Default for RemoteView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RemoteView {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();
@@ -173,9 +179,8 @@ impl RemoteView {
                     verification_uri: device.verification_uri.clone(),
                 });
                 let result = (|| -> Result<(), String> {
-                    let token =
-                        GitHubClient::poll_for_token(&device.device_code, device.interval)
-                            .map_err(|e| e.to_string())?;
+                    let token = GitHubClient::poll_for_token(&device.device_code, device.interval)
+                        .map_err(|e| e.to_string())?;
                     let store = TokenStore::new().map_err(|e| e.to_string())?;
                     store
                         .save_token(Platform::GitHub, token)
@@ -198,13 +203,14 @@ impl RemoteView {
             std::thread::spawn(move || {
                 use crate::auth;
                 use crate::portal::Platform;
-                let lines: Vec<String> = [(Platform::GitHub, "GitHub"), (Platform::GitLab, "GitLab")]
-                    .iter()
-                    .map(|(platform, name)| match auth::resolve_auth(*platform) {
-                        Some(method) => format!("{}: {}", name, method.description),
-                        None => format!("{}: Not authenticated", name),
-                    })
-                    .collect();
+                let lines: Vec<String> =
+                    [(Platform::GitHub, "GitHub"), (Platform::GitLab, "GitLab")]
+                        .iter()
+                        .map(|(platform, name)| match auth::resolve_auth(*platform) {
+                            Some(method) => format!("{}: {}", name, method.description),
+                            None => format!("{}: Not authenticated", name),
+                        })
+                        .collect();
                 let _ = tx.send(BgResult::AuthStatusDone(lines));
             });
         }
@@ -249,10 +255,10 @@ impl RemoteView {
 
         if let Some(tx) = self.bg_sender.clone() {
             std::thread::spawn(move || {
-                let result = (|| -> Result<Vec<String>, String> {
+                let result = {
                     let client = crate::github::GitHubClient::new();
                     crate::sync::scout(&client, &portal_clone).map_err(|e| e.to_string())
-                })();
+                };
                 let _ = tx.send(BgResult::ScoutDone(result));
             });
         }
@@ -461,11 +467,7 @@ impl TabView for RemoteView {
         // Top header: portal line + status line
         let header_lines = 2u16;
         // Optional auth panel (device-code prompt and/or status query result).
-        let auth_lines: u16 = self
-            .auth_device_prompt
-            .as_ref()
-            .map(|_| 3)
-            .unwrap_or(0)
+        let auth_lines: u16 = self.auth_device_prompt.as_ref().map(|_| 3).unwrap_or(0)
             + self.auth_status_lines.len() as u16;
 
         let portal_text = match &self.portal_info {

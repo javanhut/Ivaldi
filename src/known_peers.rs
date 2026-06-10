@@ -63,10 +63,10 @@ impl KnownPeers {
     /// Open the default store at `~/.ivaldi/known_peers` (overridable via
     /// `IVALDI_KNOWN_PEERS`).
     pub fn default_for_user() -> Option<Self> {
-        if let Ok(p) = std::env::var("IVALDI_KNOWN_PEERS") {
-            if !p.is_empty() {
-                return Some(Self::new(PathBuf::from(p)));
-            }
+        if let Ok(p) = std::env::var("IVALDI_KNOWN_PEERS")
+            && !p.is_empty()
+        {
+            return Some(Self::new(PathBuf::from(p)));
         }
         let base = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
@@ -142,18 +142,14 @@ impl KnownPeers {
             let pk = parts.next().ok_or_else(|| {
                 KnownPeersError::Other(format!("line {}: missing pubkey", lineno + 1))
             })?;
-            let pubkey = decode_pubkey(pk).map_err(|e| {
-                KnownPeersError::Other(format!("line {}: {}", lineno + 1, e))
-            })?;
+            let pubkey = decode_pubkey(pk)
+                .map_err(|e| KnownPeersError::Other(format!("line {}: {}", lineno + 1, e)))?;
             out.insert(key.to_string(), pubkey);
         }
         Ok(out)
     }
 
-    fn write_map(
-        &self,
-        map: &BTreeMap<String, [u8; KEY_LEN]>,
-    ) -> Result<(), KnownPeersError> {
+    fn write_map(&self, map: &BTreeMap<String, [u8; KEY_LEN]>) -> Result<(), KnownPeersError> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(KnownPeersError::Io)?;
         }
@@ -269,10 +265,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("known_peers");
         let pubkey_hex = hex::encode(key(0x77));
-        let content = format!(
-            "# top comment\n\nhost:9999 {} # tail\n\n",
-            pubkey_hex
-        );
+        let content = format!("# top comment\n\nhost:9999 {} # tail\n\n", pubkey_hex);
         std::fs::write(&path, content).unwrap();
         let kp = KnownPeers::new(path);
         assert_eq!(kp.lookup("host", 9999, &key(0x77)).unwrap(), Known::Match);

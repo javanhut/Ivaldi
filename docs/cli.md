@@ -7,13 +7,18 @@ Command-line interface for Ivaldi VCS, built with `clap`.
 | Command | Alias | Description |
 |---------|-------|-------------|
 | `forge` | | Initialize repository |
-| `gather [files]` | | Stage files for next seal |
+| `gather [files] [-p]` | | Stage files for next seal (`-p`/`--patch` picks hunks interactively) |
 | `seal "msg"` | | Create sealed commit |
-| `status` | | Show repository status |
+| `reseal [msg]` | | Redo the most recent seal — folds in staged changes and/or a new message |
+| `status [--json]` | | Show repository status |
 | `whereami` | `wai` | Show current position |
-| `log` | | View commit history |
+| `log [--format short\|medium\|full\|json]` | | View commit history |
+| `whodidit <file> [--summary]` | `blame` | Line-by-line seal attribution |
 | `diff` | | Compare changes |
-| `reset [files]` | | Unstage files |
+| `reset [files]` / `reset --hard` | | Unstage files / discard local changes |
+| `rewind <seal> [--discard]` | | Move the timeline head back to an earlier seal (`--discard` also rewrites files) |
+| `undo <seal>` | | New seal that removes an earlier seal's changes |
+| `pluck <seal>` | `cherry-pick` | New seal that applies another seal's changes |
 | `timeline create/switch/list/rename/remove` | `tl` | Manage timelines |
 | `timeline butterfly create/up/down/rm` | `tl bf` | Butterfly timelines |
 | `fuse <src> to <tgt>` | | Merge timelines (auto strategy uses MMR-based merge base) |
@@ -31,6 +36,11 @@ Command-line interface for Ivaldi VCS, built with `clap`.
 | `serve [--bind addr:port]` | | Run an `ivaldi://` peer server |
 | `peer trust/list/forget/whoami/known` | | Manage peer pubkey allowlists + TOFU known servers |
 | `review create/list/show/diff/comment/approve/request-changes/merge/close/reopen` | `rv` | Local code review system |
+| `completions <shell>` | | Print a bash/zsh/fish/powershell/elvish completion script |
+| `man [--out dir]` | | Generate man pages (used by `make install-extras`) |
+
+`timeline list`, `portal list`, and `status` accept `--json` for scripting;
+`log --format json` does the same for history.
 
 ## Global Flags
 
@@ -54,6 +64,24 @@ ivaldi config                       # launches interactive ratatui form
 ivaldi gather .
 ivaldi seal "Add feature"
 ivaldi status
+
+# Fixing up the most recent seal
+ivaldi gather forgotten.txt
+ivaldi reseal                              # fold staged changes in, keep the message
+ivaldi reseal "better message"             # and/or replace the message
+
+# Stage only some hunks of a file
+ivaldi gather -p src/main.rs               # y/n per hunk; a=rest, d=skip rest, q=quit
+
+# Going back
+ivaldi undo swift-eagle                    # new seal that removes swift-eagle's changes
+ivaldi pluck gentle-otter                  # new seal that applies gentle-otter's changes
+ivaldi rewind calm-river                   # head moves back; your files stay as-is
+ivaldi rewind calm-river --discard         # head moves back AND files are rewritten
+
+# Scripting
+ivaldi status --json | jq '.files[].path'
+ivaldi log --format json | jq '.[0].seal_name'
 
 # Timelines
 ivaldi tl create feature
@@ -120,8 +148,17 @@ ivaldi exclude "*.log" "build/" "node_modules/"
 | `--global` | Target `~/.ivaldi/config` instead of repo-local |
 | (no flag) | Launch the interactive ratatui form |
 
+`configure` is an alias for `config`.
+
+The interactive form's first field is the **scope** — toggle between
+repo-local and global with ←/→ or Enter; the form reloads from (and saves
+to) whichever config file is selected. Below that it covers `user.name`,
+`user.email`, `color.ui`, `core.autoshelf`, and (local scope only)
+`portal.default`. Email and repo-spec values are validated as you type.
+
 `ivaldi config` **no longer requires being inside an Ivaldi repo** — outside
-a repo it automatically operates on the global config.
+a repo it automatically operates on the global config (the scope selector
+is locked to global).
 
 ## Architecture
 

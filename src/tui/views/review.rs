@@ -30,6 +30,12 @@ pub struct ReviewView {
     confirm_close: bool,
 }
 
+impl Default for ReviewView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReviewView {
     pub fn new() -> Self {
         Self {
@@ -46,7 +52,7 @@ impl ReviewView {
         }
     }
 
-    fn handle_list_event(&mut self, event: &KeyEvent, ctx: &mut AppContext) -> Action {
+    fn handle_list_event(&mut self, event: &KeyEvent, _ctx: &mut AppContext) -> Action {
         match event.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 if !self.reviews.is_empty() && self.cursor < self.reviews.len() - 1 {
@@ -246,10 +252,10 @@ impl ReviewView {
                 }
                 KeyCode::Char('q') => {
                     // Close the review
-                    if let Some(ref review) = self.selected_review {
-                        if review.status != ReviewStatus::Merged {
-                            self.confirm_close = true;
-                        }
+                    if let Some(ref review) = self.selected_review
+                        && review.status != ReviewStatus::Merged
+                    {
+                        self.confirm_close = true;
                     }
                     Action::Consumed
                 }
@@ -602,10 +608,10 @@ impl TabView for ReviewView {
             self.cursor = self.reviews.len() - 1;
         }
         // Refresh selected review if in detail/diff mode
-        if let Some(ref current) = self.selected_review {
-            if let Ok(Some(updated)) = ctx.repo.load_review(current.id) {
-                self.selected_review = Some(updated);
-            }
+        if let Some(ref current) = self.selected_review
+            && let Ok(Some(updated)) = ctx.repo.load_review(current.id)
+        {
+            self.selected_review = Some(updated);
         }
     }
 

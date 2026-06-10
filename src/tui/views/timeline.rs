@@ -36,6 +36,12 @@ pub struct TimelineView {
     message: Option<(String, bool)>,
 }
 
+impl Default for TimelineView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TimelineView {
     pub fn new() -> Self {
         Self {
@@ -170,7 +176,8 @@ impl TabView for TimelineView {
             KeyCode::Char('R') => {
                 if let Some(row) = self.rows.get(self.cursor) {
                     self.dialog_mode = Some(DialogMode::Rename);
-                    self.dialog.show_with_value("Rename Timeline", row.name.clone());
+                    self.dialog
+                        .show_with_value("Rename Timeline", row.name.clone());
                 }
                 Action::Consumed
             }
@@ -332,13 +339,19 @@ impl TimelineView {
         if let Err(e) = ctx.repo.create_timeline(name, Some(&parent)) {
             return Action::Error(format!("Create failed: {}", e));
         }
-        if let Err(e) = ctx.repo.store_butterfly_meta(name, &parent, divergence_hash) {
+        if let Err(e) = ctx
+            .repo
+            .store_butterfly_meta(name, &parent, divergence_hash)
+        {
             return Action::Error(format!("Butterfly metadata failed: {}", e));
         }
         if let Err(e) = ctx.repo.switch_timeline(name) {
             return Action::Error(format!("Switch failed: {}", e));
         }
-        self.message = Some((format!("Created butterfly '{}' from '{}'", name, parent), false));
+        self.message = Some((
+            format!("Created butterfly '{}' from '{}'", name, parent),
+            false,
+        ));
         Action::Refresh
     }
 

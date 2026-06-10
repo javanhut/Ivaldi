@@ -30,9 +30,17 @@ ivaldi config --set user.email "you@example.com"
 
 # Daily workflow
 ivaldi gather .                    # Stage all files
+ivaldi gather -p src/main.rs       # Stage only some hunks (interactive)
 ivaldi seal "Add new feature"      # Commit
+ivaldi reseal "Better message"     # Redo the last seal (message and/or staged changes)
 ivaldi status                      # Check workspace state
 ivaldi log --oneline               # View history
+
+# Going back (history is never rewritten — old seals stay recoverable)
+ivaldi undo swift-eagle            # New seal that removes swift-eagle's changes
+ivaldi pluck gentle-otter          # New seal that applies gentle-otter's changes
+ivaldi rewind calm-river           # Move the head back; your files stay as-is
+ivaldi rewind calm-river --discard # Move the head back AND rewrite the files
 
 # Timelines (branches)
 ivaldi timeline create feature     # Create timeline
@@ -74,7 +82,11 @@ ivaldi peer known list             # Servers we trust (TOFU known_peers)
 | `log` | | View commit history |
 | `whodidit <file>` | `blame` | Show which seal last touched each line of a file |
 | `diff` | | Compare changes |
-| `reset` | | Unstage files or hard reset |
+| `reseal` | | Redo the most recent seal (new message and/or staged changes) |
+| `reset` | | Unstage files or discard local changes |
+| `rewind <seal>` | | Move the timeline head back (`--discard` to also rewrite files) |
+| `undo <seal>` | | New seal that removes an earlier seal's changes |
+| `pluck <seal>` | `cherry-pick` | New seal that applies another seal's changes |
 | `timeline` | `tl` | Manage timelines (create/switch/list/rename/remove) |
 | `butterfly` | `tl bf` | Experimental sandbox timelines |
 | `fuse` | | Merge timelines (auto strategy uses MMR-based merge base) |
@@ -91,6 +103,11 @@ ivaldi peer known list             # Servers we trust (TOFU known_peers)
 | `sync` | | Pull remote changes (delta only) |
 | `serve` | | Run an `ivaldi://` peer server for trusted users |
 | `peer` | | Manage trusted peers + known servers (`trust` / `list` / `forget` / `whoami` / `known`) |
+| `completions <shell>` | | Print a shell completion script (bash/zsh/fish/powershell/elvish) |
+
+`status`, `timeline list`, and `portal list` accept `--json`, and
+`log --format json` emits machine-readable history — handy for scripts and CI.
+`make install-extras` installs man pages and shell completions.
 
 ## Ivaldi vs Git
 

@@ -572,9 +572,7 @@ fn validate_name(name: &str) -> Result<(), FsMerkleError> {
 
 fn validate_mode(mode: u32, kind: NodeKind) -> Result<(), FsMerkleError> {
     match kind {
-        NodeKind::Blob
-            if mode != MODE_FILE && mode != MODE_EXEC && mode != MODE_SYMLINK =>
-        {
+        NodeKind::Blob if mode != MODE_FILE && mode != MODE_EXEC && mode != MODE_SYMLINK => {
             Err(FsMerkleError::InvalidMode {
                 mode,
                 kind,

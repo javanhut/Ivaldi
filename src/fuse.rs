@@ -28,15 +28,17 @@ pub enum Strategy {
     Base,
 }
 
-impl Strategy {
-    pub fn from_str(s: &str) -> Option<Self> {
+impl std::str::FromStr for Strategy {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "auto" => Some(Self::Auto),
-            "ours" => Some(Self::Ours),
-            "theirs" => Some(Self::Theirs),
-            "union" => Some(Self::Union),
-            "base" => Some(Self::Base),
-            _ => None,
+            "auto" => Ok(Self::Auto),
+            "ours" => Ok(Self::Ours),
+            "theirs" => Ok(Self::Theirs),
+            "union" => Ok(Self::Union),
+            "base" => Ok(Self::Base),
+            _ => Err(()),
         }
     }
 }
@@ -135,9 +137,9 @@ impl FuseEngine {
                             });
                         }
                         // Auto never concatenates; it surfaces conflicts instead.
-                        MergeDecision::Concat(..) => unreachable!(
-                            "auto strategy does not produce Concat decisions"
-                        ),
+                        MergeDecision::Concat(..) => {
+                            unreachable!("auto strategy does not produce Concat decisions")
+                        }
                     }
                 }
                 Strategy::Ours => {
@@ -567,10 +569,7 @@ mod tests {
 
     /// Build a `path -> hash` map by storing each content in `store`, so the
     /// union strategy can actually load the blobs to concatenate them.
-    fn stored(
-        store: &FsStore<'_>,
-        entries: &[(&str, &[u8])],
-    ) -> BTreeMap<String, B3Hash> {
+    fn stored(store: &FsStore<'_>, entries: &[(&str, &[u8])]) -> BTreeMap<String, B3Hash> {
         entries
             .iter()
             .map(|(path, content)| {
@@ -612,16 +611,29 @@ mod tests {
     fn union_clean_resolves_do_not_concat() {
         let (_dir, cas) = tmp_cas();
         let store = FsStore::new(&cas);
-        let base = stored(&store, &[("only_ours.txt", b"O0"), ("only_theirs.txt", b"T0")]);
+        let base = stored(
+            &store,
+            &[("only_ours.txt", b"O0"), ("only_theirs.txt", b"T0")],
+        );
         // only_ours changed on our side; only_theirs changed on theirs.
-        let ours = stored(&store, &[("only_ours.txt", b"O1"), ("only_theirs.txt", b"T0")]);
-        let theirs = stored(&store, &[("only_ours.txt", b"O0"), ("only_theirs.txt", b"T1")]);
+        let ours = stored(
+            &store,
+            &[("only_ours.txt", b"O1"), ("only_theirs.txt", b"T0")],
+        );
+        let theirs = stored(
+            &store,
+            &[("only_ours.txt", b"O0"), ("only_theirs.txt", b"T1")],
+        );
 
         let result = FuseEngine::fuse(&store, &base, &ours, &theirs, Strategy::Union);
         assert!(result.success);
         // Single-sided changes take the changed version verbatim, NOT a concat.
-        let (_, a) = store.load_blob(result.merged_files["only_ours.txt"]).unwrap();
-        let (_, b) = store.load_blob(result.merged_files["only_theirs.txt"]).unwrap();
+        let (_, a) = store
+            .load_blob(result.merged_files["only_ours.txt"])
+            .unwrap();
+        let (_, b) = store
+            .load_blob(result.merged_files["only_theirs.txt"])
+            .unwrap();
         assert_eq!(a, b"O1");
         assert_eq!(b, b"T1");
     }
@@ -698,12 +710,12 @@ mod tests {
 
     #[test]
     fn strategy_from_str() {
-        assert_eq!(Strategy::from_str("auto"), Some(Strategy::Auto));
-        assert_eq!(Strategy::from_str("ours"), Some(Strategy::Ours));
-        assert_eq!(Strategy::from_str("theirs"), Some(Strategy::Theirs));
-        assert_eq!(Strategy::from_str("union"), Some(Strategy::Union));
-        assert_eq!(Strategy::from_str("base"), Some(Strategy::Base));
-        assert_eq!(Strategy::from_str("invalid"), None);
+        assert_eq!("auto".parse::<Strategy>().ok(), Some(Strategy::Auto));
+        assert_eq!("ours".parse::<Strategy>().ok(), Some(Strategy::Ours));
+        assert_eq!("theirs".parse::<Strategy>().ok(), Some(Strategy::Theirs));
+        assert_eq!("union".parse::<Strategy>().ok(), Some(Strategy::Union));
+        assert_eq!("base".parse::<Strategy>().ok(), Some(Strategy::Base));
+        assert_eq!("invalid".parse::<Strategy>().ok(), None);
     }
 
     #[test]

@@ -78,7 +78,7 @@ impl<'a> ChunkBuilder<'a> {
 
         // Build binary tree bottom-up
         while nodes.len() > 1 {
-            let mut next_level = Vec::with_capacity((nodes.len() + 1) / 2);
+            let mut next_level = Vec::with_capacity(nodes.len().div_ceil(2));
             let mut i = 0;
             while i < nodes.len() {
                 if i + 1 < nodes.len() {

@@ -76,12 +76,10 @@ pub fn collect_garbage(
     }
 
     // Clean up empty shard directories
-    if !dry_run {
-        if let Ok(entries) = fs::read_dir(objects_dir) {
-            for entry in entries.flatten() {
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    let _ = fs::remove_dir(entry.path()); // only removes if empty
-                }
+    if !dry_run && let Ok(entries) = fs::read_dir(objects_dir) {
+        for entry in entries.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let _ = fs::remove_dir(entry.path()); // only removes if empty
             }
         }
     }

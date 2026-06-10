@@ -39,6 +39,10 @@ in Ivaldi the same afternoon.
 | Diff between two refs | `git diff A B` | `ivaldi diff A B` |
 | Unstage a file | `git restore --staged f.txt` | `ivaldi reset f.txt` |
 | Discard local changes | `git reset --hard` | `ivaldi reset --hard` |
+| Stage parts of a file | `git add -p` | `ivaldi gather -p` |
+| Fix the last commit | `git commit --amend` | `ivaldi reseal` |
+| Undo a commit safely | `git revert <sha>` | `ivaldi undo <seal>` |
+| Copy one commit over | `git cherry-pick <sha>` | `ivaldi pluck <seal>` (alias `cherry-pick`) |
 | Who wrote each line? | `git blame f.txt` | `ivaldi whodidit f.txt` (alias `blame`) |
 | Ignore a path | edit `.gitignore` | `ivaldi exclude pattern` (writes `.ivaldiignore`) |
 
@@ -65,7 +69,9 @@ in Ivaldi the same afternoon.
 |---|---|---|
 | Squash last 3 commits | `git rebase -i HEAD~3` | `ivaldi weld --last 3 -m "msg"` |
 | Squash a range | `git rebase -i <base>` | `ivaldi weld <start> to <end> -m "msg"` |
-| Hard-reset to a commit | `git reset --hard <sha>` | `ivaldi travel` → pick seal → **Overwrite** |
+| Amend the head commit | `git commit --amend` | `ivaldi reseal [msg]` |
+| Move head, keep your files | `git reset --soft/--mixed <sha>` | `ivaldi rewind <seal>` |
+| Hard-reset to a commit | `git reset --hard <sha>` | `ivaldi rewind <seal> --discard` (or `ivaldi travel` → **Overwrite**) |
 | Branch off an old commit | `git switch -c new <sha>` | `ivaldi travel` → pick seal → **Diverge** |
 | Browse old commits | `git log` then `git checkout <sha>` | `ivaldi travel` (interactive TUI) |
 | Recover a "lost" commit | `git reflog` | `ivaldi travel --all` (walks every leaf in the MMR) |
@@ -128,7 +134,8 @@ There's nothing to stash because nothing is at risk.
 each doing wildly different things. Ivaldi splits these:
 - Unstage a file: `ivaldi reset f.txt`
 - Throw away local changes: `ivaldi reset --hard`
-- Move the timeline head: `ivaldi travel` → Overwrite
+- Move the timeline head back: `ivaldi rewind <seal>` (add `--discard` to also rewrite your files)
+- Redo the last seal: `ivaldi reseal`
 - Combine commits: `ivaldi weld`
 
 **Memorable names.** Every seal gets a deterministic four-word name like
@@ -145,7 +152,7 @@ If you reach for one of these, here's the intended Ivaldi answer.
 | `git worktree` | Use butterflies, or just clone twice. The "two checkouts at once" need is rare enough that a second clone is fine. |
 | `git stash` | Auto-shelving on timeline switch. |
 | `git rebase -i` (reorder/edit) | `weld` covers squash; `travel` covers reset. Reordering individual commits is intentionally not in v0.1 — the workflows it enables are usually a smell. |
-| `git cherry-pick` | Not yet — planned. For now: branch off, copy changes, seal. |
+| `git cherry-pick` | `ivaldi pluck <seal>` (the `cherry-pick` alias also works). See docs/undo.md. |
 | `git submodule` | Supported (`src/submodule.rs`); same semantics as git. |
 | `.git/hooks/*` | `.ivaldi/hooks/*` — same shape. |
 | `git lfs` | `filechunk` handles large files via content-defined chunking; no separate tool. |

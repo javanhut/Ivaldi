@@ -133,10 +133,7 @@ pub enum Message {
     /// Client → server: send everything reachable from `timeline`. The
     /// optional `have` list lets the client say "I already have these
     /// leaf-hashes" so the server can prune.
-    WantTimeline {
-        timeline: String,
-        have: Vec<String>,
-    },
+    WantTimeline { timeline: String, have: Vec<String> },
 
     /// Server → client: data payload(s). Multiple `Bundle` messages may be
     /// sent in sequence before a final `Done`.
@@ -208,10 +205,7 @@ pub struct Channel {
 
 impl Channel {
     /// Initiator side. Performs Noise XX with the supplied static keypair.
-    pub fn connect(
-        addr: impl ToSocketAddrs,
-        identity: &Identity,
-    ) -> Result<Self, P2pError> {
+    pub fn connect(addr: impl ToSocketAddrs, identity: &Identity) -> Result<Self, P2pError> {
         let stream = TcpStream::connect(addr)?;
         stream.set_read_timeout(Some(Duration::from_secs(60)))?;
         stream.set_write_timeout(Some(Duration::from_secs(60)))?;
@@ -240,8 +234,8 @@ impl Channel {
     /// Send one logical message. Encrypts via Noise, frames with a 4-byte
     /// big-endian length prefix.
     pub fn send(&mut self, msg: &Message) -> Result<(), P2pError> {
-        let payload = serde_json::to_vec(msg)
-            .map_err(|e| P2pError::Protocol(format!("encode: {}", e)))?;
+        let payload =
+            serde_json::to_vec(msg).map_err(|e| P2pError::Protocol(format!("encode: {}", e)))?;
         if payload.len() > MAX_FRAME {
             return Err(P2pError::Protocol(format!(
                 "outbound message too large ({} > {})",
@@ -587,7 +581,7 @@ fn handle_connection(
                 serve_want(repo, &mut chan, &timeline, &have)?;
             }
             Message::PushStart { timeline } => {
-                serve_push(repo, &mut chan, &timeline, &peer_store)?;
+                serve_push(repo, &mut chan, &timeline, peer_store)?;
             }
             other => {
                 chan.send(&Message::Error {
@@ -630,13 +624,19 @@ fn serve_push(
     // Sanitize the sender label so it can't escape the `peers/` prefix.
     let sender_clean: String = sender
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
 
     let landed_as = format!("peers/{}/{}", sender_clean, timeline);
 
-    let cas = FileCas::new(repo.ivaldi_dir.join("objects"))
-        .map_err(|e| P2pError::Io(e.to_string()))?;
+    let cas =
+        FileCas::new(repo.ivaldi_dir.join("objects")).map_err(|e| P2pError::Io(e.to_string()))?;
 
     let mut leaves_landed = 0usize;
 
@@ -647,9 +647,8 @@ fn serve_push(
                 // leaf's tree walk later). Bytes are content-addressed,
                 // so duplicates are no-ops.
                 for wb in blobs {
-                    let raw = hex::decode(&wb.hash_hex).map_err(|e| {
-                        P2pError::Protocol(format!("blob hash hex: {}", e))
-                    })?;
+                    let raw = hex::decode(&wb.hash_hex)
+                        .map_err(|e| P2pError::Protocol(format!("blob hash hex: {}", e)))?;
                     let hash = crate::hash::B3Hash::from_slice(&raw)
                         .ok_or_else(|| P2pError::Protocol("blob hash wrong length".into()))?;
                     cas.put(hash, &wb.data)
@@ -705,9 +704,7 @@ fn serve_want(
     let head = repo
         .get_timeline_head(timeline)
         .map_err(|e| P2pError::Protocol(e.to_string()))?
-        .ok_or_else(|| {
-            P2pError::Protocol(format!("unknown timeline '{}'", timeline))
-        })?;
+        .ok_or_else(|| P2pError::Protocol(format!("unknown timeline '{}'", timeline)))?;
 
     // Walk the linear chain (prev_idx + merge parents) from head back, stopping
     // at any leaf whose blake3 the client already has.
@@ -907,7 +904,7 @@ pub fn fetch_into_with_policy(
                     return Err(P2pError::Protocol(format!(
                         "unexpected response to ListTimelines: {:?}",
                         other
-                    )))
+                    )));
                 }
             }
         }
@@ -926,9 +923,7 @@ pub fn fetch_into_with_policy(
 
     let mut leaves_imported = 0usize;
     let mut blobs_imported = 0usize;
-    let mut head_b3_hex: Option<String> = None;
-
-    loop {
+    let head_b3_hex: Option<String> = loop {
         match chan.recv()? {
             Message::Bundle { leaves, blobs } => {
                 for wl in leaves {
@@ -941,18 +936,17 @@ pub fn fetch_into_with_policy(
                 }
             }
             Message::Done { head_b3_hex: head } => {
-                head_b3_hex = Some(head);
-                break;
+                break Some(head);
             }
             Message::Error { message } => return Err(P2pError::Protocol(message)),
             other => {
                 return Err(P2pError::Protocol(format!(
                     "unexpected message: {:?}",
                     other
-                )))
+                )));
             }
         }
-    }
+    };
     chan.shutdown();
 
     // Materialize the working tree from the imported head.
@@ -964,11 +958,7 @@ pub fn fetch_into_with_policy(
         .get_leaf(head_idx)
         .map_err(|e| P2pError::Io(e.to_string()))?
         .ok_or_else(|| P2pError::Protocol("imported head leaf missing".into()))?;
-    let workspace = crate::workspace::Workspace::new(
-        &cas,
-        target_dir,
-        &target_dir.join(".ivaldi"),
-    );
+    let workspace = crate::workspace::Workspace::new(&cas, target_dir, target_dir.join(".ivaldi"));
     workspace
         .materialize(head_leaf.tree_root)
         .map_err(|e| P2pError::Io(e.to_string()))?;
@@ -998,14 +988,12 @@ fn enforce_tofu(
     remote: &[u8; crate::identity::KEY_LEN],
     policy: crate::known_peers::TofuPolicy,
 ) -> Result<(), P2pError> {
-    use crate::known_peers::{fingerprint, Known, KnownPeers, TofuPolicy};
+    use crate::known_peers::{Known, KnownPeers, TofuPolicy, fingerprint};
 
     let Some(store) = KnownPeers::default_for_user() else {
         // No HOME — fall through without TOFU. Identity files won't have
         // worked either; treat as "skipped" rather than fatal.
-        crate::logging::warn(
-            "no $HOME — skipping TOFU check; consider setting IVALDI_KNOWN_PEERS",
-        );
+        crate::logging::warn("no $HOME — skipping TOFU check; consider setting IVALDI_KNOWN_PEERS");
         return Ok(());
     };
 
@@ -1037,10 +1025,7 @@ fn enforce_tofu(
                 fingerprint(remote),
             ))),
             TofuPolicy::Prompt => {
-                eprintln!(
-                    "First connection to {}:{}.",
-                    url.host, url.port
-                );
+                eprintln!("First connection to {}:{}.", url.host, url.port);
                 eprintln!("  pubkey fingerprint: {}", fingerprint(remote));
                 eprint!("Trust this peer? [y/N] ");
                 use std::io::Write;
@@ -1049,8 +1034,7 @@ fn enforce_tofu(
                 std::io::stdin()
                     .read_line(&mut line)
                     .map_err(|e| P2pError::Io(e.to_string()))?;
-                if line.trim().eq_ignore_ascii_case("y")
-                    || line.trim().eq_ignore_ascii_case("yes")
+                if line.trim().eq_ignore_ascii_case("y") || line.trim().eq_ignore_ascii_case("yes")
                 {
                     store
                         .record(&url.host, url.port, remote)
@@ -1065,11 +1049,7 @@ fn enforce_tofu(
     }
 }
 
-fn apply_leaf(
-    repo: &mut crate::repo::Repo,
-    timeline: &str,
-    wl: &WireLeaf,
-) -> Result<(), P2pError> {
+fn apply_leaf(repo: &mut crate::repo::Repo, timeline: &str, wl: &WireLeaf) -> Result<(), P2pError> {
     let leaf = crate::leaf::parse_leaf(&wl.canonical)
         .map_err(|e| P2pError::Protocol(format!("parse leaf: {}", e)))?;
     repo.commit_raw(leaf, timeline)
@@ -1120,9 +1100,7 @@ pub fn push_to(
     let head_idx = repo
         .get_timeline_head(timeline)
         .map_err(|e| P2pError::Io(e.to_string()))?
-        .ok_or_else(|| {
-            P2pError::Protocol(format!("local timeline '{}' has no head", timeline))
-        })?;
+        .ok_or_else(|| P2pError::Protocol(format!("local timeline '{}' has no head", timeline)))?;
 
     let mut chan = Channel::connect(url.socket_addr(), identity)?;
     enforce_tofu(url, &chan.remote_static, tofu)?;
@@ -1156,8 +1134,8 @@ pub fn push_to(
 
     use crate::cas::{Cas, FileCas};
     use crate::fsmerkle::FsStore;
-    let cas = FileCas::new(repo.ivaldi_dir.join("objects"))
-        .map_err(|e| P2pError::Io(e.to_string()))?;
+    let cas =
+        FileCas::new(repo.ivaldi_dir.join("objects")).map_err(|e| P2pError::Io(e.to_string()))?;
     let store = FsStore::new(&cas);
 
     let mut object_hashes: BTreeSet<crate::hash::B3Hash> = BTreeSet::new();
@@ -1258,7 +1236,9 @@ mod tests {
     fn tofu_guard() -> std::sync::MutexGuard<'static, ()> {
         use std::sync::{Mutex, OnceLock};
         static GATE: OnceLock<Mutex<()>> = OnceLock::new();
-        GATE.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+        GATE.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Run `f` with `IVALDI_KNOWN_PEERS` pointing at a fresh tempfile.
@@ -1349,8 +1329,7 @@ mod tests {
         crate::forge::forge(server_dir.path()).unwrap();
         {
             let mut server_repo = crate::repo::Repo::open(server_dir.path()).unwrap();
-            let cas =
-                crate::cas::FileCas::new(server_dir.path().join(".ivaldi/objects")).unwrap();
+            let cas = crate::cas::FileCas::new(server_dir.path().join(".ivaldi/objects")).unwrap();
             let store = crate::fsmerkle::FsStore::new(&cas);
             let (blob_hash, _) = store.put_blob(b"hello p2p").unwrap();
             use crate::fsmerkle::{Entry, MODE_FILE, NodeKind};
@@ -1473,8 +1452,7 @@ mod tests {
         let bob_head_blake3;
         {
             let mut bob_repo = crate::repo::Repo::open(bob_dir.path()).unwrap();
-            let cas =
-                crate::cas::FileCas::new(bob_dir.path().join(".ivaldi/objects")).unwrap();
+            let cas = crate::cas::FileCas::new(bob_dir.path().join(".ivaldi/objects")).unwrap();
             let store = crate::fsmerkle::FsStore::new(&cas);
             let (blob_hash, _) = store.put_blob(b"bob's contribution").unwrap();
             use crate::fsmerkle::{Entry, MODE_FILE, NodeKind};
@@ -1540,12 +1518,12 @@ mod tests {
         // Inspect Alice's shared repo handle. Wait briefly for the
         // server worker to release the mutex after replying PushAccepted.
         for _ in 0..50 {
-            if let Ok(g) = alice_repo_arc.try_lock() {
-                if let Ok(Some(idx)) = g.get_timeline_head("peers/bob/main") {
-                    let leaf = g.get_leaf(idx).unwrap().unwrap();
-                    assert_eq!(leaf.hash(), bob_head_blake3);
-                    return;
-                }
+            if let Ok(g) = alice_repo_arc.try_lock()
+                && let Ok(Some(idx)) = g.get_timeline_head("peers/bob/main")
+            {
+                let leaf = g.get_leaf(idx).unwrap().unwrap();
+                assert_eq!(leaf.hash(), bob_head_blake3);
+                return;
             }
             std::thread::sleep(std::time::Duration::from_millis(30));
         }
@@ -1562,8 +1540,7 @@ mod tests {
         crate::forge::forge(server_dir.path()).unwrap();
         {
             let mut server_repo = crate::repo::Repo::open(server_dir.path()).unwrap();
-            let cas =
-                crate::cas::FileCas::new(server_dir.path().join(".ivaldi/objects")).unwrap();
+            let cas = crate::cas::FileCas::new(server_dir.path().join(".ivaldi/objects")).unwrap();
             let store = crate::fsmerkle::FsStore::new(&cas);
             let (blob_hash, _) = store.put_blob(b"concurrent body").unwrap();
             use crate::fsmerkle::{Entry, MODE_FILE, NodeKind};

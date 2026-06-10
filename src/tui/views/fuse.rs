@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::fuse::Strategy;
 use crate::hash::B3Hash;
-use crate::tui::resolver::{ConflictItem, Resolution, CHOICES};
+use crate::tui::resolver::{CHOICES, ConflictItem, Resolution};
 use crate::tui::theme::Theme;
 use crate::tui::types::{Action, AppContext};
 use crate::tui::views::TabView;
@@ -46,6 +46,12 @@ pub struct FuseView {
     merge_conflicts: Vec<String>,
     confirm_abort: bool,
     pending: Option<PendingFuse>,
+}
+
+impl Default for FuseView {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FuseView {
@@ -115,13 +121,8 @@ impl FuseView {
         let theirs = self.load_tree_map(ctx, their_tree);
 
         let store = crate::fsmerkle::FsStore::new(&ctx.repo.cas);
-        let result = crate::fuse::FuseEngine::fuse(
-            &store,
-            &base,
-            &ours,
-            &theirs,
-            self.current_strategy(),
-        );
+        let result =
+            crate::fuse::FuseEngine::fuse(&store, &base, &ours, &theirs, self.current_strategy());
 
         if result.success {
             return self.commit_merged(ctx, &result.merged_files, &source_name, &current);
@@ -188,18 +189,18 @@ impl FuseView {
                 return self.abort_resolver(ctx);
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if let Some(p) = self.pending.as_mut() {
-                    if p.cursor > 0 {
-                        p.cursor -= 1;
-                    }
+                if let Some(p) = self.pending.as_mut()
+                    && p.cursor > 0
+                {
+                    p.cursor -= 1;
                 }
                 return Action::Consumed;
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if let Some(p) = self.pending.as_mut() {
-                    if p.cursor + 1 < CHOICES.len() {
-                        p.cursor += 1;
-                    }
+                if let Some(p) = self.pending.as_mut()
+                    && p.cursor + 1 < CHOICES.len()
+                {
+                    p.cursor += 1;
                 }
                 return Action::Consumed;
             }
@@ -302,11 +303,7 @@ impl FuseView {
         self.commit_merged(ctx, &final_map, &p.source_name, &p.target_name)
     }
 
-    fn load_tree_map(
-        &self,
-        ctx: &AppContext,
-        tree_hash: B3Hash,
-    ) -> BTreeMap<String, B3Hash> {
+    fn load_tree_map(&self, ctx: &AppContext, tree_hash: B3Hash) -> BTreeMap<String, B3Hash> {
         let store = crate::fsmerkle::FsStore::new(&ctx.repo.cas);
         let mut map = BTreeMap::new();
         let _ = Self::collect_tree(&store, tree_hash, "", &mut map);
@@ -344,8 +341,15 @@ impl FuseView {
             format!(" Resolve conflicts — {}/{} decided", resolved, total),
             theme.title,
         ))
-        .block(Block::default().borders(Borders::ALL).title(" Fuse Resolver "));
-        let header_area = Rect { height: 3.min(area.height), ..area };
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Fuse Resolver "),
+        );
+        let header_area = Rect {
+            height: 3.min(area.height),
+            ..area
+        };
         frame.render_widget(header, header_area);
 
         if let Some(conflict) = p.conflicts.get(p.current) {
@@ -373,7 +377,10 @@ impl FuseView {
                     ),
                     theme.warning,
                 )),
-                Line::from(Span::styled(format!(" {}", conflict.description), theme.dim)),
+                Line::from(Span::styled(
+                    format!(" {}", conflict.description),
+                    theme.dim,
+                )),
             ])
             .block(Block::default().borders(Borders::ALL));
             frame.render_widget(text, conflict_area);
@@ -401,8 +408,11 @@ impl FuseView {
                 ListItem::new(Span::styled(text, style))
             })
             .collect();
-        let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" Choose resolution "));
+        let list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Choose resolution "),
+        );
         frame.render_widget(list, choices_area);
 
         // Footer help.
@@ -733,8 +743,7 @@ mod tests {
             ("d.txt".to_string(), Resolution::Skip),
         ];
 
-        let (final_map, skipped) =
-            apply_resolutions(&store, &merged, &ours, &theirs, &resolutions);
+        let (final_map, skipped) = apply_resolutions(&store, &merged, &ours, &theirs, &resolutions);
 
         // Skip leaves the file unresolved and out of the committed map.
         assert_eq!(skipped, vec!["d.txt".to_string()]);
