@@ -77,6 +77,16 @@ impl Portal {
         format!("{}/{}", self.owner, self.repo)
     }
 
+    /// Case-insensitive match against an "owner/repo" string.
+    ///
+    /// Owner and repo names are case-insensitive on GitHub/GitLab (the host
+    /// redirects `Owner/Repo` to its canonical casing), so portal lookups
+    /// must be too — otherwise `Owner/Repo` and `owner/repo` would be treated
+    /// as distinct portals, producing failed lookups and silent duplicates.
+    pub fn matches_repr(&self, owner_repo: &str) -> bool {
+        self.to_string_repr().eq_ignore_ascii_case(owner_repo)
+    }
+
     /// Set the platform.
     pub fn with_platform(mut self, platform: Platform) -> Self {
         self.platform = platform;
@@ -265,7 +275,7 @@ impl PortalManager {
     pub fn add(&self, portal: &Portal) -> Result<bool, PortalError> {
         let mut portals = self.list()?;
         let key = portal.to_string_repr();
-        if portals.iter().any(|p| p.to_string_repr() == key) {
+        if portals.iter().any(|p| p.matches_repr(&key)) {
             return Ok(false);
         }
         portals.push(portal.clone());
@@ -277,7 +287,7 @@ impl PortalManager {
     pub fn remove(&self, owner_repo: &str) -> Result<bool, PortalError> {
         let mut portals = self.list()?;
         let before = portals.len();
-        portals.retain(|p| p.to_string_repr() != owner_repo);
+        portals.retain(|p| !p.matches_repr(owner_repo));
         if portals.len() == before {
             return Ok(false);
         }
@@ -331,7 +341,7 @@ impl PortalManager {
         Ok(self
             .list()?
             .into_iter()
-            .find(|p| p.to_string_repr() == owner_repo))
+            .find(|p| p.matches_repr(owner_repo)))
     }
 
     fn save(&self, portals: &[Portal]) -> Result<(), PortalError> {
@@ -557,6 +567,19 @@ mod tests {
     }
 
     #[test]
+    fn portal_parse_url_with_underscores() {
+        let p = Portal::parse("https://github.com/owner/repo_name.git").unwrap();
+        assert_eq!(p.owner, "owner");
+        assert_eq!(p.repo, "repo_name");
+        assert_eq!(p.platform, Platform::GitHub);
+
+        // Underscores in both segments, and without the .git suffix.
+        let p = Portal::parse("https://github.com/my_org/my_repo_name").unwrap();
+        assert_eq!(p.owner, "my_org");
+        assert_eq!(p.repo, "my_repo_name");
+    }
+
+    #[test]
     fn add_and_list() {
         let (_dir, mgr) = setup();
         let portal = Portal::parse("owner/repo").unwrap();
@@ -575,6 +598,40 @@ mod tests {
         assert!(mgr.add(&portal).unwrap());
         assert!(!mgr.add(&portal).unwrap()); // duplicate
         assert_eq!(mgr.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn add_duplicate_is_case_insensitive() {
+        let (_dir, mgr) = setup();
+
+        assert!(mgr.add(&Portal::parse("Owner/Repo").unwrap()).unwrap());
+        // Same repo, different casing — must be rejected as a duplicate.
+        assert!(!mgr.add(&Portal::parse("owner/repo").unwrap()).unwrap());
+        assert!(!mgr.add(&Portal::parse("OWNER/REPO").unwrap()).unwrap());
+        let list = mgr.list().unwrap();
+        assert_eq!(list.len(), 1);
+        // Original casing is preserved on disk.
+        assert_eq!(list[0].to_string_repr(), "Owner/Repo");
+    }
+
+    #[test]
+    fn remove_is_case_insensitive() {
+        let (_dir, mgr) = setup();
+        mgr.add(&Portal::parse("Owner/Repo").unwrap()).unwrap();
+
+        assert!(mgr.remove("owner/repo").unwrap());
+        assert!(mgr.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_is_case_insensitive() {
+        let (_dir, mgr) = setup();
+        mgr.add(&Portal::parse("Owner/Repo").unwrap()).unwrap();
+
+        assert!(mgr.get("owner/repo").unwrap().is_some());
+        assert!(mgr.get("OWNER/REPO").unwrap().is_some());
+        assert!(mgr.get("Owner/Repo").unwrap().is_some());
+        assert!(mgr.get("other/repo").unwrap().is_none());
     }
 
     #[test]
