@@ -555,6 +555,9 @@ mod tests {
         let after_body = &objects.get(&after_sha).unwrap().body;
         let contains = |needle: &[u8]| after_body.windows(needle.len()).any(|w| w == needle);
         assert!(contains(b"100644 a.txt\0"), "kept file present");
-        assert!(!contains(b"b.txt\0"), "deleted file absent from exported tree");
+        assert!(
+            !contains(b"b.txt\0"),
+            "deleted file absent from exported tree"
+        );
     }
 }
