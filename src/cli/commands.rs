@@ -368,23 +368,48 @@ fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
         }
     }
 
+    // Classify gathered paths against the parent tree so we stage and report
+    // only real changes — added or modified — rather than every file in the
+    // workspace. Files identical to the last seal are dropped from staging:
+    // `build_seal_tree` inherits untouched files from the parent tree, so
+    // staging them changes nothing and only adds noise here and in `status`.
+    let mut added: Vec<String> = Vec::new();
+    let mut modified: Vec<String> = Vec::new();
+    for path in &all_gathered {
+        let staged_hash = ws.staging.staged_files().get(path).copied();
+        match parent_tree_files.get(path) {
+            None => added.push(path.clone()),
+            Some(parent_hash) => {
+                if staged_hash.as_ref() == Some(parent_hash) {
+                    ws.staging.unstage(path);
+                } else {
+                    modified.push(path.clone());
+                }
+            }
+        }
+    }
+
     ws.save().map_err(|e| e.to_string())?;
 
     if !quiet {
-        for file in &all_gathered {
-            println!("  gathered: {}", file);
+        for file in &added {
+            println!("  added:    {}", file);
+        }
+        for file in &modified {
+            println!("  modified: {}", file);
         }
         for file in &all_deleted {
             println!("  removed:  {}", file);
         }
-        let total = all_gathered.len() + all_deleted.len();
-        if all_deleted.is_empty() {
-            println!("{} file(s) staged", total);
+        let total = added.len() + modified.len() + all_deleted.len();
+        if total == 0 {
+            println!("Nothing to gather — workspace matches the last seal.");
         } else {
             println!(
-                "{} file(s) staged ({} added, {} deleted)",
+                "{} change(s) staged ({} added, {} modified, {} deleted)",
                 total,
-                all_gathered.len(),
+                added.len(),
+                modified.len(),
                 all_deleted.len()
             );
         }
@@ -3073,7 +3098,6 @@ fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<(), String> {
 fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
     use crate::github::GitHubClient;
     use crate::portal::Transport;
-    use crate::sync;
 
     let mut repo = open_repo()?;
 
@@ -3181,23 +3205,52 @@ fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
         }
     }
 
-    let result = sync::upload(
-        &client,
-        &repo,
-        &portal.owner,
-        &portal.repo,
-        args.branch.as_deref(),
-        args.force,
-    )
-    .map_err(|e| e.to_string())?;
+    // Push the timeline as a single packfile over smart-HTTP
+    // `git-receive-pack` (one request), instead of the old per-object REST
+    // upload that fired hundreds of requests and tripped GitHub's rate limit.
+    let timeline = args
+        .branch
+        .clone()
+        .unwrap_or_else(|| repo.current_timeline().unwrap_or_else(|_| "main".into()));
 
+    let report = crate::git_remote::SmartHttpClient::new(client.token())
+        .push_repo(
+            &mut repo,
+            &portal.owner,
+            &portal.repo,
+            &timeline,
+            args.force,
+        )
+        .map_err(|e| e.to_string())?;
+
+    if !report.unpack_ok {
+        return Err(format!(
+            "remote rejected pack: {}",
+            report.unpack_error.unwrap_or_else(|| "unknown".into())
+        ));
+    }
+    let mut had_failure = false;
+    for r in &report.refs {
+        match &r.error {
+            Some(reason) => {
+                println!("  {} REJECTED: {}", r.name, reason);
+                had_failure = true;
+            }
+            None => {
+                if !quiet {
+                    println!("  {} updated", r.name);
+                }
+            }
+        }
+    }
+    if had_failure {
+        return Err("one or more refs were rejected".into());
+    }
     if !quiet {
         println!(
-            "Uploaded to {}/{} (branch: {})",
-            portal.owner, portal.repo, result.branch
+            "Uploaded timeline '{}' to {}/{}.",
+            timeline, portal.owner, portal.repo
         );
-        println!("  {} files uploaded", result.files_uploaded);
-        println!("  commit: {}", result.commit_sha);
     }
     Ok(())
 }

@@ -107,7 +107,7 @@ impl SmartHttpClient {
         branch: Option<&str>,
     ) -> Result<FetchResult, GitRemoteError> {
         let base = format!("{}/{}/{}.git", GITHUB_BASE, owner, repo);
-        let discovery = self.discover_refs(&base)?;
+        let discovery = self.discover_refs(&base, "git-upload-pack")?;
         let (branch_name, head_sha) = select_branch_from_discovery(&discovery, branch)?;
         let pack = self.fetch_pack(&base, &head_sha)?;
         let objects = parse_packfile(&pack)?;
@@ -126,7 +126,7 @@ impl SmartHttpClient {
         repo: &str,
     ) -> Result<Vec<RemoteBranch>, GitRemoteError> {
         let base = format!("{}/{}/{}.git", GITHUB_BASE, owner, repo);
-        let discovery = self.discover_refs(&base)?;
+        let discovery = self.discover_refs(&base, "git-upload-pack")?;
         let mut branches: Vec<RemoteBranch> = discovery
             .refs
             .into_iter()
@@ -150,15 +150,18 @@ impl SmartHttpClient {
             .collect())
     }
 
-    fn discover_refs(&self, base: &str) -> Result<Discovery, GitRemoteError> {
+    /// Fetch the smart-HTTP ref advertisement for `service`
+    /// (`git-upload-pack` for fetch, `git-receive-pack` for push).
+    fn discover_refs(&self, base: &str, service: &str) -> Result<Discovery, GitRemoteError> {
         let pb = progress::spinner("Discovering remote refs");
-        let url = format!("{}/info/refs?service=git-upload-pack", base);
+        let url = format!("{}/info/refs?service={}", base, service);
+        let accept = format!("application/x-{}-advertisement", service);
         let do_call =
             |token: Option<&str>| -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
                 let mut r = self
                     .agent
                     .get(&url)
-                    .header("Accept", "application/x-git-upload-pack-advertisement")
+                    .header("Accept", accept.as_str())
                     .header("User-Agent", "ivaldi-vcs/0.1.0");
                 if let Some(t) = token {
                     r = r.header("Authorization", basic_auth_header(t));
@@ -284,6 +287,143 @@ impl SmartHttpClient {
             pb.finish_with_message(format!("Pack downloaded ({} bytes)", bytes.len()));
         }
         extract_pack_from_upload_pack(&bytes)
+    }
+
+    /// Push `branch`'s history to a Git-compatible server over smart-HTTP
+    /// `git-receive-pack`.
+    ///
+    /// Mirrors the SSH push path ([`crate::ssh_transport::SshClient::push_repo`])
+    /// but over HTTPS: translate the Ivaldi leaf chain into git objects, pack
+    /// them into a single packfile, and POST it in one request. This replaces
+    /// the old per-object GitHub REST upload, which fired one HTTP request per
+    /// blob/tree/commit and tripped GitHub's secondary rate limit.
+    pub fn push_repo(
+        &self,
+        repo: &mut crate::repo::Repo,
+        owner: &str,
+        repo_name: &str,
+        branch: &str,
+        force: bool,
+    ) -> Result<PushReport, GitRemoteError> {
+        use crate::remote::HashMapping;
+        use std::collections::BTreeSet;
+
+        let base = format!("{}/{}/{}.git", GITHUB_BASE, owner, repo_name);
+
+        // ---- Resolve local head.
+        let head_idx = repo
+            .get_timeline_head(branch)
+            .map_err(|e| GitRemoteError::Io(e.to_string()))?
+            .ok_or_else(|| {
+                GitRemoteError::Protocol(format!("local timeline '{}' has no head", branch))
+            })?;
+
+        // ---- Discover the remote's receive-pack advertisement.
+        let discovery = self.discover_refs(&base, "git-receive-pack")?;
+        let target_ref = format!("refs/heads/{}", branch);
+        let zero = "0".repeat(40);
+        let old_sha1 = discovery
+            .refs
+            .iter()
+            .find(|r| r.name == target_ref)
+            .map(|r| r.id.clone())
+            .unwrap_or_else(|| zero.clone());
+
+        // SHA-1s the server already advertised, so the exporter only skips
+        // ancestors actually present on this remote.
+        let server_has: BTreeSet<[u8; 20]> = discovery
+            .refs
+            .iter()
+            .filter(|r| r.id != zero)
+            .filter_map(|r| {
+                let raw = hex::decode(&r.id).ok()?;
+                (raw.len() == 20).then(|| {
+                    let mut b = [0u8; 20];
+                    b.copy_from_slice(&raw);
+                    b
+                })
+            })
+            .collect();
+
+        // ---- Translate Ivaldi history to git objects.
+        let mapping = HashMapping::new(&repo.ivaldi_dir);
+        let export = crate::git_export::export_chain(repo, head_idx, &mapping, &server_has)
+            .map_err(|e| GitRemoteError::Protocol(format!("git export: {}", e)))?;
+        if export.objects.is_empty() {
+            return Err(GitRemoteError::Protocol(
+                "nothing to push: every commit on this branch is already on the remote".into(),
+            ));
+        }
+        let new_sha1_hex = hex::encode(export.tip_sha1);
+        if new_sha1_hex == old_sha1 {
+            return Err(GitRemoteError::Protocol(
+                "nothing to push: remote tip already matches local tip".into(),
+            ));
+        }
+
+        // ---- Build the request body: command pkt-line + flush + packfile.
+        // `report-status` makes the server tell us the outcome. We do not
+        // request side-band-64k, so the response is plain pkt-lines.
+        let mut command_line = format!("{} {} {}", old_sha1, new_sha1_hex, target_ref);
+        command_line.push('\0');
+        command_line.push_str("report-status agent=ivaldi/0.1.0");
+        command_line.push('\n');
+        // Force vs. non-fast-forward is enforced server-side (GitHub decides
+        // based on branch protection); there is no extra wire flag to set.
+        let _ = force;
+
+        let mut body = Vec::new();
+        body.extend(pkt_line(&command_line));
+        body.extend_from_slice(b"0000");
+        let mut object_refs: Vec<&crate::git_export::GitObject> = export.objects.values().collect();
+        object_refs.sort_by_key(|o| o.sha1);
+        let pack = crate::git_pack_writer::write_pack(&object_refs)
+            .map_err(|e| GitRemoteError::Protocol(e.to_string()))?;
+        body.extend_from_slice(&pack);
+
+        // ---- Send it in one request and parse the report-status reply.
+        let pb = progress::spinner("Uploading pack");
+        let response = self.post_receive_pack(&base, &body)?;
+        pb.finish_with_message(format!("Pack uploaded ({} objects)", export.objects.len()));
+        let report = parse_report_status(&response)?;
+
+        // Record the new mapping locally on full success so the next push can
+        // short-circuit. Non-fatal if the save fails.
+        if report.unpack_ok
+            && report.refs.iter().all(|r| r.error.is_none())
+            && let Ok(Some(leaf)) = repo.get_leaf(head_idx)
+        {
+            let mut mapping = HashMapping::new(&repo.ivaldi_dir);
+            mapping.insert(&new_sha1_hex, leaf.hash());
+            let _ = mapping.save();
+        }
+
+        Ok(report)
+    }
+
+    /// POST a `git-receive-pack` request body and return the raw response
+    /// bytes (the `report-status` pkt-line block).
+    fn post_receive_pack(&self, base: &str, body: &[u8]) -> Result<Vec<u8>, GitRemoteError> {
+        let url = format!("{}/git-receive-pack", base);
+        let mut r = self
+            .agent
+            .post(&url)
+            .header("Content-Type", "application/x-git-receive-pack-request")
+            .header("Accept", "application/x-git-receive-pack-result")
+            .header("User-Agent", "ivaldi-vcs/0.1.0");
+        if let Some(t) = self.token.as_deref() {
+            r = r.header("Authorization", basic_auth_header(t));
+        }
+        let resp = r.send(body).map_err(map_transport_error)?;
+        if !resp.status().is_success() {
+            return Err(map_response_error(resp));
+        }
+        let mut bytes = Vec::new();
+        resp.into_body()
+            .into_reader()
+            .read_to_end(&mut bytes)
+            .map_err(|e| GitRemoteError::Io(e.to_string()))?;
+        Ok(bytes)
     }
 }
 
@@ -504,6 +644,109 @@ fn parse_pkt_lines(data: &[u8]) -> Result<Vec<Option<Vec<u8>>>, GitRemoteError> 
         return Err(GitRemoteError::Protocol(
             "trailing bytes after pkt-lines".into(),
         ));
+    }
+    Ok(out)
+}
+
+/// One ref's outcome from `git-receive-pack`'s report-status block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushedRef {
+    pub name: String,
+    /// `Some(reason)` if the server rejected this ref's update.
+    pub error: Option<String>,
+}
+
+/// Parsed `report-status` response. The `unpack_ok` flag covers the
+/// pack-receipt phase; `refs` carries one entry per pushed ref.
+#[derive(Debug, Clone)]
+pub struct PushReport {
+    pub unpack_ok: bool,
+    pub unpack_error: Option<String>,
+    pub refs: Vec<PushedRef>,
+}
+
+/// Parse a `report-status` block from `git-receive-pack` (shared by the SSH
+/// and smart-HTTP push paths). Format per gitprotocol-pack(5):
+///
+/// ```text
+///   "unpack ok\n" | "unpack <error>\n"
+///   ( "ok <ref>\n" | "ng <ref> <reason>\n" )*
+///   flush-pkt
+/// ```
+pub(crate) fn parse_report_status(data: &[u8]) -> Result<PushReport, GitRemoteError> {
+    let lines = parse_pkt_text_lines(data)?;
+    let mut iter = lines.into_iter();
+
+    let first = iter
+        .next()
+        .ok_or_else(|| GitRemoteError::Protocol("empty receive-pack report".into()))?;
+    let (unpack_ok, unpack_error) = if first == "unpack ok" {
+        (true, None)
+    } else if let Some(rest) = first.strip_prefix("unpack ") {
+        (false, Some(rest.to_string()))
+    } else {
+        return Err(GitRemoteError::Protocol(format!(
+            "unexpected receive-pack first line: {:?}",
+            first
+        )));
+    };
+
+    let mut refs = Vec::new();
+    for line in iter {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("ok ") {
+            refs.push(PushedRef {
+                name: rest.to_string(),
+                error: None,
+            });
+        } else if let Some(rest) = line.strip_prefix("ng ") {
+            // "ng <ref> <reason>"
+            let mut parts = rest.splitn(2, ' ');
+            let name = parts.next().unwrap_or_default().to_string();
+            let reason = parts.next().unwrap_or("rejected").to_string();
+            refs.push(PushedRef {
+                name,
+                error: Some(reason),
+            });
+        }
+        // Anything else we ignore — receive-pack also sends progress
+        // sideband when `side-band-64k` was negotiated; we didn't ask
+        // for it but be lenient.
+    }
+    Ok(PushReport {
+        unpack_ok,
+        unpack_error,
+        refs,
+    })
+}
+
+/// Read pkt-lines and return their UTF-8 payloads (newline-stripped).
+/// Flush packets terminate the stream.
+fn parse_pkt_text_lines(data: &[u8]) -> Result<Vec<String>, GitRemoteError> {
+    let mut idx = 0usize;
+    let mut out = Vec::new();
+    while idx + 4 <= data.len() {
+        let len_hex = std::str::from_utf8(&data[idx..idx + 4])
+            .map_err(|_| GitRemoteError::Protocol("invalid pkt-line length".into()))?;
+        idx += 4;
+        let len = usize::from_str_radix(len_hex, 16)
+            .map_err(|_| GitRemoteError::Protocol("invalid pkt-line length".into()))?;
+        if len == 0 {
+            // flush — stop here even if more data follows
+            break;
+        }
+        if len < 4 || idx + (len - 4) > data.len() {
+            return Err(GitRemoteError::Protocol("truncated pkt-line".into()));
+        }
+        let payload = &data[idx..idx + (len - 4)];
+        idx += len - 4;
+        let text = std::str::from_utf8(payload)
+            .map_err(|_| GitRemoteError::Protocol("non-UTF-8 pkt-line text".into()))?
+            .trim_end_matches('\n')
+            .to_string();
+        out.push(text);
     }
     Ok(out)
 }
@@ -1509,6 +1752,59 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[0].as_deref(), Some(b"hello\n".as_slice()));
         assert!(lines[1].is_none());
+    }
+
+    fn pkt(payload: &str) -> Vec<u8> {
+        pkt_line(payload)
+    }
+
+    #[test]
+    fn parse_report_status_unpack_ok_with_one_ref() {
+        let mut bytes = Vec::new();
+        bytes.extend(pkt("unpack ok\n"));
+        bytes.extend(pkt("ok refs/heads/main\n"));
+        bytes.extend(b"0000");
+        let r = parse_report_status(&bytes).unwrap();
+        assert!(r.unpack_ok);
+        assert!(r.unpack_error.is_none());
+        assert_eq!(r.refs.len(), 1);
+        assert_eq!(r.refs[0].name, "refs/heads/main");
+        assert!(r.refs[0].error.is_none());
+    }
+
+    #[test]
+    fn parse_report_status_unpack_failure() {
+        let mut bytes = Vec::new();
+        bytes.extend(pkt("unpack invalid pack\n"));
+        bytes.extend(b"0000");
+        let r = parse_report_status(&bytes).unwrap();
+        assert!(!r.unpack_ok);
+        assert_eq!(r.unpack_error.as_deref(), Some("invalid pack"));
+        assert!(r.refs.is_empty());
+    }
+
+    #[test]
+    fn parse_report_status_per_ref_ng_with_reason() {
+        let mut bytes = Vec::new();
+        bytes.extend(pkt("unpack ok\n"));
+        bytes.extend(pkt("ng refs/heads/main non-fast-forward\n"));
+        bytes.extend(pkt("ok refs/heads/feat\n"));
+        bytes.extend(b"0000");
+        let r = parse_report_status(&bytes).unwrap();
+        assert!(r.unpack_ok);
+        assert_eq!(r.refs.len(), 2);
+        assert_eq!(r.refs[0].name, "refs/heads/main");
+        assert_eq!(r.refs[0].error.as_deref(), Some("non-fast-forward"));
+        assert_eq!(r.refs[1].name, "refs/heads/feat");
+        assert!(r.refs[1].error.is_none());
+    }
+
+    #[test]
+    fn parse_report_status_rejects_garbage_first_line() {
+        let mut bytes = Vec::new();
+        bytes.extend(pkt("garbage\n"));
+        bytes.extend(b"0000");
+        assert!(parse_report_status(&bytes).is_err());
     }
 
     #[test]

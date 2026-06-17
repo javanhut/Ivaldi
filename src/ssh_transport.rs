@@ -7,8 +7,9 @@
 //! `ssh` on the user's PATH already knows about their keys, agent,
 //! known_hosts, and config — anything we'd reimplement we'd implement worse.
 //!
-//! Push (`git-receive-pack`) is intentionally out of scope for this slice.
-//! See `src/sync.rs` for upload, which still goes through GitHub's REST API.
+//! Push (`git-receive-pack`) is implemented in [`SshClient::push_repo`]; the
+//! HTTPS equivalent lives in [`crate::git_remote::SmartHttpClient::push_repo`].
+//! Both share the report-status parsing in `git_remote`.
 //!
 //! Wire shape (fetch):
 //!
@@ -22,8 +23,8 @@ use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use crate::git_remote::{
-    FetchResult, GitRemoteError, extract_pack_from_upload_pack, parse_discovery, parse_packfile,
-    select_branch_from_discovery,
+    FetchResult, GitRemoteError, PushReport, extract_pack_from_upload_pack, parse_discovery,
+    parse_packfile, parse_report_status, select_branch_from_discovery,
 };
 use crate::progress;
 use crate::remote::RemoteBranch;
@@ -414,109 +415,6 @@ impl SshClient {
     }
 }
 
-/// One ref's outcome from `git-receive-pack`'s report-status block.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PushedRef {
-    pub name: String,
-    /// `Some(reason)` if the server rejected this ref's update.
-    pub error: Option<String>,
-}
-
-/// Parsed `report-status` response. The `unpack_ok` flag covers the
-/// pack-receipt phase; `refs` carries one entry per pushed ref.
-#[derive(Debug, Clone)]
-pub struct PushReport {
-    pub unpack_ok: bool,
-    pub unpack_error: Option<String>,
-    pub refs: Vec<PushedRef>,
-}
-
-/// Parse a `report-status` block from `git-receive-pack`. Format per
-/// gitprotocol-pack(5):
-///
-/// ```text
-///   "unpack ok\n" | "unpack <error>\n"
-///   ( "ok <ref>\n" | "ng <ref> <reason>\n" )*
-///   flush-pkt
-/// ```
-fn parse_report_status(data: &[u8]) -> Result<PushReport, GitRemoteError> {
-    let lines = parse_pkt_text_lines(data)?;
-    let mut iter = lines.into_iter();
-
-    let first = iter
-        .next()
-        .ok_or_else(|| GitRemoteError::Protocol("empty receive-pack report".into()))?;
-    let (unpack_ok, unpack_error) = if first == "unpack ok" {
-        (true, None)
-    } else if let Some(rest) = first.strip_prefix("unpack ") {
-        (false, Some(rest.to_string()))
-    } else {
-        return Err(GitRemoteError::Protocol(format!(
-            "unexpected receive-pack first line: {:?}",
-            first
-        )));
-    };
-
-    let mut refs = Vec::new();
-    for line in iter {
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("ok ") {
-            refs.push(PushedRef {
-                name: rest.to_string(),
-                error: None,
-            });
-        } else if let Some(rest) = line.strip_prefix("ng ") {
-            // "ng <ref> <reason>"
-            let mut parts = rest.splitn(2, ' ');
-            let name = parts.next().unwrap_or_default().to_string();
-            let reason = parts.next().unwrap_or("rejected").to_string();
-            refs.push(PushedRef {
-                name,
-                error: Some(reason),
-            });
-        }
-        // Anything else we ignore — receive-pack also sends progress
-        // sideband when `side-band-64k` was negotiated; we didn't ask
-        // for it but be lenient.
-    }
-    Ok(PushReport {
-        unpack_ok,
-        unpack_error,
-        refs,
-    })
-}
-
-/// Read pkt-lines and return their UTF-8 payloads (newline-stripped).
-/// Flush packets terminate the stream.
-fn parse_pkt_text_lines(data: &[u8]) -> Result<Vec<String>, GitRemoteError> {
-    let mut idx = 0usize;
-    let mut out = Vec::new();
-    while idx + 4 <= data.len() {
-        let len_hex = std::str::from_utf8(&data[idx..idx + 4])
-            .map_err(|_| GitRemoteError::Protocol("invalid pkt-line length".into()))?;
-        idx += 4;
-        let len = usize::from_str_radix(len_hex, 16)
-            .map_err(|_| GitRemoteError::Protocol("invalid pkt-line length".into()))?;
-        if len == 0 {
-            // flush — stop here even if more data follows
-            break;
-        }
-        if len < 4 || idx + (len - 4) > data.len() {
-            return Err(GitRemoteError::Protocol("truncated pkt-line".into()));
-        }
-        let payload = &data[idx..idx + (len - 4)];
-        idx += len - 4;
-        let text = std::str::from_utf8(payload)
-            .map_err(|_| GitRemoteError::Protocol("non-UTF-8 pkt-line text".into()))?
-            .trim_end_matches('\n')
-            .to_string();
-        out.push(text);
-    }
-    Ok(out)
-}
-
 /// Quote a single argument for `sh -c` execution on the remote side. Wraps
 /// in single quotes and escapes embedded single quotes the standard way.
 fn quote_repo_path(p: &str) -> String {
@@ -760,58 +658,5 @@ mod tests {
         };
         let pre = t.ssh_command_prefix();
         assert!(!pre.iter().any(|a| a == "-p"));
-    }
-
-    fn pkt(payload: &str) -> Vec<u8> {
-        crate::git_remote::pkt_line(payload)
-    }
-
-    #[test]
-    fn parse_report_status_unpack_ok_with_one_ref() {
-        let mut bytes = Vec::new();
-        bytes.extend(pkt("unpack ok\n"));
-        bytes.extend(pkt("ok refs/heads/main\n"));
-        bytes.extend(b"0000");
-        let r = parse_report_status(&bytes).unwrap();
-        assert!(r.unpack_ok);
-        assert!(r.unpack_error.is_none());
-        assert_eq!(r.refs.len(), 1);
-        assert_eq!(r.refs[0].name, "refs/heads/main");
-        assert!(r.refs[0].error.is_none());
-    }
-
-    #[test]
-    fn parse_report_status_unpack_failure() {
-        let mut bytes = Vec::new();
-        bytes.extend(pkt("unpack invalid pack\n"));
-        bytes.extend(b"0000");
-        let r = parse_report_status(&bytes).unwrap();
-        assert!(!r.unpack_ok);
-        assert_eq!(r.unpack_error.as_deref(), Some("invalid pack"));
-        assert!(r.refs.is_empty());
-    }
-
-    #[test]
-    fn parse_report_status_per_ref_ng_with_reason() {
-        let mut bytes = Vec::new();
-        bytes.extend(pkt("unpack ok\n"));
-        bytes.extend(pkt("ng refs/heads/main non-fast-forward\n"));
-        bytes.extend(pkt("ok refs/heads/feat\n"));
-        bytes.extend(b"0000");
-        let r = parse_report_status(&bytes).unwrap();
-        assert!(r.unpack_ok);
-        assert_eq!(r.refs.len(), 2);
-        assert_eq!(r.refs[0].name, "refs/heads/main");
-        assert_eq!(r.refs[0].error.as_deref(), Some("non-fast-forward"));
-        assert_eq!(r.refs[1].name, "refs/heads/feat");
-        assert!(r.refs[1].error.is_none());
-    }
-
-    #[test]
-    fn parse_report_status_rejects_garbage_first_line() {
-        let mut bytes = Vec::new();
-        bytes.extend(pkt("garbage\n"));
-        bytes.extend(b"0000");
-        assert!(parse_report_status(&bytes).is_err());
     }
 }

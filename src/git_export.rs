@@ -520,4 +520,41 @@ mod tests {
         assert!(contains(b"120000 link\0"), "symlink mode preserved");
         assert!(contains(b"100644 regular.txt\0"), "regular mode preserved");
     }
+
+    #[test]
+    fn deleted_file_is_absent_from_exported_tree() {
+        // A seal that removes a file produces a `tree_root` without that file
+        // (see `Workspace::build_seal_tree`). Export must faithfully emit a git
+        // tree that also omits it — that's how a deletion reaches the remote on
+        // push. Here we model the before/after trees directly and check the
+        // exported git tree drops the deleted entry (and changes SHA-1).
+        let dir = tempfile::tempdir().unwrap();
+        let cas = FileCas::new(dir.path().join("objects")).unwrap();
+        let store = FsStore::new(&cas);
+
+        let (a, _) = store.put_blob(b"a").unwrap();
+        let (b, _) = store.put_blob(b"b").unwrap();
+        let entry = |name: &str, hash| fsmerkle::Entry {
+            name: name.into(),
+            mode: fsmerkle::MODE_FILE,
+            kind: NodeKind::Blob,
+            hash,
+        };
+
+        let before = store
+            .put_tree(vec![entry("a.txt", a), entry("b.txt", b)])
+            .unwrap();
+        let after = store.put_tree(vec![entry("a.txt", a)]).unwrap(); // b.txt deleted
+
+        let mut cache = BTreeMap::new();
+        let mut objects: BTreeMap<[u8; 20], GitObject> = BTreeMap::new();
+        let before_sha = translate_tree(&store, before, &mut cache, &mut objects).unwrap();
+        let after_sha = translate_tree(&store, after, &mut cache, &mut objects).unwrap();
+
+        assert_ne!(before_sha, after_sha, "deletion must change the tree SHA-1");
+        let after_body = &objects.get(&after_sha).unwrap().body;
+        let contains = |needle: &[u8]| after_body.windows(needle.len()).any(|w| w == needle);
+        assert!(contains(b"100644 a.txt\0"), "kept file present");
+        assert!(!contains(b"b.txt\0"), "deleted file absent from exported tree");
+    }
 }

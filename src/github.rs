@@ -632,10 +632,10 @@ mod tests {
         assert!(is_secondary_limit_body(
             r#"{"message":"You have exceeded a secondary rate limit."}"#
         ));
-        assert!(is_secondary_limit_body("triggered an abuse detection mechanism"));
-        assert!(!is_secondary_limit_body(
-            r#"{"message":"Not Found"}"#
+        assert!(is_secondary_limit_body(
+            "triggered an abuse detection mechanism"
         ));
+        assert!(!is_secondary_limit_body(r#"{"message":"Not Found"}"#));
     }
 
     #[test]

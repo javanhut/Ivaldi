@@ -248,7 +248,9 @@ pub fn parse_repo_spec(input: &str) -> Result<RepoSpec, RepoSpecError> {
 /// path anchor, so anything that does is a mistake (commonly a shell that
 /// expanded a relative argument to an absolute path before passing it on).
 fn is_local_path(s: &str) -> bool {
-    s == "." || s == ".." || s == "~"
+    s == "."
+        || s == ".."
+        || s == "~"
         || s.starts_with('/')
         || s.starts_with("./")
         || s.starts_with("../")
@@ -607,7 +609,14 @@ mod tests {
 
     #[test]
     fn spec_rejects_relative_and_home_paths() {
-        for input in ["./owner/repo", "../owner/repo", "~/owner/repo", ".", "..", "~"] {
+        for input in [
+            "./owner/repo",
+            "../owner/repo",
+            "~/owner/repo",
+            ".",
+            "..",
+            "~",
+        ] {
             assert_eq!(
                 parse_repo_spec(input).unwrap_err(),
                 RepoSpecError::Invalid,
@@ -629,9 +638,15 @@ mod tests {
     #[test]
     fn spec_still_accepts_valid_forms_after_hardening() {
         // Guard against the hardening being too aggressive.
-        assert_eq!(parse_repo_spec("javanhut/JiraCli").unwrap().owner, "javanhut");
+        assert_eq!(
+            parse_repo_spec("javanhut/JiraCli").unwrap().owner,
+            "javanhut"
+        );
         assert_eq!(parse_repo_spec("javanhut/JiraCli").unwrap().repo, "JiraCli");
-        assert_eq!(parse_repo_spec("javanhut/JiraCli/").unwrap().repo, "JiraCli");
+        assert_eq!(
+            parse_repo_spec("javanhut/JiraCli/").unwrap().repo,
+            "JiraCli"
+        );
         assert_eq!(
             parse_repo_spec("https://github.com/torvalds/linux/tree/master")
                 .unwrap()

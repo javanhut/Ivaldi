@@ -288,10 +288,25 @@ impl RemoteView {
                     if !client.is_authenticated() {
                         return Err("Not authenticated".to_string());
                     }
-                    let repo = crate::repo::Repo::open(&work_dir).map_err(|e| e.to_string())?;
-                    crate::sync::upload(&client, &repo, &owner, &repo_name, None, false)
-                        .map(|r| format!("Upload complete: {}", r.branch))
-                        .map_err(|e| e.to_string())
+                    let mut repo = crate::repo::Repo::open(&work_dir).map_err(|e| e.to_string())?;
+                    let timeline = repo.current_timeline().map_err(|e| e.to_string())?;
+                    let report = crate::git_remote::SmartHttpClient::new(client.token())
+                        .push_repo(&mut repo, &owner, &repo_name, &timeline, false)
+                        .map_err(|e| e.to_string())?;
+                    if !report.unpack_ok {
+                        return Err(format!(
+                            "remote rejected pack: {}",
+                            report.unpack_error.unwrap_or_else(|| "unknown".into())
+                        ));
+                    }
+                    if let Some(r) = report.refs.iter().find(|r| r.error.is_some()) {
+                        return Err(format!(
+                            "{} rejected: {}",
+                            r.name,
+                            r.error.clone().unwrap_or_default()
+                        ));
+                    }
+                    Ok(format!("Upload complete: {}", timeline))
                 })();
                 let _ = tx.send(BgResult::UploadDone(result));
             });
