@@ -29,24 +29,51 @@ fn make_agent() -> ureq::Agent {
         .new_agent()
 }
 
+/// Maximum number of automatic retries when GitHub reports a *secondary*
+/// (abuse) rate limit. Each retry waits `Retry-After` (when supplied) or an
+/// escalating fixed delay, so this bounds the worst-case stall.
+const MAX_RATE_LIMIT_RETRIES: u32 = 5;
+
 fn header_str<'a>(resp: &'a ureq::http::Response<ureq::Body>, name: &str) -> Option<&'a str> {
     resp.headers().get(name).and_then(|v| v.to_str().ok())
 }
 
-fn check_status(
-    resp: ureq::http::Response<ureq::Body>,
-) -> Result<ureq::http::Response<ureq::Body>, GitHubError> {
-    let status = resp.status().as_u16();
-    if (200..300).contains(&status) {
-        return Ok(resp);
-    }
+/// Pull the human-readable `message` out of a GitHub JSON error body, falling
+/// back to the raw (trimmed) body when it isn't the expected shape.
+fn github_message(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.trim().to_string())
+}
+
+/// GitHub signals a secondary (abuse) rate limit either via a `Retry-After`
+/// header or a message in the body — the primary `X-RateLimit-Remaining`
+/// counter is NOT exhausted in that case.
+fn is_secondary_limit_body(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("secondary rate limit") || lower.contains("abuse")
+}
+
+/// Map a non-2xx response (already drained into `body`) to a `GitHubError`,
+/// surfacing GitHub's own message instead of a bare status code.
+fn classify_error(status: u16, primary_exhausted: bool, body: &str) -> GitHubError {
     if status == 401 {
-        return Err(GitHubError::AuthRequired);
+        return GitHubError::AuthRequired;
     }
-    if status == 403 && header_str(&resp, "X-RateLimit-Remaining") == Some("0") {
-        return Err(GitHubError::RateLimited);
+    if status == 403 && primary_exhausted {
+        return GitHubError::RateLimited;
     }
-    Err(GitHubError::Http(format!("HTTP {}", status)))
+    let msg = github_message(body);
+    if msg.is_empty() {
+        GitHubError::Http(format!("HTTP {}", status))
+    } else {
+        GitHubError::Http(format!("HTTP {} — {}", status, msg))
+    }
 }
 
 impl Default for GitHubClient {
@@ -87,18 +114,75 @@ impl GitHubClient {
         }
     }
 
+    /// Send a request, retrying on GitHub's *secondary* (abuse) rate limit.
+    ///
+    /// A burst of content-creating requests (e.g. uploading hundreds of blobs
+    /// in parallel) can trip the secondary limit, after which the next
+    /// mutating call returns `403`/`429` while the primary quota is still
+    /// available. GitHub asks clients to back off and retry; we honor
+    /// `Retry-After` when present and otherwise wait an escalating delay.
+    /// Non-rate-limit failures (and the primary-quota case, whose reset can be
+    /// up to an hour away) are surfaced immediately.
+    fn execute_with_retry<F>(
+        &self,
+        send: F,
+    ) -> Result<ureq::http::Response<ureq::Body>, GitHubError>
+    where
+        F: Fn() -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+    {
+        let mut attempt = 0u32;
+        loop {
+            let resp = send().map_err(gh_err)?;
+            let status = resp.status().as_u16();
+            if (200..300).contains(&status) {
+                return Ok(resp);
+            }
+
+            // Capture rate-limit signals from the headers before the body,
+            // which consumes the response, is read.
+            let retry_after = header_str(&resp, "Retry-After").and_then(|s| s.parse::<u64>().ok());
+            let primary_exhausted = header_str(&resp, "X-RateLimit-Remaining") == Some("0");
+            let mut body = String::new();
+            let _ = resp.into_body().into_reader().read_to_string(&mut body);
+
+            let is_secondary = !primary_exhausted
+                && (status == 429
+                    || (status == 403
+                        && (retry_after.is_some() || is_secondary_limit_body(&body))));
+
+            if is_secondary && attempt < MAX_RATE_LIMIT_RETRIES {
+                let wait = match retry_after {
+                    Some(secs) => secs.min(300),
+                    None => (60u64 << attempt).min(300),
+                };
+                eprintln!(
+                    "GitHub secondary rate limit hit; waiting {}s before retry ({}/{})",
+                    wait,
+                    attempt + 1,
+                    MAX_RATE_LIMIT_RETRIES
+                );
+                std::thread::sleep(std::time::Duration::from_secs(wait));
+                attempt += 1;
+                continue;
+            }
+
+            return Err(classify_error(status, primary_exhausted, &body));
+        }
+    }
+
     fn get(&self, path: &str) -> Result<ureq::http::Response<ureq::Body>, GitHubError> {
         let url = self.url(path);
-        let mut r = self
-            .agent
-            .get(&url)
-            .header("Accept", ACCEPT)
-            .header("User-Agent", "ivaldi-vcs/0.1.0");
-        if let Some(ref t) = self.token {
-            r = r.header("Authorization", &format!("Bearer {}", t));
-        }
-        let resp = r.call().map_err(gh_err)?;
-        check_status(resp)
+        self.execute_with_retry(|| {
+            let mut r = self
+                .agent
+                .get(&url)
+                .header("Accept", ACCEPT)
+                .header("User-Agent", "ivaldi-vcs/0.1.0");
+            if let Some(ref t) = self.token {
+                r = r.header("Authorization", &format!("Bearer {}", t));
+            }
+            r.call()
+        })
     }
 
     fn send_json<T: serde::Serialize>(
@@ -108,20 +192,24 @@ impl GitHubClient {
         body: T,
     ) -> Result<ureq::http::Response<ureq::Body>, GitHubError> {
         let url = self.url(path);
-        let mut r = match method {
-            "POST" => self.agent.post(&url),
-            "PUT" => self.agent.put(&url),
-            "PATCH" => self.agent.patch(&url),
-            _ => panic!("unsupported method {}", method),
-        };
-        r = r
-            .header("Accept", ACCEPT)
-            .header("User-Agent", "ivaldi-vcs/0.1.0");
-        if let Some(ref t) = self.token {
-            r = r.header("Authorization", &format!("Bearer {}", t));
-        }
-        let resp = r.send_json(body).map_err(gh_err)?;
-        check_status(resp)
+        // Serialize once so the body can be re-sent on each retry attempt.
+        let value = serde_json::to_value(&body)
+            .map_err(|e| GitHubError::Other(format!("serialize request body: {}", e)))?;
+        self.execute_with_retry(|| {
+            let mut r = match method {
+                "POST" => self.agent.post(&url),
+                "PUT" => self.agent.put(&url),
+                "PATCH" => self.agent.patch(&url),
+                _ => panic!("unsupported method {}", method),
+            };
+            r = r
+                .header("Accept", ACCEPT)
+                .header("User-Agent", "ivaldi-vcs/0.1.0");
+            if let Some(ref t) = self.token {
+                r = r.header("Authorization", &format!("Bearer {}", t));
+            }
+            r.send_json(&value)
+        })
     }
 
     pub fn get_repo(&self, owner: &str, repo: &str) -> Result<RepoInfo, GitHubError> {
@@ -526,6 +614,50 @@ mod tests {
         let j = r#"{"sha":"abc","commit":{"message":"msg","author":{"name":"A","email":"a@b"},"tree":{"sha":"def"}},"parents":[{"sha":"p1"}]}"#;
         let r: CommitInfo = serde_json::from_str(j).unwrap();
         assert_eq!(r.parents.len(), 1);
+    }
+
+    #[test]
+    fn github_message_extracts_message_field() {
+        let body = r#"{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again.","documentation_url":"https://docs.github.com"}"#;
+        assert!(github_message(body).starts_with("You have exceeded a secondary rate limit"));
+    }
+
+    #[test]
+    fn github_message_falls_back_to_raw_body() {
+        assert_eq!(github_message("not json"), "not json");
+    }
+
+    #[test]
+    fn detects_secondary_rate_limit_body() {
+        assert!(is_secondary_limit_body(
+            r#"{"message":"You have exceeded a secondary rate limit."}"#
+        ));
+        assert!(is_secondary_limit_body("triggered an abuse detection mechanism"));
+        assert!(!is_secondary_limit_body(
+            r#"{"message":"Not Found"}"#
+        ));
+    }
+
+    #[test]
+    fn classify_error_maps_status_and_message() {
+        // 401 → auth required regardless of body.
+        assert!(matches!(
+            classify_error(401, false, ""),
+            GitHubError::AuthRequired
+        ));
+        // 403 with the primary quota exhausted → rate limited.
+        assert!(matches!(
+            classify_error(403, true, ""),
+            GitHubError::RateLimited
+        ));
+        // Other failures surface GitHub's message.
+        match classify_error(403, false, r#"{"message":"Resource not accessible"}"#) {
+            GitHubError::Http(m) => {
+                assert!(m.contains("403"));
+                assert!(m.contains("Resource not accessible"));
+            }
+            other => panic!("expected Http, got {:?}", other),
+        }
     }
 
     #[test]

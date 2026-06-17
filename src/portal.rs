@@ -170,6 +170,14 @@ pub fn parse_repo_spec(input: &str) -> Result<RepoSpec, RepoSpecError> {
         return Err(RepoSpecError::Empty);
     }
 
+    // A repo spec is `owner/repo` or a URL — never a local filesystem path.
+    // Reject path-anchored inputs up front so a shell-expanded absolute path
+    // like `/Users/me/owner/repo` fails loudly here instead of being silently
+    // misread as `owner=Users, repo=me` (the cause of `Downloading Users/...`).
+    if is_local_path(raw) {
+        return Err(RepoSpecError::Invalid);
+    }
+
     // Host (if one can be determined) and the "owner/repo/..." remainder.
     let (host, remainder) = extract_host_and_path(raw)?;
     let is_ssh = raw.starts_with("ssh://") || raw.starts_with("git@");
@@ -199,6 +207,18 @@ pub fn parse_repo_spec(input: &str) -> Result<RepoSpec, RepoSpecError> {
         return Err(RepoSpecError::MissingSegment);
     }
 
+    // A `/tree/<branch>` suffix (from a web URL) is the only reason a spec
+    // legitimately carries more than two path segments.
+    let is_tree = segments.len() >= 4 && segments[2] == "tree";
+
+    // A bare `owner/repo` shorthand (no scheme or recognized host) must be
+    // exactly two segments. Anything deeper is almost always a filesystem path
+    // a shell expanded by mistake (e.g. `Users/me/owner/repo`); silently taking
+    // the first two segments would target a completely unrelated repository.
+    if host.is_none() && !is_tree && segments.len() != 2 {
+        return Err(RepoSpecError::Invalid);
+    }
+
     let owner = segments[0].to_string();
     let mut repo = segments[1].to_string();
     // `owner/repo.git/extra` shouldn't happen often, but be defensive.
@@ -209,7 +229,7 @@ pub fn parse_repo_spec(input: &str) -> Result<RepoSpec, RepoSpecError> {
         return Err(RepoSpecError::MissingSegment);
     }
 
-    let branch_hint = if segments.len() >= 4 && segments[2] == "tree" {
+    let branch_hint = if is_tree {
         Some(segments[3..].join("/"))
     } else {
         None
@@ -221,6 +241,18 @@ pub fn parse_repo_spec(input: &str) -> Result<RepoSpec, RepoSpecError> {
         platform,
         branch_hint,
     })
+}
+
+/// Reports whether `s` is written as a local filesystem path rather than a
+/// repository spec. Repo specs are `owner/repo` or URLs and never begin with a
+/// path anchor, so anything that does is a mistake (commonly a shell that
+/// expanded a relative argument to an absolute path before passing it on).
+fn is_local_path(s: &str) -> bool {
+    s == "." || s == ".." || s == "~"
+        || s.starts_with('/')
+        || s.starts_with("./")
+        || s.starts_with("../")
+        || s.starts_with("~/")
 }
 
 fn extract_host_and_path(raw: &str) -> Result<(Option<String>, String), RepoSpecError> {
@@ -544,14 +576,69 @@ mod tests {
             parse_repo_spec("noslash").unwrap_err(),
             RepoSpecError::MissingSegment
         ));
+        // A leading slash makes this a filesystem path, not a bare shorthand.
         assert!(matches!(
             parse_repo_spec("/empty").unwrap_err(),
-            RepoSpecError::MissingSegment
+            RepoSpecError::Invalid
         ));
         assert!(matches!(
             parse_repo_spec("empty/").unwrap_err(),
             RepoSpecError::MissingSegment
         ));
+    }
+
+    #[test]
+    fn spec_rejects_absolute_path() {
+        // The original bug: a shell expanded `javanhut/JiraCli` to an absolute
+        // path, and the parser silently read it as `owner=Users, repo=<user>`.
+        for input in [
+            "/Users/jhutchinson/Development/javanhut/JiraCli",
+            "/Users/jhutchinson/javanhut/JiraCli",
+            "/javanhut/JiraCli",
+            "/tmp/foo/bar",
+        ] {
+            assert_eq!(
+                parse_repo_spec(input).unwrap_err(),
+                RepoSpecError::Invalid,
+                "expected {input:?} to be rejected as a path"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_rejects_relative_and_home_paths() {
+        for input in ["./owner/repo", "../owner/repo", "~/owner/repo", ".", "..", "~"] {
+            assert_eq!(
+                parse_repo_spec(input).unwrap_err(),
+                RepoSpecError::Invalid,
+                "expected {input:?} to be rejected as a path"
+            );
+        }
+    }
+
+    #[test]
+    fn spec_rejects_overlong_shorthand() {
+        // A bare shorthand with more than two segments (no leading slash) is a
+        // relative path mistake, not `owner/repo`.
+        assert_eq!(
+            parse_repo_spec("Development/javanhut/JiraCli").unwrap_err(),
+            RepoSpecError::Invalid
+        );
+    }
+
+    #[test]
+    fn spec_still_accepts_valid_forms_after_hardening() {
+        // Guard against the hardening being too aggressive.
+        assert_eq!(parse_repo_spec("javanhut/JiraCli").unwrap().owner, "javanhut");
+        assert_eq!(parse_repo_spec("javanhut/JiraCli").unwrap().repo, "JiraCli");
+        assert_eq!(parse_repo_spec("javanhut/JiraCli/").unwrap().repo, "JiraCli");
+        assert_eq!(
+            parse_repo_spec("https://github.com/torvalds/linux/tree/master")
+                .unwrap()
+                .branch_hint
+                .as_deref(),
+            Some("master")
+        );
     }
 
     #[test]
