@@ -2952,6 +2952,88 @@ fn cmd_auth(args: AuthArgs) -> Result<(), String> {
                 return Ok(());
             }
 
+            // PAT path: store a Personal Access Token read from stdin instead of
+            // running the device flow. PATs are independent per device and are
+            // immune to GitHub's 10-token-per-OAuth-app eviction, so this is the
+            // most reliable option when ivaldi is used on many machines.
+            if login_args.with_token {
+                use std::io::BufRead;
+                eprintln!(
+                    "Paste a GitHub Personal Access Token (needs 'repo' scope) and press Enter:"
+                );
+                let mut input = String::new();
+                std::io::stdin()
+                    .lock()
+                    .read_line(&mut input)
+                    .map_err(|e| e.to_string())?;
+                let pat = input.trim().to_string();
+                if pat.is_empty() {
+                    return Err("no token provided on stdin".into());
+                }
+                if GitHubClient::with_token(pat.clone()).verify_token() == Some(false) {
+                    return Err(
+                        "GitHub rejected that token. Check it is valid and has 'repo' scope.".into(),
+                    );
+                }
+                let token = crate::auth::Token {
+                    access_token: pat,
+                    token_type: "pat".to_string(),
+                    scope: String::new(),
+                    created_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0),
+                };
+                let store = TokenStore::new().map_err(|e| e.to_string())?;
+                store
+                    .save_token(Platform::GitHub, token)
+                    .map_err(|e| e.to_string())?;
+                println!("Stored your GitHub Personal Access Token for this device.");
+                return Ok(());
+            }
+
+            // Reuse-aware: don't mint another OAuth token if a usable one
+            // already resolves. Every extra token counts against GitHub's
+            // 10-per-OAuth-app/scope limit and can silently evict an older
+            // device, which is the root cause of the cross-device logouts.
+            // `--force` skips this entirely.
+            if !login_args.force {
+                // If our own stored token is no longer accepted by GitHub, drop
+                // it so we can fall back to gh / env / .netrc instead of piling
+                // on yet another token. Only delete on a definitive rejection,
+                // never on a transient network error (verify_token -> None).
+                if let Some(existing) = crate::auth::resolve_auth(Platform::GitHub)
+                    && existing.name == "ivaldi"
+                    && GitHubClient::with_token(existing.token.clone()).verify_token()
+                        == Some(false)
+                    && let Ok(store) = TokenStore::new()
+                {
+                    let _ = store.delete_token(Platform::GitHub);
+                }
+
+                // A surviving credential (a valid ivaldi token, or a gh / env /
+                // .netrc one) means there is nothing to do.
+                if let Some(existing) = crate::auth::resolve_auth(Platform::GitHub) {
+                    let trustworthy = existing.name != "ivaldi"
+                        || GitHubClient::with_token(existing.token.clone()).verify_token()
+                            != Some(false);
+                    if trustworthy {
+                        println!("Already authenticated with GitHub via {}.", existing.name);
+                        println!("  {}", existing.description);
+                        println!(
+                            "Ivaldi will use this credential automatically — no new login needed."
+                        );
+                        println!(
+                            "(Run 'ivaldi auth login --force' to mint a separate ivaldi token, or"
+                        );
+                        println!(
+                            " 'ivaldi auth login --with-token' to paste a Personal Access Token.)"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+
             println!("Initiating GitHub authentication...");
             let device_code = GitHubClient::request_device_code().map_err(|e| e.to_string())?;
 

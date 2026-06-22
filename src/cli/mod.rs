@@ -40,12 +40,15 @@ pub enum Commands {
     Gather(GatherArgs),
 
     /// Create a sealed commit from staged files
+    #[command(alias = "se")]
     Seal(SealArgs),
 
     /// Redo the most recent seal, folding in staged changes and/or a new message
+    #[command(alias = "rs")]
     Reseal(ResealArgs),
 
     /// Show repository status
+    #[command(alias = "st")]
     Status(StatusArgs),
 
     /// Show current timeline and position
@@ -53,16 +56,19 @@ pub enum Commands {
     Whereami,
 
     /// View commit history
+    #[command(alias = "lg")]
     Log(LogArgs),
 
     /// Show, line-by-line, which seal last touched each line of a file
-    #[command(alias = "blame")]
+    #[command(aliases = ["blame", "wd"])]
     Whodidit(WhodiditArgs),
 
     /// Compare changes
+    #[command(alias = "df")]
     Diff(DiffArgs),
 
     /// Remove files from the gathered set (unstage)
+    #[command(alias = "dc")]
     Discard(DiscardArgs),
 
     /// Throw away all uncommitted changes and restore the working
@@ -70,13 +76,15 @@ pub enum Commands {
     Reverse(ReverseArgs),
 
     /// Move the timeline head back to an earlier seal
+    #[command(alias = "rw")]
     Rewind(RewindArgs),
 
     /// Create a seal that undoes an earlier seal's changes
+    #[command(alias = "ud")]
     Undo(UndoArgs),
 
     /// Apply another seal's changes to the current timeline
-    #[command(alias = "cherry-pick")]
+    #[command(aliases = ["cherry-pick", "pl"])]
     Pluck(PluckArgs),
 
     /// Manage timelines (branches)
@@ -84,9 +92,11 @@ pub enum Commands {
     Timeline(TimelineArgs),
 
     /// Merge timelines together
+    #[command(alias = "fu")]
     Fuse(FuseArgs),
 
     /// Interactive time travel through history
+    #[command(alias = "tv")]
     Travel(TravelArgs),
 
     /// Combine a range of seals into a single seal (linear history)
@@ -94,31 +104,39 @@ pub enum Commands {
     Weld(WeldArgs),
 
     /// View and modify configuration (bare `config` opens an interactive form)
-    #[command(alias = "configure")]
+    #[command(aliases = ["configure", "cf"])]
     Config(ConfigArgs),
 
     /// Add patterns to .ivaldiignore
+    #[command(alias = "ex")]
     Exclude(ExcludeArgs),
 
     /// Manage GitHub/GitLab repository connections
+    #[command(alias = "pt")]
     Portal(PortalArgs),
 
     /// Authenticate with GitHub/GitLab
+    #[command(alias = "au")]
     Auth(AuthArgs),
 
     /// Clone a repository from GitHub/GitLab
+    #[command(alias = "dl")]
     Download(DownloadArgs),
 
     /// Push commits to GitHub/GitLab
+    #[command(alias = "up")]
     Upload(UploadArgs),
 
     /// Discover remote timelines
+    #[command(alias = "sc")]
     Scout(ScoutArgs),
 
     /// Download specific remote timelines
+    #[command(alias = "hv")]
     Harvest(HarvestArgs),
 
     /// Sync current timeline with remote (delta only)
+    #[command(alias = "sy")]
     Sync(SyncArgs),
 
     /// Local code review system
@@ -126,15 +144,19 @@ pub enum Commands {
     Review(ReviewArgs),
 
     /// Open interactive TUI dashboard
+    #[command(alias = "ui")]
     Tui,
 
     /// Serve the current repo to authorized peers over `ivaldi://`
+    #[command(alias = "sv")]
     Serve(ServeArgs),
 
     /// Manage authorized peers for `ivaldi serve`
+    #[command(alias = "pr")]
     Peer(PeerArgs),
 
     /// Generate shell completion script to stdout
+    #[command(alias = "cmp")]
     Completions(CompletionsArgs),
 
     /// Generate man pages into a directory
@@ -191,14 +213,19 @@ pub struct PeerArgs {
 #[derive(Subcommand, Debug)]
 pub enum PeerCommands {
     /// Trust a peer's pubkey for incoming `ivaldi serve` connections
+    #[command(alias = "tr")]
     Trust(PeerTrustArgs),
     /// List trusted peers
+    #[command(alias = "ls")]
     List,
     /// Remove a trusted peer by pubkey-hex prefix
+    #[command(alias = "fg")]
     Forget(PeerForgetArgs),
     /// Print this user's own pubkey
+    #[command(alias = "wi")]
     Whoami,
     /// Manage TOFU `~/.ivaldi/known_peers` (servers we connect to)
+    #[command(alias = "kn")]
     Known(PeerKnownArgs),
 }
 
@@ -211,8 +238,10 @@ pub struct PeerKnownArgs {
 #[derive(Subcommand, Debug)]
 pub enum PeerKnownCommands {
     /// List known peers (host:port → pubkey)
+    #[command(alias = "ls")]
     List,
     /// Forget a known peer by host[:port]
+    #[command(alias = "fg")]
     Forget(PeerKnownForgetArgs),
 }
 
@@ -459,6 +488,7 @@ pub struct ButterflyArgs {
 #[derive(Subcommand, Debug)]
 pub enum ButterflyCommands {
     /// Create a new butterfly timeline
+    #[command(alias = "cr")]
     Create(ButterflyCreateArgs),
 
     /// Sync changes up to parent timeline
@@ -596,12 +626,15 @@ pub struct PortalArgs {
 #[derive(Subcommand, Debug)]
 pub enum PortalCommands {
     /// Add a remote repository connection
+    #[command(alias = "ad")]
     Add(PortalAddArgs),
 
     /// List configured portals
+    #[command(alias = "ls")]
     List(PortalListArgs),
 
     /// Remove a portal
+    #[command(alias = "rm")]
     Remove(PortalRemoveArgs),
 }
 
@@ -641,12 +674,15 @@ pub struct AuthArgs {
 #[derive(Subcommand, Debug)]
 pub enum AuthCommands {
     /// Authenticate with a platform
+    #[command(alias = "li")]
     Login(AuthLoginArgs),
 
     /// Show authentication status
+    #[command(alias = "st")]
     Status,
 
     /// Remove stored credentials
+    #[command(alias = "lo")]
     Logout(AuthLogoutArgs),
 }
 
@@ -660,6 +696,18 @@ pub struct AuthLoginArgs {
     /// Only meaningful with `--gitlab`.
     #[arg(long)]
     pub gitlab_host: Option<String>,
+
+    /// Read a Personal Access Token from stdin and store it, instead of
+    /// running the browser device flow. PATs are independent per device and
+    /// are NOT subject to GitHub's 10-token-per-OAuth-app eviction, so this is
+    /// the most reliable choice when you use ivaldi across many machines.
+    #[arg(long)]
+    pub with_token: bool,
+
+    /// Authenticate even when a usable credential (gh CLI / env var / an
+    /// existing login) is already present, minting a separate ivaldi token.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -759,27 +807,35 @@ pub enum ReviewCommands {
     List(ReviewListArgs),
 
     /// Show review details
+    #[command(alias = "sh")]
     Show(ReviewShowArgs),
 
     /// Show diff for a review
+    #[command(alias = "df")]
     Diff(ReviewDiffArgs),
 
     /// Add a comment to a review
+    #[command(alias = "cm")]
     Comment(ReviewCommentArgs),
 
     /// Approve a review
+    #[command(alias = "ap")]
     Approve(ReviewApproveArgs),
 
     /// Request changes on a review
+    #[command(alias = "rc")]
     RequestChanges(ReviewRequestChangesArgs),
 
     /// Merge an approved review
+    #[command(alias = "mg")]
     Merge(ReviewMergeArgs),
 
     /// Close a review without merging
+    #[command(alias = "cl")]
     Close(ReviewCloseArgs),
 
     /// Reopen a closed review
+    #[command(alias = "ro")]
     Reopen(ReviewReopenArgs),
 }
 
@@ -1488,6 +1544,118 @@ mod tests {
                 _ => panic!("expected Reopen"),
             },
             _ => panic!("expected Review"),
+        }
+    }
+
+    // ---- New short command aliases ----
+
+    #[test]
+    fn parse_top_level_short_aliases() {
+        // A representative sample of the new 2-char aliases.
+        assert!(matches!(
+            Cli::try_parse_from(["ivaldi", "se"]).unwrap().command.unwrap(),
+            Commands::Seal(_)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ivaldi", "st"]).unwrap().command.unwrap(),
+            Commands::Status(_)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ivaldi", "up"]).unwrap().command.unwrap(),
+            Commands::Upload(_)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ivaldi", "dl", "owner/repo"])
+                .unwrap()
+                .command
+                .unwrap(),
+            Commands::Download(_)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ivaldi", "sy"]).unwrap().command.unwrap(),
+            Commands::Sync(_)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ivaldi", "lg"]).unwrap().command.unwrap(),
+            Commands::Log(_)
+        ));
+    }
+
+    #[test]
+    fn short_aliases_do_not_collide_at_top_level() {
+        // `up` is Upload at the top level; the same string is a Butterfly
+        // subcommand alias, so they must not interfere across levels.
+        assert!(matches!(
+            Cli::try_parse_from(["ivaldi", "up"]).unwrap().command.unwrap(),
+            Commands::Upload(_)
+        ));
+        match Cli::try_parse_from(["ivaldi", "tl", "bf", "up"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Commands::Timeline(t) => match t.command {
+                TimelineCommands::Butterfly(b) => {
+                    assert!(matches!(b.command, ButterflyCommands::Up))
+                }
+                _ => panic!("expected Butterfly"),
+            },
+            _ => panic!("expected Timeline"),
+        }
+    }
+
+    #[test]
+    fn parse_subcommand_short_aliases() {
+        // review merge -> `mg`
+        match Cli::try_parse_from(["ivaldi", "rv", "mg", "5"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Commands::Review(args) => assert!(matches!(args.command, ReviewCommands::Merge(_))),
+            _ => panic!("expected Review"),
+        }
+        // auth status -> `au st`
+        match Cli::try_parse_from(["ivaldi", "au", "st"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Commands::Auth(args) => assert!(matches!(args.command, AuthCommands::Status)),
+            _ => panic!("expected Auth"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_login_with_token_and_force() {
+        match Cli::try_parse_from(["ivaldi", "auth", "login", "--with-token"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Commands::Auth(args) => match args.command {
+                AuthCommands::Login(l) => {
+                    assert!(l.with_token);
+                    assert!(!l.force);
+                }
+                _ => panic!("expected Login"),
+            },
+            _ => panic!("expected Auth"),
+        }
+
+        match Cli::try_parse_from(["ivaldi", "auth", "login", "--force"])
+            .unwrap()
+            .command
+            .unwrap()
+        {
+            Commands::Auth(args) => match args.command {
+                AuthCommands::Login(l) => {
+                    assert!(l.force);
+                    assert!(!l.with_token);
+                }
+                _ => panic!("expected Login"),
+            },
+            _ => panic!("expected Auth"),
         }
     }
 }

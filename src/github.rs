@@ -106,6 +106,19 @@ impl GitHubClient {
         self.token.as_deref()
     }
 
+    /// Best-effort check that GitHub accepts the active token, by calling
+    /// `GET /user`. Returns `Some(true)` if accepted, `Some(false)` if GitHub
+    /// rejected it (401), and `None` on a network/other error — so callers can
+    /// avoid treating a transient outage as a bad token.
+    pub fn verify_token(&self) -> Option<bool> {
+        self.token.as_ref()?;
+        match self.get("/user") {
+            Ok(_) => Some(true),
+            Err(GitHubError::AuthRequired) => Some(false),
+            Err(_) => None,
+        }
+    }
+
     fn url(&self, path: &str) -> String {
         if path.starts_with("https://") {
             path.to_string()
