@@ -600,12 +600,96 @@ fn run_patch_session(
     Ok(staged_paths)
 }
 
-fn cmd_seal(args: SealArgs, quiet: bool) -> Result<(), String> {
-    let message = args
-        .get_message()
-        .ok_or("seal message required. Usage: ivaldi seal \"your message\"")?
-        .to_string();
+/// Resolve which editor to launch for composing a seal message. Honors
+/// `$VISUAL`, then `$EDITOR`, and falls back to `vim` when neither is set
+/// (or is set to an empty/whitespace-only value).
+fn resolve_editor() -> String {
+    std::env::var("VISUAL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("EDITOR").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| "vim".to_string())
+}
 
+/// Strip comment lines (those starting with `#`) and surrounding blank lines
+/// from an editor buffer, yielding the seal message body. Internal newlines
+/// between paragraphs are preserved.
+fn strip_message_comments(raw: &str) -> String {
+    raw.lines()
+        .filter(|line| !line.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// Open the user's editor so they can compose a multi-line seal message, the
+/// way `git commit` does when no `-m` is given. Writes a template listing the
+/// staged changes to `.ivaldi/SEAL_EDITMSG`, launches the editor on it, then
+/// reads the result back with comment lines stripped. An empty message aborts
+/// the seal.
+fn compose_message_via_editor(
+    ivaldi_dir: &std::path::Path,
+    ws: &Workspace,
+) -> Result<String, String> {
+    use std::io::IsTerminal;
+
+    // Launching a full-screen editor only makes sense with a real terminal.
+    // In a pipe or script, fail loudly so the user reaches for -m instead of
+    // hanging on an editor that can't draw.
+    if !std::io::stdin().is_terminal() {
+        return Err(
+            "no seal message given and no terminal to open an editor. \
+             Pass one with: ivaldi seal -m \"your message\""
+                .into(),
+        );
+    }
+
+    let editmsg_path = ivaldi_dir.join("SEAL_EDITMSG");
+
+    // First line is left blank for the message; the rest is commented guidance
+    // listing what will be sealed. Everything commented is dropped on read.
+    let mut template = String::from(
+        "\n# Please enter the message for your seal. Lines starting with '#'\n\
+         # will be ignored, and an empty message aborts the seal.\n#\n\
+         # Changes to be sealed:\n",
+    );
+    for path in ws.staging.staged_files().keys() {
+        template.push_str(&format!("#\tchanged: {}\n", path));
+    }
+    for path in ws.staging.staged_deletions() {
+        template.push_str(&format!("#\tdeleted: {}\n", path));
+    }
+
+    std::fs::write(&editmsg_path, &template)
+        .map_err(|e| format!("could not write seal message template: {e}"))?;
+
+    let editor = resolve_editor();
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().unwrap_or("vim");
+    let status = process::Command::new(program)
+        .args(parts)
+        .arg(&editmsg_path)
+        .status()
+        .map_err(|e| format!("could not launch editor '{editor}': {e}"))?;
+
+    if !status.success() {
+        let _ = std::fs::remove_file(&editmsg_path);
+        return Err(format!("editor '{editor}' exited abnormally; seal aborted"));
+    }
+
+    let raw = std::fs::read_to_string(&editmsg_path)
+        .map_err(|e| format!("could not read seal message: {e}"))?;
+    let _ = std::fs::remove_file(&editmsg_path);
+
+    let message = strip_message_comments(&raw);
+    if message.is_empty() {
+        return Err("aborting seal due to empty message".into());
+    }
+    Ok(message)
+}
+
+fn cmd_seal(args: SealArgs, quiet: bool) -> Result<(), String> {
     let ctx = find_repo()?;
     let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
     let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
@@ -617,6 +701,13 @@ fn cmd_seal(args: SealArgs, quiet: bool) -> Result<(), String> {
                 .into(),
         );
     }
+
+    // Message comes from the -m/positional arg, or—when omitted—an editor
+    // session over the staged changes (like `git commit` with no -m).
+    let message = match args.get_message() {
+        Some(m) => m.to_string(),
+        None => compose_message_via_editor(&ctx.ivaldi_dir, &ws)?,
+    };
 
     // Open persistent repo first so we can resolve the current timeline's
     // parent tree, then build the seal tree as parent + staging.
@@ -4045,6 +4136,64 @@ mod tests {
     use super::*;
     use crate::fsmerkle::ChangeKind;
     use crate::workspace::FileState;
+
+    mod editor_message {
+        use super::super::*;
+
+        #[test]
+        fn strips_comment_lines_and_trims_blanks() {
+            let raw = "\nFix the parser\n\nHandle empty input\n# Please enter the message\n#\tchanged: src/parse.rs\n";
+            assert_eq!(
+                strip_message_comments(raw),
+                "Fix the parser\n\nHandle empty input"
+            );
+        }
+
+        #[test]
+        fn keeps_hash_not_at_line_start() {
+            // A literal '#' mid-line (e.g. an issue ref) is not a comment.
+            assert_eq!(strip_message_comments("Closes issue #42"), "Closes issue #42");
+        }
+
+        #[test]
+        fn all_comments_yields_empty() {
+            assert_eq!(strip_message_comments("# only\n# comments\n"), "");
+        }
+
+        #[test]
+        fn editor_prefers_visual_then_editor_then_vim() {
+            // SAFETY: single-threaded test; we restore the env afterward.
+            let saved_visual = std::env::var_os("VISUAL");
+            let saved_editor = std::env::var_os("EDITOR");
+
+            unsafe {
+                std::env::remove_var("VISUAL");
+                std::env::remove_var("EDITOR");
+            }
+            assert_eq!(resolve_editor(), "vim");
+
+            unsafe { std::env::set_var("EDITOR", "nano") };
+            assert_eq!(resolve_editor(), "nano");
+
+            unsafe { std::env::set_var("VISUAL", "code --wait") };
+            assert_eq!(resolve_editor(), "code --wait");
+
+            // Whitespace-only values are ignored in favor of the next source.
+            unsafe { std::env::set_var("VISUAL", "  ") };
+            assert_eq!(resolve_editor(), "nano");
+
+            unsafe {
+                match saved_visual {
+                    Some(v) => std::env::set_var("VISUAL", v),
+                    None => std::env::remove_var("VISUAL"),
+                }
+                match saved_editor {
+                    Some(v) => std::env::set_var("EDITOR", v),
+                    None => std::env::remove_var("EDITOR"),
+                }
+            }
+        }
+    }
 
     mod patch_session {
         use super::super::*;
