@@ -600,12 +600,96 @@ fn run_patch_session(
     Ok(staged_paths)
 }
 
-fn cmd_seal(args: SealArgs, quiet: bool) -> Result<(), String> {
-    let message = args
-        .get_message()
-        .ok_or("seal message required. Usage: ivaldi seal \"your message\"")?
-        .to_string();
+/// Resolve which editor to launch for composing a seal message. Honors
+/// `$VISUAL`, then `$EDITOR`, and falls back to `vim` when neither is set
+/// (or is set to an empty/whitespace-only value).
+fn resolve_editor() -> String {
+    std::env::var("VISUAL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("EDITOR").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| "vim".to_string())
+}
 
+/// Strip comment lines (those starting with `#`) and surrounding blank lines
+/// from an editor buffer, yielding the seal message body. Internal newlines
+/// between paragraphs are preserved.
+fn strip_message_comments(raw: &str) -> String {
+    raw.lines()
+        .filter(|line| !line.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// Open the user's editor so they can compose a multi-line seal message, the
+/// way `git commit` does when no `-m` is given. Writes a template listing the
+/// staged changes to `.ivaldi/SEAL_EDITMSG`, launches the editor on it, then
+/// reads the result back with comment lines stripped. An empty message aborts
+/// the seal.
+fn compose_message_via_editor(
+    ivaldi_dir: &std::path::Path,
+    ws: &Workspace,
+) -> Result<String, String> {
+    use std::io::IsTerminal;
+
+    // Launching a full-screen editor only makes sense with a real terminal.
+    // In a pipe or script, fail loudly so the user reaches for -m instead of
+    // hanging on an editor that can't draw.
+    if !std::io::stdin().is_terminal() {
+        return Err(
+            "no seal message given and no terminal to open an editor. \
+             Pass one with: ivaldi seal -m \"your message\""
+                .into(),
+        );
+    }
+
+    let editmsg_path = ivaldi_dir.join("SEAL_EDITMSG");
+
+    // First line is left blank for the message; the rest is commented guidance
+    // listing what will be sealed. Everything commented is dropped on read.
+    let mut template = String::from(
+        "\n# Please enter the message for your seal. Lines starting with '#'\n\
+         # will be ignored, and an empty message aborts the seal.\n#\n\
+         # Changes to be sealed:\n",
+    );
+    for path in ws.staging.staged_files().keys() {
+        template.push_str(&format!("#\tchanged: {}\n", path));
+    }
+    for path in ws.staging.staged_deletions() {
+        template.push_str(&format!("#\tdeleted: {}\n", path));
+    }
+
+    std::fs::write(&editmsg_path, &template)
+        .map_err(|e| format!("could not write seal message template: {e}"))?;
+
+    let editor = resolve_editor();
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().unwrap_or("vim");
+    let status = process::Command::new(program)
+        .args(parts)
+        .arg(&editmsg_path)
+        .status()
+        .map_err(|e| format!("could not launch editor '{editor}': {e}"))?;
+
+    if !status.success() {
+        let _ = std::fs::remove_file(&editmsg_path);
+        return Err(format!("editor '{editor}' exited abnormally; seal aborted"));
+    }
+
+    let raw = std::fs::read_to_string(&editmsg_path)
+        .map_err(|e| format!("could not read seal message: {e}"))?;
+    let _ = std::fs::remove_file(&editmsg_path);
+
+    let message = strip_message_comments(&raw);
+    if message.is_empty() {
+        return Err("aborting seal due to empty message".into());
+    }
+    Ok(message)
+}
+
+fn cmd_seal(args: SealArgs, quiet: bool) -> Result<(), String> {
     let ctx = find_repo()?;
     let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
     let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
@@ -617,6 +701,13 @@ fn cmd_seal(args: SealArgs, quiet: bool) -> Result<(), String> {
                 .into(),
         );
     }
+
+    // Message comes from the -m/positional arg, or—when omitted—an editor
+    // session over the staged changes (like `git commit` with no -m).
+    let message = match args.get_message() {
+        Some(m) => m.to_string(),
+        None => compose_message_via_editor(&ctx.ivaldi_dir, &ws)?,
+    };
 
     // Open persistent repo first so we can resolve the current timeline's
     // parent tree, then build the seal tree as parent + staging.
@@ -2952,6 +3043,88 @@ fn cmd_auth(args: AuthArgs) -> Result<(), String> {
                 return Ok(());
             }
 
+            // PAT path: store a Personal Access Token read from stdin instead of
+            // running the device flow. PATs are independent per device and are
+            // immune to GitHub's 10-token-per-OAuth-app eviction, so this is the
+            // most reliable option when ivaldi is used on many machines.
+            if login_args.with_token {
+                use std::io::BufRead;
+                eprintln!(
+                    "Paste a GitHub Personal Access Token (needs 'repo' scope) and press Enter:"
+                );
+                let mut input = String::new();
+                std::io::stdin()
+                    .lock()
+                    .read_line(&mut input)
+                    .map_err(|e| e.to_string())?;
+                let pat = input.trim().to_string();
+                if pat.is_empty() {
+                    return Err("no token provided on stdin".into());
+                }
+                if GitHubClient::with_token(pat.clone()).verify_token() == Some(false) {
+                    return Err(
+                        "GitHub rejected that token. Check it is valid and has 'repo' scope.".into(),
+                    );
+                }
+                let token = crate::auth::Token {
+                    access_token: pat,
+                    token_type: "pat".to_string(),
+                    scope: String::new(),
+                    created_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0),
+                };
+                let store = TokenStore::new().map_err(|e| e.to_string())?;
+                store
+                    .save_token(Platform::GitHub, token)
+                    .map_err(|e| e.to_string())?;
+                println!("Stored your GitHub Personal Access Token for this device.");
+                return Ok(());
+            }
+
+            // Reuse-aware: don't mint another OAuth token if a usable one
+            // already resolves. Every extra token counts against GitHub's
+            // 10-per-OAuth-app/scope limit and can silently evict an older
+            // device, which is the root cause of the cross-device logouts.
+            // `--force` skips this entirely.
+            if !login_args.force {
+                // If our own stored token is no longer accepted by GitHub, drop
+                // it so we can fall back to gh / env / .netrc instead of piling
+                // on yet another token. Only delete on a definitive rejection,
+                // never on a transient network error (verify_token -> None).
+                if let Some(existing) = crate::auth::resolve_auth(Platform::GitHub)
+                    && existing.name == "ivaldi"
+                    && GitHubClient::with_token(existing.token.clone()).verify_token()
+                        == Some(false)
+                    && let Ok(store) = TokenStore::new()
+                {
+                    let _ = store.delete_token(Platform::GitHub);
+                }
+
+                // A surviving credential (a valid ivaldi token, or a gh / env /
+                // .netrc one) means there is nothing to do.
+                if let Some(existing) = crate::auth::resolve_auth(Platform::GitHub) {
+                    let trustworthy = existing.name != "ivaldi"
+                        || GitHubClient::with_token(existing.token.clone()).verify_token()
+                            != Some(false);
+                    if trustworthy {
+                        println!("Already authenticated with GitHub via {}.", existing.name);
+                        println!("  {}", existing.description);
+                        println!(
+                            "Ivaldi will use this credential automatically — no new login needed."
+                        );
+                        println!(
+                            "(Run 'ivaldi auth login --force' to mint a separate ivaldi token, or"
+                        );
+                        println!(
+                            " 'ivaldi auth login --with-token' to paste a Personal Access Token.)"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+
             println!("Initiating GitHub authentication...");
             let device_code = GitHubClient::request_device_code().map_err(|e| e.to_string())?;
 
@@ -3846,13 +4019,85 @@ fn cmd_peer(args: PeerArgs, _quiet: bool) -> Result<(), String> {
 /// `ivaldi completions <shell>` — write a completion script to stdout.
 /// Requires no repository and mutates nothing.
 fn cmd_completions(args: CompletionsArgs) -> Result<(), String> {
-    clap_complete::generate(
-        args.shell,
-        &mut <Cli as clap::CommandFactory>::command(),
-        "ivaldi",
-        &mut std::io::stdout(),
-    );
+    let mut cmd = <Cli as clap::CommandFactory>::command();
+    match args.shell.clap_shell() {
+        Some(shell) => {
+            clap_complete::generate(shell, &mut cmd, "ivaldi", &mut std::io::stdout());
+        }
+        None => {
+            // RavenShell consumes a JSON completion spec rather than a shell
+            // script. Build it from the same command tree the other shells use.
+            let spec = render_raven_spec(&cmd);
+            let json = serde_json::to_string_pretty(&spec)
+                .map_err(|e| format!("encode raven completions: {e}"))?;
+            println!("{json}");
+        }
+    }
     Ok(())
+}
+
+/// Build a RavenShell completion spec from the clap command tree. The result is
+/// the JSON that belongs at `~/.config/ravenshell/completions/ivaldi.json`.
+///
+/// RavenShell's file format (see RavenShell `completion/spec_file.go`) supports
+/// one level of subcommands, each with its own flags and an argument source.
+/// Ivaldi's grouped commands (`timeline`, `review`, …) carry a second level, so
+/// their sub-subcommand names are emitted as that subcommand's static argument
+/// candidates — enough for RavenShell to offer `ivaldi timeline <TAB>` →
+/// create/switch/…. File completion is suppressed there since those slots take
+/// a sub-subcommand, not a path.
+fn render_raven_spec(cmd: &clap::Command) -> serde_json::Value {
+    use serde_json::json;
+
+    let mut subcommands = Vec::new();
+    for sub in cmd.get_subcommands().filter(|c| !c.is_hide_set()) {
+        let mut entry = json!({ "name": sub.get_name() });
+        if let Some(about) = sub.get_about() {
+            entry["desc"] = json!(first_line(&about.to_string()));
+        }
+        let flags = raven_flags(sub);
+        if !flags.is_empty() {
+            entry["flags"] = json!(flags);
+        }
+        let nested: Vec<serde_json::Value> = sub
+            .get_subcommands()
+            .filter(|c| !c.is_hide_set())
+            .map(|c| {
+                let desc = c.get_about().map(|a| first_line(&a.to_string()));
+                json!({ "text": c.get_name(), "desc": desc.unwrap_or_default() })
+            })
+            .collect();
+        if !nested.is_empty() {
+            entry["args"] = json!({ "static": nested, "noFiles": true });
+        }
+        subcommands.push(entry);
+    }
+
+    let mut spec = json!({ "subcommands": subcommands });
+    let flags = raven_flags(cmd);
+    if !flags.is_empty() {
+        spec["flags"] = json!(flags);
+    }
+    spec
+}
+
+/// Collect a command's optional `--long` flags as RavenShell `{text, desc}`
+/// items. Positional arguments and hidden flags are skipped.
+fn raven_flags(cmd: &clap::Command) -> Vec<serde_json::Value> {
+    use serde_json::json;
+    cmd.get_arguments()
+        .filter(|arg| !arg.is_hide_set())
+        .filter_map(|arg| {
+            let long = arg.get_long()?;
+            let desc = arg.get_help().map(|h| first_line(&h.to_string()));
+            Some(json!({ "text": format!("--{long}"), "desc": desc.unwrap_or_default() }))
+        })
+        .collect()
+}
+
+/// First line of a (possibly multi-line) help string, for tidy one-line descs.
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or("").to_string()
 }
 
 /// `ivaldi man --out DIR` — render `ivaldi.1` plus one `ivaldi-<name>.1`
@@ -3891,6 +4136,64 @@ mod tests {
     use super::*;
     use crate::fsmerkle::ChangeKind;
     use crate::workspace::FileState;
+
+    mod editor_message {
+        use super::super::*;
+
+        #[test]
+        fn strips_comment_lines_and_trims_blanks() {
+            let raw = "\nFix the parser\n\nHandle empty input\n# Please enter the message\n#\tchanged: src/parse.rs\n";
+            assert_eq!(
+                strip_message_comments(raw),
+                "Fix the parser\n\nHandle empty input"
+            );
+        }
+
+        #[test]
+        fn keeps_hash_not_at_line_start() {
+            // A literal '#' mid-line (e.g. an issue ref) is not a comment.
+            assert_eq!(strip_message_comments("Closes issue #42"), "Closes issue #42");
+        }
+
+        #[test]
+        fn all_comments_yields_empty() {
+            assert_eq!(strip_message_comments("# only\n# comments\n"), "");
+        }
+
+        #[test]
+        fn editor_prefers_visual_then_editor_then_vim() {
+            // SAFETY: single-threaded test; we restore the env afterward.
+            let saved_visual = std::env::var_os("VISUAL");
+            let saved_editor = std::env::var_os("EDITOR");
+
+            unsafe {
+                std::env::remove_var("VISUAL");
+                std::env::remove_var("EDITOR");
+            }
+            assert_eq!(resolve_editor(), "vim");
+
+            unsafe { std::env::set_var("EDITOR", "nano") };
+            assert_eq!(resolve_editor(), "nano");
+
+            unsafe { std::env::set_var("VISUAL", "code --wait") };
+            assert_eq!(resolve_editor(), "code --wait");
+
+            // Whitespace-only values are ignored in favor of the next source.
+            unsafe { std::env::set_var("VISUAL", "  ") };
+            assert_eq!(resolve_editor(), "nano");
+
+            unsafe {
+                match saved_visual {
+                    Some(v) => std::env::set_var("VISUAL", v),
+                    None => std::env::remove_var("VISUAL"),
+                }
+                match saved_editor {
+                    Some(v) => std::env::set_var("EDITOR", v),
+                    None => std::env::remove_var("EDITOR"),
+                }
+            }
+        }
+    }
 
     mod patch_session {
         use super::super::*;

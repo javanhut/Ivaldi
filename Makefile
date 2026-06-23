@@ -3,7 +3,7 @@ BINDIR = $(PREFIX)/bin
 BINARY = ivaldi
 TARGET = target/release/$(BINARY)
 
-.PHONY: build test install install-extras uninstall clean help
+.PHONY: build test install install-extras install-raven-completions uninstall clean help
 
 ## Build release binary
 build:
@@ -35,6 +35,14 @@ install-extras: build
 	@$(TARGET) completions fish > $(PREFIX)/share/fish/vendor_completions.d/ivaldi.fish
 	@echo "Installed man pages and completions under $(PREFIX)/share"
 
+## Install the RavenShell completion spec to ~/.config/ravenshell/completions
+## (per-user config, so no sudo — kept separate from install-extras)
+install-raven-completions: build
+	@echo "Installing RavenShell completion spec..."
+	@install -d $(HOME)/.config/ravenshell/completions
+	@$(TARGET) completions raven > $(HOME)/.config/ravenshell/completions/ivaldi.json
+	@echo "Installed $(HOME)/.config/ravenshell/completions/ivaldi.json"
+
 ## Uninstall ivaldi from $(PREFIX)/bin
 uninstall:
 	@echo "Removing $(BINDIR)/$(BINARY)..."
@@ -53,6 +61,7 @@ help:
 	@echo "  make test       Run all tests"
 	@echo "  make install    Install to $(BINDIR) (may need sudo)"
 	@echo "  make install-extras  Install man pages and bash/zsh/fish completions (may need sudo)"
+	@echo "  make install-raven-completions  Install RavenShell completion spec (no sudo)"
 	@echo "  make uninstall  Remove from $(BINDIR) (may need sudo)"
 	@echo "  make clean      Clean build artifacts"
 	@echo ""

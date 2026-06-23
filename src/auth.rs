@@ -162,16 +162,10 @@ impl TokenStore {
 
         let data = serde_json::to_string_pretty(&storage).map_err(AuthError::Json)?;
 
-        // Write with restricted permissions
-        fs::write(&self.config_path, &data).map_err(AuthError::Io)?;
-
-        // Set file permissions to 0600 (owner read/write only)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o600);
-            fs::set_permissions(&self.config_path, perms).map_err(AuthError::Io)?;
-        }
+        // Write atomically with 0600 perms from creation, so the token (and any
+        // long-lived refresh token) is never world-readable, not even in the
+        // brief window between create and chmod that a plain write+chmod leaves.
+        write_secret_file(&self.config_path, data.as_bytes()).map_err(AuthError::Io)?;
 
         Ok(())
     }
@@ -292,6 +286,47 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }
 
+/// Write `bytes` to `path` atomically with owner-only (0600) permissions.
+///
+/// The bytes go to a temp file in the same directory, created with mode 0600
+/// up front (so the secret is never briefly world-readable as a plain
+/// `write` + later `chmod` would allow), then renamed over `path`. Readers see
+/// either the old or the new contents, never a partial file.
+fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("auth");
+    let tmp = parent.join(format!(".{}.tmp.{}", file_name, std::process::id()));
+
+    // A leftover temp from a crashed run could have the wrong perms; start clean
+    // so the `create_new` below always makes a fresh 0600 file.
+    let _ = fs::remove_file(&tmp);
+
+    let result = (|| -> std::io::Result<()> {
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
+        let mut f = fs::File::create(&tmp)?;
+
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 fn read_netrc_token(machine: &str) -> Option<String> {
     let content = fs::read_to_string(home_dir()?.join(".netrc")).ok()?;
     let mut in_machine = false;
@@ -309,6 +344,17 @@ fn read_netrc_token(machine: &str) -> Option<String> {
 }
 
 fn read_gh_cli_token() -> Option<String> {
+    // Prefer asking the gh CLI itself. By default gh stores its token in the OS
+    // keyring (macOS Keychain / libsecret), and only writes it to hosts.yml
+    // with `--insecure-storage`. Reading the file therefore misses most real
+    // installs, which previously left ivaldi unable to reuse gh's login and
+    // pushed it to mint its own competing OAuth token. `gh auth token` prints
+    // the active token regardless of where gh stored it.
+    if let Some(token) = gh_auth_token() {
+        return Some(token);
+    }
+
+    // Fallback for older gh versions / `--insecure-storage`: parse hosts.yml.
     let content = fs::read_to_string(home_dir()?.join(".config/gh/hosts.yml")).ok()?;
     let lines: Vec<&str> = content.lines().collect();
     for (i, line) in lines.iter().enumerate() {
@@ -320,6 +366,21 @@ fn read_gh_cli_token() -> Option<String> {
         }
     }
     None
+}
+
+/// Ask the gh CLI for the active GitHub token, if gh is installed and
+/// authenticated. Returns `None` on any failure (gh missing, not logged in,
+/// non-zero exit), so callers fall through to other credential sources.
+fn gh_auth_token() -> Option<String> {
+    let output = std::process::Command::new("gh")
+        .args(["auth", "token", "--hostname", "github.com"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let token = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if token.is_empty() { None } else { Some(token) }
 }
 
 fn read_glab_cli_token() -> Option<String> {

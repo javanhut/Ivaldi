@@ -261,6 +261,8 @@ impl<'a> Workspace<'a> {
     ) -> Result<GatherResult, WorkspaceError> {
         let mut gathered = Vec::new();
         let mut needs_confirmation = Vec::new();
+        // Loaded lazily the first time a directory argument needs expanding.
+        let mut ignore: Option<PatternCache> = None;
 
         for &path in paths {
             // Hard block: security-pattern files can never be staged
@@ -273,8 +275,14 @@ impl<'a> Workspace<'a> {
                 continue;
             }
 
-            // Dotfiles need explicit confirmation unless already allowed
-            let basename = path.rsplit('/').next().unwrap_or(path);
+            // Dotfiles and dot-directories need explicit confirmation unless
+            // already allowed. The trailing slash a user may type on a
+            // directory is trimmed before extracting the basename.
+            let basename = path
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or(path);
             if basename.starts_with('.')
                 && basename != ".ivaldiignore"
                 && !allowlist.is_allowed(path)
@@ -283,15 +291,20 @@ impl<'a> Workspace<'a> {
                 continue;
             }
 
-            let content = fs::read(&full_path).map_err(WorkspaceError::Io)?;
-            let canonical = BlobNode::canonical_bytes(&content);
-            let hash = B3Hash::digest(&canonical);
-            self.cas
-                .put(hash, &canonical)
-                .map_err(WorkspaceError::Cas)?;
-            on(path);
+            // Directory arguments expand into the (non-ignored) files beneath
+            // them, mirroring `gather .`. Without this, the fs::read in
+            // stage_path would fail with "Is a directory (os error 21)".
+            if full_path.is_dir() {
+                let cache = &*ignore
+                    .get_or_insert_with(|| crate::ignore::load_pattern_cache(&self.work_dir));
+                for rel in self.expand_dir(path, cache)? {
+                    self.stage_path(&rel, on)?;
+                    gathered.push(rel);
+                }
+                continue;
+            }
 
-            self.staging.stage(path, hash);
+            self.stage_path(path, on)?;
             gathered.push(path.to_string());
         }
 
@@ -301,10 +314,45 @@ impl<'a> Workspace<'a> {
         })
     }
 
+    /// Expand a directory argument into the workspace-relative paths of the
+    /// non-ignored files beneath it, sorted. Mirrors `scan`'s traversal so
+    /// ignore rules and dotfile exclusion apply exactly as for `gather .`.
+    /// Returns an empty vec when the directory itself is ignored.
+    fn expand_dir(
+        &self,
+        rel_dir: &str,
+        cache: &PatternCache,
+    ) -> Result<Vec<String>, WorkspaceError> {
+        let rel_dir = rel_dir.trim_end_matches('/');
+        if cache.is_dir_ignored(rel_dir) {
+            return Ok(Vec::new());
+        }
+        let mut files = Vec::new();
+        self.scan_dir(&self.work_dir.join(rel_dir), rel_dir, cache, &mut files)?;
+        files.sort();
+        Ok(files)
+    }
+
+    /// Read a single file at workspace-relative `rel`, store its canonical
+    /// blob in the CAS, and record it in the staging area. `on` is invoked
+    /// with `rel` right after the blob is stored (drives progress bars).
+    fn stage_path(&mut self, rel: &str, on: &mut dyn FnMut(&str)) -> Result<(), WorkspaceError> {
+        let full_path = self.work_dir.join(rel);
+        let content = fs::read(&full_path).map_err(WorkspaceError::Io)?;
+        let canonical = BlobNode::canonical_bytes(&content);
+        let hash = B3Hash::digest(&canonical);
+        self.cas.put(hash, &canonical).map_err(WorkspaceError::Cas)?;
+        on(rel);
+        self.staging.stage(rel, hash);
+        Ok(())
+    }
+
     /// Stage specific files unconditionally (used after user confirms dotfiles).
     /// Still rejects security-blocked files.
     pub fn gather_confirmed(&mut self, paths: &[&str]) -> Result<Vec<String>, WorkspaceError> {
         let mut gathered = Vec::new();
+        // Loaded lazily the first time a confirmed directory needs expanding.
+        let mut ignore: Option<PatternCache> = None;
         for &path in paths {
             if crate::ignore::is_security_blocked(path) {
                 return Err(WorkspaceError::SecurityBlocked(path.to_string()));
@@ -315,14 +363,19 @@ impl<'a> Workspace<'a> {
                 continue;
             }
 
-            let content = fs::read(&full_path).map_err(WorkspaceError::Io)?;
-            let canonical = BlobNode::canonical_bytes(&content);
-            let hash = B3Hash::digest(&canonical);
-            self.cas
-                .put(hash, &canonical)
-                .map_err(WorkspaceError::Cas)?;
+            // A confirmed directory (e.g. a dot-directory the user approved at
+            // the prompt) expands the same way as in `gather_with_progress`.
+            if full_path.is_dir() {
+                let cache = &*ignore
+                    .get_or_insert_with(|| crate::ignore::load_pattern_cache(&self.work_dir));
+                for rel in self.expand_dir(path, cache)? {
+                    self.stage_path(&rel, &mut |_| {})?;
+                    gathered.push(rel);
+                }
+                continue;
+            }
 
-            self.staging.stage(path, hash);
+            self.stage_path(path, &mut |_| {})?;
             gathered.push(path.to_string());
         }
         Ok(gathered)
@@ -1075,6 +1128,50 @@ mod tests {
         assert!(result.needs_confirmation.is_empty());
         assert!(ws.staging.is_staged("file.txt"));
         assert_eq!(cas.len(), 1); // Content stored in CAS
+    }
+
+    #[test]
+    fn gather_expands_directory_argument() {
+        let (dir, cas) = setup_workspace();
+        fs::create_dir_all(dir.path().join("solutions/01_variables")).unwrap();
+        fs::write(dir.path().join("solutions/a.oxi"), "a").unwrap();
+        fs::write(dir.path().join("solutions/01_variables/b.oxi"), "b").unwrap();
+        // A sibling file outside the directory must not be gathered.
+        fs::write(dir.path().join("outside.oxi"), "x").unwrap();
+
+        let allowlist = empty_allowlist(&dir);
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        // Trailing slash, as a user would type it, must not corrupt paths.
+        let result = ws.gather(&["solutions/"], &allowlist).unwrap();
+
+        assert_eq!(
+            result.gathered,
+            vec!["solutions/01_variables/b.oxi", "solutions/a.oxi"]
+        );
+        assert!(ws.staging.is_staged("solutions/a.oxi"));
+        assert!(ws.staging.is_staged("solutions/01_variables/b.oxi"));
+        assert!(!ws.staging.is_staged("outside.oxi"));
+    }
+
+    #[test]
+    fn gather_dot_directory_needs_confirmation() {
+        let (dir, cas) = setup_workspace();
+        fs::create_dir_all(dir.path().join(".github/workflows")).unwrap();
+        fs::write(dir.path().join(".github/workflows/ci.yml"), "ci").unwrap();
+
+        let allowlist = empty_allowlist(&dir);
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        let result = ws.gather(&[".github/"], &allowlist).unwrap();
+
+        // A dot-directory is held for confirmation, not expanded outright.
+        assert!(result.gathered.is_empty());
+        assert_eq!(result.needs_confirmation, vec![".github/"]);
+        assert!(!ws.staging.is_staged(".github/workflows/ci.yml"));
+
+        // Confirming expands it, staging the non-dot files beneath.
+        let confirmed = ws.gather_confirmed(&[".github/"]).unwrap();
+        assert_eq!(confirmed, vec![".github/workflows/ci.yml"]);
+        assert!(ws.staging.is_staged(".github/workflows/ci.yml"));
     }
 
     #[test]
