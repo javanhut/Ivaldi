@@ -1612,15 +1612,24 @@ mod tests {
     fn parse_top_level_short_aliases() {
         // A representative sample of the new 2-char aliases.
         assert!(matches!(
-            Cli::try_parse_from(["ivaldi", "se"]).unwrap().command.unwrap(),
+            Cli::try_parse_from(["ivaldi", "se"])
+                .unwrap()
+                .command
+                .unwrap(),
             Commands::Seal(_)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["ivaldi", "st"]).unwrap().command.unwrap(),
+            Cli::try_parse_from(["ivaldi", "st"])
+                .unwrap()
+                .command
+                .unwrap(),
             Commands::Status(_)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["ivaldi", "up"]).unwrap().command.unwrap(),
+            Cli::try_parse_from(["ivaldi", "up"])
+                .unwrap()
+                .command
+                .unwrap(),
             Commands::Upload(_)
         ));
         assert!(matches!(
@@ -1631,11 +1640,17 @@ mod tests {
             Commands::Download(_)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["ivaldi", "sy"]).unwrap().command.unwrap(),
+            Cli::try_parse_from(["ivaldi", "sy"])
+                .unwrap()
+                .command
+                .unwrap(),
             Commands::Sync(_)
         ));
         assert!(matches!(
-            Cli::try_parse_from(["ivaldi", "lg"]).unwrap().command.unwrap(),
+            Cli::try_parse_from(["ivaldi", "lg"])
+                .unwrap()
+                .command
+                .unwrap(),
             Commands::Log(_)
         ));
     }
@@ -1645,7 +1660,10 @@ mod tests {
         // `up` is Upload at the top level; the same string is a Butterfly
         // subcommand alias, so they must not interfere across levels.
         assert!(matches!(
-            Cli::try_parse_from(["ivaldi", "up"]).unwrap().command.unwrap(),
+            Cli::try_parse_from(["ivaldi", "up"])
+                .unwrap()
+                .command
+                .unwrap(),
             Commands::Upload(_)
         ));
         match Cli::try_parse_from(["ivaldi", "tl", "bf", "up"])

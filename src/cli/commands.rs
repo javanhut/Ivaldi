@@ -607,7 +607,11 @@ fn resolve_editor() -> String {
     std::env::var("VISUAL")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| std::env::var("EDITOR").ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
         .unwrap_or_else(|| "vim".to_string())
 }
 
@@ -638,11 +642,9 @@ fn compose_message_via_editor(
     // In a pipe or script, fail loudly so the user reaches for -m instead of
     // hanging on an editor that can't draw.
     if !std::io::stdin().is_terminal() {
-        return Err(
-            "no seal message given and no terminal to open an editor. \
+        return Err("no seal message given and no terminal to open an editor. \
              Pass one with: ivaldi seal -m \"your message\""
-                .into(),
-        );
+            .into());
     }
 
     let editmsg_path = ivaldi_dir.join("SEAL_EDITMSG");
@@ -3063,7 +3065,8 @@ fn cmd_auth(args: AuthArgs) -> Result<(), String> {
                 }
                 if GitHubClient::with_token(pat.clone()).verify_token() == Some(false) {
                     return Err(
-                        "GitHub rejected that token. Check it is valid and has 'repo' scope.".into(),
+                        "GitHub rejected that token. Check it is valid and has 'repo' scope."
+                            .into(),
                     );
                 }
                 let token = crate::auth::Token {
@@ -4152,7 +4155,10 @@ mod tests {
         #[test]
         fn keeps_hash_not_at_line_start() {
             // A literal '#' mid-line (e.g. an issue ref) is not a comment.
-            assert_eq!(strip_message_comments("Closes issue #42"), "Closes issue #42");
+            assert_eq!(
+                strip_message_comments("Closes issue #42"),
+                "Closes issue #42"
+            );
         }
 
         #[test]

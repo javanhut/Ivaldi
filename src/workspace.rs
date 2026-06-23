@@ -341,7 +341,9 @@ impl<'a> Workspace<'a> {
         let content = fs::read(&full_path).map_err(WorkspaceError::Io)?;
         let canonical = BlobNode::canonical_bytes(&content);
         let hash = B3Hash::digest(&canonical);
-        self.cas.put(hash, &canonical).map_err(WorkspaceError::Cas)?;
+        self.cas
+            .put(hash, &canonical)
+            .map_err(WorkspaceError::Cas)?;
         on(rel);
         self.staging.stage(rel, hash);
         Ok(())
