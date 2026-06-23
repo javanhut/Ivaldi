@@ -1,0 +1,21 @@
+name: Mirror to Codeberg
+
+on:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  codeberg_mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mirror to Codeberg
+        uses: yesolutions/mirror-repository@v1.4.0
+        with:
+          target_url: https://codeberg.org
+          target_username: ${{ secrets.CODEBERG_USERNAME }}
+          target_token: ${{ secrets.CODEBERG_TOKEN }}
