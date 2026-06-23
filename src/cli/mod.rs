@@ -187,7 +187,44 @@ pub struct PluckArgs {
 #[derive(clap::Args, Debug)]
 pub struct CompletionsArgs {
     /// Shell to generate completions for
-    pub shell: clap_complete::Shell,
+    pub shell: CompletionShell,
+}
+
+/// Shells that `ivaldi completions` can target.
+///
+/// The standard shells are rendered by `clap_complete`; `raven` emits a
+/// RavenShell JSON completion spec (the file that belongs at
+/// `~/.config/ravenshell/completions/ivaldi.json`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum CompletionShell {
+    /// Bourne Again SHell
+    Bash,
+    /// Elvish shell
+    Elvish,
+    /// Friendly Interactive SHell
+    Fish,
+    /// PowerShell
+    #[value(name = "powershell")]
+    PowerShell,
+    /// Z SHell
+    Zsh,
+    /// RavenShell (JSON completion spec)
+    Raven,
+}
+
+impl CompletionShell {
+    /// The matching `clap_complete` shell, or `None` for RavenShell, whose
+    /// spec is generated separately.
+    pub fn clap_shell(self) -> Option<clap_complete::Shell> {
+        match self {
+            CompletionShell::Bash => Some(clap_complete::Shell::Bash),
+            CompletionShell::Elvish => Some(clap_complete::Shell::Elvish),
+            CompletionShell::Fish => Some(clap_complete::Shell::Fish),
+            CompletionShell::PowerShell => Some(clap_complete::Shell::PowerShell),
+            CompletionShell::Zsh => Some(clap_complete::Shell::Zsh),
+            CompletionShell::Raven => None,
+        }
+    }
 }
 
 #[derive(clap::Args, Debug)]
@@ -1515,8 +1552,30 @@ mod tests {
         let cli = Cli::try_parse_from(["ivaldi", "completions", "fish"]).unwrap();
         match cli.command.unwrap() {
             Commands::Completions(args) => {
-                assert_eq!(args.shell, clap_complete::Shell::Fish);
+                assert_eq!(args.shell, CompletionShell::Fish);
             }
+            _ => panic!("expected Completions"),
+        }
+    }
+
+    #[test]
+    fn parse_completions_raven() {
+        let cli = Cli::try_parse_from(["ivaldi", "completions", "raven"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Completions(args) => {
+                assert_eq!(args.shell, CompletionShell::Raven);
+                assert!(args.shell.clap_shell().is_none());
+            }
+            _ => panic!("expected Completions"),
+        }
+    }
+
+    #[test]
+    fn parse_completions_powershell_keeps_one_word_value() {
+        // clap_complete spells it `powershell`; the derived ValueEnum must too.
+        let cli = Cli::try_parse_from(["ivaldi", "completions", "powershell"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Completions(args) => assert_eq!(args.shell, CompletionShell::PowerShell),
             _ => panic!("expected Completions"),
         }
     }

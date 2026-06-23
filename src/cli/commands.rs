@@ -3928,13 +3928,85 @@ fn cmd_peer(args: PeerArgs, _quiet: bool) -> Result<(), String> {
 /// `ivaldi completions <shell>` — write a completion script to stdout.
 /// Requires no repository and mutates nothing.
 fn cmd_completions(args: CompletionsArgs) -> Result<(), String> {
-    clap_complete::generate(
-        args.shell,
-        &mut <Cli as clap::CommandFactory>::command(),
-        "ivaldi",
-        &mut std::io::stdout(),
-    );
+    let mut cmd = <Cli as clap::CommandFactory>::command();
+    match args.shell.clap_shell() {
+        Some(shell) => {
+            clap_complete::generate(shell, &mut cmd, "ivaldi", &mut std::io::stdout());
+        }
+        None => {
+            // RavenShell consumes a JSON completion spec rather than a shell
+            // script. Build it from the same command tree the other shells use.
+            let spec = render_raven_spec(&cmd);
+            let json = serde_json::to_string_pretty(&spec)
+                .map_err(|e| format!("encode raven completions: {e}"))?;
+            println!("{json}");
+        }
+    }
     Ok(())
+}
+
+/// Build a RavenShell completion spec from the clap command tree. The result is
+/// the JSON that belongs at `~/.config/ravenshell/completions/ivaldi.json`.
+///
+/// RavenShell's file format (see RavenShell `completion/spec_file.go`) supports
+/// one level of subcommands, each with its own flags and an argument source.
+/// Ivaldi's grouped commands (`timeline`, `review`, …) carry a second level, so
+/// their sub-subcommand names are emitted as that subcommand's static argument
+/// candidates — enough for RavenShell to offer `ivaldi timeline <TAB>` →
+/// create/switch/…. File completion is suppressed there since those slots take
+/// a sub-subcommand, not a path.
+fn render_raven_spec(cmd: &clap::Command) -> serde_json::Value {
+    use serde_json::json;
+
+    let mut subcommands = Vec::new();
+    for sub in cmd.get_subcommands().filter(|c| !c.is_hide_set()) {
+        let mut entry = json!({ "name": sub.get_name() });
+        if let Some(about) = sub.get_about() {
+            entry["desc"] = json!(first_line(&about.to_string()));
+        }
+        let flags = raven_flags(sub);
+        if !flags.is_empty() {
+            entry["flags"] = json!(flags);
+        }
+        let nested: Vec<serde_json::Value> = sub
+            .get_subcommands()
+            .filter(|c| !c.is_hide_set())
+            .map(|c| {
+                let desc = c.get_about().map(|a| first_line(&a.to_string()));
+                json!({ "text": c.get_name(), "desc": desc.unwrap_or_default() })
+            })
+            .collect();
+        if !nested.is_empty() {
+            entry["args"] = json!({ "static": nested, "noFiles": true });
+        }
+        subcommands.push(entry);
+    }
+
+    let mut spec = json!({ "subcommands": subcommands });
+    let flags = raven_flags(cmd);
+    if !flags.is_empty() {
+        spec["flags"] = json!(flags);
+    }
+    spec
+}
+
+/// Collect a command's optional `--long` flags as RavenShell `{text, desc}`
+/// items. Positional arguments and hidden flags are skipped.
+fn raven_flags(cmd: &clap::Command) -> Vec<serde_json::Value> {
+    use serde_json::json;
+    cmd.get_arguments()
+        .filter(|arg| !arg.is_hide_set())
+        .filter_map(|arg| {
+            let long = arg.get_long()?;
+            let desc = arg.get_help().map(|h| first_line(&h.to_string()));
+            Some(json!({ "text": format!("--{long}"), "desc": desc.unwrap_or_default() }))
+        })
+        .collect()
+}
+
+/// First line of a (possibly multi-line) help string, for tidy one-line descs.
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or("").to_string()
 }
 
 /// `ivaldi man --out DIR` — render `ivaldi.1` plus one `ivaldi-<name>.1`
