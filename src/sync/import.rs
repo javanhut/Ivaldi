@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 
+use crate::atomic_io::atomic_write;
 use crate::cas::FileCas;
 use crate::fsmerkle::FsStore;
 use crate::github::{CommitInfo, GitHubClient, GitHubError, TreeResponse};
@@ -238,7 +239,7 @@ fn ensure_timeline_ref(repo: &Repo, local_timeline: &str) -> Result<(), SyncErro
         if let Some(parent) = ref_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&ref_path, "")?;
+        atomic_write(&ref_path, b"")?;
     }
     Ok(())
 }

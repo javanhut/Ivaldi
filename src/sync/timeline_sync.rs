@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
+use crate::atomic_io::atomic_write;
 use crate::cas::FileCas;
 use crate::fsmerkle::FsStore;
 use crate::github::{CommitInfo, GitHubClient};
@@ -433,7 +434,7 @@ fn create_temp_timeline(
     if let Some(parent) = ref_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&ref_path, "")?;
+    atomic_write(&ref_path, b"")?;
     repo.store.set_timeline_head(temp_timeline, ancestor_idx)?;
     Ok(())
 }

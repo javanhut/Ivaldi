@@ -22,11 +22,13 @@ pub enum TimelineError {
     LeafOutOfRange(u64),
     #[error("no common ancestor found")]
     NoCommonAncestor,
+    #[error("corrupt history: {0}")]
+    CorruptHistory(String),
 }
 
-/// In-memory timeline store mapping timeline names to head leaf indices.
+/// In-memory timeline store. `None` is an existing timeline with no commits.
 pub struct TimelineStore {
-    heads: HashMap<String, u64>,
+    heads: HashMap<String, Option<u64>>,
 }
 
 impl TimelineStore {
@@ -37,11 +39,15 @@ impl TimelineStore {
     }
 
     pub fn get_head(&self, name: &str) -> Option<u64> {
-        self.heads.get(name).copied()
+        self.heads.get(name).copied().flatten()
     }
 
     pub fn set_head(&mut self, name: &str, idx: u64) {
-        self.heads.insert(name.to_string(), idx);
+        self.heads.insert(name.to_string(), Some(idx));
+    }
+
+    pub fn create(&mut self, name: &str, head: Option<u64>) {
+        self.heads.insert(name.to_string(), head);
     }
 
     pub fn remove(&mut self, name: &str) -> bool {
@@ -75,9 +81,11 @@ pub struct HistoryManager {
 impl HistoryManager {
     /// Create a new history manager with "main" as the default timeline.
     pub fn new() -> Self {
+        let mut timelines = TimelineStore::new();
+        timelines.create("main", None);
         Self {
             mmr: Mmr::new(),
-            timelines: TimelineStore::new(),
+            timelines,
             current: "main".to_string(),
         }
     }
@@ -89,7 +97,7 @@ impl HistoryManager {
 
     /// Set the current active timeline.
     pub fn set_current_timeline(&mut self, name: &str) -> Result<(), TimelineError> {
-        if !self.timelines.exists(name) && self.mmr.size() > 0 {
+        if !self.timelines.exists(name) {
             return Err(TimelineError::NotFound(name.to_string()));
         }
         self.current = name.to_string();
@@ -105,6 +113,9 @@ impl HistoryManager {
         timeline: &str,
         mut leaf: Leaf,
     ) -> Result<(u64, B3Hash), TimelineError> {
+        if !self.timelines.exists(timeline) {
+            return Err(TimelineError::NotFound(timeline.to_string()));
+        }
         // Fill prev_idx from current timeline head
         leaf.prev_idx = self.timelines.get_head(timeline).unwrap_or(NO_PARENT);
         leaf.timeline_id = timeline.to_string();
@@ -126,10 +137,11 @@ impl HistoryManager {
         }
 
         let source_name = source.unwrap_or(&self.current);
-        if let Some(head_idx) = self.timelines.get_head(source_name) {
-            self.timelines.set_head(name, head_idx);
+        if !self.timelines.exists(source_name) {
+            return Err(TimelineError::NotFound(source_name.to_string()));
         }
-        // If source has no head (empty timeline), just create with no head
+        self.timelines
+            .create(name, self.timelines.get_head(source_name));
 
         Ok(())
     }
@@ -168,23 +180,26 @@ impl HistoryManager {
     ///
     /// Uses ancestor-set tracing (works across timelines).
     pub fn lca(&self, a_idx: u64, b_idx: u64) -> Result<u64, TimelineError> {
-        if a_idx == b_idx {
-            return Ok(a_idx);
-        }
-
         if a_idx >= self.mmr.size() {
             return Err(TimelineError::LeafOutOfRange(a_idx));
         }
         if b_idx >= self.mmr.size() {
             return Err(TimelineError::LeafOutOfRange(b_idx));
         }
+        if a_idx == b_idx {
+            return Ok(a_idx);
+        }
 
-        // Build ancestor set for A
+        // Build ancestor set for A, validating every link as we traverse it.
         let mut ancestors_a = HashSet::new();
         let mut current = a_idx;
         loop {
-            ancestors_a.insert(current);
-            let leaf = self.mmr.get_leaf(current).unwrap();
+            if !ancestors_a.insert(current) {
+                return Err(TimelineError::CorruptHistory(format!(
+                    "cycle at leaf {current}"
+                )));
+            }
+            let leaf = self.checked_leaf(current)?;
             if leaf.has_parent() {
                 current = leaf.prev_idx;
             } else {
@@ -194,11 +209,17 @@ impl HistoryManager {
 
         // Walk back from B looking for common ancestor
         current = b_idx;
+        let mut ancestors_b = HashSet::new();
         loop {
             if ancestors_a.contains(&current) {
                 return Ok(current);
             }
-            let leaf = self.mmr.get_leaf(current).unwrap();
+            if !ancestors_b.insert(current) {
+                return Err(TimelineError::CorruptHistory(format!(
+                    "cycle at leaf {current}"
+                )));
+            }
+            let leaf = self.checked_leaf(current)?;
             if leaf.has_parent() {
                 current = leaf.prev_idx;
             } else {
@@ -207,6 +228,12 @@ impl HistoryManager {
         }
 
         Err(TimelineError::NoCommonAncestor)
+    }
+
+    fn checked_leaf(&self, idx: u64) -> Result<&Leaf, TimelineError> {
+        self.mmr.get_leaf(idx).ok_or_else(|| {
+            TimelineError::CorruptHistory(format!("leaf {idx} references a missing parent"))
+        })
     }
 }
 
@@ -235,7 +262,7 @@ mod tests {
         let mgr = HistoryManager::new();
         assert_eq!(mgr.current_timeline(), "main");
         assert_eq!(mgr.mmr.size(), 0);
-        assert!(mgr.list_timelines().is_empty());
+        assert_eq!(mgr.list_timelines(), vec!["main"]);
     }
 
     #[test]
@@ -287,6 +314,33 @@ mod tests {
 
         mgr.create_timeline("feature", Some("main")).unwrap();
         assert_eq!(mgr.get_timeline_head("feature"), Some(1));
+    }
+
+    #[test]
+    fn create_and_switch_empty_timeline() {
+        let mut mgr = HistoryManager::new();
+        mgr.create_timeline("empty", Some("main")).unwrap();
+
+        assert!(mgr.timelines.exists("empty"));
+        assert_eq!(mgr.get_timeline_head("empty"), None);
+        mgr.switch_timeline("empty").unwrap();
+        mgr.commit("empty", make_leaf("first")).unwrap();
+        assert_eq!(mgr.get_timeline_head("empty"), Some(0));
+    }
+
+    #[test]
+    fn create_timeline_rejects_missing_source() {
+        let mut mgr = HistoryManager::new();
+        let result = mgr.create_timeline("feature", Some("missing"));
+        assert!(matches!(result, Err(TimelineError::NotFound(_))));
+        assert!(!mgr.timelines.exists("feature"));
+    }
+
+    #[test]
+    fn commit_rejects_missing_timeline() {
+        let mut mgr = HistoryManager::new();
+        let result = mgr.commit("missing", make_leaf("first"));
+        assert!(matches!(result, Err(TimelineError::NotFound(_))));
     }
 
     #[test]
@@ -435,5 +489,21 @@ mod tests {
 
         let result = mgr.lca(0, 99);
         assert!(matches!(result, Err(TimelineError::LeafOutOfRange(99))));
+        assert!(matches!(
+            mgr.lca(99, 99),
+            Err(TimelineError::LeafOutOfRange(99))
+        ));
+    }
+
+    #[test]
+    fn lca_rejects_corrupt_parent_link() {
+        let mut mgr = HistoryManager::new();
+        mgr.commit("main", make_leaf("base")).unwrap();
+        let mut corrupt = make_leaf("corrupt");
+        corrupt.prev_idx = 99;
+        mgr.mmr.append_leaf(corrupt);
+
+        let result = mgr.lca(1, 0);
+        assert!(matches!(result, Err(TimelineError::CorruptHistory(_))));
     }
 }

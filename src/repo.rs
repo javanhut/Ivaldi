@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::atomic_io::atomic_write;
 use crate::cas::FileCas;
 use crate::config::{self, Config};
 use crate::forge::{self, HeadRef};
@@ -201,9 +202,9 @@ impl Repo {
             .map_err(RepoError::Store)?;
         let ref_path = self.ivaldi_dir.join("refs/heads").join(name);
         if let Some(parent) = ref_path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            std::fs::create_dir_all(parent).map_err(RepoError::Io)?;
         }
-        std::fs::write(&ref_path, "").ok();
+        atomic_write(&ref_path, b"").map_err(RepoError::Io)?;
         Ok(())
     }
 
@@ -246,9 +247,9 @@ impl Repo {
         // Create ref file
         let ref_path = self.ivaldi_dir.join("refs/heads").join(name);
         if let Some(parent) = ref_path.parent() {
-            std::fs::create_dir_all(parent).ok();
+            std::fs::create_dir_all(parent).map_err(RepoError::Io)?;
         }
-        std::fs::write(&ref_path, "").ok();
+        atomic_write(&ref_path, b"").map_err(RepoError::Io)?;
 
         Ok(())
     }
@@ -329,9 +330,9 @@ impl Repo {
         let old_ref = self.ivaldi_dir.join("refs/heads").join(old_name);
         let new_ref = self.ivaldi_dir.join("refs/heads").join(new_name);
         if old_ref.exists() {
-            let _ = std::fs::rename(&old_ref, &new_ref);
+            std::fs::rename(&old_ref, &new_ref).map_err(RepoError::Io)?;
         } else {
-            let _ = std::fs::write(&new_ref, "");
+            atomic_write(&new_ref, b"").map_err(RepoError::Io)?;
         }
 
         // Update HEAD if this was the current timeline
@@ -901,6 +902,8 @@ pub enum RepoError {
     NotARepo,
     #[error("store error: {0}")]
     Store(#[from] StoreError),
+    #[error("repository I/O: {0}")]
+    Io(#[from] std::io::Error),
     #[error("{0}")]
     Other(String),
 }

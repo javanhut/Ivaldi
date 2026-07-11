@@ -20,6 +20,18 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// filesystems), fsyncs it, renames it over `path`, then best-effort fsyncs
 /// the parent directory. The parent directory must already exist.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write_impl(path, bytes, false)
+}
+
+/// Atomically replace a secret file, creating it with owner-only permissions.
+///
+/// On Unix the temporary file is created as mode 0600, so secret bytes are
+/// never visible through a permissive process umask before the final rename.
+pub fn atomic_write_secret(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write_impl(path, bytes, true)
+}
+
+fn atomic_write_impl(path: &Path, bytes: &[u8], secret: bool) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -33,10 +45,17 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     ));
 
     let result = (|| {
-        let mut f = fs::File::create(&tmp)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if secret {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut f = options.open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
-        fs::rename(&tmp, path)
+        replace_file(&tmp, path)
     })();
 
     if result.is_err() {
@@ -51,6 +70,40 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: both pointers refer to NUL-terminated UTF-16 buffers that remain
+    // alive for the duration of the call.
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -105,5 +158,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("no/such/dir/state");
         assert!(atomic_write(&path, b"data").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_write_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        atomic_write_secret(&path, b"sensitive").unwrap();
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }

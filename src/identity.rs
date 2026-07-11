@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::atomic_io::atomic_write_secret;
+
 /// Length of an X25519 key (public or secret) in bytes.
 pub const KEY_LEN: usize = 32;
 
@@ -98,15 +100,7 @@ impl Identity {
         };
         let json =
             serde_json::to_vec_pretty(&stored).map_err(|e| IdentityError::Other(e.to_string()))?;
-        // Atomic-ish write: temp file + rename, then chmod 0600 on Unix.
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, &json).map_err(IdentityError::Io)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
-        }
-        fs::rename(&tmp, path).map_err(IdentityError::Io)?;
+        atomic_write_secret(path, &json).map_err(IdentityError::Io)?;
         Ok(())
     }
 

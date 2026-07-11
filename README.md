@@ -145,4 +145,6 @@ ivaldi forge        # initialize your first repository
 
 ## License
 
-See LICENSE file.
+No license has been granted yet. Until a license is added, the source remains
+copyrighted by its contributors and is not available for redistribution under
+an open-source license.

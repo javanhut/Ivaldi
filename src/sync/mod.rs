@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
+use crate::atomic_io::atomic_write;
 use crate::cas::FileCas;
 use crate::fsmerkle::FsStore;
 use crate::git_remote::{self, FetchResult, SmartHttpClient};
@@ -302,7 +303,7 @@ where
             fs::create_dir_all(parent)?;
         }
         if !ref_path.exists() {
-            fs::write(&ref_path, "")?;
+            atomic_write(&ref_path, b"")?;
         }
         crate::forge::write_head(
             &ivaldi_dir,

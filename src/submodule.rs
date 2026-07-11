@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::atomic_io::atomic_write;
+
 /// A submodule configuration entry.
 #[derive(Debug, Clone)]
 pub struct Submodule {
@@ -154,7 +156,10 @@ impl SubmoduleManager {
             let branch = m.branch.as_deref().unwrap_or("");
             lines.push(format!("{}\t{}\t{}\t{}", m.name, m.path, m.url, branch));
         }
-        fs::write(self.ivaldi_dir.join("submodules"), lines.join("\n"))
+        atomic_write(
+            &self.ivaldi_dir.join("submodules"),
+            lines.join("\n").as_bytes(),
+        )
     }
 }
 
