@@ -106,10 +106,22 @@ impl SmartHttpClient {
         repo: &str,
         branch: Option<&str>,
     ) -> Result<FetchResult, GitRemoteError> {
-        let base = format!("{}/{}/{}.git", GITHUB_BASE, owner, repo);
-        let discovery = self.discover_refs(&base, "git-upload-pack")?;
+        self.fetch_repo_url(&format!("{}/{}/{}.git", GITHUB_BASE, owner, repo), branch)
+    }
+
+    /// Clone from an explicit Git smart-HTTP base URL rather than a GitHub
+    /// owner/repo — e.g. `https://aur.archlinux.org/yay.git` or a self-hosted
+    /// Gitea/cgit instance. The URL is used verbatim (trailing slash trimmed),
+    /// matching `git clone` semantics.
+    pub fn fetch_repo_url(
+        &self,
+        base: &str,
+        branch: Option<&str>,
+    ) -> Result<FetchResult, GitRemoteError> {
+        let base = base.trim_end_matches('/');
+        let discovery = self.discover_refs(base, "git-upload-pack")?;
         let (branch_name, head_sha) = select_branch_from_discovery(&discovery, branch)?;
-        let pack = self.fetch_pack(&base, &head_sha)?;
+        let pack = self.fetch_pack(base, &head_sha)?;
         let objects = parse_packfile(&pack)?;
 
         Ok(FetchResult {
@@ -125,8 +137,13 @@ impl SmartHttpClient {
         owner: &str,
         repo: &str,
     ) -> Result<Vec<RemoteBranch>, GitRemoteError> {
-        let base = format!("{}/{}/{}.git", GITHUB_BASE, owner, repo);
-        let discovery = self.discover_refs(&base, "git-upload-pack")?;
+        self.list_branch_refs_url(&format!("{}/{}/{}.git", GITHUB_BASE, owner, repo))
+    }
+
+    /// List branch refs from an explicit smart-HTTP base URL (generic host).
+    pub fn list_branch_refs_url(&self, base: &str) -> Result<Vec<RemoteBranch>, GitRemoteError> {
+        let base = base.trim_end_matches('/');
+        let discovery = self.discover_refs(base, "git-upload-pack")?;
         let mut branches: Vec<RemoteBranch> = discovery
             .refs
             .into_iter()
@@ -305,10 +322,27 @@ impl SmartHttpClient {
         branch: &str,
         force: bool,
     ) -> Result<PushReport, GitRemoteError> {
+        self.push_repo_url(
+            repo,
+            &format!("{}/{}/{}.git", GITHUB_BASE, owner, repo_name),
+            branch,
+            force,
+        )
+    }
+
+    /// Push to an explicit Git smart-HTTP base URL (a non-GitHub host such as
+    /// a self-hosted Gitea or cgit instance). Same protocol as [`push_repo`].
+    pub fn push_repo_url(
+        &self,
+        repo: &mut crate::repo::Repo,
+        base: &str,
+        branch: &str,
+        force: bool,
+    ) -> Result<PushReport, GitRemoteError> {
         use crate::remote::HashMapping;
         use std::collections::BTreeSet;
 
-        let base = format!("{}/{}/{}.git", GITHUB_BASE, owner, repo_name);
+        let base = base.trim_end_matches('/');
 
         // ---- Resolve local head.
         let head_idx = repo
@@ -319,7 +353,7 @@ impl SmartHttpClient {
             })?;
 
         // ---- Discover the remote's receive-pack advertisement.
-        let discovery = self.discover_refs(&base, "git-receive-pack")?;
+        let discovery = self.discover_refs(base, "git-receive-pack")?;
         let target_ref = format!("refs/heads/{}", branch);
         let zero = "0".repeat(40);
         let old_sha1 = discovery
@@ -383,7 +417,7 @@ impl SmartHttpClient {
 
         // ---- Send it in one request and parse the report-status reply.
         let pb = progress::spinner("Uploading pack");
-        let response = self.post_receive_pack(&base, &body)?;
+        let response = self.post_receive_pack(base, &body)?;
         pb.finish_with_message(format!("Pack uploaded ({} objects)", export.objects.len()));
         let report = parse_report_status(&response)?;
 

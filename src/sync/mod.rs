@@ -36,6 +36,10 @@ type WorkspaceDelta = (Vec<String>, Vec<String>, Vec<String>);
 pub enum RemoteFetcher {
     Https {
         token: Option<String>,
+        /// Full smart-HTTP base URL for a generic (non-GitHub) host. When
+        /// set, the URL-based client methods are used instead of deriving a
+        /// GitHub URL from owner/repo.
+        base_url: Option<String>,
     },
     Ssh {
         target: crate::ssh_transport::SshTarget,
@@ -48,26 +52,32 @@ impl RemoteFetcher {
     pub fn for_portal(portal: &Portal, token: Option<&str>) -> Self {
         match portal.transport() {
             Transport::Ssh(target) => RemoteFetcher::Ssh { target },
+            // Generic host: talk to its URL, and resolve auth per-host
+            // (the GitHub token passed in doesn't apply).
+            Transport::GenericHttps(url) => {
+                let host = crate::portal::http_host(&url).unwrap_or_default();
+                RemoteFetcher::Https {
+                    token: crate::auth::generic_git_token(&host),
+                    base_url: Some(url),
+                }
+            }
             // P2P portals can't be served by HTTPS scout/harvest/sync;
             // those callers should branch on the portal first. Falling
             // back to HTTPS gives a coherent error path.
             Transport::Peer(_) | Transport::Https => RemoteFetcher::Https {
                 token: token.map(str::to_string),
+                base_url: None,
             },
         }
     }
 
     /// List branches of the remote, name-only (no SHAs).
     pub fn list_branches(&self, owner: &str, repo_name: &str) -> Result<Vec<String>, SyncError> {
-        match self {
-            RemoteFetcher::Https { token } => SmartHttpClient::new(token.as_deref())
-                .list_branches(owner, repo_name)
-                .map_err(SyncError::from),
-            RemoteFetcher::Ssh { target } => SshClient::new(target.clone())
-                .list_branch_refs()
-                .map(|refs| refs.into_iter().map(|b| b.name).collect())
-                .map_err(SyncError::from),
-        }
+        Ok(self
+            .list_branch_refs(owner, repo_name)?
+            .into_iter()
+            .map(|b| b.name)
+            .collect())
     }
 
     /// List branches with SHAs (for sync-state classification).
@@ -77,9 +87,13 @@ impl RemoteFetcher {
         repo_name: &str,
     ) -> Result<Vec<RemoteBranch>, SyncError> {
         match self {
-            RemoteFetcher::Https { token } => SmartHttpClient::new(token.as_deref())
-                .list_branch_refs(owner, repo_name)
-                .map_err(SyncError::from),
+            RemoteFetcher::Https { token, base_url } => {
+                let c = SmartHttpClient::new(token.as_deref());
+                match base_url {
+                    Some(base) => c.list_branch_refs_url(base).map_err(SyncError::from),
+                    None => c.list_branch_refs(owner, repo_name).map_err(SyncError::from),
+                }
+            }
             RemoteFetcher::Ssh { target } => SshClient::new(target.clone())
                 .list_branch_refs()
                 .map_err(SyncError::from),
@@ -94,9 +108,13 @@ impl RemoteFetcher {
         branch: Option<&str>,
     ) -> Result<FetchResult, SyncError> {
         match self {
-            RemoteFetcher::Https { token } => SmartHttpClient::new(token.as_deref())
-                .fetch_repo(owner, repo_name, branch)
-                .map_err(SyncError::from),
+            RemoteFetcher::Https { token, base_url } => {
+                let c = SmartHttpClient::new(token.as_deref());
+                match base_url {
+                    Some(base) => c.fetch_repo_url(base, branch).map_err(SyncError::from),
+                    None => c.fetch_repo(owner, repo_name, branch).map_err(SyncError::from),
+                }
+            }
             RemoteFetcher::Ssh { target } => SshClient::new(target.clone())
                 .fetch_repo(branch)
                 .map_err(SyncError::from),
@@ -139,9 +157,38 @@ pub fn download(
         target_dir,
         owner,
         repo_name,
+        None,
         |branch| {
             SmartHttpClient::new(client.token())
                 .fetch_repo(owner, repo_name, branch)
+                .map_err(SyncError::from)
+        },
+        branch,
+    )
+}
+
+/// Clone from an arbitrary Git smart-HTTP URL (AUR, Gitea, cgit, self-hosted,
+/// ...). `owner`/`repo_name` are display/portal labels derived from the URL;
+/// `base_url` is passed verbatim to the smart-HTTP client. `token` is used for
+/// hosts that require Basic auth (public repos pass `None`).
+pub fn download_url(
+    base_url: &str,
+    owner: &str,
+    repo_name: &str,
+    target_dir: &Path,
+    token: Option<&str>,
+    branch: Option<&str>,
+) -> Result<DownloadResult, SyncError> {
+    let base = base_url.to_string();
+    let tok = token.map(str::to_string);
+    download_with_fetch(
+        target_dir,
+        owner,
+        repo_name,
+        Some(base_url),
+        move |branch| {
+            SmartHttpClient::new(tok.as_deref())
+                .fetch_repo_url(&base, branch)
                 .map_err(SyncError::from)
         },
         branch,
@@ -162,6 +209,7 @@ pub fn download_ssh(
         target_dir,
         &owner,
         &repo_name,
+        None,
         move |branch| {
             crate::ssh_transport::SshClient::new(target_clone.clone())
                 .fetch_repo(branch)
@@ -197,6 +245,7 @@ fn download_with_fetch<F>(
     target_dir: &Path,
     owner: &str,
     repo_name: &str,
+    remote_url: Option<&str>,
     fetch: F,
     branch: Option<&str>,
 ) -> Result<DownloadResult, SyncError>
@@ -224,8 +273,13 @@ where
         let ivaldi_dir = target_dir.join(".ivaldi");
 
         let portal_mgr = crate::portal::PortalManager::new(&ivaldi_dir);
-        let portal = crate::portal::Portal::parse(&format!("{}/{}", owner, repo_name))
+        let mut portal = crate::portal::Portal::parse(&format!("{}/{}", owner, repo_name))
             .ok_or_else(|| SyncError::Other(format!("invalid portal '{}/{}'", owner, repo_name)))?;
+        // Generic (non-GitHub) clones record their smart-HTTP URL so the portal
+        // round-trips the real remote instead of a bogus GitHub owner/repo.
+        if let Some(url) = remote_url {
+            portal = portal.with_base_url(url);
+        }
         let _ = portal_mgr.add(&portal);
 
         let mut cfg = crate::config::Config::new();

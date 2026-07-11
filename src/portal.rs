@@ -68,6 +68,11 @@ impl Portal {
             if let Some(peer) = crate::p2p::PeerUrl::parse(url) {
                 return Transport::Peer(peer);
             }
+            // A plain http(s) base URL that isn't github/gitlab is a generic
+            // Git smart-HTTP host (AUR, Gitea, cgit, self-hosted, ...).
+            if is_generic_https(url) {
+                return Transport::GenericHttps(url.clone());
+            }
         }
         Transport::Https
     }
@@ -107,6 +112,30 @@ pub enum Platform {
     GitLab,
 }
 
+/// Extract the host from an `http(s)://` URL, e.g. `aur.archlinux.org`.
+/// Returns `None` for non-HTTP URLs (SSH, `ivaldi://`, bare shorthand).
+pub fn http_host(url: &str) -> Option<String> {
+    let after = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    after
+        .split('/')
+        .next()
+        .filter(|h| !h.is_empty())
+        .map(|h| h.to_string())
+}
+
+/// True for an `http(s)` URL whose host is neither github.com nor gitlab.com —
+/// i.e. a generic Git smart-HTTP host handled by the URL-based transport.
+fn is_generic_https(url: &str) -> bool {
+    match http_host(url) {
+        Some(h) => {
+            !h.eq_ignore_ascii_case("github.com") && !h.eq_ignore_ascii_case("gitlab.com")
+        }
+        None => false,
+    }
+}
+
 /// Transport used to talk to a portal's remote. Derived from the portal's
 /// stored URL via [`Portal::transport`]; nothing on disk changes — SSH
 /// and `ivaldi://` portals just round-trip their original URL through
@@ -116,6 +145,9 @@ pub enum Transport {
     /// Default — talk to GitHub/GitLab over their HTTPS smart-HTTP +
     /// REST APIs (existing `SmartHttpClient` + `GitHubClient` paths).
     Https,
+    /// Generic Git smart-HTTP host (AUR, Gitea, cgit, self-hosted). Carries
+    /// the full base URL, used verbatim for `git-upload-pack`/`receive-pack`.
+    GenericHttps(String),
     /// Talk to a Git server over SSH using the resolved target.
     Ssh(crate::ssh_transport::SshTarget),
     /// Ivaldi-native peer-to-peer over `ivaldi://`.
@@ -444,6 +476,28 @@ mod tests {
     #[test]
     fn portal_transport_https_for_https_url() {
         let p = Portal::parse("https://github.com/owner/repo.git").unwrap();
+        assert!(matches!(p.transport(), Transport::Https));
+    }
+
+    #[test]
+    fn portal_transport_generic_https_for_non_github_base_url() {
+        let p = Portal::parse("aur.archlinux.org/yay")
+            .unwrap()
+            .with_base_url("https://aur.archlinux.org/yay.git");
+        match p.transport() {
+            Transport::GenericHttps(url) => {
+                assert_eq!(url, "https://aur.archlinux.org/yay.git")
+            }
+            other => panic!("expected GenericHttps, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn portal_transport_https_not_generic_for_github_base_url() {
+        // A github/gitlab base URL must keep the platform-specific Https path.
+        let p = Portal::parse("owner/repo")
+            .unwrap()
+            .with_base_url("https://github.com/owner/repo.git");
         assert!(matches!(p.transport(), Transport::Https));
     }
 

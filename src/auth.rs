@@ -327,6 +327,16 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     result
 }
 
+/// Resolve a Basic-auth token for a generic (non-GitHub/GitLab) Git host:
+/// the `IVALDI_GIT_TOKEN` env override first, then the host's `.netrc`
+/// password. Returns `None` for public hosts that need no auth.
+pub fn generic_git_token(host: &str) -> Option<String> {
+    std::env::var("IVALDI_GIT_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| read_netrc_token(host))
+}
+
 fn read_netrc_token(machine: &str) -> Option<String> {
     let content = fs::read_to_string(home_dir()?.join(".netrc")).ok()?;
     let mut in_machine = false;

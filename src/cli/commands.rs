@@ -3250,6 +3250,19 @@ fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<(), String> {
         return Ok(());
     }
 
+    // Generic Git smart-HTTP host (AUR, Gitea, cgit, self-hosted, ...).
+    // GitHub/GitLab return None and keep their existing REST-aware path below.
+    if let Some((base, owner, repo)) = parse_generic_git_url(&args.repo) {
+        let target_dir = std::path::PathBuf::from(args.directory.as_deref().unwrap_or(&repo));
+        let result =
+            sync::download_url(&base, &owner, &repo, &target_dir, None, None).map_err(|e| e.to_string())?;
+        if !quiet {
+            println!("Cloned {} → {}", base, target_dir.display());
+            println!("  {} files downloaded", result.files_downloaded);
+        }
+        return Ok(());
+    }
+
     let spec = parse_repo_arg(&args.repo)?;
     let client = GitHubClient::new();
 
@@ -3269,6 +3282,36 @@ fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<(), String> {
         println!("  {} files downloaded", result.files_downloaded);
     }
     Ok(())
+}
+
+/// Parse a generic Git smart-HTTP URL into `(base_url, owner, repo)`.
+///
+/// Returns `None` for non-URLs (bare `owner/repo` shorthand) and for
+/// github.com/gitlab.com, which keep their platform-specific download path.
+/// The base URL is returned verbatim (trailing slash trimmed); owner/repo are
+/// display/portal labels derived from the path (host stands in for owner when
+/// the path is a single segment, e.g. AUR's `/yay.git`).
+fn parse_generic_git_url(raw: &str) -> Option<(String, String, String)> {
+    let raw = raw.trim();
+    let after = raw
+        .strip_prefix("https://")
+        .or_else(|| raw.strip_prefix("http://"))?;
+    let (host, path) = after.split_once('/')?;
+    if host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("gitlab.com") {
+        return None;
+    }
+    let path_clean = path.trim_end_matches('/');
+    let path_clean = path_clean.strip_suffix(".git").unwrap_or(path_clean);
+    let segs: Vec<&str> = path_clean.split('/').filter(|s| !s.is_empty()).collect();
+    let (owner, repo) = match segs.as_slice() {
+        [] => return None,
+        [one] => (host.to_string(), (*one).to_string()),
+        many => (
+            many[many.len() - 2].to_string(),
+            many[many.len() - 1].to_string(),
+        ),
+    };
+    Some((raw.trim_end_matches('/').to_string(), owner, repo))
 }
 
 fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
@@ -3359,6 +3402,65 @@ fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
                 "  landed as: {} ({} leaves, {} objects)",
                 summary.landed_as, summary.leaves_sent, summary.objects_sent
             );
+        }
+        return Ok(());
+    }
+
+    // Generic Git smart-HTTP host (AUR, Gitea, cgit, self-hosted). Push
+    // straight to the portal's URL; auth resolves per-host (env / .netrc).
+    if let Transport::GenericHttps(base_url) = portal.transport() {
+        let host = crate::portal::http_host(&base_url).unwrap_or_default();
+        let token = crate::auth::generic_git_token(&host);
+
+        if args.force {
+            print!(
+                "WARNING: Force push will OVERWRITE remote history! Type 'force push' to confirm: "
+            );
+            std::io::stdout().flush().map_err(|e| e.to_string())?;
+            let mut input = String::new();
+            std::io::stdin()
+                .read_line(&mut input)
+                .map_err(|e| e.to_string())?;
+            if input.trim() != "force push" {
+                println!("Aborted.");
+                return Ok(());
+            }
+        }
+
+        let timeline = args
+            .branch
+            .clone()
+            .unwrap_or_else(|| repo.current_timeline().unwrap_or_else(|_| "main".into()));
+
+        let report = crate::git_remote::SmartHttpClient::new(token.as_deref())
+            .push_repo_url(&mut repo, &base_url, &timeline, args.force)
+            .map_err(|e| e.to_string())?;
+
+        if !report.unpack_ok {
+            return Err(format!(
+                "remote rejected pack: {}",
+                report.unpack_error.unwrap_or_else(|| "unknown".into())
+            ));
+        }
+        let mut had_failure = false;
+        for r in &report.refs {
+            match &r.error {
+                Some(reason) => {
+                    println!("  {} REJECTED: {}", r.name, reason);
+                    had_failure = true;
+                }
+                None => {
+                    if !quiet {
+                        println!("  {} updated", r.name);
+                    }
+                }
+            }
+        }
+        if had_failure {
+            return Err("one or more refs were rejected".into());
+        }
+        if !quiet {
+            println!("Uploaded timeline '{}' to {}.", timeline, base_url);
         }
         return Ok(());
     }
@@ -4139,6 +4241,34 @@ mod tests {
     use super::*;
     use crate::fsmerkle::ChangeKind;
     use crate::workspace::FileState;
+
+    #[test]
+    fn generic_git_url_parsing() {
+        // AUR: single-segment path → host stands in for owner.
+        assert_eq!(
+            parse_generic_git_url("https://aur.archlinux.org/yay.git"),
+            Some((
+                "https://aur.archlinux.org/yay.git".into(),
+                "aur.archlinux.org".into(),
+                "yay".into()
+            ))
+        );
+        // Gitea-style owner/repo, no .git, trailing slash.
+        assert_eq!(
+            parse_generic_git_url("https://gitea.example.com/foo/bar/"),
+            Some((
+                "https://gitea.example.com/foo/bar".into(),
+                "foo".into(),
+                "bar".into()
+            ))
+        );
+        // GitHub/GitLab keep their own path.
+        assert_eq!(parse_generic_git_url("https://github.com/torvalds/linux"), None);
+        assert_eq!(parse_generic_git_url("https://gitlab.com/foo/bar"), None);
+        // Bare shorthand and SSH are handled elsewhere.
+        assert_eq!(parse_generic_git_url("owner/repo"), None);
+        assert_eq!(parse_generic_git_url("git@example.com:foo/bar.git"), None);
+    }
 
     mod editor_message {
         use super::super::*;
