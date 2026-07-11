@@ -217,10 +217,15 @@ fn translate_tree(
         .load_tree(tree_hash)
         .map_err(|e| ExportError::Other(e.to_string()))?;
 
-    // Git tree entries must be sorted lexically by name. Ivaldi already
-    // canonicalizes that way, but be defensive.
+    // Git orders tree entries by name, but compares a directory as though its
+    // name carried a trailing '/'. A plain byte sort disagrees whenever a
+    // directory name is a prefix of a sibling file's name — e.g. `build` (dir)
+    // vs `build.sh` (file): git wants `build.sh` first because '/' (0x2f) is
+    // greater than '.' (0x2e). Emitting the wrong order produces a tree the
+    // remote's receive fsck rejects with the opaque "unpack index-pack
+    // failed". Sort exactly the way git's base_name_compare does.
     let mut entries = tree.entries.clone();
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries.sort_by(|a, b| git_tree_entry_order(a, b));
 
     let mut body: Vec<u8> = Vec::new();
     for entry in &entries {
@@ -334,6 +339,31 @@ fn mint_git_commit_body(leaf: &Leaf, tree_sha1: &[u8; 20], parents: &[[u8; 20]])
 // =====================================================================
 // Helpers
 // =====================================================================
+
+/// Order two tree entries the way git canonicalizes a tree object: by name,
+/// but with a directory compared as though its name ended in '/' (git's
+/// `base_name_compare`). Receivers run fsck on push and reject — with the
+/// opaque "unpack index-pack failed" — any tree whose entries aren't in this
+/// exact order, so a plain `name.cmp(&name)` is not enough.
+fn git_tree_entry_order(a: &fsmerkle::Entry, b: &fsmerkle::Entry) -> std::cmp::Ordering {
+    let an = a.name.as_bytes();
+    let bn = b.name.as_bytes();
+    let common = an.len().min(bn.len());
+    match an[..common].cmp(&bn[..common]) {
+        std::cmp::Ordering::Equal => {}
+        ord => return ord,
+    }
+    // Names share a prefix and one ran out: compare the byte just past it,
+    // substituting '/' for the end of a directory's name.
+    let next = |name: &[u8], is_dir: bool| -> u8 {
+        name.get(common)
+            .copied()
+            .unwrap_or(if is_dir { b'/' } else { 0 })
+    };
+    let a_dir = matches!(a.kind, NodeKind::Tree);
+    let b_dir = matches!(b.kind, NodeKind::Tree);
+    next(an, a_dir).cmp(&next(bn, b_dir))
+}
 
 fn sha1_hex_to_bytes(hex: &str) -> Option<[u8; 20]> {
     if hex.len() != 40 {
@@ -519,6 +549,61 @@ mod tests {
         assert!(contains(b"100755 run.sh\0"), "executable mode preserved");
         assert!(contains(b"120000 link\0"), "symlink mode preserved");
         assert!(contains(b"100644 regular.txt\0"), "regular mode preserved");
+    }
+
+    #[test]
+    fn translate_tree_orders_dir_like_git_against_prefix_file() {
+        // `build` (dir) next to `build.sh` (file) is the canonical trap: a
+        // plain name sort emits `build` first, but git — and GitHub's receive
+        // fsck — want `build.sh` first because a directory sorts as `build/`
+        // and '/' (0x2f) > '.' (0x2e). Getting this wrong is exactly what makes
+        // a push die with "unpack index-pack failed".
+        let dir = tempfile::tempdir().unwrap();
+        let cas = FileCas::new(dir.path().join("objects")).unwrap();
+        let store = FsStore::new(&cas);
+
+        let (script, _) = store.put_blob(b"#!/bin/sh\n").unwrap();
+        let (inner, _) = store.put_blob(b"x").unwrap();
+        let build_dir = store
+            .put_tree(vec![fsmerkle::Entry {
+                name: "main.rs".into(),
+                mode: fsmerkle::MODE_FILE,
+                kind: NodeKind::Blob,
+                hash: inner,
+            }])
+            .unwrap();
+
+        let tree_hash = store
+            .put_tree(vec![
+                fsmerkle::Entry {
+                    name: "build".into(),
+                    mode: fsmerkle::MODE_DIR,
+                    kind: NodeKind::Tree,
+                    hash: build_dir,
+                },
+                fsmerkle::Entry {
+                    name: "build.sh".into(),
+                    mode: fsmerkle::MODE_EXEC,
+                    kind: NodeKind::Blob,
+                    hash: script,
+                },
+            ])
+            .unwrap();
+
+        let mut cache = BTreeMap::new();
+        let mut objects: BTreeMap<[u8; 20], GitObject> = BTreeMap::new();
+        let tree_sha = translate_tree(&store, tree_hash, &mut cache, &mut objects).unwrap();
+        let body = &objects.get(&tree_sha).unwrap().body;
+
+        let pos = |needle: &[u8]| {
+            body.windows(needle.len())
+                .position(|w| w == needle)
+                .unwrap_or_else(|| panic!("entry not found in tree body"))
+        };
+        assert!(
+            pos(b"100755 build.sh\0") < pos(b"40000 build\0"),
+            "git orders the prefix file before the directory"
+        );
     }
 
     #[test]

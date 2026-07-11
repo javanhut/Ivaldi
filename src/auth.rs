@@ -22,7 +22,7 @@ use crate::portal::Platform;
 pub const GITHUB_CLIENT_ID: &str = "178c6fc778ccc68e1d6a"; // GitHub CLI's public OAuth App
 pub const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 pub const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
-pub const GITHUB_SCOPES: &str = "repo,read:user,user:email";
+pub const GITHUB_SCOPES: &str = "repo,workflow,read:user,user:email";
 
 /// GitLab OAuth (Device Authorization Grant — RFC 8628).
 ///

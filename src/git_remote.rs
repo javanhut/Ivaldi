@@ -674,7 +674,14 @@ pub struct PushReport {
 ///   flush-pkt
 /// ```
 pub(crate) fn parse_report_status(data: &[u8]) -> Result<PushReport, GitRemoteError> {
-    let lines = parse_pkt_text_lines(data)?;
+    // GitHub relays the report-status multiplexed over the git side-band even
+    // though we never advertise `side-band-64k`, so the raw bytes look like
+    // `\x01001dunpack index-pack failed`. Demux to channel 1 before parsing the
+    // inner pkt-lines; a clean push that comes back as plain pkt-lines passes
+    // through untouched. Without this, a real failure parses as garbage and a
+    // rejected push can be misreported as success.
+    let payload = demux_report_status(data)?;
+    let lines = parse_pkt_text_lines(&payload)?;
     let mut iter = lines.into_iter();
 
     let first = iter
@@ -720,6 +727,45 @@ pub(crate) fn parse_report_status(data: &[u8]) -> Result<PushReport, GitRemoteEr
         unpack_error,
         refs,
     })
+}
+
+/// Demultiplex a `git-receive-pack` response that GitHub muxes over the git
+/// side-band (channel 1 = report-status, 2 = progress, 3 = fatal error). Return
+/// the channel-1 byte stream — the actual report-status pkt-lines. If the
+/// response isn't muxed (a plain pkt-line report, common on a clean push) or
+/// isn't clean pkt framing at all, return it unchanged so the text parser can
+/// try. A channel-3 frame is a fatal server message; surface it as an error.
+fn demux_report_status(data: &[u8]) -> Result<Vec<u8>, GitRemoteError> {
+    let frames = match parse_pkt_lines(data) {
+        Ok(f) => f,
+        Err(_) => return Ok(data.to_vec()),
+    };
+    let muxed = frames
+        .iter()
+        .flatten()
+        .find(|f| !f.is_empty())
+        .map(|f| matches!(f[0], 1 | 2 | 3))
+        .unwrap_or(false);
+    if !muxed {
+        return Ok(data.to_vec());
+    }
+    let mut report = Vec::new();
+    for frame in frames.iter().flatten() {
+        let Some((&channel, rest)) = frame.split_first() else {
+            continue;
+        };
+        match channel {
+            1 => report.extend_from_slice(rest),
+            2 => {} // progress (stderr) — not part of report-status
+            3 => {
+                return Err(GitRemoteError::Protocol(
+                    String::from_utf8_lossy(rest).trim().to_string(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(report)
 }
 
 /// Read pkt-lines and return their UTF-8 payloads (newline-stripped).
@@ -1781,6 +1827,35 @@ mod tests {
         assert!(!r.unpack_ok);
         assert_eq!(r.unpack_error.as_deref(), Some("invalid pack"));
         assert!(r.refs.is_empty());
+    }
+
+    #[test]
+    fn parse_report_status_demuxes_sideband_failure() {
+        // Reproduce GitHub's real reply: the report-status muxed over side-band
+        // channel 1, i.e. the `\x01001dunpack index-pack failed` bytes the user
+        // saw. Before the demux fix this parsed as the opaque "unexpected
+        // receive-pack first line" error and could even masquerade as success.
+        fn sideband1(inner: &[u8]) -> Vec<u8> {
+            let mut payload = vec![1u8];
+            payload.extend_from_slice(inner);
+            let mut out = format!("{:04x}", payload.len() + 4).into_bytes();
+            out.extend_from_slice(&payload);
+            out
+        }
+        let mut inner = Vec::new();
+        inner.extend(pkt("unpack index-pack failed\n"));
+        inner.extend(pkt("ng refs/heads/carrier-mac-vm unpacker error\n"));
+        inner.extend(b"0000"); // inner (report-status) flush
+
+        let mut bytes = sideband1(&inner);
+        bytes.extend(b"0000"); // outer (side-band) flush
+
+        let r = parse_report_status(&bytes).unwrap();
+        assert!(!r.unpack_ok);
+        assert_eq!(r.unpack_error.as_deref(), Some("index-pack failed"));
+        assert_eq!(r.refs.len(), 1);
+        assert_eq!(r.refs[0].name, "refs/heads/carrier-mac-vm");
+        assert_eq!(r.refs[0].error.as_deref(), Some("unpacker error"));
     }
 
     #[test]
