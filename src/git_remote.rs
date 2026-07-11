@@ -778,7 +778,7 @@ fn demux_report_status(data: &[u8]) -> Result<Vec<u8>, GitRemoteError> {
         .iter()
         .flatten()
         .find(|f| !f.is_empty())
-        .map(|f| matches!(f[0], 1 | 2 | 3))
+        .map(|f| matches!(f[0], 1..=3))
         .unwrap_or(false);
     if !muxed {
         return Ok(data.to_vec());

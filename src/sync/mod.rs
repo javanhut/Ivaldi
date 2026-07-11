@@ -91,7 +91,9 @@ impl RemoteFetcher {
                 let c = SmartHttpClient::new(token.as_deref());
                 match base_url {
                     Some(base) => c.list_branch_refs_url(base).map_err(SyncError::from),
-                    None => c.list_branch_refs(owner, repo_name).map_err(SyncError::from),
+                    None => c
+                        .list_branch_refs(owner, repo_name)
+                        .map_err(SyncError::from),
                 }
             }
             RemoteFetcher::Ssh { target } => SshClient::new(target.clone())
@@ -112,7 +114,9 @@ impl RemoteFetcher {
                 let c = SmartHttpClient::new(token.as_deref());
                 match base_url {
                     Some(base) => c.fetch_repo_url(base, branch).map_err(SyncError::from),
-                    None => c.fetch_repo(owner, repo_name, branch).map_err(SyncError::from),
+                    None => c
+                        .fetch_repo(owner, repo_name, branch)
+                        .map_err(SyncError::from),
                 }
             }
             RemoteFetcher::Ssh { target } => SshClient::new(target.clone())

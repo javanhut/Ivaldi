@@ -132,7 +132,7 @@ impl TabView for LogView {
                     let merge_flag = if entry.is_merge { " M" } else { "" };
                     let text = format!(
                         "{} {} {} {}{}",
-                        marker, &entry.short_hash, entry.seal_name, entry.message, merge_flag,
+                        marker, entry.short_hash, entry.seal_name, entry.message, merge_flag,
                     );
                     let style = if i == self.cursor {
                         theme.cursor

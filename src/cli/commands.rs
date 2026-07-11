@@ -3254,8 +3254,8 @@ fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<(), String> {
     // GitHub/GitLab return None and keep their existing REST-aware path below.
     if let Some((base, owner, repo)) = parse_generic_git_url(&args.repo) {
         let target_dir = std::path::PathBuf::from(args.directory.as_deref().unwrap_or(&repo));
-        let result =
-            sync::download_url(&base, &owner, &repo, &target_dir, None, None).map_err(|e| e.to_string())?;
+        let result = sync::download_url(&base, &owner, &repo, &target_dir, None, None)
+            .map_err(|e| e.to_string())?;
         if !quiet {
             println!("Cloned {} → {}", base, target_dir.display());
             println!("  {} files downloaded", result.files_downloaded);
@@ -4263,7 +4263,10 @@ mod tests {
             ))
         );
         // GitHub/GitLab keep their own path.
-        assert_eq!(parse_generic_git_url("https://github.com/torvalds/linux"), None);
+        assert_eq!(
+            parse_generic_git_url("https://github.com/torvalds/linux"),
+            None
+        );
         assert_eq!(parse_generic_git_url("https://gitlab.com/foo/bar"), None);
         // Bare shorthand and SSH are handled elsewhere.
         assert_eq!(parse_generic_git_url("owner/repo"), None);

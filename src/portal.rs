@@ -129,9 +129,7 @@ pub fn http_host(url: &str) -> Option<String> {
 /// i.e. a generic Git smart-HTTP host handled by the URL-based transport.
 fn is_generic_https(url: &str) -> bool {
     match http_host(url) {
-        Some(h) => {
-            !h.eq_ignore_ascii_case("github.com") && !h.eq_ignore_ascii_case("gitlab.com")
-        }
+        Some(h) => !h.eq_ignore_ascii_case("github.com") && !h.eq_ignore_ascii_case("gitlab.com"),
         None => false,
     }
 }

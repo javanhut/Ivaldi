@@ -225,7 +225,7 @@ fn translate_tree(
     // remote's receive fsck rejects with the opaque "unpack index-pack
     // failed". Sort exactly the way git's base_name_compare does.
     let mut entries = tree.entries.clone();
-    entries.sort_by(|a, b| git_tree_entry_order(a, b));
+    entries.sort_by(git_tree_entry_order);
 
     let mut body: Vec<u8> = Vec::new();
     for entry in &entries {
