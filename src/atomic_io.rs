@@ -31,7 +31,7 @@ pub fn atomic_write_secret(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     atomic_write_impl(path, bytes, true)
 }
 
-fn atomic_write_impl(path: &Path, bytes: &[u8], secret: bool) -> std::io::Result<()> {
+fn atomic_write_impl(path: &Path, bytes: &[u8], _secret: bool) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path
         .file_name()
@@ -48,7 +48,7 @@ fn atomic_write_impl(path: &Path, bytes: &[u8], secret: bool) -> std::io::Result
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
-        if secret {
+        if _secret {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }

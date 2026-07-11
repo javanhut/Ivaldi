@@ -3,7 +3,7 @@
 //! redb serializes individual store transactions, but multi-step operations
 //! (seal, timeline switch, fuse, ...) also touch plain files under
 //! `.ivaldi/` (HEAD, staging, shelves) with no coordination. [`RepoLock`]
-//! gives mutating commands an exclusive advisory `flock(2)` on
+//! gives mutating commands an exclusive advisory operating-system lock on
 //! `.ivaldi/repo.lock` so two concurrent ivaldi processes can't interleave.
 //!
 //! The kernel releases the lock when the holding process exits — including
@@ -15,9 +15,10 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+#[cfg(unix)]
 use rustix::fs::{FlockOperation, flock};
 
-/// Held for the duration of a mutating command. The flock is released when
+/// Held for the duration of a mutating command. The OS lock is released when
 /// this struct is dropped (or the process dies).
 #[derive(Debug)]
 pub struct RepoLock {
@@ -45,19 +46,59 @@ impl RepoLock {
             .truncate(false)
             .open(&path)?;
 
-        flock(&file, FlockOperation::NonBlockingLockExclusive).map_err(|e| {
-            if e == rustix::io::Errno::WOULDBLOCK {
-                LockError::Contended
-            } else {
-                LockError::Io(std::io::Error::from(e))
-            }
-        })?;
+        try_lock(&file)?;
 
         // Diagnostic only — never read for correctness. Safe: we hold the lock.
         let _ = file.set_len(0);
         let _ = writeln!(file, "{}", std::process::id());
 
         Ok(RepoLock { _file: file })
+    }
+}
+
+#[cfg(unix)]
+fn try_lock(file: &fs::File) -> Result<(), LockError> {
+    flock(file, FlockOperation::NonBlockingLockExclusive).map_err(|e| {
+        if e == rustix::io::Errno::WOULDBLOCK {
+            LockError::Contended
+        } else {
+            LockError::Io(std::io::Error::from(e))
+        }
+    })
+}
+
+#[cfg(windows)]
+fn try_lock(file: &fs::File) -> Result<(), LockError> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    // SAFETY: the raw handle belongs to `file` and remains open for the call;
+    // `overlapped` is initialized and lives until this synchronous call ends.
+    let result = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if result != 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        Err(LockError::Contended)
+    } else {
+        Err(LockError::Io(error))
     }
 }
 
