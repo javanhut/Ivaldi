@@ -119,6 +119,35 @@ Verify with:
 ivaldi forge        # initialize your first repository
 ```
 
+## Verifying releases
+
+Prebuilt, signed binaries are attached to each
+[GitHub release](https://github.com/javanhut/ivaldi/releases) for Linux, macOS,
+and Windows on both `x86_64` and `arm64`. Every archive is signed, and each
+release ships a single `SHA256SUMS` file covering all artifacts.
+
+Signing is keyless via [Sigstore](https://www.sigstore.dev/) — there is no
+long-lived public key to trust. Instead you verify that a signature was
+produced by Ivaldi's own release workflow. Install
+[`cosign`](https://docs.sigstore.dev/cosign/system_config/installation/), then:
+
+```bash
+# 1. Verify the checksums file was signed by Ivaldi's release workflow.
+cosign verify-blob \
+  --bundle SHA256SUMS.cosign.bundle \
+  --certificate-identity-regexp 'https://github.com/javanhut/ivaldi/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+
+# 2. Check your downloaded archive against the trusted checksums.
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+The first command fails if the checksums file was not produced by this
+repository's release workflow; the second fails if your download does not match.
+Both must pass. To verify an individual archive directly, use its own
+`.cosign.bundle` with the same `cosign verify-blob` invocation.
+
 ## Learn Ivaldi
 
 - **[Quick Start guide](docs/quick-start.md)** — a hands-on walkthrough of
