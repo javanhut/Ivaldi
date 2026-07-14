@@ -25,14 +25,15 @@
 
 use std::collections::BTreeMap;
 
-use crate::filechunk::{read_uvarint, read_varint, write_uvarint, write_varint};
+use crate::filechunk::{write_uvarint, write_varint};
 use crate::hash::B3Hash;
+use crate::reader::ByteReader;
 
 /// Sentinel value indicating no parent commit.
 pub const NO_PARENT: u64 = u64::MAX;
 
 /// A commit record in the history.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Leaf {
     /// BLAKE3 root hash of the filesystem tree (from fsmerkle).
     pub tree_root: B3Hash,
@@ -160,99 +161,42 @@ impl Leaf {
 }
 
 /// Parse canonical bytes back into a Leaf.
+///
+/// Every field is read through a bounded reader, so a truncated or malformed
+/// buffer returns a typed error rather than panicking. Length prefixes
+/// (`merge_idxs`, `meta`) are never used to pre-allocate, so a bogus count
+/// cannot exhaust memory — a short buffer just errors on the next read.
 pub fn parse_leaf(data: &[u8]) -> Result<Leaf, LeafError> {
-    let mut offset = 0;
+    let mut r = ByteReader::new(data);
 
-    // Version
-    let (version, n) = read_uvarint(&data[offset..]);
-    offset += n;
+    let version = r.uvarint()?;
     if version != 1 {
         return Err(LeafError::UnsupportedVersion(version));
     }
 
-    // TreeRoot
-    if offset + 32 > data.len() {
-        return Err(LeafError::InvalidData("truncated tree root".into()));
-    }
-    let tree_root = B3Hash::from_slice(&data[offset..offset + 32]).unwrap();
-    offset += 32;
+    let tree_root = B3Hash::from_bytes(r.array::<32>()?);
+    let timeline_id = r.string("timeline ID")?;
+    let prev_idx = r.uvarint()?;
 
-    // TimelineID
-    let (tl_len, n) = read_uvarint(&data[offset..]);
-    offset += n;
-    let tl_end = offset + tl_len as usize;
-    if tl_end > data.len() {
-        return Err(LeafError::InvalidData("truncated timeline ID".into()));
-    }
-    let timeline_id = String::from_utf8(data[offset..tl_end].to_vec())
-        .map_err(|_| LeafError::InvalidData("invalid UTF-8 in timeline ID".into()))?;
-    offset = tl_end;
-
-    // PrevIdx
-    let (prev_idx, n) = read_uvarint(&data[offset..]);
-    offset += n;
-
-    // MergeIdxs
-    let (merge_count, n) = read_uvarint(&data[offset..]);
-    offset += n;
-    let mut merge_idxs = Vec::with_capacity(merge_count as usize);
+    let merge_count = r.uvarint()?;
+    let mut merge_idxs = Vec::new();
     for _ in 0..merge_count {
-        let (idx, n) = read_uvarint(&data[offset..]);
-        offset += n;
-        merge_idxs.push(idx);
+        merge_idxs.push(r.uvarint()?);
     }
 
-    // Author
-    let (author_len, n) = read_uvarint(&data[offset..]);
-    offset += n;
-    let author_end = offset + author_len as usize;
-    if author_end > data.len() {
-        return Err(LeafError::InvalidData("truncated author".into()));
-    }
-    let author = String::from_utf8(data[offset..author_end].to_vec())
-        .map_err(|_| LeafError::InvalidData("invalid UTF-8 in author".into()))?;
-    offset = author_end;
+    let author = r.string("author")?;
+    let time_unix = r.varint()?;
+    let message = r.string("message")?;
 
-    // TimeUnix (signed varint)
-    let (time_unix, n) = read_varint(&data[offset..]);
-    offset += n;
-
-    // Message
-    let (msg_len, n) = read_uvarint(&data[offset..]);
-    offset += n;
-    let msg_end = offset + msg_len as usize;
-    if msg_end > data.len() {
-        return Err(LeafError::InvalidData("truncated message".into()));
-    }
-    let message = String::from_utf8(data[offset..msg_end].to_vec())
-        .map_err(|_| LeafError::InvalidData("invalid UTF-8 in message".into()))?;
-    offset = msg_end;
-
-    // Meta
-    let (meta_count, n) = read_uvarint(&data[offset..]);
-    offset += n;
+    let meta_count = r.uvarint()?;
     let mut meta = BTreeMap::new();
     for _ in 0..meta_count {
-        let (key_len, n) = read_uvarint(&data[offset..]);
-        offset += n;
-        let key_end = offset + key_len as usize;
-        let key = String::from_utf8(data[offset..key_end].to_vec())
-            .map_err(|_| LeafError::InvalidData("invalid UTF-8 in meta key".into()))?;
-        offset = key_end;
-
-        let (val_len, n) = read_uvarint(&data[offset..]);
-        offset += n;
-        let val_end = offset + val_len as usize;
-        let value = String::from_utf8(data[offset..val_end].to_vec())
-            .map_err(|_| LeafError::InvalidData("invalid UTF-8 in meta value".into()))?;
-        offset = val_end;
-
+        let key = r.string("meta key")?;
+        let value = r.string("meta value")?;
         meta.insert(key, value);
     }
 
-    if offset != data.len() {
-        return Err(LeafError::InvalidData("extra data after leaf".into()));
-    }
+    r.finish()?; // reject trailing data after the leaf
 
     Ok(Leaf {
         tree_root,
@@ -272,6 +216,8 @@ pub enum LeafError {
     UnsupportedVersion(u64),
     #[error("invalid data: {0}")]
     InvalidData(String),
+    #[error("malformed leaf: {0}")]
+    Read(#[from] crate::reader::ReadError),
 }
 
 #[cfg(test)]

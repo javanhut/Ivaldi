@@ -35,6 +35,7 @@ pub mod peers;
 pub mod pick;
 pub mod portal;
 pub mod progress;
+pub mod reader;
 pub mod remote;
 pub mod repo;
 pub mod rescue;

@@ -14,8 +14,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use crate::cas::{Cas, CasError};
-use crate::filechunk::{read_uvarint, write_uvarint};
+use crate::filechunk::write_uvarint;
 use crate::hash::B3Hash;
+use crate::reader::ByteReader;
 
 /// The kind of a filesystem node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,51 +143,32 @@ impl TreeNode {
 }
 
 /// Parse canonical tree bytes back into a TreeNode.
+///
+/// Bounds-checked throughout: a truncated buffer or a bogus entry count returns
+/// a typed error instead of panicking or pre-allocating from the count.
 pub fn parse_tree(data: &[u8]) -> Result<TreeNode, FsMerkleError> {
-    let mut offset = 0;
+    let mut r = ByteReader::new(data);
 
-    let (count, n) = read_uvarint(&data[offset..]);
-    offset += n;
-
-    let mut entries = Vec::with_capacity(count as usize);
+    let count = r.uvarint()?;
+    let mut entries = Vec::new();
     for _ in 0..count {
-        let (mode, n) = read_uvarint(&data[offset..]);
-        offset += n;
-
-        let (name_len, n) = read_uvarint(&data[offset..]);
-        offset += n;
-
-        let name_end = offset + name_len as usize;
-        if name_end > data.len() {
-            return Err(FsMerkleError::InvalidData("truncated entry name".into()));
-        }
-        let name = String::from_utf8(data[offset..name_end].to_vec())
-            .map_err(|_| FsMerkleError::InvalidData("invalid UTF-8 in name".into()))?;
-        offset = name_end;
-
-        if offset >= data.len() {
-            return Err(FsMerkleError::InvalidData("truncated entry kind".into()));
-        }
-        let kind = match data[offset] {
+        let mode = r.uvarint()? as u32;
+        let name = r.string("name")?;
+        let kind = match r.u8()? {
             1 => NodeKind::Blob,
             2 => NodeKind::Tree,
             k => return Err(FsMerkleError::InvalidData(format!("unknown kind: {}", k))),
         };
-        offset += 1;
-
-        if offset + 32 > data.len() {
-            return Err(FsMerkleError::InvalidData("truncated entry hash".into()));
-        }
-        let hash = B3Hash::from_slice(&data[offset..offset + 32]).unwrap();
-        offset += 32;
-
+        let hash = B3Hash::from_bytes(r.array::<32>()?);
         entries.push(Entry {
             name,
-            mode: mode as u32,
+            mode,
             kind,
             hash,
         });
     }
+
+    r.finish()?; // reject trailing data after the tree
 
     Ok(TreeNode { entries })
 }
@@ -615,6 +597,9 @@ pub enum FsMerkleError {
 
     #[error("CAS error: {0}")]
     Cas(#[from] CasError),
+
+    #[error("malformed tree: {0}")]
+    Read(#[from] crate::reader::ReadError),
 }
 
 #[cfg(test)]
