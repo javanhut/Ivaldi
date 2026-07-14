@@ -21,6 +21,9 @@ const BUTTERFLY_DATA: TableDefinition<&str, &[u8]> = TableDefinition::new("butte
 const BUTTERFLY_CHILDREN: TableDefinition<&str, &str> = TableDefinition::new("bf_children");
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
 
+pub const MMR_SIZE_KEY: &str = "mmr.size";
+pub const MMR_ROOT_KEY: &str = "mmr.root";
+
 /// Persistent store backed by redb.
 pub struct Store {
     db: Database,
@@ -87,7 +90,14 @@ impl Store {
     pub fn put_leaf(&self, idx: u64, data: &[u8]) -> Result<(), StoreError> {
         let w = self.db.begin_write()?;
         {
-            w.open_table(LEAVES)?.insert(idx, data)?;
+            let mut leaves = w.open_table(LEAVES)?;
+            if leaves.get(idx)?.is_some() {
+                return Err(StoreError(format!(
+                    "refusing to overwrite append-only MMR leaf {}",
+                    idx
+                )));
+            }
+            leaves.insert(idx, data)?;
         }
         w.commit()?;
         Ok(())
@@ -278,9 +288,9 @@ impl Store {
         Ok(())
     }
 
-    /// Persist a single commit's leaf, timeline head, seal mapping, and
-    /// `mmr.size` meta in one redb write transaction (one fsync) instead of
-    /// four. Hot path during bulk import.
+    /// Persist a single commit's leaf, timeline head, seal mapping, and MMR
+    /// size/root checkpoint in one redb write transaction (one fsync).
+    /// Existing leaf indices cannot be overwritten.
     #[allow(clippy::too_many_arguments)]
     pub fn commit_leaf_atomic(
         &self,
@@ -291,21 +301,76 @@ impl Store {
         seal_name: &str,
         seal_hash: B3Hash,
         mmr_size: u64,
+        mmr_root: B3Hash,
     ) -> Result<(), StoreError> {
+        if mmr_size != idx + 1 {
+            return Err(StoreError(format!(
+                "invalid MMR append: leaf index {} does not produce size {}",
+                idx, mmr_size
+            )));
+        }
+
         let w = self.db.begin_write()?;
         {
-            w.open_table(LEAVES)?.insert(idx, canonical)?;
+            let mut leaves = w.open_table(LEAVES)?;
+            if leaves.get(idx)?.is_some() {
+                return Err(StoreError(format!(
+                    "refusing to overwrite append-only MMR leaf {}",
+                    idx
+                )));
+            }
+            leaves.insert(idx, canonical)?;
             w.open_table(TIMELINE_HEADS)?
                 .insert(timeline, timeline_head)?;
             w.open_table(SEAL_NAME_TO_HASH)?
                 .insert(seal_name, seal_hash.as_bytes().as_slice())?;
             w.open_table(HASH_TO_SEAL_NAME)?
                 .insert(seal_hash.as_bytes().as_slice(), seal_name)?;
-            w.open_table(META)?
-                .insert("mmr.size", mmr_size.to_string().as_str())?;
+            let mut meta = w.open_table(META)?;
+            if let Some(previous_size) = meta.get(MMR_SIZE_KEY)? {
+                let previous_size = previous_size.value().parse::<u64>().map_err(|_| {
+                    StoreError("stored MMR size checkpoint is not a valid integer".into())
+                })?;
+                if previous_size != idx {
+                    return Err(StoreError(format!(
+                        "non-contiguous MMR append: stored size is {}, new leaf index is {}",
+                        previous_size, idx
+                    )));
+                }
+            } else if idx != 0 {
+                return Err(StoreError(format!(
+                    "missing MMR size checkpoint before appending leaf {}",
+                    idx
+                )));
+            }
+            meta.insert(MMR_SIZE_KEY, mmr_size.to_string().as_str())?;
+            meta.insert(MMR_ROOT_KEY, mmr_root.to_hex().as_str())?;
         }
         w.commit()?;
         Ok(())
+    }
+
+    /// Establish or repair both MMR checkpoint fields in one transaction.
+    /// Used when opening legacy repositories that predate root checkpoints.
+    pub fn set_mmr_checkpoint(&self, size: u64, root: B3Hash) -> Result<(), StoreError> {
+        let w = self.db.begin_write()?;
+        {
+            let mut meta = w.open_table(META)?;
+            meta.insert(MMR_SIZE_KEY, size.to_string().as_str())?;
+            meta.insert(MMR_ROOT_KEY, root.to_hex().as_str())?;
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_meta(&self, key: &str) -> Result<bool, StoreError> {
+        let w = self.db.begin_write()?;
+        let removed;
+        {
+            removed = w.open_table(META)?.remove(key)?.is_some();
+        }
+        w.commit()?;
+        Ok(removed)
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>, StoreError> {
@@ -331,6 +396,15 @@ mod tests {
         s.put_leaf(0, b"data").unwrap();
         assert_eq!(s.get_leaf(0).unwrap().unwrap(), b"data");
         assert!(s.get_leaf(99).unwrap().is_none());
+    }
+
+    #[test]
+    fn leaf_indices_are_append_only() {
+        let (_d, s) = setup();
+        s.put_leaf(0, b"original").unwrap();
+        let error = s.put_leaf(0, b"replacement").unwrap_err();
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert_eq!(s.get_leaf(0).unwrap().unwrap(), b"original");
     }
 
     #[test]
@@ -409,6 +483,8 @@ mod tests {
         let (_d, s) = setup();
         s.set_meta("k", "v").unwrap();
         assert_eq!(s.get_meta("k").unwrap(), Some("v".into()));
+        assert!(s.remove_meta("k").unwrap());
+        assert_eq!(s.get_meta("k").unwrap(), None);
     }
 
     #[test]

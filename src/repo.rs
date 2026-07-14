@@ -14,7 +14,7 @@ use crate::hash::B3Hash;
 use crate::leaf::{self, Leaf, NO_PARENT};
 use crate::mmr::Mmr;
 use crate::seal;
-use crate::store::{Store, StoreError};
+use crate::store::{MMR_ROOT_KEY, MMR_SIZE_KEY, Store, StoreError};
 
 /// A persistent repository backed by redb + file CAS.
 pub struct Repo {
@@ -37,14 +37,76 @@ impl Repo {
         let cas = FileCas::new(ivaldi_dir.join("objects"))
             .map_err(|e| RepoError::Other(format!("failed to open CAS: {}", e)))?;
 
-        // Rebuild in-memory MMR from persisted leaves
+        // Validate the append-only index sequence before rebuilding. A leaf
+        // count alone cannot distinguish [0, 1, 2] from [0, 1, 7].
+        let indices = store.all_leaf_indices().map_err(RepoError::Store)?;
+        for (expected, actual) in indices.iter().copied().enumerate() {
+            let expected = expected as u64;
+            if actual != expected {
+                return Err(RepoError::Integrity(format!(
+                    "MMR leaf index gap: expected {}, found {}",
+                    expected, actual
+                )));
+            }
+        }
+        let actual_size = indices.len() as u64;
+
+        let stored_size = match store.get_meta(MMR_SIZE_KEY).map_err(RepoError::Store)? {
+            Some(value) => Some(value.parse::<u64>().map_err(|_| {
+                RepoError::Integrity(format!("invalid {} checkpoint: {:?}", MMR_SIZE_KEY, value))
+            })?),
+            None => None,
+        };
+        if let Some(expected_size) = stored_size
+            && expected_size != actual_size
+        {
+            return Err(RepoError::Integrity(format!(
+                "MMR size mismatch: checkpoint says {}, store contains {} leaves",
+                expected_size, actual_size
+            )));
+        }
+
+        let stored_root = match store.get_meta(MMR_ROOT_KEY).map_err(RepoError::Store)? {
+            Some(value) => Some(B3Hash::from_hex(&value).ok_or_else(|| {
+                RepoError::Integrity(format!("invalid {} checkpoint: {:?}", MMR_ROOT_KEY, value))
+            })?),
+            None => None,
+        };
+        if stored_root.is_some() && stored_size.is_none() {
+            return Err(RepoError::Integrity(
+                "MMR root checkpoint exists without a size checkpoint".into(),
+            ));
+        }
+
+        // Rebuild the in-memory MMR and compare it with the durable root.
         let mut mmr = Mmr::new();
-        let count = store.leaf_count().map_err(RepoError::Store)?;
-        for idx in 0..count {
-            if let Some(data) = store.get_leaf(idx).map_err(RepoError::Store)? {
-                let parsed_leaf = leaf::parse_leaf(&data)
-                    .map_err(|e| RepoError::Other(format!("corrupt leaf {}: {}", idx, e)))?;
-                mmr.append_leaf(parsed_leaf);
+        for idx in indices {
+            let data = store
+                .get_leaf(idx)
+                .map_err(RepoError::Store)?
+                .ok_or_else(|| {
+                    RepoError::Integrity(format!("MMR leaf {} disappeared during open", idx))
+                })?;
+            let parsed_leaf = leaf::parse_leaf(&data)
+                .map_err(|e| RepoError::Integrity(format!("corrupt leaf {}: {}", idx, e)))?;
+            mmr.append_leaf(parsed_leaf);
+        }
+
+        let actual_root = mmr.root();
+        match stored_root {
+            Some(expected_root) if expected_root != actual_root => {
+                return Err(RepoError::Integrity(format!(
+                    "MMR root mismatch: checkpoint is {}, rebuilt root is {}",
+                    expected_root, actual_root
+                )));
+            }
+            Some(_) => {}
+            None => {
+                // One-time migration for repositories created before root
+                // checkpoints. Once established, later opens fail closed.
+                store
+                    .set_mmr_checkpoint(actual_size, actual_root)
+                    .map_err(RepoError::Store)?;
             }
         }
 
@@ -152,9 +214,9 @@ impl Repo {
         let idx = self.mmr.size();
         let (leaf_idx, root) = self.mmr.append_leaf(leaf);
 
-        // Persist all four redb writes (leaf, timeline head, seal mapping,
-        // mmr size) in a single transaction → one fsync per commit instead
-        // of four. Hot path during bulk import.
+        // Persist the leaf, refs, mappings, and MMR size/root checkpoint in a
+        // single transaction. A crash cannot expose a leaf without the root
+        // that authenticates it.
         self.store
             .commit_leaf_atomic(
                 idx,
@@ -164,6 +226,7 @@ impl Repo {
                 &seal_name,
                 leaf_hash,
                 self.mmr.size(),
+                root,
             )
             .map_err(RepoError::Store)?;
 
@@ -904,6 +967,8 @@ pub enum RepoError {
     Store(#[from] StoreError),
     #[error("repository I/O: {0}")]
     Io(#[from] std::io::Error),
+    #[error("repository integrity error: {0}")]
+    Integrity(String),
     #[error("{0}")]
     Other(String),
 }
@@ -912,6 +977,8 @@ pub enum RepoError {
 mod tests {
     use super::*;
     use crate::forge;
+
+    const TEST_LEAVES: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("leaves");
 
     fn setup_repo() -> (tempfile::TempDir, Repo) {
         let dir = tempfile::tempdir().unwrap();
@@ -938,6 +1005,102 @@ mod tests {
     fn open_nonexistent_fails() {
         let dir = tempfile::tempdir().unwrap();
         assert!(Repo::open(dir.path()).is_err());
+    }
+
+    #[test]
+    fn mmr_checkpoint_survives_reopen() {
+        let (dir, expected_root) = {
+            let (dir, mut repo) = setup_repo();
+            repo.commit(B3Hash::digest(b"tree 1"), "A", "one").unwrap();
+            repo.commit(B3Hash::digest(b"tree 2"), "A", "two").unwrap();
+            let root = repo.root();
+            assert_eq!(repo.store.get_meta(MMR_SIZE_KEY).unwrap(), Some("2".into()));
+            assert_eq!(
+                repo.store.get_meta(MMR_ROOT_KEY).unwrap(),
+                Some(root.to_hex())
+            );
+            (dir, root)
+        };
+
+        let reopened = Repo::open(dir.path()).unwrap();
+        assert_eq!(reopened.root(), expected_root);
+        assert_eq!(reopened.commit_count(), 2);
+    }
+
+    #[test]
+    fn legacy_repo_without_root_checkpoint_is_migrated_once() {
+        let (dir, expected_root) = {
+            let (dir, mut repo) = setup_repo();
+            repo.commit(B3Hash::digest(b"legacy tree"), "A", "legacy")
+                .unwrap();
+            let root = repo.root();
+            assert!(repo.store.remove_meta(MMR_ROOT_KEY).unwrap());
+            (dir, root)
+        };
+
+        let reopened = Repo::open(dir.path()).unwrap();
+        assert_eq!(reopened.root(), expected_root);
+        assert_eq!(
+            reopened.store.get_meta(MMR_ROOT_KEY).unwrap(),
+            Some(expected_root.to_hex())
+        );
+    }
+
+    #[test]
+    fn open_rejects_tampered_historical_leaf() {
+        let (dir, replacement) = {
+            let (dir, mut repo) = setup_repo();
+            let committed = repo
+                .commit(B3Hash::digest(b"original tree"), "A", "original")
+                .unwrap();
+            let mut leaf = repo.get_leaf(committed.index).unwrap().unwrap();
+            leaf.message = "tampered".into();
+            (dir, leaf.canonical_bytes())
+        };
+
+        // Simulate out-of-band database modification, bypassing Store's
+        // append-only API. The durable checkpoint must catch it on reopen.
+        let db = redb::Database::create(dir.path().join(".ivaldi/store.db")).unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            use redb::ReadableTable;
+            let mut leaves = write.open_table(TEST_LEAVES).unwrap();
+            assert!(leaves.get(0).unwrap().is_some());
+            leaves.insert(0, replacement.as_slice()).unwrap();
+        }
+        write.commit().unwrap();
+        drop(db);
+
+        let error = Repo::open(dir.path()).err().unwrap();
+        assert!(error.to_string().contains("MMR root mismatch"), "{error}");
+    }
+
+    #[test]
+    fn open_rejects_leaf_index_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        forge::forge(dir.path()).unwrap();
+
+        let leaf = Leaf::new(B3Hash::digest(b"tree"), "main", "A", 1, "gap");
+        {
+            let store = Store::open(&dir.path().join(".ivaldi/store.db")).unwrap();
+            store.put_leaf(1, &leaf.canonical_bytes()).unwrap();
+        }
+
+        let error = Repo::open(dir.path()).err().unwrap();
+        assert!(error.to_string().contains("MMR leaf index gap"), "{error}");
+    }
+
+    #[test]
+    fn open_rejects_size_checkpoint_mismatch() {
+        let dir = {
+            let (dir, mut repo) = setup_repo();
+            repo.commit(B3Hash::digest(b"tree"), "A", "one").unwrap();
+            repo.store.set_meta(MMR_SIZE_KEY, "99").unwrap();
+            dir
+        };
+
+        let error = Repo::open(dir.path()).err().unwrap();
+        assert!(error.to_string().contains("MMR size mismatch"), "{error}");
     }
 
     #[test]

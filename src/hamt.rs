@@ -1,8 +1,15 @@
-//! Hash Array Mapped Trie (HAMT) for immutable directory trees.
+//! Experimental Hash Array Mapped Trie (HAMT) prototype.
 //!
-//! Provides O(log32 n) lookups with structural sharing — unchanged subtrees
-//! share storage between versions. Used as an optimization layer over fsmerkle
-//! TreeNode for large directories.
+//! This module explores a possible future directory index for very large
+//! directories. It is not connected to `fsmerkle`, the CAS, repository
+//! persistence, or any CLI operation. Current repository trees use canonical
+//! content-addressed Merkle nodes from `fsmerkle`.
+//!
+//! The prototype provides an immutable API with approximately O(log32 n)
+//! lookup. Its `Box<Node>` representation deep-clones unchanged branches, so
+//! it does not yet provide true structural sharing. A production integration
+//! would require CAS-backed nodes or shared ownership such as `Arc<Node>`.
+//! See `docs/hamt.md` for the proposed integration path.
 
 use crate::hash::B3Hash;
 
@@ -50,7 +57,7 @@ impl<V: Clone> Hamt<V> {
             .and_then(|node| get_recursive(node, key, hash, 0))
     }
 
-    /// Insert a key-value pair. Returns a new HAMT (structural sharing).
+    /// Insert a key-value pair, returning a new immutable HAMT value.
     pub fn insert(&self, key: String, value: V) -> Self {
         let existed = self.get(&key).is_some();
         let hash = B3Hash::digest(key.as_bytes());
@@ -332,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_sharing() {
+    fn immutable_versions_are_independent() {
         let h1 = Hamt::new().insert("a".into(), 1).insert("b".into(), 2);
         let h2 = h1.insert("c".into(), 3);
         // h1 still works (immutable)

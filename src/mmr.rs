@@ -3,7 +3,7 @@
 //! An append-only structure that tracks commit history with:
 //! - Efficient root computation: O(log n)
 //! - Inclusion proofs: O(log n)
-//! - Tamper-proof history
+//! - Tamper-evident history when checked against a trusted root
 //!
 //! Hashing rules:
 //! - Leaf hash:     `BLAKE3(0x00 || LeafHash)`

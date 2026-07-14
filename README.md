@@ -69,7 +69,7 @@ trying to do:
 | Stashing | Manual `git stash` | Automatic on timeline switch |
 | Merge conflicts | Markers in files | Clean workspace, strategy selection |
 | Clone | All branches | Selective (`scout` + `harvest`) |
-| Directories | Flat tree | HAMT (structural sharing) |
+| Directories | Canonical Merkle trees | Content-addressed Merkle trees |
 | Peer-to-peer | Not built in | `ivaldi serve` + `ivaldi://` transport |
 
 The vocabulary is different on purpose — names match the action, not git
@@ -137,11 +137,17 @@ ivaldi forge        # initialize your first repository
 
 - **BLAKE3** — all hashing (files, trees, commits, proofs)
 - **Merkle Mountain Range** — append-only commit history with inclusion proofs
-- **HAMT** — immutable directory trees with structural sharing
+- **Content-addressed Merkle trees** — unchanged directory subtrees retain
+  the same hashes and are reused across seals
 - **Content-addressable storage** — deduplication across timelines, 64KB
   file chunking for large files
 - **redb** — pure-Rust, ACID, crash-safe embedded database for commits,
   timelines, and seal names
+
+An in-memory HAMT prototype exists as a possible future backend for very large
+directories, but it is not part of the current repository storage path. See
+[`docs/hamt.md`](docs/hamt.md) for its status and the criteria for integrating
+it.
 
 ## License
 

@@ -18,11 +18,14 @@ Location: `.ivaldi/store.db`
 | `hash_to_seal` | `[u8] → str` | BLAKE3 hash → seal name |
 | `butterflies` | `str → [u8]` | Butterfly name → metadata |
 | `bf_children` | `str → str` | Parent → comma-separated children |
-| `meta` | `str → str` | Generic metadata (e.g., mmr.size) |
+| `meta` | `str → str` | Metadata, including atomic `mmr.size` and `mmr.root` checkpoints |
 
 ## Properties
 
 - **ACID**: All writes are transactional — commit or rollback, no partial state
 - **Crash-safe**: Survives power loss, process crashes
+- **Append-only MMR leaves**: Existing leaf indices cannot be overwritten
+- **Verified history checkpoint**: Repository open rebuilds and verifies the
+  MMR size and root before accepting history
 - **Never-fail**: Critical for workspace rematerialization
 - **No unsafe code**: redb is pure safe Rust
