@@ -32,6 +32,8 @@ impl Repo {
         if !ivaldi_dir.join("HEAD").exists() {
             return Err(RepoError::NotARepo);
         }
+        // Refuse a repository written by a newer Ivaldi before touching it.
+        forge::check_format(&ivaldi_dir).map_err(|e| RepoError::Other(e.to_string()))?;
 
         let store = Store::open(&ivaldi_dir.join("store.db")).map_err(RepoError::Store)?;
         let cas = FileCas::new(ivaldi_dir.join("objects"))

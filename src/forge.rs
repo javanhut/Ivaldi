@@ -15,6 +15,7 @@
 //! ├── butterflies/    # Butterfly metadata
 //! ├── stage/          # Staging area
 //! ├── config          # Repository configuration
+//! ├── FORMAT          # On-disk format version + compatibility
 //! └── HEAD            # Current timeline pointer
 //! ```
 
@@ -79,6 +80,9 @@ pub fn forge(work_dir: &Path) -> Result<ForgeResult, ForgeError> {
     let head_path = ivaldi_dir.join("HEAD");
     fs::write(&head_path, "ref: refs/heads/main\n").map_err(ForgeError::Io)?;
 
+    // Stamp the on-disk format so newer repos can be refused by older binaries.
+    write_format(&ivaldi_dir).map_err(ForgeError::Io)?;
+
     // Create default config
     let config = Config::new();
     config
@@ -94,6 +98,94 @@ pub fn forge(work_dir: &Path) -> Result<ForgeResult, ForgeError> {
         already_existed: false,
         git_imported,
     })
+}
+
+/// On-disk repository format this binary writes and can open. Bump on any
+/// breaking change to a persisted encoding; a repository stamped higher than
+/// this is refused. See plan.md Phase 1.
+pub const CURRENT_FORMAT: u32 = 1;
+
+/// Oldest Ivaldi version that understands `CURRENT_FORMAT`. Written into
+/// `.ivaldi/FORMAT` purely so the "too new" error can name a version to
+/// install; the actual gate is the format number.
+const MIN_IVALDI: &str = "0.1.1";
+
+/// Parsed `.ivaldi/FORMAT`. A missing file means format 0 (repositories
+/// created before FORMAT existed) and is always openable.
+#[derive(Debug, Clone)]
+pub struct RepoFormat {
+    pub version: u32,
+    pub min_ivaldi: String,
+}
+
+/// Write `.ivaldi/FORMAT` as plain `key = value` lines. The line format is
+/// deliberate: an older or newer binary can read the keys it knows and ignore
+/// the rest, which a strict struct decode could not.
+fn write_format(ivaldi_dir: &Path) -> std::io::Result<()> {
+    // ponytail: `features` is empty until a real optional feature exists;
+    // add feature-gating on open when one does.
+    let body = format!("format = {CURRENT_FORMAT}\nmin_ivaldi = {MIN_IVALDI}\nfeatures =\n");
+    crate::atomic_io::atomic_write(&ivaldi_dir.join("FORMAT"), body.as_bytes())
+}
+
+/// Read `.ivaldi/FORMAT`. A missing file is format 0, not an error.
+pub fn read_format(ivaldi_dir: &Path) -> Result<RepoFormat, ForgeError> {
+    let path = ivaldi_dir.join("FORMAT");
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RepoFormat {
+                version: 0,
+                min_ivaldi: String::new(),
+            });
+        }
+        Err(e) => return Err(ForgeError::Io(e)),
+    };
+
+    let mut version = None;
+    let mut min_ivaldi = String::new();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "format" => {
+                version = Some(value.trim().parse::<u32>().map_err(|_| {
+                    ForgeError::Io(std::io::Error::other(format!(
+                        "{}: invalid format version {:?}",
+                        path.display(),
+                        value.trim()
+                    )))
+                })?);
+            }
+            "min_ivaldi" => min_ivaldi = value.trim().to_string(),
+            _ => {} // unknown key: forward-compatible, ignore
+        }
+    }
+
+    match version {
+        Some(version) => Ok(RepoFormat {
+            version,
+            min_ivaldi,
+        }),
+        None => Err(ForgeError::Io(std::io::Error::other(format!(
+            "{}: missing 'format' field",
+            path.display()
+        )))),
+    }
+}
+
+/// Refuse to open a repository whose format is newer than this binary supports.
+pub fn check_format(ivaldi_dir: &Path) -> Result<(), ForgeError> {
+    let fmt = read_format(ivaldi_dir)?;
+    if fmt.version > CURRENT_FORMAT {
+        return Err(ForgeError::FormatTooNew {
+            found: fmt.version,
+            supported: CURRENT_FORMAT,
+            min_ivaldi: fmt.min_ivaldi,
+        });
+    }
+    Ok(())
 }
 
 /// Detect a .git/ directory and import basic refs info.
@@ -194,6 +286,14 @@ pub enum ForgeError {
     AlreadyExists(PathBuf),
     #[error("not an Ivaldi repository")]
     NotARepo,
+    #[error(
+        "repository format v{found} is newer than this Ivaldi supports (up to v{supported}); upgrade to Ivaldi >= {min_ivaldi}"
+    )]
+    FormatTooNew {
+        found: u32,
+        supported: u32,
+        min_ivaldi: String,
+    },
 }
 
 #[cfg(test)]
@@ -219,6 +319,60 @@ mod tests {
         assert!(ivaldi.join("stage").is_dir());
         assert!(ivaldi.join("HEAD").is_file());
         assert!(ivaldi.join("config").is_file());
+        assert!(ivaldi.join("FORMAT").is_file());
+    }
+
+    #[test]
+    fn format_roundtrips_current() {
+        let dir = tempfile::tempdir().unwrap();
+        forge(dir.path()).unwrap();
+        let ivaldi = dir.path().join(".ivaldi");
+
+        let fmt = read_format(&ivaldi).unwrap();
+        assert_eq!(fmt.version, CURRENT_FORMAT);
+        assert_eq!(fmt.min_ivaldi, MIN_IVALDI);
+        check_format(&ivaldi).unwrap(); // current format opens fine
+    }
+
+    #[test]
+    fn missing_format_is_version_zero() {
+        // Pre-FORMAT repositories have no FORMAT file and must still open.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path()).unwrap();
+        assert_eq!(read_format(dir.path()).unwrap().version, 0);
+        check_format(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn newer_format_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("FORMAT"),
+            format!("format = {}\nmin_ivaldi = 9.9.9\n", CURRENT_FORMAT + 1),
+        )
+        .unwrap();
+
+        match check_format(dir.path()) {
+            Err(ForgeError::FormatTooNew {
+                found, min_ivaldi, ..
+            }) => {
+                assert_eq!(found, CURRENT_FORMAT + 1);
+                assert_eq!(min_ivaldi, "9.9.9");
+            }
+            other => panic!("expected FormatTooNew, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored() {
+        // Forward compatibility: a future key must not break an older reader.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("FORMAT"),
+            format!("format = {CURRENT_FORMAT}\nfuture_thing = enabled\n"),
+        )
+        .unwrap();
+        assert_eq!(read_format(dir.path()).unwrap().version, CURRENT_FORMAT);
     }
 
     #[test]
