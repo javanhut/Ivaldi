@@ -151,6 +151,11 @@ it.
 
 ## License
 
-No license has been granted yet. Until a license is added, the source remains
-copyrighted by its contributors and is not available for redistribution under
-an open-source license.
+Ivaldi is licensed under the **GNU Affero General Public License v3.0**
+([AGPL-3.0-only](LICENSE)).
+
+You are free to use, study, and modify Ivaldi. The share-alike obligation is
+strong: if you distribute a modified version **or run one as a network
+service**, you must make your complete source code available to your users
+under the same license. Running Ivaldi unmodified, for yourself, carries no
+such obligation.
