@@ -168,6 +168,20 @@ pub enum Commands {
 
     /// Recover files from a damaged repository, bypassing refs and the MMR
     Rescue(RescueArgs),
+
+    /// Diagnose a repository and print recovery guidance
+    Doctor(DoctorArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct DoctorArgs {
+    /// Skip the full object re-hash (faster, shallower).
+    #[arg(long)]
+    pub quick: bool,
+
+    /// Emit the underlying integrity report as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Args, Debug)]

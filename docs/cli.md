@@ -37,11 +37,16 @@ Command-line interface for Ivaldi VCS, built with `clap`.
 | `serve [--bind addr:port]` | | Run an `ivaldi://` peer server |
 | `peer trust/list/forget/whoami/known` | | Manage peer pubkey allowlists + TOFU known servers |
 | `review create/list/show/diff/comment/approve/request-changes/merge/close/reopen` | `rv` | Local code review system |
+| `verify [--full] [--json]` | | Check repository integrity (`--full` re-hashes every stored object) |
+| `rescue [--out dir] [--json]` | | Recover files from a damaged repository, bypassing refs and the MMR |
+| `doctor [--quick] [--json]` | | Diagnose a repository and print recovery guidance |
 | `completions <shell>` | | Print a bash/zsh/fish/powershell/elvish completion script |
 | `man [--out dir]` | | Generate man pages (used by `make install-extras`) |
 
 `timeline list`, `portal list`, and `status` accept `--json` for scripting;
-`log --format json` does the same for history.
+`log --format json` does the same for history. `verify`, `rescue`, and
+`doctor` all accept `--json`, and `verify`/`doctor` exit non-zero when the
+repository has problems.
 
 ## Global Flags
 

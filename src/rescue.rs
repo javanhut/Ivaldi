@@ -6,11 +6,11 @@
 //! before use, so rescued content is guaranteed intact; anything corrupt,
 //! missing, or unsafe is skipped and reported.
 //!
-//! Two independent sources, either of which may be broken:
-//!   1. The redb store gives commit leaves → tree roots (+ author/message).
-//!   2. The CAS (`objects/`) gives the blob/tree content to materialize.
-//! If the store is unreadable, an orphan sweep still materializes every tree
-//! that parses out of the CAS, so files come back even with no commit records.
+//! Two independent sources, either of which may be broken: the redb store gives
+//! commit leaves → tree roots (with author/message), and the CAS (`objects/`)
+//! gives the blob/tree content to materialize. If the store is unreadable, an
+//! orphan sweep still materializes every tree that parses out of the CAS, so
+//! files come back even with no commit records.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

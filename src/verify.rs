@@ -33,6 +33,38 @@ impl Report {
         Self { ok, full, checks }
     }
 
+    /// Actionable recovery guidance derived from which checks failed. Used by
+    /// `ivaldi doctor` to turn a diagnosis into next steps.
+    pub fn guidance(&self) -> Vec<String> {
+        if self.ok {
+            return vec!["Repository is healthy. No action needed.".into()];
+        }
+        let mut out = Vec::new();
+        for c in self.checks.iter().filter(|c| !c.ok) {
+            match c.name.as_str() {
+                "format" => out.push(
+                    "Format problem: this repository was written by a newer Ivaldi. \
+                     Upgrade Ivaldi to the version named in the error above."
+                        .into(),
+                ),
+                "structure" => out.push(
+                    "History is damaged (MMR/leaf/checkpoint inconsistency). Your file \
+                     content is likely still intact — recover it with:\n    \
+                     ivaldi rescue --out ./ivaldi-rescue"
+                        .into(),
+                ),
+                "cas-objects" => out.push(
+                    "Some stored objects are corrupt on disk. Recover the intact files with:\n    \
+                     ivaldi rescue --out ./ivaldi-rescue\n  \
+                     (corrupt objects cannot be reconstructed and will be reported as missing)."
+                        .into(),
+                ),
+                other => out.push(format!("{other}: {}", c.detail)),
+            }
+        }
+        out
+    }
+
     /// Human-readable rendering for the terminal.
     pub fn print_human(&self) {
         for c in &self.checks {
@@ -175,6 +207,36 @@ fn verify_cas_objects(objects_dir: &Path) -> Check {
 mod tests {
     use super::*;
     use crate::cas::FileCas;
+
+    #[test]
+    fn guidance_points_damaged_repo_at_rescue() {
+        let report = Report::from_checks(
+            true,
+            vec![Check {
+                name: "structure".into(),
+                ok: false,
+                detail: "MMR root mismatch".into(),
+            }],
+        );
+        let guidance = report.guidance();
+        assert!(guidance.iter().any(|g| g.contains("ivaldi rescue")));
+    }
+
+    #[test]
+    fn guidance_is_clean_when_healthy() {
+        let report = Report::from_checks(
+            false,
+            vec![Check {
+                name: "format".into(),
+                ok: true,
+                detail: "v1".into(),
+            }],
+        );
+        assert_eq!(
+            report.guidance(),
+            vec!["Repository is healthy. No action needed."]
+        );
+    }
 
     #[test]
     fn clean_repo_verifies() {

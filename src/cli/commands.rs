@@ -91,6 +91,38 @@ fn cmd_rescue(args: RescueArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_doctor(args: DoctorArgs) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    // Locate the repo leniently (objects/ present) so we can diagnose one that
+    // is too broken for Repo::open to succeed.
+    let ivaldi_dir = crate::rescue::find_ivaldi_dir(&cwd)
+        .ok_or("no .ivaldi/objects found here or in any parent directory")?;
+    let work_dir = ivaldi_dir
+        .parent()
+        .ok_or("could not resolve repository root")?;
+
+    let report = crate::verify::verify(work_dir, !args.quick);
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+    } else {
+        report.print_human();
+        println!();
+        println!("{}", color::bold("Diagnosis:"));
+        for line in report.guidance() {
+            println!("  {line}");
+        }
+    }
+
+    if !report.ok {
+        process::exit(1);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------

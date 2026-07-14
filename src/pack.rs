@@ -34,19 +34,57 @@ const OP_INSERT: u8 = 1;
 /// Minimum savings ratio to use delta (25% savings required).
 const DELTA_MIN_SAVINGS: f64 = 0.25;
 
+/// Deepest delta chain resolved before giving up. Bounds recursion against a
+/// cyclic or pathologically deep chain in a hostile pack — either would
+/// otherwise overflow the stack.
+const MAX_DELTA_DEPTH: usize = 50;
+
+/// Absolute cap on a single delta-expanded object. A hostile delta can encode
+/// a huge output from a tiny input (a "delta bomb"); refuse rather than exhaust
+/// memory. ponytail: flat cap, not a ratio — raise if real objects approach it.
+const MAX_DELTA_OUTPUT: usize = 1 << 30; // 1 GiB
+
+/// Bounds- and overflow-checked `data[start..start + len]`. Never panics.
+fn slice_len(data: &[u8], start: usize, len: usize) -> Result<&[u8], PackError> {
+    let end = start.checked_add(len).ok_or(PackError::Corrupt)?;
+    data.get(start..end).ok_or(PackError::Corrupt)
+}
+
+/// Validate that an index region of `entry_count` entries fits within `data`,
+/// returning the offset where the data section starts. Bounds `entry_count`
+/// (a hostile count cannot overflow the multiply or outrun the buffer) so
+/// later per-entry reads and any allocation are safe.
+fn data_section_start(
+    data_len: usize,
+    index_start: usize,
+    entry_count: usize,
+    entry_size: usize,
+) -> Result<usize, PackError> {
+    let index_size = entry_count
+        .checked_mul(entry_size)
+        .ok_or(PackError::Corrupt)?;
+    let data_start = index_start
+        .checked_add(index_size)
+        .ok_or(PackError::Corrupt)?;
+    if data_start > data_len {
+        return Err(PackError::Corrupt);
+    }
+    Ok(data_start)
+}
+
 /// Read a 32-byte BLAKE3 hash at `off`, failing with `Corrupt` on short reads.
 fn read_hash(data: &[u8], off: usize) -> Result<B3Hash, PackError> {
-    data.get(off..off + 32)
+    let end = off.checked_add(32).ok_or(PackError::Corrupt)?;
+    data.get(off..end)
         .and_then(B3Hash::from_slice)
         .ok_or(PackError::Corrupt)
 }
 
 /// Read a little-endian u64 at `off`, failing with `Corrupt` on short reads.
 fn read_u64_le(data: &[u8], off: usize) -> Result<u64, PackError> {
-    let bytes: [u8; 8] = data
-        .get(off..off + 8)
-        .and_then(|s| s.try_into().ok())
-        .ok_or(PackError::Corrupt)?;
+    let bytes: [u8; 8] = slice_len(data, off, 8)?
+        .try_into()
+        .map_err(|_| PackError::Corrupt)?;
     Ok(u64::from_le_bytes(bytes))
 }
 
@@ -280,9 +318,8 @@ impl PackReader {
             match version {
                 PACK_VERSION => {
                     // v1: 48-byte index entries (hash:32 + offset:8 + size:8)
-                    let index_size = entry_count * 48;
                     let index_start = 13;
-                    let data_start = index_start + index_size;
+                    let data_start = data_section_start(data.len(), index_start, entry_count, 48)?;
 
                     for i in 0..entry_count {
                         let idx_off = index_start + i * 48;
@@ -290,9 +327,9 @@ impl PackReader {
                         let offset = read_u64_le(&data, idx_off + 32)? as usize;
                         let size = read_u64_le(&data, idx_off + 40)? as usize;
 
-                        let abs_offset = data_start + offset;
-                        if abs_offset + size <= data.len() {
-                            let obj_data = &data[abs_offset..abs_offset + size];
+                        let abs_offset =
+                            data_start.checked_add(offset).ok_or(PackError::Corrupt)?;
+                        if let Ok(obj_data) = slice_len(&data, abs_offset, size) {
                             cas.put(hash, obj_data)
                                 .map_err(|e| PackError::Other(e.to_string()))?;
                             count += 1;
@@ -301,13 +338,12 @@ impl PackReader {
                 }
                 PACK_VERSION_DELTA => {
                     // v2: 49-byte index entries (hash:32 + offset:8 + size:8 + type:1)
-                    let index_size = entry_count * 49;
                     let index_start = 13;
-                    let data_start = index_start + index_size;
+                    let data_start = data_section_start(data.len(), index_start, entry_count, 49)?;
 
-                    // First pass: parse index
-                    let mut entries: Vec<(B3Hash, usize, usize, u8)> =
-                        Vec::with_capacity(entry_count);
+                    // First pass: parse index. `data_section_start` has bounded
+                    // entry_count, so no untrusted pre-allocation.
+                    let mut entries: Vec<(B3Hash, usize, usize, u8)> = Vec::new();
                     for i in 0..entry_count {
                         let idx_off = index_start + i * 49;
                         let hash = read_hash(&data, idx_off)?;
@@ -326,11 +362,13 @@ impl PackReader {
 
                     // Resolve and extract each entry
                     for (hash, offset, size, etype) in &entries {
-                        let abs_offset = data_start + offset;
-                        if abs_offset + size > data.len() {
+                        let abs_offset = match data_start.checked_add(*offset) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let Ok(raw) = slice_len(&data, abs_offset, *size) else {
                             continue;
-                        }
-                        let raw = &data[abs_offset..abs_offset + size];
+                        };
 
                         let obj_data = if *etype == ENTRY_DELTA {
                             self.resolve_delta_chain(
@@ -339,6 +377,7 @@ impl PackReader {
                                 &hash_to_idx,
                                 &data,
                                 data_start,
+                                0,
                             )?
                         } else {
                             raw.to_vec()
@@ -369,7 +408,7 @@ impl PackReader {
         match version {
             PACK_VERSION => {
                 let index_start = 13;
-                let data_start = index_start + entry_count * 48;
+                let data_start = data_section_start(data.len(), index_start, entry_count, 48)?;
 
                 for i in 0..entry_count {
                     let idx_off = index_start + i * 48;
@@ -380,19 +419,18 @@ impl PackReader {
 
                     let offset = read_u64_le(data, idx_off + 32)? as usize;
                     let size = read_u64_le(data, idx_off + 40)? as usize;
-                    let abs_offset = data_start + offset;
-                    if abs_offset + size > data.len() {
-                        return Err(PackError::Corrupt);
-                    }
-                    return Ok(Some(data[abs_offset..abs_offset + size].to_vec()));
+                    let abs_offset = data_start.checked_add(offset).ok_or(PackError::Corrupt)?;
+                    let obj = slice_len(data, abs_offset, size)?;
+                    return Ok(Some(obj.to_vec()));
                 }
                 Ok(None)
             }
             PACK_VERSION_DELTA => {
                 let index_start = 13;
+                let data_start = data_section_start(data.len(), index_start, entry_count, 49)?;
 
-                // Parse all index entries
-                let mut entries: Vec<(B3Hash, usize, usize, u8)> = Vec::with_capacity(entry_count);
+                // Parse all index entries. entry_count is already bounded above.
+                let mut entries: Vec<(B3Hash, usize, usize, u8)> = Vec::new();
                 for i in 0..entry_count {
                     let idx_off = index_start + i * 49;
                     let hash = read_hash(data, idx_off)?;
@@ -402,7 +440,6 @@ impl PackReader {
                     entries.push((hash, offset, size, etype));
                 }
 
-                let data_start = index_start + entry_count * 49;
                 let hash_to_idx: BTreeMap<B3Hash, usize> = entries
                     .iter()
                     .enumerate()
@@ -416,15 +453,12 @@ impl PackReader {
                 };
 
                 let (_, offset, size, etype) = &entries[target_idx];
-                let abs_offset = data_start + offset;
-                if abs_offset + size > data.len() {
-                    return Err(PackError::Corrupt);
-                }
-                let raw = &data[abs_offset..abs_offset + size];
+                let abs_offset = data_start.checked_add(*offset).ok_or(PackError::Corrupt)?;
+                let raw = slice_len(data, abs_offset, *size)?;
 
                 if *etype == ENTRY_DELTA {
                     let resolved =
-                        self.resolve_delta_chain(raw, &entries, &hash_to_idx, data, data_start)?;
+                        self.resolve_delta_chain(raw, &entries, &hash_to_idx, data, data_start, 0)?;
                     Ok(Some(resolved))
                 } else {
                     Ok(Some(raw.to_vec()))
@@ -441,7 +475,13 @@ impl PackReader {
         hash_to_idx: &BTreeMap<B3Hash, usize>,
         pack_data: &[u8],
         data_start: usize,
+        depth: usize,
     ) -> Result<Vec<u8>, PackError> {
+        // Bound recursion: a cyclic or absurdly deep chain in a hostile pack
+        // would otherwise overflow the stack.
+        if depth >= MAX_DELTA_DEPTH {
+            return Err(PackError::Corrupt);
+        }
         if raw.len() < 32 {
             return Err(PackError::Corrupt);
         }
@@ -451,20 +491,26 @@ impl PackReader {
         // Find base object
         let base_idx = hash_to_idx.get(&base_hash).ok_or(PackError::Corrupt)?;
         let (_, base_offset, base_size, base_etype) = &entries[*base_idx];
-        let abs_base = data_start + base_offset;
-        if abs_base + base_size > pack_data.len() {
-            return Err(PackError::Corrupt);
-        }
-        let base_raw = &pack_data[abs_base..abs_base + base_size];
+        let abs_base = data_start
+            .checked_add(*base_offset)
+            .ok_or(PackError::Corrupt)?;
+        let base_raw = slice_len(pack_data, abs_base, *base_size)?;
 
         // Recursively resolve if base is also a delta
         let base_data = if *base_etype == ENTRY_DELTA {
-            self.resolve_delta_chain(base_raw, entries, hash_to_idx, pack_data, data_start)?
+            self.resolve_delta_chain(
+                base_raw,
+                entries,
+                hash_to_idx,
+                pack_data,
+                data_start,
+                depth + 1,
+            )?
         } else {
             base_raw.to_vec()
         };
 
-        Ok(apply_delta(&base_data, delta_bytes))
+        apply_delta(&base_data, delta_bytes)
     }
 }
 
@@ -546,7 +592,15 @@ fn flush_insert(delta: &mut Vec<u8>, buf: &[u8]) {
 }
 
 /// Apply a delta to a base object, producing the target object.
-pub fn apply_delta(base: &[u8], delta: &[u8]) -> Vec<u8> {
+///
+/// Bounded against hostile deltas: the output is capped at
+/// [`MAX_DELTA_OUTPUT`] (a small delta can otherwise encode an enormous
+/// result — a "delta bomb"), and all slicing is bounds-checked.
+pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, PackError> {
+    apply_delta_capped(base, delta, MAX_DELTA_OUTPUT)
+}
+
+fn apply_delta_capped(base: &[u8], delta: &[u8], max_output: usize) -> Result<Vec<u8>, PackError> {
     let mut result = Vec::new();
     let mut di = 0;
 
@@ -556,33 +610,42 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Vec<u8> {
 
         match op {
             OP_COPY => {
-                if di + 8 > delta.len() {
-                    break;
+                let offset = u32::from_le_bytes(
+                    slice_len(delta, di, 4)?
+                        .try_into()
+                        .map_err(|_| PackError::Corrupt)?,
+                ) as usize;
+                let len = u32::from_le_bytes(
+                    slice_len(delta, di + 4, 4)?
+                        .try_into()
+                        .map_err(|_| PackError::Corrupt)?,
+                ) as usize;
+                di += 8;
+                let chunk = slice_len(base, offset, len)?;
+                if result.len().saturating_add(chunk.len()) > max_output {
+                    return Err(PackError::Corrupt);
                 }
-                let offset = u32::from_le_bytes(delta[di..di + 4].try_into().unwrap()) as usize;
-                di += 4;
-                let len = u32::from_le_bytes(delta[di..di + 4].try_into().unwrap()) as usize;
-                di += 4;
-                if offset + len <= base.len() {
-                    result.extend_from_slice(&base[offset..offset + len]);
-                }
+                result.extend_from_slice(chunk);
             }
             OP_INSERT => {
-                if di + 4 > delta.len() {
-                    break;
-                }
-                let len = u32::from_le_bytes(delta[di..di + 4].try_into().unwrap()) as usize;
+                let len = u32::from_le_bytes(
+                    slice_len(delta, di, 4)?
+                        .try_into()
+                        .map_err(|_| PackError::Corrupt)?,
+                ) as usize;
                 di += 4;
-                if di + len <= delta.len() {
-                    result.extend_from_slice(&delta[di..di + len]);
-                    di += len;
+                let chunk = slice_len(delta, di, len)?;
+                di += len;
+                if result.len().saturating_add(chunk.len()) > max_output {
+                    return Err(PackError::Corrupt);
                 }
+                result.extend_from_slice(chunk);
             }
-            _ => break,
+            _ => return Err(PackError::Corrupt),
         }
     }
 
-    result
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -704,7 +767,7 @@ mod tests {
         let target = b"Hello, world! This is a test of the improved delta compression system.";
 
         let delta = compute_delta(base, target);
-        let result = apply_delta(base, &delta);
+        let result = apply_delta(base, &delta).unwrap();
         assert_eq!(result, target);
     }
 
@@ -712,7 +775,7 @@ mod tests {
     fn delta_identical() {
         let data = b"identical data here";
         let delta = compute_delta(data, data);
-        let result = apply_delta(data, &delta);
+        let result = apply_delta(data, &delta).unwrap();
         assert_eq!(result, data);
     }
 
@@ -721,7 +784,7 @@ mod tests {
         let base = b"aaaa bbbb cccc";
         let target = b"xxxx yyyy zzzz";
         let delta = compute_delta(base, target);
-        let result = apply_delta(base, &delta);
+        let result = apply_delta(base, &delta).unwrap();
         assert_eq!(result, target);
     }
 
@@ -730,7 +793,7 @@ mod tests {
         let base = b"";
         let target = b"new content";
         let delta = compute_delta(base, target);
-        let result = apply_delta(base, &delta);
+        let result = apply_delta(base, &delta).unwrap();
         assert_eq!(result, target);
     }
 
@@ -739,7 +802,7 @@ mod tests {
         let base = b"old content";
         let target = b"";
         let delta = compute_delta(base, target);
-        let result = apply_delta(base, &delta);
+        let result = apply_delta(base, &delta).unwrap();
         assert_eq!(result, target);
     }
 
@@ -944,5 +1007,82 @@ mod tests {
 
         let obj = reader.get_from_pack_data(&full, hash1).unwrap();
         assert_eq!(obj.as_deref(), Some(data1.as_slice()));
+    }
+
+    // --- Adversarial: a hostile pack must error, never panic / OOM / overflow
+    // the stack. ---
+
+    #[test]
+    fn huge_entry_count_is_corrupt() {
+        // Header claims u64::MAX entries with no index behind it: the index
+        // size multiply overflows and must be rejected, not allocated.
+        let mut p = Vec::new();
+        p.extend_from_slice(PACK_MAGIC);
+        p.push(PACK_VERSION);
+        p.extend_from_slice(&u64::MAX.to_le_bytes());
+
+        let reader = PackReader::new(std::path::Path::new("/nonexistent"));
+        assert!(matches!(
+            reader.get_from_pack_data(&p, B3Hash::ZERO),
+            Err(PackError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn delta_cycle_terminates() {
+        // Two delta entries whose bases point at each other. Resolution must
+        // stop at the depth limit instead of overflowing the stack.
+        let a = B3Hash::from_bytes([1u8; 32]);
+        let b = B3Hash::from_bytes([2u8; 32]);
+
+        let mut p = Vec::new();
+        p.extend_from_slice(PACK_MAGIC);
+        p.push(PACK_VERSION_DELTA);
+        p.extend_from_slice(&2u64.to_le_bytes());
+        // index entry A: base is B
+        p.extend_from_slice(a.as_bytes());
+        p.extend_from_slice(&0u64.to_le_bytes()); // offset
+        p.extend_from_slice(&32u64.to_le_bytes()); // size
+        p.push(ENTRY_DELTA);
+        // index entry B: base is A
+        p.extend_from_slice(b.as_bytes());
+        p.extend_from_slice(&32u64.to_le_bytes());
+        p.extend_from_slice(&32u64.to_le_bytes());
+        p.push(ENTRY_DELTA);
+        // data: A's payload = base hash B (empty delta); B's payload = base hash A
+        p.extend_from_slice(b.as_bytes());
+        p.extend_from_slice(a.as_bytes());
+
+        let reader = PackReader::new(std::path::Path::new("/nonexistent"));
+        assert!(matches!(
+            reader.get_from_pack_data(&p, a),
+            Err(PackError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn delta_bomb_is_rejected() {
+        // A tiny delta that expands past the cap must error before allocating.
+        let base = vec![0u8; 10];
+        let mut delta = Vec::new();
+        for _ in 0..5 {
+            delta.push(OP_COPY);
+            delta.extend_from_slice(&0u32.to_le_bytes()); // offset 0
+            delta.extend_from_slice(&10u32.to_le_bytes()); // len 10
+        }
+        // 5 * 10 = 50 bytes of output; cap it below that.
+        assert!(matches!(
+            apply_delta_capped(&base, &delta, 15),
+            Err(PackError::Corrupt)
+        ));
+        // Same delta under a generous cap succeeds.
+        assert_eq!(apply_delta_capped(&base, &delta, 100).unwrap().len(), 50);
+    }
+
+    #[test]
+    fn malformed_delta_ops_error() {
+        assert!(apply_delta(b"base", &[OP_COPY, 0, 0, 0]).is_err()); // truncated COPY
+        assert!(apply_delta(b"base", &[OP_INSERT, 0xFF, 0xFF, 0, 0]).is_err()); // INSERT past end
+        assert!(apply_delta(b"base", &[99]).is_err()); // unknown opcode
     }
 }
