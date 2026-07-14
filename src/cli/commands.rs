@@ -91,6 +91,37 @@ fn cmd_rescue(args: RescueArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_recover(args: RecoverArgs) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    // Locate leniently (objects/ present) so a repo too broken for Repo::open
+    // can still be repaired.
+    let ivaldi_dir = crate::rescue::find_ivaldi_dir(&cwd)
+        .ok_or("no .ivaldi/objects found here or in any parent directory")?;
+    let work_dir = ivaldi_dir
+        .parent()
+        .ok_or("could not resolve repository root")?;
+
+    // recover mutates, so take the exclusive repo lock like seal/fuse do. A
+    // dry run writes nothing, so it needs no lock (and won't contend).
+    let _lock = if args.dry_run {
+        None
+    } else {
+        Some(crate::lock::RepoLock::acquire(&ivaldi_dir).map_err(|e| e.to_string())?)
+    };
+
+    let report = crate::recover::recover(work_dir, args.dry_run);
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+    } else {
+        report.print_human();
+    }
+    Ok(())
+}
+
 fn cmd_doctor(args: DoctorArgs) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     // Locate the repo leniently (objects/ present) so we can diagnose one that

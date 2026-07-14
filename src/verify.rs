@@ -6,10 +6,12 @@
 //! CAS object and confirms it matches its address — the one integrity property
 //! `FileCas::get` does not check on read.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::hash::B3Hash;
 use crate::repo::Repo;
+use crate::store::Store;
 
 /// One named integrity check and its outcome.
 #[derive(serde::Serialize)]
@@ -127,9 +129,161 @@ pub fn verify(work_dir: &Path, full: bool) -> Report {
     // Content: re-hash every CAS object (opt-in; O(total bytes)).
     if full {
         checks.push(verify_cas_objects(&ivaldi_dir.join("objects")));
+
+        // Deeper structural checks need direct store access. Never create a
+        // store if store.db is absent (redb would materialize an empty one).
+        let store_path = ivaldi_dir.join("store.db");
+        let store = if store_path.exists() {
+            Store::open(&store_path).ok()
+        } else {
+            None
+        };
+        checks.push(verify_refs(&ivaldi_dir, store.as_ref()));
+        checks.push(verify_seal_mappings(store.as_ref()));
     }
 
     Report::from_checks(full, checks)
+}
+
+/// Every `refs/heads/<name>` must resolve: either the store has a timeline head
+/// for that name, or (for the rare ref file that records a value) that value is
+/// a leaf index the store actually holds. Empty ref files are legitimate "no
+/// seals yet" markers. Anything else is a dangling ref.
+fn verify_refs(ivaldi_dir: &Path, store: Option<&Store>) -> Check {
+    let heads_dir = ivaldi_dir.join("refs/heads");
+    let entries = match std::fs::read_dir(&heads_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Check {
+                name: "refs".into(),
+                ok: true,
+                detail: "no refs/heads directory (nothing to check)".into(),
+            };
+        }
+        Err(e) => {
+            return Check {
+                name: "refs".into(),
+                ok: false,
+                detail: format!("cannot read {}: {e}", heads_dir.display()),
+            };
+        }
+    };
+
+    let head_names: HashSet<String> = store
+        .and_then(|s| s.list_timeline_heads().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    let indices: HashSet<u64> = store
+        .and_then(|s| s.all_leaf_indices().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    let mut count = 0u64;
+    let mut dangling = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        count += 1;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if head_names.contains(&name) {
+            continue; // resolves via the store's timeline head
+        }
+        // No store head: an empty file is an uncommitted-timeline marker; a
+        // recorded leaf index resolves only if the store holds that leaf.
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(idx) = trimmed.parse::<u64>()
+            && indices.contains(&idx)
+        {
+            continue;
+        }
+        dangling.push(name);
+    }
+
+    if dangling.is_empty() {
+        Check {
+            name: "refs".into(),
+            ok: true,
+            detail: format!("{count} refs resolve"),
+        }
+    } else {
+        Check {
+            name: "refs".into(),
+            ok: false,
+            detail: format!("dangling refs: {}", dangling.join(", ")),
+        }
+    }
+}
+
+/// Every seal name must map to a hash that belongs to a leaf that exists. A
+/// seal pointing at a hash with no matching leaf is a broken mapping.
+fn verify_seal_mappings(store: Option<&Store>) -> Check {
+    let Some(store) = store else {
+        return Check {
+            name: "seal-mappings".into(),
+            ok: true,
+            detail: "no store (nothing to check)".into(),
+        };
+    };
+
+    let indices = match store.all_leaf_indices() {
+        Ok(i) => i,
+        Err(e) => {
+            return Check {
+                name: "seal-mappings".into(),
+                ok: false,
+                detail: format!("cannot list leaves: {e}"),
+            };
+        }
+    };
+    let mut leaf_hashes = HashSet::new();
+    let mut problems = Vec::new();
+    for idx in &indices {
+        match store.get_leaf(*idx) {
+            Ok(Some(bytes)) => match crate::leaf::parse_leaf(&bytes) {
+                Ok(l) => {
+                    leaf_hashes.insert(l.hash());
+                }
+                Err(e) => problems.push(format!("leaf {idx} corrupt: {e}")),
+            },
+            Ok(None) => {}
+            Err(e) => problems.push(format!("leaf {idx} unreadable: {e}")),
+        }
+    }
+
+    let names = store.find_seal_names_by_prefix("").unwrap_or_default();
+    let mut count = 0u64;
+    for name in &names {
+        count += 1;
+        match store.get_hash_by_seal_name(name) {
+            Ok(Some(h)) if leaf_hashes.contains(&h) => {}
+            Ok(Some(h)) => problems.push(format!("seal '{name}' -> {h} has no matching leaf")),
+            Ok(None) => problems.push(format!("seal '{name}' has no hash mapping")),
+            Err(e) => problems.push(format!("seal '{name}': {e}")),
+        }
+    }
+
+    if problems.is_empty() {
+        Check {
+            name: "seal-mappings".into(),
+            ok: true,
+            detail: format!("{count} seal mappings resolve"),
+        }
+    } else {
+        Check {
+            name: "seal-mappings".into(),
+            ok: false,
+            detail: format!("{count} checked; {}", problems.join("; ")),
+        }
+    }
 }
 
 /// Re-hash every object under a `FileCas` root (`<objects>/<2hex>/<62hex>`) and
@@ -277,5 +431,25 @@ mod tests {
         let fast = verify(dir.path(), false);
         assert!(fast.checks.iter().all(|c| c.name == "cas-objects" || c.ok));
         assert!(!fast.checks.iter().any(|c| c.name == "cas-objects"));
+    }
+
+    #[test]
+    fn dangling_ref_fails_full_check() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+
+        // A ref file for a timeline the store has no head for, recording a leaf
+        // index the store does not hold: dangling.
+        let heads = dir.path().join(".ivaldi/refs/heads");
+        std::fs::create_dir_all(&heads).unwrap();
+        std::fs::write(heads.join("ghost"), "999").unwrap();
+
+        let report = verify(dir.path(), true);
+        assert!(report.checks.iter().any(|c| c.name == "refs" && !c.ok));
+        assert!(!report.ok);
+
+        // The fast check does not run the deeper refs pass.
+        let fast = verify(dir.path(), false);
+        assert!(!fast.checks.iter().any(|c| c.name == "refs"));
     }
 }

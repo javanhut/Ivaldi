@@ -98,6 +98,7 @@ pub fn run_command(cli: Cli) {
         Commands::Man(args) => cmd_man(args, cli.quiet),
         Commands::Verify(args) => cmd_verify(args),
         Commands::Rescue(args) => cmd_rescue(args),
+        Commands::Recover(args) => cmd_recover(args),
         Commands::Doctor(args) => cmd_doctor(args),
     };
     if let Err(e) = result {

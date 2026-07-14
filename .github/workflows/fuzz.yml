@@ -1,0 +1,34 @@
+name: Fuzz
+
+on:
+  pull_request:
+  schedule:
+    # Nightly at 03:00 UTC — the longer continuous run.
+    - cron: "0 3 * * *"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parse_leaf, parse_tree, parse_blob, apply_delta, byte_reader]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz
+      - name: Fuzz ${{ matrix.target }}
+        run: |
+          # 10 minutes nightly, 1 minute on pull requests.
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            SECS=600
+          else
+            SECS=60
+          fi
+          cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=$SECS

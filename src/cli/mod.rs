@@ -169,8 +169,22 @@ pub enum Commands {
     /// Recover files from a damaged repository, bypassing refs and the MMR
     Rescue(RescueArgs),
 
+    /// Safely repair a repository in place (never discards data)
+    Recover(RecoverArgs),
+
     /// Diagnose a repository and print recovery guidance
     Doctor(DoctorArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct RecoverArgs {
+    /// Report what would be repaired without touching disk.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Emit the recovery report as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Args, Debug)]

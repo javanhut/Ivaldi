@@ -1,0 +1,51 @@
+[package]
+name = "ivaldi-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone crate: the root Cargo.toml has no [workspace], so an empty one here
+# keeps `cargo build` at the repo root from pulling fuzz/ into its build.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ivaldi = { path = ".." }
+
+[[bin]]
+name = "parse_leaf"
+path = "fuzz_targets/parse_leaf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_tree"
+path = "fuzz_targets/parse_tree.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_blob"
+path = "fuzz_targets/parse_blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "apply_delta"
+path = "fuzz_targets/apply_delta.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "byte_reader"
+path = "fuzz_targets/byte_reader.rs"
+test = false
+doc = false
+bench = false

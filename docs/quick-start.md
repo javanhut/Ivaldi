@@ -388,3 +388,7 @@ More detail: [config.md](config.md), [color.md](color.md).
 `status`, `timeline list`, and `portal list` accept `--json`, and
 `log --format json` emits machine-readable history — handy for scripts
 and CI. `make install-extras` installs man pages and shell completions.
+
+Running Ivaldi as your primary VCS while keeping a Git backup? See
+[dogfooding.md](dogfooding.md) and
+[`scripts/mirror-to-git.sh`](../scripts/mirror-to-git.sh).
