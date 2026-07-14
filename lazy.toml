@@ -19,6 +19,15 @@ run = ["cargo build --release"]
 desc = "# Run all tests"
 run = ["cargo test"]
 
+[commands.check]
+desc = "Run cargo check on all targets"
+run = ["cargo check --all-targets"]
+
+[commands.format]
+desc = "Format all cargo packages"
+alias = ["fmt"]
+run = ["cargo fmt --all"]
+
 [commands.install]
 desc = "# Install ivaldi to $(PREFIX)/bin (default: /usr/local/bin)"
 run = [
