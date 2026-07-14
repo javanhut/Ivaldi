@@ -162,6 +162,20 @@ pub enum Commands {
     /// Generate man pages into a directory
     #[command(hide = true)]
     Man(ManArgs),
+
+    /// Check repository integrity
+    Verify(VerifyArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct VerifyArgs {
+    /// Re-hash every stored object (slower; O(total repository size)).
+    #[arg(long)]
+    pub full: bool,
+
+    /// Emit the report as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Args, Debug)]

@@ -96,6 +96,7 @@ pub fn run_command(cli: Cli) {
         Commands::Peer(args) => cmd_peer(args, cli.quiet),
         Commands::Completions(args) => cmd_completions(args),
         Commands::Man(args) => cmd_man(args, cli.quiet),
+        Commands::Verify(args) => cmd_verify(args),
     };
     if let Err(e) = result {
         exit_with_error(&e);

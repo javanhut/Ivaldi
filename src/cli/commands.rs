@@ -50,6 +50,29 @@ fn open_repo() -> Result<Repo, String> {
     Repo::open(&root).map_err(|e| e.to_string())
 }
 
+fn cmd_verify(args: VerifyArgs) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let root = forge::find_repo_root(&cwd)
+        .ok_or("not an Ivaldi repository (or any parent). Run 'ivaldi forge' to initialize.")?;
+
+    let report = crate::verify::verify(&root, args.full);
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+    } else {
+        report.print_human();
+    }
+
+    // Report already printed; signal failure through the exit code.
+    if !report.ok {
+        process::exit(1);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
