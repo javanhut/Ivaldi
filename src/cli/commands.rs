@@ -73,6 +73,24 @@ fn cmd_verify(args: VerifyArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_rescue(args: RescueArgs) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let ivaldi_dir = crate::rescue::find_ivaldi_dir(&cwd)
+        .ok_or("no .ivaldi/objects found here or in any parent directory")?;
+
+    let report = crate::rescue::rescue(&ivaldi_dir, &args.out).map_err(|e| e.to_string())?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+    } else {
+        report.print_human(&args.out);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------

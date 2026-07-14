@@ -165,6 +165,9 @@ pub enum Commands {
 
     /// Check repository integrity
     Verify(VerifyArgs),
+
+    /// Recover files from a damaged repository, bypassing refs and the MMR
+    Rescue(RescueArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -172,6 +175,17 @@ pub struct VerifyArgs {
     /// Re-hash every stored object (slower; O(total repository size)).
     #[arg(long)]
     pub full: bool,
+
+    /// Emit the report as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct RescueArgs {
+    /// Directory to write recovered files into (created if missing).
+    #[arg(long, default_value = "ivaldi-rescue")]
+    pub out: std::path::PathBuf,
 
     /// Emit the report as JSON.
     #[arg(long)]

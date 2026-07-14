@@ -97,6 +97,7 @@ pub fn run_command(cli: Cli) {
         Commands::Completions(args) => cmd_completions(args),
         Commands::Man(args) => cmd_man(args, cli.quiet),
         Commands::Verify(args) => cmd_verify(args),
+        Commands::Rescue(args) => cmd_rescue(args),
     };
     if let Err(e) = result {
         exit_with_error(&e);

@@ -37,6 +37,7 @@ pub mod portal;
 pub mod progress;
 pub mod remote;
 pub mod repo;
+pub mod rescue;
 pub mod review;
 pub mod seal;
 pub mod shelf;
