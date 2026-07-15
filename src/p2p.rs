@@ -61,8 +61,23 @@ use crate::peers::PeerStore;
 pub const DEFAULT_PORT: u16 = 9418;
 
 const NOISE_PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
+/// Noise prologue — both sides must agree or the handshake itself fails, so
+/// a v1 (JSON-frame) peer can never half-connect to a v2 (protobuf) peer.
+/// Bump together with `p2p_proto::PROTOCOL_VERSION` on framing changes.
+const NOISE_PROLOGUE: &[u8] = b"ivaldi/2";
 const MAX_FRAME: usize = 16 * 1024 * 1024; // 16 MiB per logical message
 const NOISE_MSG_MAX: usize = 65535; // Noise transport limit
+
+/// Objects larger than this are streamed as [`Message::BlobChunk`] slices
+/// instead of riding inline in a bundle.
+const INLINE_BLOB_MAX: usize = 1024 * 1024;
+/// Data bytes per BlobChunk frame (well under MAX_FRAME with envelope
+/// overhead).
+const BLOB_CHUNK_DATA: usize = 4 * 1024 * 1024;
+/// Hard cap on a single object transiting ivaldi://.
+/// ponytail: assembly buffers the object in memory, so this caps peak RAM
+/// per connection; spool to a temp file if repos ever need bigger objects.
+const MAX_WIRE_BLOB: u64 = 1024 * 1024 * 1024;
 
 /// Parsed `ivaldi://` URL.
 ///
@@ -150,6 +165,10 @@ pub struct WireBlob {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum Message {
+    /// Both directions, immediately after the Noise handshake: wire
+    /// protocol version check. A mismatch is refused explicitly.
+    Hello { version: u32 },
+
     /// Client → server: list local timelines.
     ListTimelines,
     /// Server → client: response to `ListTimelines`.
@@ -198,6 +217,18 @@ pub enum Message {
 
     /// Server → client: error (logical, not transport).
     Error { message: String },
+
+    /// Either direction: one slice of a large object too big to ride inline
+    /// in a bundle. Chunks for one object are contiguous and never
+    /// interleaved with another object's; the receiving [`BlobAssembler`]
+    /// enforces contiguity, the declared length, a hard size cap, and the
+    /// BLAKE3 before the object becomes visible.
+    BlobChunk {
+        hash_hex: String,
+        total_len: u64,
+        offset: u64,
+        data: Vec<u8>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -236,11 +267,13 @@ impl Channel {
         stream.set_write_timeout(Some(Duration::from_secs(60)))?;
         let noise = handshake_initiator(&stream, identity)?;
         let remote_static = extract_remote_static(&noise)?;
-        Ok(Self {
+        let mut chan = Self {
             stream,
             noise,
             remote_static,
-        })
+        };
+        chan.exchange_hello()?;
+        Ok(chan)
     }
 
     /// Responder side. Caller has already accepted a TCP connection.
@@ -249,23 +282,46 @@ impl Channel {
         stream.set_write_timeout(Some(Duration::from_secs(60)))?;
         let noise = handshake_responder(&stream, identity)?;
         let remote_static = extract_remote_static(&noise)?;
-        Ok(Self {
+        let mut chan = Self {
             stream,
             noise,
             remote_static,
-        })
+        };
+        chan.exchange_hello()?;
+        Ok(chan)
+    }
+
+    /// Both sides send `Hello` and require the peer's in return, immediately
+    /// after the handshake. The Noise prologue already guarantees both peers
+    /// speak the protobuf framing; this catches in-era version drift with an
+    /// actionable error instead of a mid-stream decode failure.
+    fn exchange_hello(&mut self) -> Result<(), P2pError> {
+        let version = crate::p2p_proto::PROTOCOL_VERSION;
+        self.send(&Message::Hello { version })?;
+        match self.recv()? {
+            Message::Hello { version: v } if v == version => Ok(()),
+            Message::Hello { version: v } => Err(P2pError::Protocol(format!(
+                "peer speaks ivaldi protocol v{}, this build speaks v{} — \
+                 upgrade the older peer",
+                v, version
+            ))),
+            other => Err(P2pError::Protocol(format!(
+                "expected Hello after handshake, got {:?}",
+                other
+            ))),
+        }
     }
 
     /// Send one logical message. Encrypts via Noise, frames with a 4-byte
     /// big-endian length prefix.
     pub fn send(&mut self, msg: &Message) -> Result<(), P2pError> {
-        let payload =
-            serde_json::to_vec(msg).map_err(|e| P2pError::Protocol(format!("encode: {}", e)))?;
+        let payload = crate::p2p_proto::encode(msg);
         if payload.len() > MAX_FRAME {
+            // Senders keep bundles small and stream large objects as
+            // BlobChunk slices, so this is an internal invariant, not a
+            // user-reachable limit.
             return Err(P2pError::Protocol(format!(
-                "outbound message too large ({} > {}) — a single file larger than \
-                 ~4 MiB cannot yet transit ivaldi:// (JSON encoding overhead); \
-                 use an HTTPS or SSH portal for this repo",
+                "outbound message too large ({} > {})",
                 payload.len(),
                 MAX_FRAME
             )));
@@ -335,9 +391,7 @@ impl Channel {
                 break;
             }
         }
-        let msg: Message = serde_json::from_slice(&payload)
-            .map_err(|e| P2pError::Protocol(format!("decode: {}", e)))?;
-        Ok(msg)
+        crate::p2p_proto::decode(&payload).map_err(|e| P2pError::Protocol(format!("decode: {}", e)))
     }
 
     pub fn shutdown(&mut self) {
@@ -354,6 +408,7 @@ fn handshake_initiator(
         .map_err(|e: snow::Error| P2pError::Handshake(e.to_string()))?;
     let mut h = snow::Builder::new(params)
         .local_private_key(&identity.secret)
+        .prologue(NOISE_PROLOGUE)
         .build_initiator()
         .map_err(|e| P2pError::Handshake(e.to_string()))?;
 
@@ -390,6 +445,7 @@ fn handshake_responder(
         .map_err(|e: snow::Error| P2pError::Handshake(e.to_string()))?;
     let mut h = snow::Builder::new(params)
         .local_private_key(&identity.secret)
+        .prologue(NOISE_PROLOGUE)
         .build_responder()
         .map_err(|e| P2pError::Handshake(e.to_string()))?;
 
@@ -668,8 +724,24 @@ fn serve_push(
         FileCas::new(repo.ivaldi_dir.join("objects")).map_err(|e| P2pError::Io(e.to_string()))?;
 
     let mut lander = LeafLander::default();
+    let mut asm = BlobAssembler::default();
     let claimed_head = loop {
         match chan.recv()? {
+            Message::BlobChunk {
+                hash_hex,
+                total_len,
+                offset,
+                data,
+            } => match asm.feed(&hash_hex, total_len, offset, &data) {
+                Ok(None) => {}
+                Ok(Some(wb)) => apply_blob(&cas, &wb)?,
+                Err(e) => {
+                    chan.send(&Message::PushRejected {
+                        reason: e.to_string(),
+                    })?;
+                    return Ok(());
+                }
+            },
             Message::PushBundle { leaves, blobs } => {
                 // Write objects first (they're prerequisites for any
                 // leaf's tree walk later). Bytes are content-addressed,
@@ -693,7 +765,15 @@ fn serve_push(
                     }
                 }
             }
-            Message::PushDone { head_b3_hex } => break head_b3_hex,
+            Message::PushDone { head_b3_hex } => {
+                if let Err(e) = asm.finish() {
+                    chan.send(&Message::PushRejected {
+                        reason: e.to_string(),
+                    })?;
+                    return Ok(());
+                }
+                break head_b3_hex;
+            }
             Message::Error { message } => return Err(P2pError::Protocol(message)),
             other => {
                 chan.send(&Message::PushRejected {
@@ -922,36 +1002,13 @@ fn serve_want(
         .ok_or_else(|| P2pError::Protocol("head leaf vanished".into()))?;
     let head_hex = hex::encode(head_leaf.hash().as_bytes());
 
-    // Chunk: ship leaves first, then blobs.
+    // Objects first, then leaves: the receiver lands each leaf durably as it
+    // arrives, so every tree/blob a leaf references must already be present.
+    send_objects(chan, &cas, &object_hashes, false)?;
     chan.send(&Message::Bundle {
         leaves,
         blobs: Vec::new(),
     })?;
-
-    let mut chunk: Vec<WireBlob> = Vec::new();
-    for hash in object_hashes {
-        use crate::cas::Cas;
-        let bytes = cas
-            .get(hash)
-            .map_err(|e| P2pError::Protocol(format!("cas read: {}", e)))?;
-        chunk.push(WireBlob {
-            hash_hex: hex::encode(hash.as_bytes()),
-            data: bytes,
-        });
-        if chunk.len() >= 64 {
-            let take = std::mem::take(&mut chunk);
-            chan.send(&Message::Bundle {
-                leaves: Vec::new(),
-                blobs: take,
-            })?;
-        }
-    }
-    if !chunk.is_empty() {
-        chan.send(&Message::Bundle {
-            leaves: Vec::new(),
-            blobs: chunk,
-        })?;
-    }
 
     chan.send(&Message::Done {
         head_b3_hex: head_hex,
@@ -1081,9 +1138,21 @@ fn fetch_into_created_target(
         .map_err(|e| P2pError::Io(e.to_string()))?;
 
     let mut lander = LeafLander::default();
+    let mut asm = BlobAssembler::default();
     let mut blobs_imported = 0usize;
     let head_b3_hex: String = loop {
         match chan.recv()? {
+            Message::BlobChunk {
+                hash_hex,
+                total_len,
+                offset,
+                data,
+            } => {
+                if let Some(wb) = asm.feed(&hash_hex, total_len, offset, &data)? {
+                    apply_blob(&cas, &wb)?;
+                    blobs_imported += 1;
+                }
+            }
             Message::Bundle { leaves, blobs } => {
                 for wl in leaves {
                     lander.land(&mut repo, &timeline, &wl)?;
@@ -1094,6 +1163,7 @@ fn fetch_into_created_target(
                 }
             }
             Message::Done { head_b3_hex: head } => {
+                asm.finish()?;
                 break head;
             }
             Message::Error { message } => return Err(P2pError::Protocol(message)),
@@ -1237,6 +1307,188 @@ fn apply_blob(cas: &crate::cas::FileCas, wb: &WireBlob) -> Result<(), P2pError> 
     Ok(())
 }
 
+/// Ship every object in `hashes`: small objects batched into size-bounded
+/// bundles, large ones streamed as [`Message::BlobChunk`] slices. Callers
+/// send objects BEFORE the leaves that reference them, so an interrupted
+/// transfer can never land a durable leaf whose tree bytes never arrived.
+/// Returns the number of objects sent.
+fn send_objects(
+    chan: &mut Channel,
+    cas: &crate::cas::FileCas,
+    hashes: &BTreeSet<B3Hash>,
+    push: bool,
+) -> Result<usize, P2pError> {
+    use crate::cas::Cas;
+
+    fn flush(chan: &mut Channel, batch: &mut Vec<WireBlob>, push: bool) -> Result<(), P2pError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let blobs = std::mem::take(batch);
+        chan.send(&if push {
+            Message::PushBundle {
+                leaves: Vec::new(),
+                blobs,
+            }
+        } else {
+            Message::Bundle {
+                leaves: Vec::new(),
+                blobs,
+            }
+        })
+    }
+
+    let mut sent = 0usize;
+    let mut batch: Vec<WireBlob> = Vec::new();
+    let mut batch_bytes = 0usize;
+    for &hash in hashes {
+        let bytes = cas
+            .get(hash)
+            .map_err(|e| P2pError::Protocol(format!("cas read: {}", e)))?;
+        sent += 1;
+        if bytes.len() > INLINE_BLOB_MAX {
+            send_blob_chunks(chan, &hex::encode(hash.as_bytes()), &bytes)?;
+            continue;
+        }
+        batch_bytes += bytes.len();
+        batch.push(WireBlob {
+            hash_hex: hex::encode(hash.as_bytes()),
+            data: bytes,
+        });
+        if batch.len() >= 64 || batch_bytes >= 4 * 1024 * 1024 {
+            flush(chan, &mut batch, push)?;
+            batch_bytes = 0;
+        }
+    }
+    flush(chan, &mut batch, push)?;
+    Ok(sent)
+}
+
+/// Send one CAS object: small objects are batched inline into bundles by the
+/// caller; large ones are streamed here as bounded [`Message::BlobChunk`]
+/// slices so no single frame approaches `MAX_FRAME`.
+fn send_blob_chunks(chan: &mut Channel, hash_hex: &str, data: &[u8]) -> Result<(), P2pError> {
+    let total_len = data.len() as u64;
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let take = (data.len() - offset).min(BLOB_CHUNK_DATA);
+        chan.send(&Message::BlobChunk {
+            hash_hex: hash_hex.to_string(),
+            total_len,
+            offset: offset as u64,
+            data: data[offset..offset + take].to_vec(),
+        })?;
+        offset += take;
+    }
+    Ok(())
+}
+
+/// Reassembles one chunk-streamed object at a time from an untrusted peer.
+///
+/// Enforced before any byte becomes visible: a hard size cap, chunk
+/// contiguity (no gaps, overlaps, or interleaved objects), the declared
+/// total length, and finally the BLAKE3 of the assembled bytes. `feed`
+/// returns the completed object once its last chunk arrives.
+#[derive(Default)]
+struct BlobAssembler {
+    current: Option<(String, u64, Vec<u8>)>,
+}
+
+impl BlobAssembler {
+    fn feed(
+        &mut self,
+        hash_hex: &str,
+        total_len: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Option<WireBlob>, P2pError> {
+        if total_len == 0 || total_len > MAX_WIRE_BLOB {
+            return Err(P2pError::Protocol(format!(
+                "peer declared a {} byte object; ivaldi:// allows 1..={} bytes per object",
+                total_len, MAX_WIRE_BLOB
+            )));
+        }
+        if data.is_empty() || data.len() as u64 > total_len {
+            return Err(P2pError::Protocol(
+                "object chunk is empty or larger than its declared object".into(),
+            ));
+        }
+
+        let (cur_hash, cur_total, buf) = match &mut self.current {
+            None => {
+                if offset != 0 {
+                    return Err(P2pError::Protocol(format!(
+                        "first chunk of object {} starts at offset {}, expected 0",
+                        hash_hex, offset
+                    )));
+                }
+                // Grown chunk-by-chunk (each bounded by MAX_FRAME) rather
+                // than pre-allocating the peer-declared total.
+                self.current = Some((hash_hex.to_string(), total_len, Vec::new()));
+                let cur = self.current.as_mut().expect("just set");
+                (&cur.0, cur.1, &mut cur.2)
+            }
+            Some((h, t, buf)) => {
+                if h != hash_hex || *t != total_len {
+                    return Err(P2pError::Protocol(format!(
+                        "chunk of object {} interleaved with unfinished object {}",
+                        hash_hex, h
+                    )));
+                }
+                (&*h, *t, buf)
+            }
+        };
+
+        if offset != buf.len() as u64 {
+            return Err(P2pError::Protocol(format!(
+                "non-contiguous chunk for object {}: offset {}, expected {}",
+                cur_hash,
+                offset,
+                buf.len()
+            )));
+        }
+        if buf.len() as u64 + data.len() as u64 > cur_total {
+            return Err(P2pError::Protocol(format!(
+                "chunks for object {} exceed the declared {} bytes",
+                cur_hash, cur_total
+            )));
+        }
+        buf.extend_from_slice(data);
+
+        if (buf.len() as u64) < cur_total {
+            return Ok(None);
+        }
+        let (hash_hex, _, data) = self.current.take().expect("assembly in progress");
+        let claimed = hex::decode(&hash_hex)
+            .ok()
+            .and_then(|raw| B3Hash::from_slice(&raw))
+            .ok_or_else(|| P2pError::Protocol("chunked object hash is not a BLAKE3 hex".into()))?;
+        let actual = B3Hash::digest(&data);
+        if actual != claimed {
+            return Err(P2pError::Protocol(format!(
+                "chunked object hash mismatch: declared {}, got {}",
+                hash_hex,
+                hex::encode(actual.as_bytes())
+            )));
+        }
+        Ok(Some(WireBlob { hash_hex, data }))
+    }
+
+    /// A transfer phase ended (Done/PushDone): any half-assembled object
+    /// means the stream was truncated mid-object.
+    fn finish(&mut self) -> Result<(), P2pError> {
+        match self.current.take() {
+            None => Ok(()),
+            Some((h, t, buf)) => Err(P2pError::Protocol(format!(
+                "stream ended mid-object: {} arrived {}/{} bytes",
+                h,
+                buf.len(),
+                t
+            ))),
+        }
+    }
+}
+
 /// Result of a successful fetch.
 #[derive(Debug, Clone)]
 pub struct FetchSummary {
@@ -1301,7 +1553,7 @@ pub fn push_to(
         }
     }
 
-    use crate::cas::{Cas, FileCas};
+    use crate::cas::FileCas;
     use crate::fsmerkle::FsStore;
     let cas =
         FileCas::new(repo.ivaldi_dir.join("objects")).map_err(|e| P2pError::Io(e.to_string()))?;
@@ -1346,38 +1598,15 @@ pub fn push_to(
         .ok_or_else(|| P2pError::Protocol("head leaf vanished".into()))?;
     let head_b3_hex = hex::encode(head_leaf.hash().as_bytes());
 
-    // Ship leaves first (one bundle), then objects in 64-entry chunks.
+    // Objects first, then leaves: the server lands each leaf durably as it
+    // arrives, so every tree/blob a leaf references must already be present —
+    // an interrupted push then always leaves a valid, verifiable prefix.
     let leaves_sent = wire_leaves.len();
+    let objects_sent = send_objects(&mut chan, &cas, &object_hashes, true)?;
     chan.send(&Message::PushBundle {
         leaves: wire_leaves,
         blobs: Vec::new(),
     })?;
-
-    let mut objects_sent = 0usize;
-    let mut chunk: Vec<WireBlob> = Vec::new();
-    for hash in object_hashes {
-        let bytes = cas
-            .get(hash)
-            .map_err(|e| P2pError::Io(format!("cas read: {}", e)))?;
-        chunk.push(WireBlob {
-            hash_hex: hex::encode(hash.as_bytes()),
-            data: bytes,
-        });
-        objects_sent += 1;
-        if chunk.len() >= 64 {
-            let take = std::mem::take(&mut chunk);
-            chan.send(&Message::PushBundle {
-                leaves: Vec::new(),
-                blobs: take,
-            })?;
-        }
-    }
-    if !chunk.is_empty() {
-        chan.send(&Message::PushBundle {
-            leaves: Vec::new(),
-            blobs: chunk,
-        })?;
-    }
 
     chan.send(&Message::PushDone { head_b3_hex })?;
 
@@ -1477,20 +1706,73 @@ mod tests {
     }
 
     #[test]
-    fn message_roundtrips_via_serde_json() {
-        let m = Message::WantTimeline {
-            timeline: "main".into(),
-            have: vec!["abc".into(), "def".into()],
-        };
-        let j = serde_json::to_string(&m).unwrap();
-        let back: Message = serde_json::from_str(&j).unwrap();
-        match back {
-            Message::WantTimeline { timeline, have } => {
-                assert_eq!(timeline, "main");
-                assert_eq!(have, vec!["abc", "def"]);
-            }
-            _ => panic!("wrong variant"),
-        }
+    fn blob_assembler_reassembles_contiguous_chunks_and_verifies_hash() {
+        let data: Vec<u8> = (0..10_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let hash_hex = hex::encode(B3Hash::digest(&data).as_bytes());
+        let mut asm = BlobAssembler::default();
+        let total = data.len() as u64;
+        let mid = data.len() / 2;
+
+        assert!(
+            asm.feed(&hash_hex, total, 0, &data[..mid])
+                .unwrap()
+                .is_none(),
+            "half an object must not surface"
+        );
+        let wb = asm
+            .feed(&hash_hex, total, mid as u64, &data[mid..])
+            .unwrap()
+            .expect("last chunk completes the object");
+        assert_eq!(wb.data, data);
+        assert_eq!(wb.hash_hex, hash_hex);
+        asm.finish().expect("nothing in flight after completion");
+    }
+
+    #[test]
+    fn blob_assembler_rejects_hostile_chunk_sequences() {
+        let data = vec![7u8; 100];
+        let hash_hex = hex::encode(B3Hash::digest(&data).as_bytes());
+
+        // Declared size over the cap: refused before any allocation.
+        let err = BlobAssembler::default()
+            .feed(&hash_hex, MAX_WIRE_BLOB + 1, 0, &data)
+            .unwrap_err();
+        assert!(err.to_string().contains("bytes per object"), "{err}");
+
+        // First chunk not at offset 0.
+        assert!(
+            BlobAssembler::default()
+                .feed(&hash_hex, 100, 10, &data[10..])
+                .is_err()
+        );
+
+        // Gap between chunks.
+        let mut asm = BlobAssembler::default();
+        asm.feed(&hash_hex, 100, 0, &data[..40]).unwrap();
+        assert!(asm.feed(&hash_hex, 100, 60, &data[60..]).is_err());
+
+        // Interleaved second object while the first is unfinished.
+        let mut asm = BlobAssembler::default();
+        asm.feed(&hash_hex, 100, 0, &data[..40]).unwrap();
+        let other = hex::encode(B3Hash::digest(b"other").as_bytes());
+        assert!(asm.feed(&other, 5, 0, b"aaaaa").is_err());
+
+        // More bytes than declared.
+        let mut asm = BlobAssembler::default();
+        asm.feed(&hash_hex, 50, 0, &data[..40]).unwrap();
+        assert!(asm.feed(&hash_hex, 50, 40, &data[40..]).is_err());
+
+        // Completed object whose bytes don't match the declared hash.
+        let lying_hash = hex::encode(B3Hash::digest(b"something else").as_bytes());
+        let err = BlobAssembler::default()
+            .feed(&lying_hash, 100, 0, &data)
+            .unwrap_err();
+        assert!(err.to_string().contains("hash mismatch"), "{err}");
+
+        // Stream ending mid-object is a loud error.
+        let mut asm = BlobAssembler::default();
+        asm.feed(&hash_hex, 100, 0, &data[..40]).unwrap();
+        assert!(asm.finish().is_err());
     }
 
     #[test]
@@ -2194,5 +2476,85 @@ mod tests {
         // Leave the serve thread running — it will be torn down when the
         // test process exits. Cleaner shutdown is a follow-up.
         drop(server_handle);
+    }
+
+    #[test]
+    fn large_blob_streams_in_chunks_over_localhost_push() {
+        // 6 MiB: over INLINE_BLOB_MAX (1 MiB) so it must stream as BlobChunk
+        // slices, and over the ~4 MiB single-object ceiling the v1 JSON
+        // framing had — the case this protocol rev exists to fix.
+        let payload: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+
+        let alice_dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(alice_dir.path()).unwrap();
+        seal_file(alice_dir.path(), "existing.txt", b"already here");
+
+        let alice_id = Identity::generate().unwrap();
+        let bob_id = Identity::generate().unwrap();
+        let peer_store = PeerStore::new(alice_dir.path().join(".ivaldi/authorized_peers"));
+        peer_store.trust(bob_id.public, Some("bob")).unwrap();
+
+        let bob_dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(bob_dir.path()).unwrap();
+        let bob_tree = seal_file(bob_dir.path(), "big.bin", &payload);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let alice_repo_arc = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::repo::Repo::open(alice_dir.path()).unwrap(),
+        ));
+        let alice_id_clone = alice_id.clone();
+        let alice_peer_path = alice_dir.path().join(".ivaldi/authorized_peers");
+        let alice_repo_for_server = alice_repo_arc.clone();
+        let _server = std::thread::spawn(move || {
+            let _ = serve_with_repo(
+                &format!("127.0.0.1:{}", port),
+                alice_repo_for_server,
+                &alice_id_clone,
+                alice_peer_path,
+            );
+        });
+        for _ in 0..50 {
+            if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let url = PeerUrl::parse(&format!("ivaldi://127.0.0.1:{}", port)).unwrap();
+        let summary = with_isolated_known_peers(|| {
+            let mut bob_repo = crate::repo::Repo::open(bob_dir.path()).unwrap();
+            push_to(
+                &url,
+                &mut bob_repo,
+                &bob_id,
+                "main",
+                crate::known_peers::TofuPolicy::AcceptAll,
+            )
+        })
+        .expect("push with a 6 MiB blob should succeed");
+        assert_eq!(summary.landed_as, "peers/bob/main");
+
+        // Wait for the landing worker, then read the blob back through the
+        // landed tree — proving the chunked bytes reassembled intact.
+        let alice_cas = crate::cas::FileCas::new(alice_dir.path().join(".ivaldi/objects")).unwrap();
+        let store = crate::fsmerkle::FsStore::new(&alice_cas);
+        for attempt in 0..100 {
+            if let Ok(tree) = store.load_tree(bob_tree) {
+                let entry = tree.find_entry("big.bin").expect("big.bin in landed tree");
+                let (_, content) = store.load_blob(entry.hash).expect("blob readable");
+                assert_eq!(content, payload, "blob bytes must survive chunking");
+                if let Ok(g) = alice_repo_arc.try_lock() {
+                    assert!(g.get_timeline_head("peers/bob/main").unwrap().is_some());
+                }
+                return;
+            }
+            if attempt == 99 {
+                panic!("6 MiB blob never landed in the server CAS");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 }

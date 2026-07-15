@@ -36,13 +36,19 @@ pub struct SyncResult {
 /// Detects whether the local and remote have diverged:
 /// - **Up to date:** no new remote commits → no-op
 /// - **Fast-forward:** remote has new commits, local hasn't diverged → import + advance
-/// - **Diverged:** both have new commits → auto-fuse (Ivaldi's auto-merge philosophy)
+/// - **Diverged:** both have new commits → fuse
+///
+/// Consent-first: fetching and inspecting remote state is free, but once
+/// the incoming/local seal counts are known and integration would mutate
+/// the timeline, `consent(incoming, local)` is asked exactly once —
+/// `false` aborts with [`SyncError::Declined`] and no local mutation.
 pub fn sync_timeline(
     client: &GitHubClient,
     repo: &mut Repo,
     owner: &str,
     repo_name: &str,
     timeline: &str,
+    consent: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Result<SyncResult, SyncError> {
     let branches = client.list_branches(owner, repo_name)?;
     let branch = branches
@@ -104,6 +110,13 @@ pub fn sync_timeline(
 
     if new_remote_count == 0 {
         return Ok(up_to_date_result());
+    }
+
+    // Consent gate: everything above only fetched and compared; everything
+    // below mutates the user's timeline. Ivaldi never integrates remote
+    // changes without permission.
+    if !consent(new_remote_count, new_local_count as usize) {
+        return Err(SyncError::Declined);
     }
 
     // Classify: fast-forward or diverged

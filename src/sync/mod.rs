@@ -678,6 +678,10 @@ pub enum SyncError {
     Store(#[from] crate::store::StoreError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// The user declined to integrate incoming changes. Not a failure —
+    /// nothing was mutated.
+    #[error("sync declined; no changes were made")]
+    Declined,
     #[error("{0}")]
     Other(String),
 }

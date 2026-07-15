@@ -3696,8 +3696,62 @@ fn cmd_sync(args: SyncArgs, quiet: bool) -> Result<(), String> {
         );
     }
 
-    let result = sync::sync_timeline(&client, &mut repo, &portal.owner, &portal.repo, &timeline)
-        .map_err(|e| e.to_string())?;
+    // Consent-first: the sync fetches and reports what's incoming, then asks
+    // before integrating anything. `--yes` (or a piped stdin with --yes)
+    // skips the prompt; non-interactive without --yes declines safely.
+    let mut consent = |incoming: usize, local: usize| -> bool {
+        if args.yes {
+            return true;
+        }
+        let what = if local == 0 {
+            format!(
+                "{} incoming seal(s) would fast-forward '{}'",
+                incoming, timeline
+            )
+        } else {
+            format!(
+                "{} incoming seal(s) would fuse with {} local seal(s) on '{}'",
+                incoming, local, timeline
+            )
+        };
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            eprintln!(
+                "{}. Refusing to integrate without confirmation in a non-interactive \
+                 session — rerun with 'ivaldi sync --yes'.",
+                what
+            );
+            return false;
+        }
+        eprint!("{}. Pull them in? [y/N] ", what);
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return false;
+        }
+        matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    };
+
+    let result = match sync::sync_timeline(
+        &client,
+        &mut repo,
+        &portal.owner,
+        &portal.repo,
+        &timeline,
+        &mut consent,
+    ) {
+        Ok(result) => result,
+        // Declining is a clean outcome, not a failure: nothing was mutated.
+        Err(sync::SyncError::Declined) => {
+            println!(
+                "Sync declined — timeline '{}' is unchanged. Run 'ivaldi sync' again when ready.",
+                color::bold(&timeline)
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e.to_string()),
+    };
 
     if result.no_changes {
         println!(

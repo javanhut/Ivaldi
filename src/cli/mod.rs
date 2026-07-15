@@ -881,6 +881,9 @@ pub struct HarvestArgs {
 pub struct SyncArgs {
     /// Timeline to sync (defaults to current)
     pub timeline: Option<String>,
+    /// Integrate incoming seals without asking
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 #[derive(clap::Args, Debug)]

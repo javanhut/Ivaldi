@@ -31,6 +31,7 @@ pub mod logging;
 pub mod mmr;
 pub mod oauth_device;
 pub mod p2p;
+pub mod p2p_proto;
 pub mod pack;
 pub mod peers;
 pub mod pick;
