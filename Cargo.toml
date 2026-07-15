@@ -11,6 +11,11 @@ rust-version = "1.89"
 keywords = ["version-control", "vcs", "git", "distributed"]
 categories = ["command-line-utilities", "development-tools"]
 
+[features]
+# Test-only deterministic crash injection (see src/failpoint.rs and
+# tests/crash_matrix.rs). Never enable in release builds.
+failpoints = []
+
 [dependencies]
 blake3 = "1"
 hex = "0.4"

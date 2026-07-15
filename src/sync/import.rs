@@ -155,74 +155,85 @@ pub(super) fn import_full_history_into(
     // --- Phase 2: Parallel tree pre-fetch ---
     let prefetched_trees = prefetch_trees(client, owner, repo_name, &unique_tree_shas);
 
-    // --- Phase 3: Global blob batch download ---
-    let blobs_to_download =
-        collect_blobs_to_download(&commits, &unskipped, &prefetched_trees, &hash_mapping);
-    let blobs_downloaded = download_and_store_blobs(
-        client,
-        owner,
-        repo_name,
-        &blobs_to_download,
-        &store,
-        &mut hash_mapping,
-    )?;
+    // Phases 3 and 4 run inside a closure so the hash mapping is persisted
+    // even when the import fails part-way: every blob and commit that did
+    // land is durable and a retry skips it instead of redoing the work.
+    let import_result: Result<(usize, usize, usize), SyncError> = (|| {
+        // --- Phase 3: Global blob batch download ---
+        let blobs_to_download =
+            collect_blobs_to_download(&commits, &unskipped, &prefetched_trees, &hash_mapping);
+        let blobs_downloaded = download_and_store_blobs(
+            client,
+            owner,
+            repo_name,
+            &blobs_to_download,
+            &store,
+            &mut hash_mapping,
+        )?;
 
-    // --- Phase 4: Commit loop using build_tree_from_hash_map ---
-    // Track SHA1 → leaf index for parent resolution
-    let mut sha_to_idx: HashMap<String, u64> = HashMap::new();
-    // Cache tree SHA → Ivaldi tree hash to avoid re-downloading identical trees
-    let mut tree_cache: HashMap<String, B3Hash> = HashMap::new();
+        // --- Phase 4: Commit loop using build_tree_from_hash_map ---
+        // Track SHA1 → leaf index for parent resolution
+        let mut sha_to_idx: HashMap<String, u64> = HashMap::new();
+        // Cache tree SHA → Ivaldi tree hash to avoid re-downloading identical trees
+        let mut tree_cache: HashMap<String, B3Hash> = HashMap::new();
 
-    let mut commits_imported = 0usize;
-    let mut commits_skipped = 0usize;
+        let mut commits_imported = 0usize;
+        let mut commits_skipped = 0usize;
 
-    let pb = crate::progress::file_bar(commits.len() as u64, "Importing commits");
-    for commit in &commits {
-        pb.inc(1);
+        let pb = crate::progress::file_bar(commits.len() as u64, "Importing commits");
+        for commit in &commits {
+            pb.inc(1);
 
-        // Skip if already mapped — still populate sha_to_idx from existing
-        // data for parent resolution.
-        if let Some(b3) = hash_mapping.get_blake3(&commit.sha) {
-            if let Some(idx) = find_leaf_idx_by_hash(repo, b3) {
-                sha_to_idx.insert(commit.sha.clone(), idx);
+            // Skip if already mapped — still populate sha_to_idx from existing
+            // data for parent resolution.
+            if let Some(b3) = hash_mapping.get_blake3(&commit.sha) {
+                if let Some(idx) = find_leaf_idx_by_hash(repo, b3) {
+                    sha_to_idx.insert(commit.sha.clone(), idx);
+                }
+                commits_skipped += 1;
+                continue;
             }
-            commits_skipped += 1;
-            continue;
+
+            // Build tree using hash-based approach (Phase 4 optimization)
+            let tree_sha = &commit.commit.tree.sha;
+            let ivaldi_tree_hash = if let Some(&cached) = tree_cache.get(tree_sha) {
+                cached
+            } else {
+                let tree_hash = ivaldi_tree_for_commit(
+                    client,
+                    owner,
+                    repo_name,
+                    &store,
+                    tree_sha,
+                    &prefetched_trees,
+                    &hash_mapping,
+                )?;
+                tree_cache.insert(tree_sha.clone(), tree_hash);
+                tree_hash
+            };
+
+            let leaf = build_import_leaf(commit, ivaldi_tree_hash, local_timeline, &sha_to_idx);
+            let result = repo.commit_raw(leaf, local_timeline)?;
+
+            // Record mappings
+            hash_mapping.insert(&commit.sha, result.hash);
+            sha_to_idx.insert(commit.sha.clone(), result.index);
+            commits_imported += 1;
         }
+        pb.finish_with_message(format!(
+            "{} commits imported, {} skipped",
+            commits_imported, commits_skipped
+        ));
+        Ok((blobs_downloaded, commits_imported, commits_skipped))
+    })();
 
-        // Build tree using hash-based approach (Phase 4 optimization)
-        let tree_sha = &commit.commit.tree.sha;
-        let ivaldi_tree_hash = if let Some(&cached) = tree_cache.get(tree_sha) {
-            cached
-        } else {
-            let tree_hash = ivaldi_tree_for_commit(
-                client,
-                owner,
-                repo_name,
-                &store,
-                tree_sha,
-                &prefetched_trees,
-                &hash_mapping,
-            )?;
-            tree_cache.insert(tree_sha.clone(), tree_hash);
-            tree_hash
-        };
-
-        let leaf = build_import_leaf(commit, ivaldi_tree_hash, local_timeline, &sha_to_idx);
-        let result = repo.commit_raw(leaf, local_timeline)?;
-
-        // Record mappings
-        hash_mapping.insert(&commit.sha, result.hash);
-        sha_to_idx.insert(commit.sha.clone(), result.index);
-        commits_imported += 1;
+    match hash_mapping.save() {
+        Ok(()) => {}
+        // Don't let a mapping-save failure mask the original import error.
+        Err(e) if import_result.is_ok() => return Err(e.into()),
+        Err(e) => crate::logging::warn(&format!("failed to save hash mapping: {}", e)),
     }
-    pb.finish_with_message(format!(
-        "{} commits imported, {} skipped",
-        commits_imported, commits_skipped
-    ));
-
-    // Save hash mapping
-    hash_mapping.save()?;
+    let (blobs_downloaded, commits_imported, commits_skipped) = import_result?;
 
     Ok(ImportResult {
         commits_imported,
@@ -401,7 +412,11 @@ fn download_and_store_blobs(
     });
     pb_blobs.finish_with_message(format!("{} blobs downloaded", blobs_to_download.len()));
 
+    // Store every successful blob first (so a retry after a partial failure
+    // does not re-download them), then fail loudly if anything is missing.
+    // Committing a tree with silently absent files would be data loss.
     let mut blobs_downloaded = 0usize;
+    let mut failures: Vec<String> = Vec::new();
     for result in blob_results {
         match result {
             Ok((_, sha1, content)) => {
@@ -409,10 +424,17 @@ fn download_and_store_blobs(
                 hash_mapping.insert(&sha1, b3_hash);
                 blobs_downloaded += 1;
             }
-            Err(msg) => {
-                crate::logging::warn(&msg);
-            }
+            Err(msg) => failures.push(msg),
         }
+    }
+    if !failures.is_empty() {
+        return Err(SyncError::Other(format!(
+            "{} of {} blob downloads failed; refusing to import incomplete trees. \
+             First failure: {}. Retry the import — completed blobs are cached.",
+            failures.len(),
+            blobs_to_download.len(),
+            failures[0]
+        )));
     }
     Ok(blobs_downloaded)
 }
@@ -441,15 +463,26 @@ fn ivaldi_tree_for_commit(
         None => client.get_tree(owner, repo_name, tree_sha)?,
     };
 
-    // Build hash map from tree entries — pure HashMap lookups, zero disk I/O
+    // Build hash map from tree entries — pure HashMap lookups, zero disk I/O.
+    // A blob with no local mapping means its download was never scheduled or
+    // failed; committing a tree without it would silently drop the file.
     let mut hash_file_map: BTreeMap<String, B3Hash> = BTreeMap::new();
     for entry in &tree.tree {
-        if entry.entry_type == "blob"
-            && let Some(b3) = hash_mapping.get_blake3(&entry.sha)
-        {
-            hash_file_map.insert(entry.path.clone(), b3);
+        if entry.entry_type != "blob" {
+            continue;
         }
-        // else: blob wasn't downloaded (error during batch) — skip
+        match hash_mapping.get_blake3(&entry.sha) {
+            Some(b3) => {
+                hash_file_map.insert(entry.path.clone(), b3);
+            }
+            None => {
+                return Err(SyncError::Other(format!(
+                    "tree {} references blob {} ({}) that was not downloaded; \
+                     refusing to import an incomplete tree. Retry the import.",
+                    tree_sha, entry.sha, entry.path
+                )));
+            }
+        }
     }
 
     // Build Merkle tree from hashes only — NO blob content reads

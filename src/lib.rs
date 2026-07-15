@@ -7,6 +7,7 @@ pub mod cli;
 pub mod color;
 pub mod config;
 pub mod diff;
+pub mod failpoint;
 pub mod filechunk;
 pub mod forge;
 pub mod fsmerkle;

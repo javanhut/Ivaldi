@@ -300,6 +300,7 @@ pub fn write_head(ivaldi_dir: &Path, head: &HeadRef) -> Result<(), ForgeError> {
             format!("{}\n", hash)
         }
     };
+    crate::failpoint::fail_point("head.before_write");
     crate::atomic_io::atomic_write(&head_path, content.as_bytes()).map_err(ForgeError::Io)
 }
 

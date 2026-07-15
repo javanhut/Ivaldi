@@ -194,8 +194,8 @@ impl Repo {
         let timeline = self.current_timeline()?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
 
         // Build leaf with parent from current timeline head
         let prev_idx = self
@@ -239,8 +239,8 @@ impl Repo {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
 
         let mut new_leaf = Leaf::new(tree_root, &timeline, author, now, message);
         new_leaf.prev_idx = old_leaf.prev_idx;
@@ -271,12 +271,14 @@ impl Repo {
         // Materialize the marker before the database transaction. If a later
         // step fails, an empty marker is a valid headless timeline and retry is
         // safe; the inverse (a durable head with no marker) is inconsistent.
+        crate::failpoint::fail_point("commit.before_marker");
         if let Some(parent) = ref_path.parent() {
             std::fs::create_dir_all(parent).map_err(RepoError::Io)?;
         }
         if !ref_path.exists() {
             atomic_write(&ref_path, b"").map_err(RepoError::Io)?;
         }
+        crate::failpoint::fail_point("commit.after_marker");
 
         // Compute hash and seal name
         let leaf_hash = leaf.hash();
@@ -305,6 +307,7 @@ impl Repo {
                 root,
             )
             .map_err(RepoError::Store)?;
+        crate::failpoint::fail_point("commit.after_txn");
         self.mmr = next_mmr;
 
         Ok(CommitResult {
@@ -438,14 +441,19 @@ impl Repo {
             return Err(RepoError::Other("cannot remove current timeline".into()));
         }
 
+        // Remove the stored head before the marker file. A crash in between
+        // leaves an orphan marker (a valid headless timeline, and `remove`
+        // retries cleanly); the reverse order could leave a stored head with
+        // no marker, which is an integrity violation.
+        self.store
+            .remove_timeline_head(name)
+            .map_err(RepoError::Store)?;
+        crate::failpoint::fail_point("timeline.remove.after_head");
         match std::fs::remove_file(&ref_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(RepoError::Io(e)),
         }
-        self.store
-            .remove_timeline_head(name)
-            .map_err(RepoError::Store)?;
 
         Ok(())
     }
@@ -473,36 +481,46 @@ impl Repo {
             )));
         }
 
-        // Copy head to new name
-        let head_idx = self
+        if self
             .store
             .get_timeline_head(old_name)
             .map_err(RepoError::Store)?
-            .ok_or_else(|| RepoError::Other(format!("timeline '{}' not found", old_name)))?;
-        self.store
-            .set_timeline_head(new_name, head_idx)
-            .map_err(RepoError::Store)?;
+            .is_none()
+        {
+            return Err(RepoError::Other(format!(
+                "timeline '{}' not found",
+                old_name
+            )));
+        }
 
-        // Remove old name
-        self.store
-            .remove_timeline_head(old_name)
-            .map_err(RepoError::Store)?;
-
-        // Update ref files
+        // Ordered so every crash window leaves at worst a harmless orphan
+        // marker: (1) create the new marker, (2) move the head in one store
+        // transaction, (3) repoint HEAD, (4) remove the old marker.
         if let Some(parent) = new_ref.parent() {
             std::fs::create_dir_all(parent).map_err(RepoError::Io)?;
         }
-        if old_ref.exists() {
-            std::fs::rename(&old_ref, &new_ref).map_err(RepoError::Io)?;
-        } else {
-            atomic_write(&new_ref, b"").map_err(RepoError::Io)?;
-        }
+        atomic_write(&new_ref, b"").map_err(RepoError::Io)?;
+        crate::failpoint::fail_point("timeline.rename.after_marker");
 
-        // Update HEAD if this was the current timeline
+        self.store
+            .rename_timeline_head(old_name, new_name)
+            .map_err(RepoError::Store)?;
+        crate::failpoint::fail_point("timeline.rename.after_store");
+
+        // Update HEAD before removing the old marker: if we crash in between,
+        // HEAD already points at the fully materialized new name and the old
+        // marker is just a headless leftover.
         let current = self.current_timeline()?;
         if current == old_name {
             forge::write_head(&self.ivaldi_dir, &HeadRef::Timeline(new_name.to_string()))
                 .map_err(|e| RepoError::Other(e.to_string()))?;
+        }
+        crate::failpoint::fail_point("timeline.rename.before_old_marker");
+
+        match std::fs::remove_file(&old_ref) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(RepoError::Io(e)),
         }
 
         Ok(())

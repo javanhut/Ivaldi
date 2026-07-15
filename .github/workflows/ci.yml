@@ -35,7 +35,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   test:
     strategy:
@@ -47,7 +47,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked --all-targets
+      # --all-features enables the test-only `failpoints` feature so the
+      # crash-consistency matrix (tests/crash_matrix.rs) runs on every OS.
+      - run: cargo test --locked --all-targets --all-features
 
   minimum-rust:
     runs-on: ubuntu-latest

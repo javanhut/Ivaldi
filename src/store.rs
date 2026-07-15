@@ -147,6 +147,25 @@ impl Store {
         Ok(t.get(name)?.map(|v| v.value()))
     }
 
+    /// Move a timeline head to a new name in one transaction. A crash can
+    /// never leave both names (or neither name) holding the head.
+    pub fn rename_timeline_head(&self, old_name: &str, new_name: &str) -> Result<(), StoreError> {
+        let w = self.db.begin_write()?;
+        {
+            let mut heads = w.open_table(TIMELINE_HEADS)?;
+            if heads.get(new_name)?.is_some() {
+                return Err(StoreError(format!("timeline {new_name:?} already exists")));
+            }
+            let head = heads
+                .remove(old_name)?
+                .map(|v| v.value())
+                .ok_or_else(|| StoreError(format!("timeline {old_name:?} not found")))?;
+            heads.insert(new_name, head)?;
+        }
+        w.commit()?;
+        Ok(())
+    }
+
     pub fn remove_timeline_head(&self, name: &str) -> Result<bool, StoreError> {
         let w = self.db.begin_write()?;
         let removed;
@@ -363,7 +382,9 @@ impl Store {
             meta.insert(MMR_SIZE_KEY, mmr_size.to_string().as_str())?;
             meta.insert(MMR_ROOT_KEY, mmr_root.to_hex().as_str())?;
         }
+        crate::failpoint::fail_point("store.commit_leaf.before_commit");
         w.commit()?;
+        crate::failpoint::fail_point("store.commit_leaf.after_commit");
         Ok(())
     }
 
