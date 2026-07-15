@@ -15,6 +15,7 @@ use crate::atomic_io::atomic_write;
 use crate::hash::B3Hash;
 use crate::leaf::parse_leaf;
 use crate::mmr::Mmr;
+use crate::refname::timeline_ref_path;
 use crate::store::{MMR_ROOT_KEY, MMR_SIZE_KEY, Store};
 
 /// One repair the recover pass considered. `done` is false in `--dry-run` (the
@@ -243,18 +244,15 @@ fn recover_timeline_refs(
         }
     };
     for (name, _idx) in heads {
-        let relative = Path::new(&name);
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|component| !matches!(component, std::path::Component::Normal(_)))
-        {
-            report.problems.push(format!(
-                "unsafe timeline ref name '{name}'; refusing to recreate"
-            ));
-            continue;
-        }
-        let ref_path = ivaldi_dir.join("refs/heads").join(&name);
+        let ref_path = match timeline_ref_path(ivaldi_dir, &name) {
+            Ok(path) => path,
+            Err(e) => {
+                report.problems.push(format!(
+                    "unsafe timeline ref name '{name}'; refusing to recreate: {e}"
+                ));
+                continue;
+            }
+        };
         if ref_path.exists() {
             continue;
         }
@@ -393,7 +391,7 @@ mod tests {
             repo.commit(B3Hash::digest(b"t"), "A", "c").unwrap();
         }
         let ref_path = dir.path().join(".ivaldi/refs/heads/main");
-        // A normal commit doesn't materialize the ref file; ensure it's absent.
+        // Simulate loss of the marker after a normal commit materialized it.
         std::fs::remove_file(&ref_path).ok();
         assert!(!ref_path.exists());
 

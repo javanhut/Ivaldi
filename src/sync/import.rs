@@ -9,6 +9,7 @@ use crate::fsmerkle::FsStore;
 use crate::github::{CommitInfo, GitHubClient, GitHubError, TreeResponse};
 use crate::hash::B3Hash;
 use crate::leaf::Leaf;
+use crate::refname::timeline_ref_path;
 use crate::remote::HashMapping;
 use crate::repo::Repo;
 
@@ -235,7 +236,8 @@ pub(super) fn import_full_history_into(
 /// exists (with no head yet) so it shows up in tools that scan refs/heads.
 fn ensure_timeline_ref(repo: &Repo, local_timeline: &str) -> Result<(), SyncError> {
     if repo.get_timeline_head(local_timeline)?.is_none() {
-        let ref_path = repo.ivaldi_dir.join("refs/heads").join(local_timeline);
+        let ref_path = timeline_ref_path(&repo.ivaldi_dir, local_timeline)
+            .map_err(|e| SyncError::Other(e.to_string()))?;
         if let Some(parent) = ref_path.parent() {
             fs::create_dir_all(parent)?;
         }

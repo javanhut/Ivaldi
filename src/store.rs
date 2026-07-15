@@ -209,6 +209,23 @@ impl Store {
         Ok(m)
     }
 
+    /// List the reverse seal registry (`leaf hash -> seal name`) for integrity
+    /// verification. Invalid hash keys are reported rather than skipped.
+    pub fn list_seal_hash_mappings(&self) -> Result<Vec<(B3Hash, String)>, StoreError> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(HASH_TO_SEAL_NAME)?;
+        let mut mappings = Vec::new();
+        for entry in t.iter()? {
+            let (hash, name) = entry?;
+            let hash = B3Hash::from_slice(hash.value()).ok_or_else(|| {
+                StoreError("invalid hash key in reverse seal registry".to_string())
+            })?;
+            mappings.push((hash, name.value().to_string()));
+        }
+        mappings.sort_by(|a, b| a.1.cmp(&b.1));
+        Ok(mappings)
+    }
+
     // -- Butterfly --
 
     pub fn put_butterfly(&self, name: &str, data: &[u8]) -> Result<(), StoreError> {
@@ -458,6 +475,20 @@ mod tests {
         s.put_seal_name("swift-wolf", B3Hash::digest(b"2")).unwrap();
         s.put_seal_name("bold-hawk", B3Hash::digest(b"3")).unwrap();
         assert_eq!(s.find_seal_names_by_prefix("swift").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn reverse_seal_mappings_are_listed() {
+        let (_d, s) = setup();
+        let first = B3Hash::digest(b"first");
+        let second = B3Hash::digest(b"second");
+        s.put_seal_name("zeta", second).unwrap();
+        s.put_seal_name("alpha", first).unwrap();
+
+        assert_eq!(
+            s.list_seal_hash_mappings().unwrap(),
+            vec![(first, "alpha".into()), (second, "zeta".into())]
+        );
     }
 
     #[test]

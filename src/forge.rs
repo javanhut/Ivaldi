@@ -23,6 +23,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
+use crate::hash::B3Hash;
 
 /// Result of a forge operation.
 #[derive(Debug)]
@@ -78,7 +79,8 @@ pub fn forge(work_dir: &Path) -> Result<ForgeResult, ForgeError> {
 
     // Create HEAD pointing to main
     let head_path = ivaldi_dir.join("HEAD");
-    fs::write(&head_path, "ref: refs/heads/main\n").map_err(ForgeError::Io)?;
+    crate::atomic_io::atomic_write(&head_path, b"ref: refs/heads/main\n")
+        .map_err(ForgeError::Io)?;
 
     // Stamp the on-disk format so newer repos can be refused by older binaries.
     write_format(&ivaldi_dir).map_err(ForgeError::Io)?;
@@ -201,24 +203,55 @@ fn detect_and_import_git(work_dir: &Path, ivaldi_dir: &Path) -> usize {
     // Import HEAD
     if let Ok(head_content) = fs::read_to_string(git_dir.join("HEAD")) {
         let head = head_content.trim();
-        if let Some(ref_path) = head.strip_prefix("ref: refs/heads/") {
-            // Write Ivaldi HEAD pointing to same branch
-            let _ = fs::write(
-                ivaldi_dir.join("HEAD"),
-                format!("ref: refs/heads/{}\n", ref_path),
+        if let Some(ref_path) = head.strip_prefix("ref: refs/heads/")
+            && crate::refname::validate_timeline_name(ref_path).is_ok()
+        {
+            // Write Ivaldi HEAD pointing to the same safe branch.
+            let _ = crate::atomic_io::atomic_write(
+                &ivaldi_dir.join("HEAD"),
+                format!("ref: refs/heads/{}\n", ref_path).as_bytes(),
             );
         }
     }
 
-    // Import branch names from .git/refs/heads/
+    // Import loose branch names recursively from .git/refs/heads/. Git branch
+    // names commonly contain slashes, so scanning only the first directory
+    // level silently omitted branches such as `feature/parser`.
     let git_heads = git_dir.join("refs").join("heads");
-    if let Ok(entries) = fs::read_dir(&git_heads) {
+    let mut pending = vec![git_heads.clone()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let ivaldi_ref = ivaldi_dir.join("refs/heads").join(&name);
-                // Create empty ref file (will be populated on first commit)
-                let _ = fs::write(&ivaldi_ref, "");
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let Ok(relative) = entry.path().strip_prefix(&git_heads).map(Path::to_path_buf) else {
+                continue;
+            };
+            let Some(name) = relative
+                .to_str()
+                .map(|name| name.replace(std::path::MAIN_SEPARATOR, "/"))
+            else {
+                continue;
+            };
+            let Ok(ivaldi_ref) = crate::refname::timeline_ref_path(ivaldi_dir, &name) else {
+                continue;
+            };
+            if let Some(parent) = ivaldi_ref.parent()
+                && fs::create_dir_all(parent).is_err()
+            {
+                continue;
+            }
+            if crate::atomic_io::atomic_write(&ivaldi_ref, b"").is_ok() {
                 imported += 1;
             }
         }
@@ -235,8 +268,16 @@ pub fn read_head(ivaldi_dir: &Path) -> Result<HeadRef, ForgeError> {
     let content = content.trim();
 
     if let Some(ref_path) = content.strip_prefix("ref: refs/heads/") {
+        crate::refname::validate_timeline_name(ref_path)
+            .map_err(|e| ForgeError::Io(std::io::Error::other(e.to_string())))?;
         Ok(HeadRef::Timeline(ref_path.to_string()))
     } else {
+        B3Hash::from_hex(content).ok_or_else(|| {
+            ForgeError::Io(std::io::Error::other(format!(
+                "{}: detached HEAD is not a full BLAKE3 hash",
+                head_path.display()
+            )))
+        })?;
         Ok(HeadRef::Detached(content.to_string()))
     }
 }
@@ -245,8 +286,19 @@ pub fn read_head(ivaldi_dir: &Path) -> Result<HeadRef, ForgeError> {
 pub fn write_head(ivaldi_dir: &Path, head: &HeadRef) -> Result<(), ForgeError> {
     let head_path = ivaldi_dir.join("HEAD");
     let content = match head {
-        HeadRef::Timeline(name) => format!("ref: refs/heads/{}\n", name),
-        HeadRef::Detached(hash) => format!("{}\n", hash),
+        HeadRef::Timeline(name) => {
+            crate::refname::validate_timeline_name(name)
+                .map_err(|e| ForgeError::Io(std::io::Error::other(e.to_string())))?;
+            format!("ref: refs/heads/{}\n", name)
+        }
+        HeadRef::Detached(hash) => {
+            B3Hash::from_hex(hash).ok_or_else(|| {
+                ForgeError::Io(std::io::Error::other(
+                    "detached HEAD must be a full BLAKE3 hash",
+                ))
+            })?;
+            format!("{}\n", hash)
+        }
     };
     crate::atomic_io::atomic_write(&head_path, content.as_bytes()).map_err(ForgeError::Io)
 }
@@ -385,6 +437,28 @@ mod tests {
     }
 
     #[test]
+    fn forge_imports_nested_loose_git_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = dir.path().join(".git");
+        fs::create_dir_all(git.join("refs/heads/feature")).unwrap();
+        fs::write(git.join("HEAD"), "ref: refs/heads/feature/parser\n").unwrap();
+        fs::write(
+            git.join("refs/heads/feature/parser"),
+            "0000000000000000000000000000000000000000\n",
+        )
+        .unwrap();
+
+        let result = forge(dir.path()).unwrap();
+        assert_eq!(result.git_imported, 1);
+        let ivaldi = dir.path().join(".ivaldi");
+        assert_eq!(
+            read_head(&ivaldi).unwrap(),
+            HeadRef::Timeline("feature/parser".into())
+        );
+        assert!(ivaldi.join("refs/heads/feature/parser").is_file());
+    }
+
+    #[test]
     fn forge_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let result1 = forge(dir.path()).unwrap();
@@ -427,6 +501,17 @@ mod tests {
 
         let head = read_head(&ivaldi_dir).unwrap();
         assert_eq!(head, HeadRef::Detached(hash.to_string()));
+    }
+
+    #[test]
+    fn detached_head_requires_full_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        forge(dir.path()).unwrap();
+        let ivaldi_dir = dir.path().join(".ivaldi");
+
+        assert!(write_head(&ivaldi_dir, &HeadRef::Detached("short".into())).is_err());
+        fs::write(ivaldi_dir.join("HEAD"), "not-a-hash\n").unwrap();
+        assert!(read_head(&ivaldi_dir).is_err());
     }
 
     #[test]

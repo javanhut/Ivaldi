@@ -13,6 +13,7 @@ use crate::forge::{self, HeadRef};
 use crate::hash::B3Hash;
 use crate::leaf::{self, Leaf, NO_PARENT};
 use crate::mmr::Mmr;
+use crate::refname::{timeline_ref_path, validate_timeline_name};
 use crate::seal;
 use crate::store::{MMR_ROOT_KEY, MMR_SIZE_KEY, Store, StoreError};
 
@@ -35,7 +36,22 @@ impl Repo {
         // Refuse a repository written by a newer Ivaldi before touching it.
         forge::check_format(&ivaldi_dir).map_err(|e| RepoError::Other(e.to_string()))?;
 
+        // Validate HEAD before Store::open, which can create a missing store.
+        // Merely attempting to open a malformed repository must not mutate it.
+        let head = forge::read_head(&ivaldi_dir).map_err(|e| RepoError::Other(e.to_string()))?;
+        if let HeadRef::Timeline(name) = &head {
+            validate_timeline_name(name)
+                .map_err(|e| RepoError::Integrity(format!("invalid HEAD: {e}")))?;
+        }
+
         let store = Store::open(&ivaldi_dir.join("store.db")).map_err(RepoError::Store)?;
+
+        // Persisted timeline names become paths and remote Git refs. Refuse a
+        // repository containing a name that cannot be represented safely.
+        let timeline_heads = store.list_timeline_heads().map_err(RepoError::Store)?;
+        for (name, _) in &timeline_heads {
+            validate_timeline_name(name).map_err(|e| RepoError::Integrity(e.to_string()))?;
+        }
         let cas = FileCas::new(ivaldi_dir.join("objects"))
             .map_err(|e| RepoError::Other(format!("failed to open CAS: {}", e)))?;
 
@@ -52,6 +68,13 @@ impl Repo {
             }
         }
         let actual_size = indices.len() as u64;
+        for (name, head) in &timeline_heads {
+            if *head >= actual_size {
+                return Err(RepoError::Integrity(format!(
+                    "timeline {name:?} points to missing leaf {head} (store has {actual_size} leaves)"
+                )));
+            }
+        }
 
         let stored_size = match store.get_meta(MMR_SIZE_KEY).map_err(RepoError::Store)? {
             Some(value) => Some(value.parse::<u64>().map_err(|_| {
@@ -91,6 +114,28 @@ impl Repo {
                 })?;
             let parsed_leaf = leaf::parse_leaf(&data)
                 .map_err(|e| RepoError::Integrity(format!("corrupt leaf {}: {}", idx, e)))?;
+            validate_timeline_name(&parsed_leaf.timeline_id).map_err(|e| {
+                RepoError::Integrity(format!("leaf {idx} has invalid timeline: {e}"))
+            })?;
+            if parsed_leaf.prev_idx != NO_PARENT && parsed_leaf.prev_idx >= idx {
+                return Err(RepoError::Integrity(format!(
+                    "leaf {idx} has non-prior parent {}",
+                    parsed_leaf.prev_idx
+                )));
+            }
+            let mut merge_parents = std::collections::HashSet::new();
+            for parent in &parsed_leaf.merge_idxs {
+                if *parent == NO_PARENT || *parent >= idx {
+                    return Err(RepoError::Integrity(format!(
+                        "leaf {idx} has invalid merge parent {parent}"
+                    )));
+                }
+                if !merge_parents.insert(*parent) {
+                    return Err(RepoError::Integrity(format!(
+                        "leaf {idx} repeats merge parent {parent}"
+                    )));
+                }
+            }
             mmr.append_leaf(parsed_leaf);
         }
 
@@ -126,7 +171,11 @@ impl Repo {
         let head =
             forge::read_head(&self.ivaldi_dir).map_err(|e| RepoError::Other(e.to_string()))?;
         match head {
-            HeadRef::Timeline(name) => Ok(name),
+            HeadRef::Timeline(name) => {
+                validate_timeline_name(&name)
+                    .map_err(|e| RepoError::Integrity(format!("invalid HEAD: {e}")))?;
+                Ok(name)
+            }
             HeadRef::Detached(hash) => {
                 Err(RepoError::Other(format!("HEAD is detached at {}", hash)))
             }
@@ -160,10 +209,8 @@ impl Repo {
 
         // Delegate to commit_raw so all store writes (leaf, timeline head,
         // seal mapping, mmr size) land in one transaction — a crash can never
-        // leave a leaf without its head pointer. Note commit_raw appends to
-        // the in-memory MMR before the store transaction; if the transaction
-        // fails the in-memory MMR is one leaf ahead, which is fine because
-        // every caller propagates the error and the process exits.
+        // leave a leaf without its head pointer, and the in-memory MMR advances
+        // only after that transaction commits.
         self.commit_raw(new_leaf, &timeline)
     }
 
@@ -207,14 +254,41 @@ impl Repo {
     /// auto-set `prev_idx`. The caller is responsible for setting all Leaf fields.
     /// Used for history import where commit metadata comes from an external source.
     pub fn commit_raw(&mut self, leaf: Leaf, timeline: &str) -> Result<CommitResult, RepoError> {
+        let ref_path = timeline_ref_path(&self.ivaldi_dir, timeline)
+            .map_err(|e| RepoError::Other(e.to_string()))?;
+        let next_idx = self.mmr.size();
+        for parent in std::iter::once(leaf.prev_idx)
+            .chain(leaf.merge_idxs.iter().copied())
+            .filter(|idx| *idx != NO_PARENT)
+        {
+            if parent >= next_idx {
+                return Err(RepoError::Integrity(format!(
+                    "leaf {next_idx} references non-prior parent {parent}"
+                )));
+            }
+        }
+
+        // Materialize the marker before the database transaction. If a later
+        // step fails, an empty marker is a valid headless timeline and retry is
+        // safe; the inverse (a durable head with no marker) is inconsistent.
+        if let Some(parent) = ref_path.parent() {
+            std::fs::create_dir_all(parent).map_err(RepoError::Io)?;
+        }
+        if !ref_path.exists() {
+            atomic_write(&ref_path, b"").map_err(RepoError::Io)?;
+        }
+
         // Compute hash and seal name
         let leaf_hash = leaf.hash();
         let seal_name = seal::generate_seal_name(leaf_hash);
 
-        // Compute canonical bytes + indices, append to in-memory MMR.
+        // Stage the MMR append on a clone. The live accumulator changes only
+        // after the database transaction commits, so a recoverable store error
+        // cannot leave this Repo instance one leaf ahead on retry.
         let canonical = leaf.canonical_bytes();
-        let idx = self.mmr.size();
-        let (leaf_idx, root) = self.mmr.append_leaf(leaf);
+        let idx = next_idx;
+        let mut next_mmr = self.mmr.clone();
+        let (leaf_idx, root) = next_mmr.append_leaf(leaf);
 
         // Persist the leaf, refs, mappings, and MMR size/root checkpoint in a
         // single transaction. A crash cannot expose a leaf without the root
@@ -227,10 +301,11 @@ impl Repo {
                 leaf_idx,
                 &seal_name,
                 leaf_hash,
-                self.mmr.size(),
+                next_mmr.size(),
                 root,
             )
             .map_err(RepoError::Store)?;
+        self.mmr = next_mmr;
 
         Ok(CommitResult {
             index: leaf_idx,
@@ -255,6 +330,7 @@ impl Repo {
 
     /// Get the head leaf index for a timeline.
     pub fn get_timeline_head(&self, name: &str) -> Result<Option<u64>, RepoError> {
+        validate_timeline_name(name).map_err(|e| RepoError::Other(e.to_string()))?;
         self.store.get_timeline_head(name).map_err(RepoError::Store)
     }
 
@@ -262,14 +338,25 @@ impl Repo {
     /// file exists. Used by import paths (e.g. `harvest`) when no new commits
     /// were created but the timeline still needs to materialize locally.
     pub fn set_timeline_head(&self, name: &str, leaf_idx: u64) -> Result<(), RepoError> {
-        self.store
-            .set_timeline_head(name, leaf_idx)
-            .map_err(RepoError::Store)?;
-        let ref_path = self.ivaldi_dir.join("refs/heads").join(name);
+        let ref_path = timeline_ref_path(&self.ivaldi_dir, name)
+            .map_err(|e| RepoError::Other(e.to_string()))?;
+        if self
+            .store
+            .get_leaf(leaf_idx)
+            .map_err(RepoError::Store)?
+            .is_none()
+        {
+            return Err(RepoError::Integrity(format!(
+                "cannot point timeline {name:?} at missing leaf {leaf_idx}"
+            )));
+        }
         if let Some(parent) = ref_path.parent() {
             std::fs::create_dir_all(parent).map_err(RepoError::Io)?;
         }
         atomic_write(&ref_path, b"").map_err(RepoError::Io)?;
+        self.store
+            .set_timeline_head(name, leaf_idx)
+            .map_err(RepoError::Store)?;
         Ok(())
     }
 
@@ -280,6 +367,8 @@ impl Repo {
 
     /// Create a new timeline forking from the current one (or a named source).
     pub fn create_timeline(&self, name: &str, source: Option<&str>) -> Result<(), RepoError> {
+        let ref_path = timeline_ref_path(&self.ivaldi_dir, name)
+            .map_err(|e| RepoError::Other(e.to_string()))?;
         // Check if already exists
         if self
             .store
@@ -298,29 +387,30 @@ impl Repo {
             None => self.current_timeline()?,
         };
 
-        // Copy head from source
-        if let Some(head_idx) = self
+        let source_head = self
             .store
             .get_timeline_head(&source_name)
-            .map_err(RepoError::Store)?
-        {
-            self.store
-                .set_timeline_head(name, head_idx)
-                .map_err(RepoError::Store)?;
-        }
+            .map_err(RepoError::Store)?;
 
-        // Create ref file
-        let ref_path = self.ivaldi_dir.join("refs/heads").join(name);
+        // Create the marker first. If the later database update fails, the
+        // result is a valid headless timeline rather than a hidden stored head.
         if let Some(parent) = ref_path.parent() {
             std::fs::create_dir_all(parent).map_err(RepoError::Io)?;
         }
         atomic_write(&ref_path, b"").map_err(RepoError::Io)?;
+        if let Some(head_idx) = source_head {
+            self.store
+                .set_timeline_head(name, head_idx)
+                .map_err(RepoError::Store)?;
+        }
 
         Ok(())
     }
 
     /// Switch to a different timeline (updates HEAD).
     pub fn switch_timeline(&self, name: &str) -> Result<(), RepoError> {
+        let ref_path = timeline_ref_path(&self.ivaldi_dir, name)
+            .map_err(|e| RepoError::Other(e.to_string()))?;
         // Verify timeline exists
         if self
             .store
@@ -329,7 +419,6 @@ impl Repo {
             .is_none()
         {
             // Check if ref file exists even without a head (newly created, no commits)
-            let ref_path = self.ivaldi_dir.join("refs/heads").join(name);
             if !ref_path.exists() {
                 return Err(RepoError::Other(format!("timeline '{}' not found", name)));
             }
@@ -342,23 +431,31 @@ impl Repo {
 
     /// Remove a timeline.
     pub fn remove_timeline(&self, name: &str) -> Result<(), RepoError> {
+        let ref_path = timeline_ref_path(&self.ivaldi_dir, name)
+            .map_err(|e| RepoError::Other(e.to_string()))?;
         let current = self.current_timeline()?;
         if current == name {
             return Err(RepoError::Other("cannot remove current timeline".into()));
         }
 
+        match std::fs::remove_file(&ref_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(RepoError::Io(e)),
+        }
         self.store
             .remove_timeline_head(name)
             .map_err(RepoError::Store)?;
-
-        let ref_path = self.ivaldi_dir.join("refs/heads").join(name);
-        let _ = std::fs::remove_file(&ref_path);
 
         Ok(())
     }
 
     /// Rename a timeline. If it's the current timeline, HEAD is updated too.
     pub fn rename_timeline(&self, old_name: &str, new_name: &str) -> Result<(), RepoError> {
+        let old_ref = timeline_ref_path(&self.ivaldi_dir, old_name)
+            .map_err(|e| RepoError::Other(e.to_string()))?;
+        let new_ref = timeline_ref_path(&self.ivaldi_dir, new_name)
+            .map_err(|e| RepoError::Other(e.to_string()))?;
         if old_name == new_name {
             return Ok(());
         }
@@ -392,8 +489,9 @@ impl Repo {
             .map_err(RepoError::Store)?;
 
         // Update ref files
-        let old_ref = self.ivaldi_dir.join("refs/heads").join(old_name);
-        let new_ref = self.ivaldi_dir.join("refs/heads").join(new_name);
+        if let Some(parent) = new_ref.parent() {
+            std::fs::create_dir_all(parent).map_err(RepoError::Io)?;
+        }
         if old_ref.exists() {
             std::fs::rename(&old_ref, &new_ref).map_err(RepoError::Io)?;
         } else {
@@ -1093,6 +1191,53 @@ mod tests {
     }
 
     #[test]
+    fn open_rejects_timeline_head_to_missing_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        forge::forge(dir.path()).unwrap();
+        {
+            let store = Store::open(&dir.path().join(".ivaldi/store.db")).unwrap();
+            store.set_timeline_head("main", 0).unwrap();
+        }
+
+        let error = Repo::open(dir.path()).err().unwrap();
+        assert!(
+            error.to_string().contains("points to missing leaf"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn open_rejects_non_prior_parent_link() {
+        let dir = tempfile::tempdir().unwrap();
+        forge::forge(dir.path()).unwrap();
+        let mut leaf = Leaf::new(B3Hash::digest(b"tree"), "main", "A", 1, "bad parent");
+        leaf.prev_idx = 0;
+        {
+            let store = Store::open(&dir.path().join(".ivaldi/store.db")).unwrap();
+            store.put_leaf(0, &leaf.canonical_bytes()).unwrap();
+        }
+
+        let error = Repo::open(dir.path()).err().unwrap();
+        assert!(error.to_string().contains("non-prior parent"), "{error}");
+    }
+
+    #[test]
+    fn open_rejects_unsafe_persisted_timeline_name() {
+        let dir = tempfile::tempdir().unwrap();
+        forge::forge(dir.path()).unwrap();
+        {
+            let store = Store::open(&dir.path().join(".ivaldi/store.db")).unwrap();
+            store.set_timeline_head("../escape", 0).unwrap();
+        }
+
+        let error = Repo::open(dir.path()).err().unwrap();
+        assert!(
+            error.to_string().contains("invalid timeline name"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn open_rejects_size_checkpoint_mismatch() {
         let dir = {
             let (dir, mut repo) = setup_repo();
@@ -1124,6 +1269,26 @@ mod tests {
         assert_eq!(leaf.message, "First commit");
         assert_eq!(leaf.timeline_id, "main");
         assert_eq!(leaf.prev_idx, NO_PARENT);
+    }
+
+    #[test]
+    fn failed_commit_does_not_advance_in_memory_mmr() {
+        let (_dir, mut repo) = setup_repo();
+        let original_root = repo.root();
+
+        // Force commit_leaf_atomic to reject the append, then repair the
+        // checkpoint and retry through the same Repo instance.
+        repo.store.set_meta(MMR_SIZE_KEY, "99").unwrap();
+        assert!(repo.commit(B3Hash::digest(b"first"), "A", "fails").is_err());
+        assert_eq!(repo.commit_count(), 0);
+        assert_eq!(repo.root(), original_root);
+
+        repo.store.set_meta(MMR_SIZE_KEY, "0").unwrap();
+        let committed = repo
+            .commit(B3Hash::digest(b"second"), "A", "retry")
+            .unwrap();
+        assert_eq!(committed.index, 0);
+        assert_eq!(repo.commit_count(), 1);
     }
 
     #[test]

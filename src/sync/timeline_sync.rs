@@ -9,6 +9,7 @@ use crate::cas::FileCas;
 use crate::fsmerkle::FsStore;
 use crate::github::{CommitInfo, GitHubClient};
 use crate::leaf::Leaf;
+use crate::refname::timeline_ref_path;
 use crate::remote::HashMapping;
 use crate::repo::Repo;
 
@@ -430,7 +431,8 @@ fn create_temp_timeline(
     temp_timeline: &str,
     ancestor_idx: u64,
 ) -> Result<(), SyncError> {
-    let ref_path = repo.ivaldi_dir.join("refs/heads").join(temp_timeline);
+    let ref_path = timeline_ref_path(&repo.ivaldi_dir, temp_timeline)
+        .map_err(|e| SyncError::Other(e.to_string()))?;
     if let Some(parent) = ref_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -442,7 +444,9 @@ fn create_temp_timeline(
 /// Best-effort removal of the temp sync timeline (head entry + ref file).
 fn cleanup_temp_timeline(repo: &Repo, temp_timeline: &str) {
     let _ = repo.store.remove_timeline_head(temp_timeline);
-    let _ = fs::remove_file(repo.ivaldi_dir.join("refs/heads").join(temp_timeline));
+    if let Ok(path) = timeline_ref_path(&repo.ivaldi_dir, temp_timeline) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 /// Map the remote tip SHA to the freshly created fuse commit at the timeline

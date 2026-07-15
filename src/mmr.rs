@@ -34,6 +34,7 @@ struct Peak {
 ///
 /// Internally tracks leaves and a stack of peaks. When two peaks of the
 /// same height exist, they merge into one peak of height+1.
+#[derive(Clone)]
 pub struct Mmr {
     leaves: Vec<Leaf>,
     /// Stack of peaks, each representing a complete binary subtree.

@@ -298,7 +298,8 @@ where
         // branch we actually fetched so `whereami` and `timeline list` agree
         // with the working tree. Also materialise the on-disk ref file so the
         // timeline shows up in tools that scan refs/heads.
-        let ref_path = ivaldi_dir.join("refs/heads").join(&remote.branch);
+        let ref_path = crate::refname::timeline_ref_path(&ivaldi_dir, &remote.branch)
+            .map_err(|e| SyncError::Other(e.to_string()))?;
         if let Some(parent) = ref_path.parent() {
             fs::create_dir_all(parent)?;
         }

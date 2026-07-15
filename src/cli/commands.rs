@@ -1958,7 +1958,8 @@ pub(crate) fn do_timeline_switch(
     // Verify target exists before any side effects
     let target_head_idx = repo.get_timeline_head(target).map_err(|e| e.to_string())?;
     if target_head_idx.is_none() {
-        let ref_path = ivaldi_dir.join("refs/heads").join(target);
+        let ref_path =
+            crate::refname::timeline_ref_path(ivaldi_dir, target).map_err(|e| e.to_string())?;
         if !ref_path.exists() {
             return Err(format!("timeline '{}' not found", target));
         }
