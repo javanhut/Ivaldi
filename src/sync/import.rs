@@ -170,6 +170,10 @@ pub(super) fn import_full_history_into(
             &store,
             &mut hash_mapping,
         )?;
+        // Make the downloaded blobs' directory entries durable before any
+        // durable record (leaf transaction, mapping save) references them.
+        cas.flush()?;
+        crate::failpoint::fail_point("import.api.after_blobs");
 
         // --- Phase 4: Commit loop using build_tree_from_hash_map ---
         // Track SHA1 → leaf index for parent resolution
@@ -180,16 +184,23 @@ pub(super) fn import_full_history_into(
         let mut commits_imported = 0usize;
         let mut commits_skipped = 0usize;
 
+        // SHAs present in this listing: used to tell "parent beyond the
+        // depth-truncated window" (legitimate shallow root) apart from
+        // "parent that should have been imported but wasn't" (hard error).
+        let listed_shas: std::collections::HashSet<&str> =
+            commits.iter().map(|c| c.sha.as_str()).collect();
+
         let pb = crate::progress::file_bar(commits.len() as u64, "Importing commits");
         for commit in &commits {
             pb.inc(1);
 
-            // Skip if already mapped — still populate sha_to_idx from existing
-            // data for parent resolution.
-            if let Some(b3) = hash_mapping.get_blake3(&commit.sha) {
-                if let Some(idx) = find_leaf_idx_by_hash(repo, b3) {
-                    sha_to_idx.insert(commit.sha.clone(), idx);
-                }
+            // Skip only when the mapping resolves to a leaf that actually
+            // exists locally — a mapping entry without its leaf is stale and
+            // the commit must be re-imported, not silently trusted.
+            if let Some(b3) = hash_mapping.get_blake3(&commit.sha)
+                && let Some(idx) = find_leaf_idx_by_hash(repo, b3)
+            {
+                sha_to_idx.insert(commit.sha.clone(), idx);
                 commits_skipped += 1;
                 continue;
             }
@@ -212,8 +223,18 @@ pub(super) fn import_full_history_into(
                 tree_hash
             };
 
-            let leaf = build_import_leaf(commit, ivaldi_tree_hash, local_timeline, &sha_to_idx);
+            let leaf = build_import_leaf(
+                commit,
+                ivaldi_tree_hash,
+                local_timeline,
+                &sha_to_idx,
+                &listed_shas,
+            )?;
+            // Flush this commit's tree nodes before the append-only leaf
+            // transaction durably references them.
+            cas.flush()?;
             let result = repo.commit_raw(leaf, local_timeline)?;
+            crate::failpoint::fail_point("import.api.mid_commits");
 
             // Record mappings
             hash_mapping.insert(&commit.sha, result.hash);
@@ -491,12 +512,20 @@ fn ivaldi_tree_for_commit(
 
 /// Import phase 4 helper: build an Ivaldi leaf mirroring a GitHub commit
 /// (author, timestamp, parent indices resolved through `sha_to_idx`).
+///
+/// Parent resolution is strict: a parent that appears in the fetched commit
+/// listing (`listed_shas`) but has no resolved index is a hard error — the
+/// alternative is silently importing this commit as a fake root, severing
+/// its ancestry. A parent *outside* the listing means the listing was
+/// depth-truncated (shallow import); that commit legitimately becomes the
+/// shallow root, and out-of-window merge parents are dropped with a warning.
 fn build_import_leaf(
     commit: &CommitInfo,
     tree_hash: B3Hash,
     local_timeline: &str,
     sha_to_idx: &HashMap<String, u64>,
-) -> Leaf {
+    listed_shas: &std::collections::HashSet<&str>,
+) -> Result<Leaf, SyncError> {
     // Parse author and timestamp
     let author = format!(
         "{} <{}>",
@@ -510,22 +539,47 @@ fn build_import_leaf(
         .and_then(parse_iso8601_to_unix)
         .unwrap_or(0);
 
-    // Resolve parent indices
-    let prev_idx = if !commit.parents.is_empty() {
-        sha_to_idx
-            .get(&commit.parents[0].sha)
-            .copied()
-            .unwrap_or(crate::leaf::NO_PARENT)
-    } else {
-        crate::leaf::NO_PARENT
+    // Resolve parent indices.
+    let resolve = |parent_sha: &str| -> Result<Option<u64>, SyncError> {
+        if let Some(&idx) = sha_to_idx.get(parent_sha) {
+            return Ok(Some(idx));
+        }
+        if listed_shas.contains(parent_sha) {
+            return Err(SyncError::Other(format!(
+                "commit {} lists parent {} which was in the fetched history but resolved to \
+                 no local seal — refusing to sever ancestry; retry the sync",
+                commit.sha, parent_sha
+            )));
+        }
+        // Beyond the depth-truncated window: shallow-import boundary.
+        Ok(None)
     };
 
-    let merge_idxs: Vec<u64> = commit
-        .parents
-        .iter()
-        .skip(1)
-        .filter_map(|p| sha_to_idx.get(&p.sha).copied())
-        .collect();
+    let prev_idx = match commit.parents.first() {
+        Some(p) => match resolve(&p.sha)? {
+            Some(idx) => idx,
+            None => {
+                crate::logging::warn(&format!(
+                    "commit {} becomes the shallow-import root: its parent {} is beyond \
+                     the fetched history window",
+                    commit.sha, p.sha
+                ));
+                crate::leaf::NO_PARENT
+            }
+        },
+        None => crate::leaf::NO_PARENT,
+    };
+
+    let mut merge_idxs: Vec<u64> = Vec::new();
+    for p in commit.parents.iter().skip(1) {
+        match resolve(&p.sha)? {
+            Some(idx) => merge_idxs.push(idx),
+            None => crate::logging::warn(&format!(
+                "commit {}: dropping merge parent {} which is beyond the fetched history window",
+                commit.sha, p.sha
+            )),
+        }
+    }
 
     let mut leaf = Leaf::new(
         tree_hash,
@@ -536,5 +590,74 @@ fn build_import_leaf(
     );
     leaf.prev_idx = prev_idx;
     leaf.merge_idxs = merge_idxs;
-    leaf
+    Ok(leaf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::{AuthorInfo, CommitDetail, ParentRef, TreeRef};
+
+    fn commit_info(sha: &str, parents: &[&str]) -> CommitInfo {
+        CommitInfo {
+            sha: sha.to_string(),
+            commit: CommitDetail {
+                message: "msg".into(),
+                author: AuthorInfo {
+                    name: "A".into(),
+                    email: "a@x".into(),
+                    date: None,
+                },
+                tree: TreeRef { sha: "t".into() },
+            },
+            parents: parents
+                .iter()
+                .map(|p| ParentRef { sha: p.to_string() })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn parent_outside_fetched_window_becomes_shallow_root() {
+        let commit = commit_info("child", &["beyond-window"]);
+        let sha_to_idx = HashMap::new();
+        let listed: std::collections::HashSet<&str> = ["child"].into();
+        let leaf = build_import_leaf(&commit, B3Hash::digest(b"t"), "main", &sha_to_idx, &listed)
+            .expect("shallow boundary is legitimate");
+        assert_eq!(leaf.prev_idx, crate::leaf::NO_PARENT);
+    }
+
+    #[test]
+    fn listed_but_unresolvable_parent_is_a_hard_error() {
+        // Parent IS in the fetched listing, so it should have been imported —
+        // failing to resolve it means severed ancestry, never a silent root.
+        let commit = commit_info("child", &["parent"]);
+        let sha_to_idx = HashMap::new();
+        let listed: std::collections::HashSet<&str> = ["child", "parent"].into();
+        let err = build_import_leaf(&commit, B3Hash::digest(b"t"), "main", &sha_to_idx, &listed)
+            .expect_err("must refuse to sever ancestry");
+        assert!(err.to_string().contains("sever ancestry"), "{}", err);
+    }
+
+    #[test]
+    fn resolved_parents_populate_prev_and_merge_indices() {
+        let commit = commit_info("m", &["p1", "p2"]);
+        let mut sha_to_idx = HashMap::new();
+        sha_to_idx.insert("p1".to_string(), 4u64);
+        sha_to_idx.insert("p2".to_string(), 7u64);
+        let listed: std::collections::HashSet<&str> = ["m", "p1", "p2"].into();
+        let leaf =
+            build_import_leaf(&commit, B3Hash::digest(b"t"), "main", &sha_to_idx, &listed).unwrap();
+        assert_eq!(leaf.prev_idx, 4);
+        assert_eq!(leaf.merge_idxs, vec![7]);
+    }
+
+    #[test]
+    fn iso8601_parsing() {
+        assert_eq!(
+            parse_iso8601_to_unix("2024-01-15T10:30:00Z"),
+            parse_iso8601_to_unix("2024-01-15T05:30:00-05:00"),
+        );
+        assert!(parse_iso8601_to_unix("garbage").is_none());
+    }
 }

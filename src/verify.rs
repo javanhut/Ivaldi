@@ -14,7 +14,7 @@ use crate::repo::Repo;
 use crate::store::Store;
 
 /// One named integrity check and its outcome.
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct Check {
     pub name: String,
     pub ok: bool,

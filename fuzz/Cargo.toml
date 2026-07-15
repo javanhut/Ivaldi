@@ -49,3 +49,17 @@ path = "fuzz_targets/byte_reader.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "git_parse_packfile"
+path = "fuzz_targets/git_parse_packfile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "git_apply_delta"
+path = "fuzz_targets/git_apply_delta.rs"
+test = false
+doc = false
+bench = false

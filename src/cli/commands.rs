@@ -391,7 +391,11 @@ fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
         }
     }
 
+    // The single commit point: every staging mutation above is in-memory
+    // until this atomic_write lands, so a crash is old-or-new by design.
+    crate::failpoint::fail_point("gather.before_stage_save");
     ws.save().map_err(|e| e.to_string())?;
+    crate::failpoint::fail_point("gather.after_stage_save");
 
     if !quiet {
         for file in &added {
@@ -823,6 +827,10 @@ fn cmd_reseal(args: ResealArgs, quiet: bool) -> Result<(), String> {
     let result = repo
         .reseal_head(tree_hash, &author, &message)
         .map_err(|e| e.to_string())?;
+    // A crash here leaves the reseal durable with staging still populated;
+    // retrying folds the identical delta onto the resealed head (same tree,
+    // one more orphaned leaf) — confusing but never data loss.
+    crate::failpoint::fail_point("reseal.after_commit");
 
     let mut ws_mut = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
     ws_mut.staging.clear();
@@ -1536,15 +1544,18 @@ fn cmd_rewind(args: RewindArgs, quiet: bool) -> Result<(), String> {
         .get_timeline_head(&timeline)
         .map_err(|e| e.to_string())?
         .ok_or("timeline has no seals")?;
-    if target_idx == head_idx {
-        if !quiet {
-            println!("Already at that seal — nothing to rewind.");
-        }
-        return Ok(());
+    // Already at the target: skip the head move but still run the staging
+    // clear (and --discard materialize) below. A rewind that crashed between
+    // moving the head and clearing staging must converge on retry instead of
+    // silently keeping stale staging gathered against the old head.
+    let already_there = target_idx == head_idx;
+    if already_there && !quiet {
+        println!("Already at that seal — refreshing staging/working state.");
     }
-    if !repo
-        .is_ancestor(target_idx, head_idx)
-        .map_err(|e| e.to_string())?
+    if !already_there
+        && !repo
+            .is_ancestor(target_idx, head_idx)
+            .map_err(|e| e.to_string())?
         && !quiet
     {
         println!(
@@ -1554,8 +1565,11 @@ fn cmd_rewind(args: RewindArgs, quiet: bool) -> Result<(), String> {
         );
     }
 
-    repo.set_timeline_head(&timeline, target_idx)
-        .map_err(|e| e.to_string())?;
+    if !already_there {
+        repo.set_timeline_head(&timeline, target_idx)
+            .map_err(|e| e.to_string())?;
+    }
+    crate::failpoint::fail_point("rewind.after_head");
 
     let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
     {
@@ -1563,6 +1577,7 @@ fn cmd_rewind(args: RewindArgs, quiet: bool) -> Result<(), String> {
         ws_mut.staging.clear();
         ws_mut.save().map_err(|e| e.to_string())?;
     }
+    crate::failpoint::fail_point("rewind.after_staging_clear");
     if args.discard {
         let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
         ws.materialize(target_leaf.tree_root)
@@ -1604,6 +1619,9 @@ fn cmd_reverse(_args: ReverseArgs, quiet: bool) -> Result<(), String> {
         let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
         let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
         ws.materialize(leaf.tree_root).map_err(|e| e.to_string())?;
+        // A crash here leaves stale staging behind; retrying `reverse`
+        // converges because it always re-runs both steps.
+        crate::failpoint::fail_point("reverse.after_materialize");
         // Clear staging
         let mut ws_mut = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
         ws_mut.staging.clear();
@@ -1830,11 +1848,14 @@ fn ensure_no_interrupted_switch(ivaldi_dir: &std::path::Path) -> Result<(), Stri
 /// Switch timelines with crash-recovery journaling.
 ///
 /// Ordering: shelve the current timeline's dirty state (and flush the CAS —
-/// the shelf holds the only copies), clear staging, write the journal, then
-/// do the destructive-but-idempotent steps (HEAD rewrite, materialize,
-/// shelf restore) and clear the journal. A crash after the journal is
-/// written is recovered by re-running the switch toward `to` (complete) or
-/// `from` (roll back); both replay only idempotent steps.
+/// the shelf holds the only copies), write the journal, then do the
+/// destructive-but-idempotent steps (HEAD rewrite, materialize, staging
+/// clear + shelf restore), clear the journal, and only then remove the
+/// restored shelf. A crash before the journal leaves the worktree and
+/// staging intact (retry re-captures); a crash after it is recovered by
+/// re-running the switch toward `to` (complete) or `from` (roll back), and
+/// every replayed step draws from the still-present shelves, so no window
+/// loses shelved or staged content.
 pub(crate) fn do_timeline_switch(
     work_dir: &std::path::Path,
     ivaldi_dir: &std::path::Path,
@@ -1876,7 +1897,13 @@ pub(crate) fn do_timeline_switch(
     }
 
     // Finish a switch to `dest`: HEAD rewrite, materialize, shelf restore.
-    // Every step is idempotent, so this is safe to replay on resume.
+    // Every step is idempotent, so this is safe to replay on resume. The
+    // dest shelf is deliberately NOT removed here: while the journal exists
+    // the shelf is the authoritative source of the restored staging entries,
+    // so a crash anywhere inside `finish` (even right after `save`) replays
+    // against an intact shelf. The caller removes it only after the journal
+    // is cleared; a leftover shelf is harmless — the next switch away from
+    // `dest` rewrites or removes it.
     let finish = |dest: &str| -> Result<Vec<String>, String> {
         repo.switch_timeline(dest).map_err(|e| e.to_string())?;
 
@@ -1888,6 +1915,7 @@ pub(crate) fn do_timeline_switch(
                 .materialize_with_ignore(leaf.tree_root, &ignore_cache)
                 .map_err(|e| format!("failed to materialize timeline: {}", e))?;
         }
+        crate::failpoint::fail_point("switch.after_materialize");
 
         let mut restored_summary = Vec::new();
         let mut ws_mut = Workspace::new(&cas, work_dir, ivaldi_dir);
@@ -1902,7 +1930,6 @@ pub(crate) fn do_timeline_switch(
                 ws_mut.staging.stage(path, *hash);
             }
             restored_summary = change_counts(&shelf.workspace_changes, shelf.staged_files.len());
-            shelf_mgr.remove_shelf(dest).ok();
         }
         ws_mut.save().map_err(|e| e.to_string())?;
         Ok(restored_summary)
@@ -1934,7 +1961,10 @@ pub(crate) fn do_timeline_switch(
             }
         }
         let restored_summary = finish(target)?;
+        crate::failpoint::fail_point("switch.before_journal_clear");
         switch_journal::clear(ivaldi_dir).map_err(|e| e.to_string())?;
+        crate::failpoint::fail_point("switch.before_shelf_remove");
+        shelf_mgr.remove_shelf(target).ok();
         if !quiet {
             println!("Switched to timeline: {}", target);
             if !restored_summary.is_empty() {
@@ -2012,18 +2042,19 @@ pub(crate) fn do_timeline_switch(
     // The shelf references blobs that capture_changes just wrote — the CAS
     // now holds the only copies of the user's uncommitted content, and
     // materialize is about to destroy the working-tree copies.
+    crate::failpoint::fail_point("switch.after_shelf_save");
     cas.flush().map_err(|e| e.to_string())?;
 
-    // The staged entries belong to `current` and now live in its shelf;
-    // clear staging so a crash can't leave the target timeline pointing at
-    // the source's stale staging entries.
-    {
-        let mut ws_mut = Workspace::new(&cas, work_dir, ivaldi_dir);
-        ws_mut.staging.clear();
-        ws_mut.save().map_err(|e| e.to_string())?;
-    }
-
     // ---- Journal, then the idempotent destructive steps ----
+    //
+    // The journal must land BEFORE staging is touched: everything after it
+    // (including the staging clear inside `finish`) is replayed on resume
+    // from the shelves, so no window can lose the staged entries. (Clearing
+    // staging before the journal would let a crash + retry re-capture with
+    // an empty staging area and overwrite the shelf, dropping staged files
+    // whose content diverged from the working tree.) Until `finish` saves,
+    // the staging file still names `current`'s entries — harmless, because
+    // the journal blocks every mutating command until the switch resumes.
     switch_journal::write(
         ivaldi_dir,
         &SwitchJournal {
@@ -2037,9 +2068,13 @@ pub(crate) fn do_timeline_switch(
         },
     )
     .map_err(|e| e.to_string())?;
+    crate::failpoint::fail_point("switch.after_journal");
 
     let restored_summary = finish(target)?;
+    crate::failpoint::fail_point("switch.before_journal_clear");
     switch_journal::clear(ivaldi_dir).map_err(|e| e.to_string())?;
+    crate::failpoint::fail_point("switch.before_shelf_remove");
+    shelf_mgr.remove_shelf(target).ok();
 
     if !quiet {
         if !shelved_summary.is_empty() {
@@ -2332,9 +2367,22 @@ fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
     if let Some(base_idx) = repo
         .merge_base(target_head, source_head)
         .map_err(|e| e.to_string())?
-        && let Some(base_leaf) = repo.get_leaf(base_idx).map_err(|e| e.to_string())?
     {
-        collect_blob_hashes(&store, base_leaf.tree_root, "", &mut base_files)?;
+        // Source already reachable from the target head: nothing to fuse.
+        // This also makes retrying a fuse that crashed after its commit a
+        // clean no-op instead of a redundant merge seal.
+        if base_idx == source_head {
+            if !quiet {
+                println!(
+                    "Timeline '{}' is already fused into '{}' — nothing to do.",
+                    source, target
+                );
+            }
+            return Ok(());
+        }
+        if let Some(base_leaf) = repo.get_leaf(base_idx).map_err(|e| e.to_string())? {
+            collect_blob_hashes(&store, base_leaf.tree_root, "", &mut base_files)?;
+        }
     }
     collect_blob_hashes(&store, target_leaf.tree_root, "", &mut ours_files)?;
     collect_blob_hashes(&store, source_leaf.tree_root, "", &mut theirs_files)?;
@@ -2360,9 +2408,18 @@ fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
         let mut fuse_leaf = crate::leaf::Leaf::new(merged_tree, &target, &author, now, &message);
         fuse_leaf.prev_idx = target_head;
         fuse_leaf.merge_idxs = vec![source_head];
+
+        // Make the merged tree nodes (and any union-strategy concat blobs —
+        // content that exists nowhere else) durable BEFORE the commit record
+        // that references them. Without this, power loss after the store
+        // transaction could persist a merge seal whose tree is gone, which
+        // `verify --full` would reject.
+        cas.flush().map_err(|e| e.to_string())?;
+        crate::failpoint::fail_point("fuse.before_commit");
         let commit_result = repo
             .commit_raw(fuse_leaf, &target)
             .map_err(|e| e.to_string())?;
+        crate::failpoint::fail_point("fuse.after_commit");
 
         // Write the merged tree out to the workspace so the user actually
         // sees the resolved files. Without this the seal exists in the MMR
@@ -2389,6 +2446,7 @@ fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
             conflicts: conflict_paths.clone(),
         };
         repo.save_merge_state(&state).map_err(|e| e.to_string())?;
+        crate::failpoint::fail_point("fuse.after_merge_state");
 
         println!("[CONFLICTS] Merge conflicts detected:\n");
         for path in &conflict_paths {
@@ -2470,6 +2528,15 @@ fn cmd_travel(args: TravelArgs) -> Result<(), String> {
                 repo.store
                     .set_timeline_head(&timeline, seal_index)
                     .map_err(|e| e.to_string())?;
+                // Staged entries were gathered against the old head; a later
+                // seal would silently commit old-head content onto the moved
+                // head, so clear them with the same ordering `rewind` uses.
+                let ctx = find_repo()?;
+                let cas =
+                    FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
+                let mut ws_mut = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
+                ws_mut.staging.clear();
+                ws_mut.save().map_err(|e| e.to_string())?;
                 println!(
                     "Timeline '{}' moved back to seal at index {}",
                     timeline, seal_index
@@ -2708,9 +2775,13 @@ fn cmd_weld(args: WeldArgs, quiet: bool) -> Result<(), String> {
         .take_while(|idx| *idx != end_idx)
         .collect();
 
-    // Build the welded leaf and append on the current timeline. `commit_raw`
-    // assigns a fresh MMR index, parents at our chosen `prev_idx`, and updates
-    // the timeline head to point at the new seal.
+    // Build the welded leaf plus every replayed trailing seal up front, then
+    // commit the whole chain in ONE store transaction. Committing them one by
+    // one would let a crash land the welded seal (or a partial replay chain)
+    // with the remaining trailing seals silently orphaned from the head —
+    // invisible loss, since orphaned MMR leaves are legal. Batch indices are
+    // assigned consecutively from `commit_count`, so each replayed leaf can
+    // chain onto its predecessor's predicted index.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -2718,16 +2789,14 @@ fn cmd_weld(args: WeldArgs, quiet: bool) -> Result<(), String> {
     let mut welded_leaf = Leaf::new(end_leaf.tree_root, &timeline, &author, now, &message);
     welded_leaf.prev_idx = welded_prev;
 
-    let welded_result = repo
-        .commit_raw(welded_leaf, &timeline)
-        .map_err(|e| e.to_string())?;
+    let base_idx = repo.commit_count();
+    let mut batch = vec![welded_leaf];
 
     // Replay trailing seals on top of the welded seal, oldest-first, each
     // parented on the previous replay (or on the welded seal itself for the
     // first one). Tree, author, message, and timestamp are preserved; only
     // `prev_idx` changes, which produces a new hash — there is no way to
     // keep the original seal hashes when their parent linkage changes.
-    let mut prev_for_next = welded_result.index;
     for trailing_idx in trailing.iter().rev() {
         let original = repo
             .get_leaf(*trailing_idx)
@@ -2740,13 +2809,17 @@ fn cmd_weld(args: WeldArgs, quiet: bool) -> Result<(), String> {
             original.time_unix,
             &original.message,
         );
-        replayed.prev_idx = prev_for_next;
+        replayed.prev_idx = base_idx + batch.len() as u64 - 1;
         replayed.merge_idxs = original.merge_idxs.clone();
-        let r = repo
-            .commit_raw(replayed, &timeline)
-            .map_err(|e| e.to_string())?;
-        prev_for_next = r.index;
+        batch.push(replayed);
     }
+
+    crate::failpoint::fail_point("weld.before_commit");
+    let results = repo
+        .commit_batch_raw(batch, &timeline)
+        .map_err(|e| e.to_string())?;
+    crate::failpoint::fail_point("weld.after_commit");
+    let welded_result = &results[0];
 
     if !quiet {
         println!(

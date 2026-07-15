@@ -29,6 +29,14 @@ pub struct Store {
     db: Database,
 }
 
+/// One leaf in a multi-leaf atomic append (see [`Store::commit_leaves_atomic`]).
+pub struct BatchLeaf<'a> {
+    pub idx: u64,
+    pub canonical: &'a [u8],
+    pub seal_name: &'a str,
+    pub seal_hash: B3Hash,
+}
+
 /// Unified error type — stringifies redb's varied error types.
 #[derive(Debug, thiserror::Error)]
 #[error("store: {0}")]
@@ -388,6 +396,90 @@ impl Store {
         Ok(())
     }
 
+    /// Persist a batch of contiguous new leaves, their seal mappings, the
+    /// final timeline head, and the MMR size/root checkpoint in ONE redb
+    /// write transaction. Used by multi-seal rewrites (`weld`) so a crash
+    /// can never expose a partially replayed chain: either every leaf in
+    /// the batch is visible with the head on the last one, or none are.
+    pub fn commit_leaves_atomic(
+        &self,
+        entries: &[BatchLeaf<'_>],
+        timeline: &str,
+        timeline_head: u64,
+        mmr_size: u64,
+        mmr_root: B3Hash,
+    ) -> Result<(), StoreError> {
+        let first = entries
+            .first()
+            .ok_or_else(|| StoreError("empty leaf batch".into()))?;
+        let last_idx = entries.last().unwrap().idx;
+        if mmr_size != last_idx + 1 {
+            return Err(StoreError(format!(
+                "invalid MMR batch append: last leaf index {} does not produce size {}",
+                last_idx, mmr_size
+            )));
+        }
+        if timeline_head != last_idx {
+            return Err(StoreError(format!(
+                "batch head {} is not the batch's last leaf {}",
+                timeline_head, last_idx
+            )));
+        }
+
+        let w = self.db.begin_write()?;
+        {
+            let mut leaves = w.open_table(LEAVES)?;
+            for (expected, entry) in (first.idx..).zip(entries.iter()) {
+                if entry.idx != expected {
+                    return Err(StoreError(format!(
+                        "non-contiguous leaf batch: expected index {}, got {}",
+                        expected, entry.idx
+                    )));
+                }
+                if leaves.get(entry.idx)?.is_some() {
+                    return Err(StoreError(format!(
+                        "refusing to overwrite append-only MMR leaf {}",
+                        entry.idx
+                    )));
+                }
+                leaves.insert(entry.idx, entry.canonical)?;
+            }
+            w.open_table(TIMELINE_HEADS)?
+                .insert(timeline, timeline_head)?;
+            {
+                let mut n2h = w.open_table(SEAL_NAME_TO_HASH)?;
+                let mut h2n = w.open_table(HASH_TO_SEAL_NAME)?;
+                for entry in entries {
+                    n2h.insert(entry.seal_name, entry.seal_hash.as_bytes().as_slice())?;
+                    h2n.insert(entry.seal_hash.as_bytes().as_slice(), entry.seal_name)?;
+                }
+            }
+            let mut meta = w.open_table(META)?;
+            if let Some(previous_size) = meta.get(MMR_SIZE_KEY)? {
+                let previous_size = previous_size.value().parse::<u64>().map_err(|_| {
+                    StoreError("stored MMR size checkpoint is not a valid integer".into())
+                })?;
+                if previous_size != first.idx {
+                    return Err(StoreError(format!(
+                        "non-contiguous MMR append: stored size is {}, batch starts at index {}",
+                        previous_size, first.idx
+                    )));
+                }
+            } else if first.idx != 0 {
+                return Err(StoreError(format!(
+                    "missing MMR size checkpoint before appending leaf {}",
+                    first.idx
+                )));
+            }
+            meta.insert(MMR_SIZE_KEY, mmr_size.to_string().as_str())?;
+            meta.insert(MMR_ROOT_KEY, mmr_root.to_hex().as_str())?;
+        }
+        crate::failpoint::fail_point("store.commit_leaves.before_commit");
+        w.commit()?;
+        crate::failpoint::fail_point("store.commit_leaves.after_commit");
+        Ok(())
+    }
+
     /// Establish or repair both MMR checkpoint fields in one transaction.
     /// Used when opening legacy repositories that predate root checkpoints.
     pub fn set_mmr_checkpoint(&self, size: u64, root: B3Hash) -> Result<(), StoreError> {
@@ -537,6 +629,72 @@ mod tests {
         assert_eq!(s.get_meta("k").unwrap(), Some("v".into()));
         assert!(s.remove_meta("k").unwrap());
         assert_eq!(s.get_meta("k").unwrap(), None);
+    }
+
+    #[test]
+    fn batch_commit_is_atomic_and_validated() {
+        let (_d, s) = setup();
+        let h = |b: &[u8]| B3Hash::digest(b);
+
+        // Establish the checkpoint with a first ordinary commit.
+        s.commit_leaf_atomic(0, b"leaf0", "main", 0, "alpha", h(b"0"), 1, h(b"r0"))
+            .unwrap();
+
+        // A valid two-leaf batch: both leaves land, head on the last one.
+        let batch = [
+            BatchLeaf {
+                idx: 1,
+                canonical: b"leaf1",
+                seal_name: "beta",
+                seal_hash: h(b"1"),
+            },
+            BatchLeaf {
+                idx: 2,
+                canonical: b"leaf2",
+                seal_name: "gamma",
+                seal_hash: h(b"2"),
+            },
+        ];
+        s.commit_leaves_atomic(&batch, "main", 2, 3, h(b"r2"))
+            .unwrap();
+        assert_eq!(s.get_leaf(1).unwrap().unwrap(), b"leaf1");
+        assert_eq!(s.get_leaf(2).unwrap().unwrap(), b"leaf2");
+        assert_eq!(s.get_timeline_head("main").unwrap(), Some(2));
+        assert_eq!(s.get_hash_by_seal_name("gamma").unwrap(), Some(h(b"2")));
+
+        // Refusals: empty batch, gap against the checkpoint, head not on the
+        // last leaf, overwrite of an existing leaf. None may leave residue.
+        assert!(s.commit_leaves_atomic(&[], "main", 0, 0, h(b"r")).is_err());
+        let gap = [BatchLeaf {
+            idx: 5,
+            canonical: b"leaf5",
+            seal_name: "delta",
+            seal_hash: h(b"5"),
+        }];
+        assert!(s.commit_leaves_atomic(&gap, "main", 5, 6, h(b"r")).is_err());
+        let overwrite = [BatchLeaf {
+            idx: 2,
+            canonical: b"evil",
+            seal_name: "evil",
+            seal_hash: h(b"e"),
+        }];
+        assert!(
+            s.commit_leaves_atomic(&overwrite, "main", 2, 3, h(b"r"))
+                .is_err()
+        );
+        let wrong_head = [BatchLeaf {
+            idx: 3,
+            canonical: b"leaf3",
+            seal_name: "eps",
+            seal_hash: h(b"3"),
+        }];
+        assert!(
+            s.commit_leaves_atomic(&wrong_head, "main", 1, 4, h(b"r"))
+                .is_err()
+        );
+        assert_eq!(s.get_leaf(2).unwrap().unwrap(), b"leaf2");
+        assert_eq!(s.get_timeline_head("main").unwrap(), Some(2));
+        assert_eq!(s.get_meta(MMR_SIZE_KEY).unwrap(), Some("3".into()));
     }
 
     #[test]

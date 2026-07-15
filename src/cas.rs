@@ -149,9 +149,10 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl FileCas {
     /// Flush directory metadata to disk for shards written since the last
-    /// flush. Call after a seal, bulk import, or shelf capture — anywhere the
-    /// CAS holds the only copy of data before a commit record references it.
-    /// Per-`put` fsyncs are intentionally skipped to keep the hot path fast.
+    /// flush. Object *contents* are already fsynced by `put` before their
+    /// rename; this makes the directory entries themselves durable. Call
+    /// before any durable record (commit, mapping save, timeline head)
+    /// references objects written since the last flush.
     /// No-op when nothing was written.
     pub fn flush(&self) -> Result<(), CasError> {
         let shards: Vec<PathBuf> = {
@@ -204,13 +205,19 @@ impl Cas for FileCas {
         // Write to a per-process, per-call unique temp file then rename
         // (atomic on most filesystems). The unique suffix lets concurrent
         // writers race on the same hash without clobbering each other's tmp.
-        // No fsync on the hot path — rely on the atomic rename for visibility,
-        // and on `FileCas::flush` for end-of-import durability.
+        // The content is fsynced BEFORE the rename publishes it: `flush()`
+        // only makes directory entries durable, so without this a durable
+        // commit record could reference an object whose bytes vanish on
+        // power loss — and because `put` dedups on `path.exists()`, a
+        // truncated survivor would poison every retry.
+        // ponytail: one fsync per new object; batch pending files in flush()
+        // if import throughput ever demands it.
         let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = path.with_extension(format!("tmp.{}.{}", process::id(), n));
         {
             let mut file = fs::File::create(&tmp_path)?;
             file.write_all(data)?;
+            file.sync_all()?;
         }
         if let Err(e) = fs::rename(&tmp_path, &path) {
             // If a concurrent writer already published the same hash, that's

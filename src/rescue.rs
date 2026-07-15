@@ -507,12 +507,13 @@ mod tests {
         let fs_store = FsStore::new(&cas);
         let (blob, _) = fs_store.put_blob(b"pwn").unwrap();
 
-        // A tree that tries to escape via "../pwned". parse_tree must accept it
-        // (proving we exercise the guard), but rescue must refuse to write it.
+        // A tree that tries to escape via "../pwned". parse_tree rejects the
+        // name at decode time (first line of defense), and rescue must still
+        // refuse to write anything from it.
         let evil_bytes = forge_tree_bytes("../pwned", NodeKind::Blob, blob);
         assert!(
-            fsmerkle::parse_tree(&evil_bytes).is_ok(),
-            "hand-encoded tree must parse or the test proves nothing"
+            fsmerkle::parse_tree(&evil_bytes).is_err(),
+            "decode-side name validation must reject traversal entries"
         );
         let evil_tree = B3Hash::digest(&evil_bytes);
         cas.put(evil_tree, &evil_bytes).unwrap();
@@ -527,7 +528,7 @@ mod tests {
         let report = rescue(&ivaldi, &out).unwrap();
 
         assert_eq!(report.files_written, 0, "no file should be written");
-        assert!(report.problems.iter().any(|p| p.contains("unsafe name")));
+        assert!(report.problems.iter().any(|p| p.contains("unparseable")));
         // The escaped target must not exist anywhere outside the tree dir.
         assert!(!out.join("pwned").exists());
         assert!(!dir.path().join("pwned").exists());

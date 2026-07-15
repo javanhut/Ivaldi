@@ -319,6 +319,88 @@ impl Repo {
         })
     }
 
+    /// Commit a chain of pre-built leaves in ONE store transaction, moving
+    /// the timeline head to the last leaf. Used by `weld`, whose rewrite is
+    /// a welded seal plus replayed trailing seals: committing them one by
+    /// one would let a crash silently orphan every not-yet-replayed seal
+    /// from the head. With a single transaction the rewrite is old-or-new.
+    ///
+    /// Leaves are assigned consecutive MMR indices starting at
+    /// [`Self::commit_count`]; the caller sets each leaf's `prev_idx`
+    /// (typically chaining onto the previous leaf's predicted index).
+    pub fn commit_batch_raw(
+        &mut self,
+        leaves: Vec<Leaf>,
+        timeline: &str,
+    ) -> Result<Vec<CommitResult>, RepoError> {
+        if leaves.is_empty() {
+            return Err(RepoError::Other("empty leaf batch".into()));
+        }
+        let ref_path = timeline_ref_path(&self.ivaldi_dir, timeline)
+            .map_err(|e| RepoError::Other(e.to_string()))?;
+        let base_idx = self.mmr.size();
+        for (offset, leaf) in leaves.iter().enumerate() {
+            let assigned = base_idx + offset as u64;
+            for parent in std::iter::once(leaf.prev_idx)
+                .chain(leaf.merge_idxs.iter().copied())
+                .filter(|idx| *idx != NO_PARENT)
+            {
+                if parent >= assigned {
+                    return Err(RepoError::Integrity(format!(
+                        "leaf {assigned} references non-prior parent {parent}"
+                    )));
+                }
+            }
+        }
+
+        // Same headless-marker ordering as `commit_raw`: an empty marker with
+        // no stored head is valid; a stored head with no marker is not.
+        if let Some(parent) = ref_path.parent() {
+            std::fs::create_dir_all(parent).map_err(RepoError::Io)?;
+        }
+        if !ref_path.exists() {
+            atomic_write(&ref_path, b"").map_err(RepoError::Io)?;
+        }
+
+        // Stage every append on a clone; the live MMR advances only after
+        // the transaction commits.
+        let mut next_mmr = self.mmr.clone();
+        let mut canonicals = Vec::with_capacity(leaves.len());
+        let mut results = Vec::with_capacity(leaves.len());
+        for leaf in leaves {
+            let leaf_hash = leaf.hash();
+            let seal_name = seal::generate_seal_name(leaf_hash);
+            canonicals.push(leaf.canonical_bytes());
+            let (leaf_idx, new_root) = next_mmr.append_leaf(leaf);
+            results.push(CommitResult {
+                index: leaf_idx,
+                hash: leaf_hash,
+                seal_name,
+                root: new_root,
+                timeline: timeline.to_string(),
+            });
+        }
+        let entries: Vec<crate::store::BatchLeaf<'_>> = results
+            .iter()
+            .zip(canonicals.iter())
+            .map(|(r, canonical)| crate::store::BatchLeaf {
+                idx: r.index,
+                canonical,
+                seal_name: &r.seal_name,
+                seal_hash: r.hash,
+            })
+            .collect();
+        let (head, root) = {
+            let last = results.last().unwrap();
+            (last.index, last.root)
+        };
+        self.store
+            .commit_leaves_atomic(&entries, timeline, head, next_mmr.size(), root)
+            .map_err(RepoError::Store)?;
+        self.mmr = next_mmr;
+        Ok(results)
+    }
+
     /// Get a leaf by index.
     pub fn get_leaf(&self, idx: u64) -> Result<Option<Leaf>, RepoError> {
         match self.store.get_leaf(idx).map_err(RepoError::Store)? {

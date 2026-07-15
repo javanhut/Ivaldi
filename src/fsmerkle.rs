@@ -170,7 +170,14 @@ pub fn parse_tree(data: &[u8]) -> Result<TreeNode, FsMerkleError> {
 
     r.finish()?; // reject trailing data after the tree
 
-    Ok(TreeNode { entries })
+    // Decode-side validation, not just encode-side: tree-node bytes arrive
+    // verbatim from remote peers (the CAS only checks the hash), and every
+    // materialize path joins entry names into filesystem paths. Rejecting
+    // "../", "/", ".", duplicates, and bad modes here protects every
+    // consumer of decoded trees at once — no bypass via a hostile peer.
+    let node = TreeNode { entries };
+    node.validate()?;
+    Ok(node)
 }
 
 /// Parse canonical blob bytes back into content.

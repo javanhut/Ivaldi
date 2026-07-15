@@ -326,10 +326,16 @@ fn sync_diverged(
 
     let temp_timeline = format!("__sync_{}", timeline);
 
+    // A previous sync that crashed after its fuse commit leaves the temp
+    // timeline stranded (cleanup is best-effort). Remove any leftover before
+    // reuse so stale state can't leak into this sync.
+    cleanup_temp_timeline(repo, &temp_timeline);
+
     // Create temp timeline pointing at the common ancestor, if known
     if let Some(ancestor_idx) = common_ancestor_idx {
         create_temp_timeline(repo, &temp_timeline, ancestor_idx)?;
     }
+    crate::failpoint::fail_point("sync.after_temp_timeline");
 
     // Import remote history into temp timeline (fetch from real remote branch)
     let _import =
@@ -390,8 +396,8 @@ fn sync_diverged(
         "ivaldi-sync",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64,
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
         format!(
             "Fused sync from {}/{} (branch: {})",
             owner, repo_name, timeline
@@ -402,15 +408,21 @@ fn sync_diverged(
         fuse_leaf.merge_idxs = vec![their_head];
     }
 
+    // The merged tree nodes were written to the CAS without their directory
+    // entries being durable; flush before the commit record references them.
+    cas.flush()?;
     repo.commit_raw(fuse_leaf, timeline)?;
+    crate::failpoint::fail_point("sync.after_fuse_commit");
 
     // Update workspace
     checkout_tree_to_workspace(repo, &store, timeline)?;
 
     // Map remote tip SHA to the fuse commit so the next sync recognizes it
+    crate::failpoint::fail_point("sync.before_tip_remap");
     map_remote_tip_to_head(repo, timeline, remote_tip_sha)?;
 
     cleanup_temp_timeline(repo, &temp_timeline);
+    crate::failpoint::fail_point("sync.after_cleanup");
 
     let (added, modified, deleted) = compute_file_changes(&base_files, &fuse_result.merged_files);
 
@@ -493,4 +505,140 @@ fn save_sync_conflicts(
         was_fused: false,
         conflicts,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::{AuthorInfo, CommitDetail, ParentRef, TreeRef};
+
+    fn commit_info(sha: &str, parents: &[&str]) -> CommitInfo {
+        CommitInfo {
+            sha: sha.to_string(),
+            commit: CommitDetail {
+                message: "msg".into(),
+                author: AuthorInfo {
+                    name: "A".into(),
+                    email: "a@x".into(),
+                    date: None,
+                },
+                tree: TreeRef { sha: "t".into() },
+            },
+            parents: parents
+                .iter()
+                .map(|p| ParentRef { sha: p.to_string() })
+                .collect(),
+        }
+    }
+
+    /// Forge a repo with a 3-seal chain on main; returns the repo.
+    fn repo_with_chain() -> (tempfile::TempDir, Repo) {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let mut repo = Repo::open(dir.path()).unwrap();
+        let cas = FileCas::new(dir.path().join(".ivaldi/objects")).unwrap();
+        let store = FsStore::new(&cas);
+        for i in 0..3u8 {
+            let (blob, _) = store.put_blob(&[i]).unwrap();
+            use crate::fsmerkle::{Entry, MODE_FILE, NodeKind};
+            let tree = store
+                .put_tree(vec![Entry {
+                    name: "f".into(),
+                    mode: MODE_FILE,
+                    kind: NodeKind::Blob,
+                    hash: blob,
+                }])
+                .unwrap();
+            repo.commit(tree, "t <t@x>", &format!("c{}", i)).unwrap();
+        }
+        (dir, repo)
+    }
+
+    #[test]
+    fn count_new_remote_commits_stops_at_common_ancestor() {
+        let commits = vec![
+            commit_info("tip", &["mid"]),
+            commit_info("mid", &["base"]),
+            commit_info("base", &[]),
+        ];
+        assert_eq!(count_new_remote_commits(&commits, Some("mid")), 1);
+        assert_eq!(count_new_remote_commits(&commits, Some("tip")), 0);
+        assert_eq!(count_new_remote_commits(&commits, None), 3);
+        assert_eq!(count_new_remote_commits(&commits, Some("unknown")), 3);
+    }
+
+    #[test]
+    fn collect_local_reachable_walks_prev_chain() {
+        let (_dir, repo) = repo_with_chain();
+        let reachable = collect_local_reachable(&repo, Some(2));
+        assert!(reachable.contains(&0) && reachable.contains(&1) && reachable.contains(&2));
+        assert_eq!(collect_local_reachable(&repo, None).len(), 0);
+    }
+
+    #[test]
+    fn count_new_local_commits_counts_steps_to_ancestor() {
+        let (_dir, repo) = repo_with_chain();
+        assert_eq!(
+            count_new_local_commits(&repo, "main", Some(2), Some(0)).unwrap(),
+            2
+        );
+        assert_eq!(
+            count_new_local_commits(&repo, "main", Some(2), Some(2)).unwrap(),
+            0
+        );
+        // No common ancestor: every local commit is new.
+        assert_eq!(
+            count_new_local_commits(&repo, "main", Some(2), None).unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn find_common_ancestor_skips_stale_and_unreachable() {
+        let (_dir, repo) = repo_with_chain();
+        let mut mapping = HashMapping::new(&repo.ivaldi_dir);
+        let leaf1 = repo.get_leaf(1).unwrap().unwrap();
+        mapping.insert("remote-mid", leaf1.hash());
+        // Also map the tip to a leaf NOT reachable from the searched head.
+        let leaf2 = repo.get_leaf(2).unwrap().unwrap();
+        mapping.insert("remote-tip", leaf2.hash());
+
+        let commits = vec![
+            commit_info("remote-tip", &["remote-mid"]),
+            commit_info("remote-mid", &["remote-base"]),
+        ];
+        // Reachable set limited to leaves 0-1: the tip's mapping (leaf 2) is
+        // outside it, so the mid commit must win.
+        let reachable: BTreeSet<u64> = [0u64, 1].into();
+        let (sha, idx) =
+            find_common_ancestor(&repo, &commits, &mapping, &reachable, &BTreeSet::new());
+        assert_eq!(sha.as_deref(), Some("remote-mid"));
+        assert_eq!(idx, Some(1));
+
+        // Marking the mid stale skips it entirely.
+        let stale: BTreeSet<String> = ["remote-mid".to_string(), "remote-tip".to_string()].into();
+        let (sha, idx) = find_common_ancestor(&repo, &commits, &mapping, &reachable, &stale);
+        assert_eq!(sha, None);
+        assert_eq!(idx, None);
+    }
+
+    /// A stranded `__sync_<name>` timeline from a crashed sync must be
+    /// removable, and cleanup must leave the repo fully consistent.
+    #[test]
+    fn stranded_temp_timeline_cleanup_is_safe() {
+        let (dir, repo) = repo_with_chain();
+        create_temp_timeline(&repo, "__sync_main", 1).unwrap();
+        assert_eq!(repo.get_timeline_head("__sync_main").unwrap(), Some(1));
+
+        cleanup_temp_timeline(&repo, "__sync_main");
+        assert!(repo.get_timeline_head("__sync_main").unwrap().is_none());
+        assert!(
+            !timeline_ref_path(&repo.ivaldi_dir, "__sync_main")
+                .unwrap()
+                .exists()
+        );
+        drop(repo);
+        let report = crate::verify::verify(dir.path(), true);
+        assert!(report.ok, "verify --full failed: {:?}", report.checks);
+    }
 }
