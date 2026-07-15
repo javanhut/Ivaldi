@@ -182,8 +182,15 @@ fn verify_refs(ivaldi_dir: &Path, store: Option<&Store>) -> Check {
         .collect();
 
     let mut count = 0u64;
-    let mut dangling = Vec::new();
-    for entry in entries.flatten() {
+    let mut problems = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                problems.push(format!("cannot read ref directory entry: {e}"));
+                continue;
+            }
+        };
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -195,7 +202,13 @@ fn verify_refs(ivaldi_dir: &Path, store: Option<&Store>) -> Check {
         }
         // No store head: an empty file is an uncommitted-timeline marker; a
         // recorded leaf index resolves only if the store holds that leaf.
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) => {
+                problems.push(format!("ref '{name}' is unreadable: {e}"));
+                continue;
+            }
+        };
         let trimmed = content.trim();
         if trimmed.is_empty() {
             continue;
@@ -205,10 +218,10 @@ fn verify_refs(ivaldi_dir: &Path, store: Option<&Store>) -> Check {
         {
             continue;
         }
-        dangling.push(name);
+        problems.push(format!("dangling ref '{name}'"));
     }
 
-    if dangling.is_empty() {
+    if problems.is_empty() {
         Check {
             name: "refs".into(),
             ok: true,
@@ -218,7 +231,7 @@ fn verify_refs(ivaldi_dir: &Path, store: Option<&Store>) -> Check {
         Check {
             name: "refs".into(),
             ok: false,
-            detail: format!("dangling refs: {}", dangling.join(", ")),
+            detail: problems.join("; "),
         }
     }
 }
@@ -451,5 +464,22 @@ mod tests {
         // The fast check does not run the deeper refs pass.
         let fast = verify(dir.path(), false);
         assert!(!fast.checks.iter().any(|c| c.name == "refs"));
+    }
+
+    #[test]
+    fn malformed_ref_fails_full_check() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let heads = dir.path().join(".ivaldi/refs/heads");
+        std::fs::write(heads.join("broken"), [0xff]).unwrap();
+
+        let report = verify(dir.path(), true);
+        let refs = report
+            .checks
+            .iter()
+            .find(|c| c.name == "refs")
+            .expect("full verification should include refs");
+        assert!(!refs.ok);
+        assert!(refs.detail.contains("unreadable"));
     }
 }

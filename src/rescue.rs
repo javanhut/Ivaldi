@@ -87,19 +87,26 @@ pub fn rescue(ivaldi_dir: &Path, out_dir: &Path) -> std::io::Result<RescueReport
 
     std::fs::create_dir_all(out_dir)?;
     let mut manifest = String::new();
-    let mut visited: HashSet<B3Hash> = HashSet::new();
+    // Track trees reachable from a recorded snapshot so the orphan sweep does
+    // not export them again. This must not be used to suppress materialization:
+    // the same content-addressed subtree can legitimately appear in multiple
+    // snapshots or at multiple paths within one snapshot.
+    let mut reachable: HashSet<B3Hash> = HashSet::new();
+    let mut materialized_roots: HashSet<B3Hash> = HashSet::new();
 
     // 3. Materialize each distinct snapshot referenced by a commit.
     for leaf in &leaves {
         let short = &leaf.tree_root.to_hex()[..16];
         let dest = out_dir.join(short);
-        if !visited.contains(&leaf.tree_root) {
+        if materialized_roots.insert(leaf.tree_root) {
+            let mut ancestors = HashSet::new();
             materialize_tree(
                 &objects,
                 leaf.tree_root,
                 &dest,
                 0,
-                &mut visited,
+                &mut reachable,
+                &mut ancestors,
                 &mut report,
             );
             report.trees_materialized += 1;
@@ -116,16 +123,18 @@ pub fn rescue(ivaldi_dir: &Path, out_dir: &Path) -> std::io::Result<RescueReport
     //    dumped anyway. This is what recovers data when the store is gone.
     let orphans_root = out_dir.join("orphans");
     for (&hash, bytes) in &objects {
-        if visited.contains(&hash) || fsmerkle::parse_tree(bytes).is_err() {
+        if reachable.contains(&hash) || fsmerkle::parse_tree(bytes).is_err() {
             continue;
         }
         let short = &hash.to_hex()[..16];
+        let mut ancestors = HashSet::new();
         materialize_tree(
             &objects,
             hash,
             &orphans_root.join(short),
             0,
-            &mut visited,
+            &mut reachable,
+            &mut ancestors,
             &mut report,
         );
         report.trees_materialized += 1;
@@ -225,13 +234,16 @@ fn read_leaves(store_path: &Path, report: &mut RescueReport) -> Vec<leaf::Leaf> 
 
 /// Best-effort materialization of one tree into `dest`. Never returns an error:
 /// every failure is recorded and skipped so one bad object can't abort a
-/// recovery. `visited` prevents re-walking shared subtrees.
+/// recovery. `reachable` records trees for the later orphan sweep, while
+/// `ancestors` is path-local recursion protection and must be removed on unwind
+/// so shared subtrees can be written at every destination that references them.
 fn materialize_tree(
     objects: &HashMap<B3Hash, Vec<u8>>,
     tree_hash: B3Hash,
     dest: &Path,
     depth: usize,
-    visited: &mut HashSet<B3Hash>,
+    reachable: &mut HashSet<B3Hash>,
+    ancestors: &mut HashSet<B3Hash>,
     report: &mut RescueReport,
 ) {
     if depth >= MAX_DEPTH {
@@ -240,11 +252,16 @@ fn materialize_tree(
         ));
         return;
     }
-    if !visited.insert(tree_hash) {
-        return; // already materialized elsewhere
+    reachable.insert(tree_hash);
+    if !ancestors.insert(tree_hash) {
+        report
+            .problems
+            .push(format!("tree cycle detected at {tree_hash}, stopped"));
+        return;
     }
     let Some(bytes) = objects.get(&tree_hash) else {
         report.problems.push(format!("tree {tree_hash} missing"));
+        ancestors.remove(&tree_hash);
         return;
     };
     let tree = match fsmerkle::parse_tree(bytes) {
@@ -253,6 +270,7 @@ fn materialize_tree(
             report
                 .problems
                 .push(format!("tree {tree_hash} unparseable: {e}"));
+            ancestors.remove(&tree_hash);
             return;
         }
     };
@@ -260,6 +278,7 @@ fn materialize_tree(
         report
             .problems
             .push(format!("mkdir {}: {e}", dest.display()));
+        ancestors.remove(&tree_hash);
         return;
     }
 
@@ -276,7 +295,15 @@ fn materialize_tree(
         let child = dest.join(&entry.name);
         match entry.kind {
             NodeKind::Tree => {
-                materialize_tree(objects, entry.hash, &child, depth + 1, visited, report);
+                materialize_tree(
+                    objects,
+                    entry.hash,
+                    &child,
+                    depth + 1,
+                    reachable,
+                    ancestors,
+                    report,
+                );
             }
             NodeKind::Blob => {
                 let Some(blob) = objects.get(&entry.hash) else {
@@ -307,6 +334,7 @@ fn materialize_tree(
             }
         }
     }
+    ancestors.remove(&tree_hash);
 }
 
 /// A tree entry name must be exactly one safe path component.
@@ -334,7 +362,7 @@ fn set_exec_if_needed(_path: &Path, _mode: u32) {}
 mod tests {
     use super::*;
     use crate::cas::{Cas, FileCas};
-    use crate::fsmerkle::{Entry, FsStore, MODE_FILE};
+    use crate::fsmerkle::{Entry, FsStore, MODE_DIR, MODE_FILE};
 
     /// Seed a repo's CAS with a blob+tree and its commit leaf, then damage the
     /// refs and HEAD and confirm rescue still recovers the file content.
@@ -374,6 +402,68 @@ mod tests {
         let short = &tree.to_hex()[..16];
         let recovered = std::fs::read(out.join(short).join("notes.txt")).unwrap();
         assert_eq!(recovered, b"secret data");
+    }
+
+    #[test]
+    fn materializes_shared_subtree_at_every_path_and_snapshot_root() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let ivaldi = dir.path().join(".ivaldi");
+
+        let cas = FileCas::new(ivaldi.join("objects")).unwrap();
+        let fs_store = FsStore::new(&cas);
+        let (blob, _) = fs_store.put_blob(b"shared").unwrap();
+        let shared = fs_store
+            .put_tree(vec![Entry {
+                name: "file.txt".into(),
+                mode: MODE_FILE,
+                kind: NodeKind::Blob,
+                hash: blob,
+            }])
+            .unwrap();
+        let root = fs_store
+            .put_tree(vec![
+                Entry {
+                    name: "first".into(),
+                    mode: MODE_DIR,
+                    kind: NodeKind::Tree,
+                    hash: shared,
+                },
+                Entry {
+                    name: "second".into(),
+                    mode: MODE_DIR,
+                    kind: NodeKind::Tree,
+                    hash: shared,
+                },
+            ])
+            .unwrap();
+        cas.flush().unwrap();
+
+        let store = Store::open(&ivaldi.join("store.db")).unwrap();
+        let leaf = leaf::Leaf::new(root, "main", "x", 0, "shared subtree");
+        store.put_leaf(0, &leaf.canonical_bytes()).unwrap();
+        let leaf = leaf::Leaf::new(shared, "main", "x", 1, "subtree as snapshot");
+        store.put_leaf(1, &leaf.canonical_bytes()).unwrap();
+        drop(store);
+
+        let out = dir.path().join("rescued");
+        let report = rescue(&ivaldi, &out).unwrap();
+        let snapshot = out.join(&root.to_hex()[..16]);
+
+        assert_eq!(report.files_written, 3);
+        assert_eq!(
+            std::fs::read(snapshot.join("first/file.txt")).unwrap(),
+            b"shared"
+        );
+        assert_eq!(
+            std::fs::read(snapshot.join("second/file.txt")).unwrap(),
+            b"shared"
+        );
+        let shared_snapshot = out.join(&shared.to_hex()[..16]);
+        assert_eq!(
+            std::fs::read(shared_snapshot.join("file.txt")).unwrap(),
+            b"shared"
+        );
     }
 
     // --- Adversarial tests: rescue must survive hostile/corrupt input without

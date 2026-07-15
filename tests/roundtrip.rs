@@ -182,7 +182,7 @@ fn leaf_roundtrips() {
 
 #[test]
 fn tree_roundtrips() {
-    let mut rng = Rng::new(0x7_9EE_5EED);
+    let mut rng = Rng::new(0x79EE_5EED);
     for _ in 0..5000 {
         let tree = gen_tree(&mut rng);
         let bytes = tree.canonical_bytes().expect("encode");

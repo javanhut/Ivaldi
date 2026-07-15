@@ -243,6 +243,17 @@ fn recover_timeline_refs(
         }
     };
     for (name, _idx) in heads {
+        let relative = Path::new(&name);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            report.problems.push(format!(
+                "unsafe timeline ref name '{name}'; refusing to recreate"
+            ));
+            continue;
+        }
         let ref_path = ivaldi_dir.join("refs/heads").join(&name);
         if ref_path.exists() {
             continue;
@@ -257,10 +268,10 @@ fn recover_timeline_refs(
             continue;
         }
         // Match the rest of the codebase: ref files are empty markers, the head
-        // index lives in the store. refs/heads already exists (forge creates
-        // it), but create_dir_all keeps this robust if it was lost too.
-        let written = std::fs::create_dir_all(ivaldi_dir.join("refs/heads"))
-            .and_then(|_| atomic_write(&ref_path, b""));
+        // index lives in the store. Create the immediate parent as timeline
+        // names may contain path components such as `feature/parser`.
+        let parent = ref_path.parent().unwrap_or(ivaldi_dir);
+        let written = std::fs::create_dir_all(parent).and_then(|_| atomic_write(&ref_path, b""));
         match written {
             Ok(()) => report.act("timeline-ref", name, "recreated missing ref file", true),
             Err(e) => report
@@ -393,6 +404,32 @@ mod tests {
                 .actions
                 .iter()
                 .any(|a| a.kind == "timeline-ref" && a.target == "main" && a.done)
+        );
+    }
+
+    #[test]
+    fn rebuilds_nested_timeline_ref_and_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_repo(dir.path());
+        {
+            let mut repo = Repo::open(dir.path()).unwrap();
+            repo.commit(B3Hash::digest(b"t"), "A", "c").unwrap();
+            repo.create_timeline("feature/parser", None).unwrap();
+        }
+        let refs = dir.path().join(".ivaldi/refs");
+        std::fs::remove_dir_all(&refs).unwrap();
+
+        let report = recover(dir.path(), false);
+        let nested = refs.join("heads/feature/parser");
+        assert!(
+            nested.exists(),
+            "recover should recreate nested ref parents"
+        );
+        assert!(
+            report
+                .actions
+                .iter()
+                .any(|a| { a.kind == "timeline-ref" && a.target == "feature/parser" && a.done })
         );
     }
 
