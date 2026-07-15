@@ -112,6 +112,11 @@ pub fn sync_timeline(
         return Ok(up_to_date_result());
     }
 
+    // Sync rewrites the workspace to match the incoming tree (overwriting and
+    // deleting files), so any uncommitted change would be silently lost.
+    // Refuse before touching anything if the working tree is dirty.
+    ensure_workspace_clean(repo, local_head_idx)?;
+
     // Consent gate: everything above only fetched and compared; everything
     // below mutates the user's timeline. Ivaldi never integrates remote
     // changes without permission.
@@ -140,6 +145,47 @@ pub fn sync_timeline(
         common_ancestor_idx,
         &branch.commit.sha,
     )
+}
+
+/// `checkout_tree_to_workspace` (used by every sync path) makes the workspace
+/// exactly match the incoming tree: it overwrites modified files and deletes any
+/// on-disk file not in that tree, including untracked ones. That is only safe
+/// when the working tree already matches HEAD. Enforce that precondition so sync
+/// can never destroy uncommitted work.
+fn ensure_workspace_clean(repo: &Repo, local_head_idx: Option<u64>) -> Result<(), SyncError> {
+    let head_tree = match local_head_idx {
+        Some(idx) => repo.get_leaf(idx)?.map(|l| l.tree_root),
+        None => None,
+    };
+
+    let cas = FileCas::new(repo.ivaldi_dir.join("objects"))?;
+    let ws = crate::workspace::Workspace::new(&cas, &repo.work_dir, &repo.ivaldi_dir);
+    let ignore = crate::ignore::load_pattern_cache(&repo.work_dir);
+    let dirty: Vec<String> = ws
+        .status(head_tree, &ignore)
+        .map_err(|e| SyncError::Other(e.to_string()))?
+        .into_iter()
+        .filter(|f| f.state != crate::workspace::FileState::Unmodified)
+        .map(|f| f.path)
+        .collect();
+
+    if dirty.is_empty() {
+        return Ok(());
+    }
+
+    let shown: Vec<String> = dirty.iter().take(10).cloned().collect();
+    let more = dirty.len() - shown.len();
+    let suffix = if more > 0 {
+        format!("\n  ... and {} more", more)
+    } else {
+        String::new()
+    };
+    Err(SyncError::Other(format!(
+        "you have uncommitted changes that sync would overwrite:\n  {}{}\n\n\
+         Seal them ('ivaldi seal') or throw them away ('ivaldi discard') before syncing.",
+        shown.join("\n  "),
+        suffix
+    )))
 }
 
 /// A `SyncResult` for the nothing-to-do case.
@@ -633,6 +679,40 @@ mod tests {
         let (sha, idx) = find_common_ancestor(&repo, &commits, &mapping, &reachable, &stale);
         assert_eq!(sha, None);
         assert_eq!(idx, None);
+    }
+
+    /// Sync must refuse when the workspace has uncommitted changes, since the
+    /// checkout would overwrite modified files and delete untracked ones.
+    #[test]
+    fn ensure_workspace_clean_refuses_uncommitted_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let mut repo = Repo::open(dir.path()).unwrap();
+        let cas = FileCas::new(dir.path().join(".ivaldi/objects")).unwrap();
+        let store = FsStore::new(&cas);
+
+        let mut files = BTreeMap::new();
+        files.insert("a.txt".to_string(), b"hello".to_vec());
+        let tree = store.build_tree_from_map(&files).unwrap();
+        repo.commit(tree, "author", "init").unwrap();
+        let head = repo.get_timeline_head("main").unwrap();
+
+        // Make the workspace match HEAD, then it must pass.
+        checkout_tree_to_workspace(&repo, &store, "main").unwrap();
+        assert!(ensure_workspace_clean(&repo, head).is_ok());
+
+        // An uncommitted edit must block sync, naming the file.
+        fs::write(dir.path().join("a.txt"), b"local edit").unwrap();
+        let err = ensure_workspace_clean(&repo, head).unwrap_err();
+        assert!(
+            err.to_string().contains("a.txt"),
+            "error should name the dirty file: {err}"
+        );
+
+        // An untracked file must also block sync (it would be deleted).
+        fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        fs::write(dir.path().join("new.txt"), b"local only").unwrap();
+        assert!(ensure_workspace_clean(&repo, head).is_err());
     }
 
     /// A stranded `__sync_<name>` timeline from a crashed sync must be
