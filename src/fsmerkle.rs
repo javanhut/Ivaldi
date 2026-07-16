@@ -540,7 +540,7 @@ fn diff_recursive(
 // Validation helpers
 // ---------------------------------------------------------------------------
 
-fn validate_name(name: &str) -> Result<(), FsMerkleError> {
+pub(crate) fn validate_name(name: &str) -> Result<(), FsMerkleError> {
     if name.is_empty() {
         return Err(FsMerkleError::InvalidName("empty filename".into()));
     }
@@ -559,7 +559,7 @@ fn validate_name(name: &str) -> Result<(), FsMerkleError> {
     Ok(())
 }
 
-fn validate_mode(mode: u32, kind: NodeKind) -> Result<(), FsMerkleError> {
+pub(crate) fn validate_mode(mode: u32, kind: NodeKind) -> Result<(), FsMerkleError> {
     match kind {
         NodeKind::Blob if mode != MODE_FILE && mode != MODE_EXEC && mode != MODE_SYMLINK => {
             Err(FsMerkleError::InvalidMode {

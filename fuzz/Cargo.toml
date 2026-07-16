@@ -63,3 +63,10 @@ path = "fuzz_targets/git_apply_delta.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "parse_hamt_node"
+path = "fuzz_targets/parse_hamt_node.rs"
+test = false
+doc = false
+bench = false
