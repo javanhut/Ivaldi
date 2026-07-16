@@ -179,6 +179,17 @@ pub fn parse_node(data: &[u8]) -> Result<HamtNode, HamtError> {
     Ok(node)
 }
 
+/// Quick check whether raw CAS bytes are a HAMT node. Used to dispatch
+/// between the two directory encodings: the `'H' <version>` prefix can never
+/// begin a valid fsmerkle tree (it would put mode 1 on the first entry,
+/// which `validate_mode` rejects), so the check is unambiguous.
+pub fn is_hamt_node(data: &[u8]) -> bool {
+    data.len() >= 3
+        && data[0] == MAGIC
+        && data[1] == HAMT_VERSION
+        && (data[2] == TAG_LEAF || data[2] == TAG_BRANCH)
+}
+
 /// The 5-bit slot index for `hash` at trie level `level`. The hash is a
 /// big-endian bit string; level L reads bits [5L, 5L+5) MSB-first through a
 /// 16-bit window so the field crosses byte boundaries correctly. Bits past
@@ -297,6 +308,39 @@ impl<'a> HamtStore<'a> {
         self.walk(root, 0, &mut slots, &mut |e| out.push(e))?;
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
+    }
+
+    /// Every HAMT node hash under `root` (inclusive) plus all directory
+    /// entries. Object-graph walkers (sync transfer sets, reachability) use
+    /// this to enumerate interior nodes, which no directory entry references
+    /// directly — missing them would strand the receiver or GC them away.
+    pub fn nodes_and_entries(
+        &self,
+        root: B3Hash,
+    ) -> Result<(Vec<B3Hash>, Vec<Entry>), HamtError> {
+        let mut nodes = Vec::new();
+        let mut entries = Vec::new();
+        self.collect_nodes(root, 0, &mut nodes, &mut entries)?;
+        Ok((nodes, entries))
+    }
+
+    fn collect_nodes(
+        &self,
+        hash: B3Hash,
+        level: u32,
+        nodes: &mut Vec<B3Hash>,
+        entries: &mut Vec<Entry>,
+    ) -> Result<(), HamtError> {
+        nodes.push(hash);
+        match self.load(hash, level)? {
+            HamtNode::Leaf(e) => entries.push(e),
+            HamtNode::Branch { children, .. } => {
+                for child in children {
+                    self.collect_nodes(child, level + 1, nodes, entries)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Differences between two roots, sorted by name. Skips shared subtrees

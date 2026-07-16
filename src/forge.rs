@@ -105,12 +105,21 @@ pub fn forge(work_dir: &Path) -> Result<ForgeResult, ForgeError> {
 /// On-disk repository format this binary writes and can open. Bump on any
 /// breaking change to a persisted encoding; a repository stamped higher than
 /// this is refused. See plan.md Phase 1.
-pub const CURRENT_FORMAT: u32 = 1;
+///
+/// Format history:
+/// - 1: original encoding set.
+/// - 2: directories with more than `fsmerkle::HAMT_DIR_THRESHOLD` entries
+///   are stored as HAMT roots (see docs/hamt.md). Format-1 repositories
+///   remain fully supported read/write and never receive HAMT objects.
+pub const CURRENT_FORMAT: u32 = 2;
+
+/// First repository format whose directories may use the HAMT encoding.
+pub const HAMT_DIRS_FORMAT: u32 = 2;
 
 /// Oldest Ivaldi version that understands `CURRENT_FORMAT`. Written into
 /// `.ivaldi/FORMAT` purely so the "too new" error can name a version to
 /// install; the actual gate is the format number.
-const MIN_IVALDI: &str = "0.1.1";
+const MIN_IVALDI: &str = "0.1.2";
 
 /// Parsed `.ivaldi/FORMAT`. A missing file means format 0 (repositories
 /// created before FORMAT existed) and is always openable.

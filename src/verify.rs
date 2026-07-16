@@ -187,12 +187,28 @@ fn verify_reachable_content(ivaldi_dir: &Path, store: Option<&Store>) -> Check {
         }
     };
 
+    /// What the referencing context says an object must be. `Tree` covers
+    /// both directory encodings (a directory entry cannot know whether its
+    /// child crossed the HAMT threshold); `HamtInterior` is a node referenced
+    /// by a HAMT branch, which must never be an empty branch.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ObjKind {
+        Blob,
+        Tree,
+        HamtInterior,
+    }
+    // A HAMT root is also a valid interior node of some other directory
+    // whose trie happens to embed it — the two expectations are compatible.
+    fn kinds_conflict(a: ObjKind, b: ObjKind) -> bool {
+        a != b && (a == ObjKind::Blob || b == ObjKind::Blob)
+    }
+
     let mut problems = Vec::new();
     let mut queue = VecDeque::new();
     for idx in indices {
         match store.get_leaf(idx) {
             Ok(Some(bytes)) => match crate::leaf::parse_leaf(&bytes) {
-                Ok(leaf) => queue.push_back((leaf.tree_root, crate::fsmerkle::NodeKind::Tree)),
+                Ok(leaf) => queue.push_back((leaf.tree_root, ObjKind::Tree)),
                 Err(e) => problems.push(format!("leaf {idx} is corrupt: {e}")),
             },
             Ok(None) => problems.push(format!("leaf {idx} is missing")),
@@ -201,10 +217,10 @@ fn verify_reachable_content(ivaldi_dir: &Path, store: Option<&Store>) -> Check {
     }
 
     let objects_dir = ivaldi_dir.join("objects");
-    let mut seen: HashMap<B3Hash, crate::fsmerkle::NodeKind> = HashMap::new();
+    let mut seen: HashMap<B3Hash, ObjKind> = HashMap::new();
     while let Some((hash, expected_kind)) = queue.pop_front() {
         if let Some(previous_kind) = seen.get(&hash) {
-            if *previous_kind != expected_kind {
+            if kinds_conflict(*previous_kind, expected_kind) {
                 problems.push(format!(
                     "object {hash} is referenced as both {previous_kind:?} and {expected_kind:?}"
                 ));
@@ -233,19 +249,55 @@ fn verify_reachable_content(ivaldi_dir: &Path, store: Option<&Store>) -> Check {
         }
 
         match expected_kind {
-            crate::fsmerkle::NodeKind::Tree => match crate::fsmerkle::parse_tree(&bytes) {
+            ObjKind::Tree | ObjKind::HamtInterior if crate::hamt::is_hamt_node(&bytes) => {
+                match crate::hamt::parse_node(&bytes) {
+                    Ok(crate::hamt::HamtNode::Branch { bitmap, children }) => {
+                        if bitmap == 0 && expected_kind == ObjKind::HamtInterior {
+                            problems
+                                .push(format!("HAMT node {hash} is an empty non-root branch"));
+                            continue;
+                        }
+                        for child in children {
+                            queue.push_back((child, ObjKind::HamtInterior));
+                        }
+                    }
+                    Ok(crate::hamt::HamtNode::Leaf(entry)) => {
+                        queue.push_back((
+                            entry.hash,
+                            match entry.kind {
+                                crate::fsmerkle::NodeKind::Blob => ObjKind::Blob,
+                                crate::fsmerkle::NodeKind::Tree => ObjKind::Tree,
+                            },
+                        ));
+                    }
+                    Err(e) => problems
+                        .push(format!("HAMT node {hash} does not decode as a node: {e}")),
+                }
+            }
+            ObjKind::HamtInterior => {
+                problems.push(format!(
+                    "object {hash} is referenced by a HAMT branch but is not a HAMT node"
+                ));
+            }
+            ObjKind::Tree => match crate::fsmerkle::parse_tree(&bytes) {
                 Ok(tree) => {
                     if let Err(e) = tree.validate() {
                         problems.push(format!("tree {hash} violates invariants: {e}"));
                         continue;
                     }
                     for entry in tree.entries {
-                        queue.push_back((entry.hash, entry.kind));
+                        queue.push_back((
+                            entry.hash,
+                            match entry.kind {
+                                crate::fsmerkle::NodeKind::Blob => ObjKind::Blob,
+                                crate::fsmerkle::NodeKind::Tree => ObjKind::Tree,
+                            },
+                        ));
                     }
                 }
                 Err(e) => problems.push(format!("tree {hash} does not decode as a tree: {e}")),
             },
-            crate::fsmerkle::NodeKind::Blob => {
+            ObjKind::Blob => {
                 if let Err(e) = crate::fsmerkle::parse_blob(&bytes) {
                     problems.push(format!("blob {hash} does not decode as a blob: {e}"));
                 }

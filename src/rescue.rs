@@ -123,7 +123,9 @@ pub fn rescue(ivaldi_dir: &Path, out_dir: &Path) -> std::io::Result<RescueReport
     //    dumped anyway. This is what recovers data when the store is gone.
     let orphans_root = out_dir.join("orphans");
     for (&hash, bytes) in &objects {
-        if reachable.contains(&hash) || fsmerkle::parse_tree(bytes).is_err() {
+        if reachable.contains(&hash)
+            || (fsmerkle::parse_tree(bytes).is_err() && !crate::hamt::is_hamt_node(bytes))
+        {
             continue;
         }
         let short = &hash.to_hex()[..16];
@@ -232,6 +234,45 @@ fn read_leaves(store_path: &Path, report: &mut RescueReport) -> Vec<leaf::Leaf> 
     leaves
 }
 
+/// Best-effort flattening of a HAMT directory from verified in-RAM objects.
+/// Missing or malformed nodes are recorded and skipped — one bad node must
+/// not discard the rest of a directory during recovery. Every visited node
+/// is marked reachable so the orphan sweep does not re-dump interiors of a
+/// directory that already materialized.
+fn collect_hamt_entries(
+    objects: &HashMap<B3Hash, Vec<u8>>,
+    node_hash: B3Hash,
+    depth: usize,
+    reachable: &mut HashSet<B3Hash>,
+    entries: &mut Vec<fsmerkle::Entry>,
+    report: &mut RescueReport,
+) {
+    if depth >= MAX_DEPTH {
+        report.problems.push(format!(
+            "HAMT node {node_hash} exceeds max depth {MAX_DEPTH}, stopped"
+        ));
+        return;
+    }
+    reachable.insert(node_hash);
+    let Some(bytes) = objects.get(&node_hash) else {
+        report
+            .problems
+            .push(format!("HAMT node {node_hash} missing"));
+        return;
+    };
+    match crate::hamt::parse_node(bytes) {
+        Ok(crate::hamt::HamtNode::Leaf(entry)) => entries.push(entry),
+        Ok(crate::hamt::HamtNode::Branch { children, .. }) => {
+            for child in children {
+                collect_hamt_entries(objects, child, depth + 1, reachable, entries, report);
+            }
+        }
+        Err(e) => report
+            .problems
+            .push(format!("HAMT node {node_hash} unparseable: {e}")),
+    }
+}
+
 /// Best-effort materialization of one tree into `dest`. Never returns an error:
 /// every failure is recorded and skipped so one bad object can't abort a
 /// recovery. `reachable` records trees for the later orphan sweep, while
@@ -264,14 +305,22 @@ fn materialize_tree(
         ancestors.remove(&tree_hash);
         return;
     };
-    let tree = match fsmerkle::parse_tree(bytes) {
-        Ok(t) => t,
-        Err(e) => {
-            report
-                .problems
-                .push(format!("tree {tree_hash} unparseable: {e}"));
-            ancestors.remove(&tree_hash);
-            return;
+    let entries = if crate::hamt::is_hamt_node(bytes) {
+        // HAMT directory: flatten best-effort. A missing or corrupt interior
+        // node loses only its own subtrie, never the rest of the directory.
+        let mut entries = Vec::new();
+        collect_hamt_entries(objects, tree_hash, depth, reachable, &mut entries, report);
+        entries
+    } else {
+        match fsmerkle::parse_tree(bytes) {
+            Ok(t) => t.entries,
+            Err(e) => {
+                report
+                    .problems
+                    .push(format!("tree {tree_hash} unparseable: {e}"));
+                ancestors.remove(&tree_hash);
+                return;
+            }
         }
     };
     if let Err(e) = std::fs::create_dir_all(dest) {
@@ -282,7 +331,7 @@ fn materialize_tree(
         return;
     }
 
-    for entry in tree.entries {
+    for entry in entries {
         // Trust boundary: entry.name is attacker-influenceable. A tree entry is
         // a single path component; anything else is rejected so a corrupt tree
         // cannot escape `dest` (path traversal / absolute paths).

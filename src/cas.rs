@@ -38,6 +38,15 @@ pub trait Cas: Send + Sync {
 
     /// Check if data exists for the given hash.
     fn has(&self, hash: B3Hash) -> Result<bool, CasError>;
+
+    /// Whether directories written through this CAS may use the HAMT
+    /// encoding (repository format >= 2). Carried by the CAS so every
+    /// `FsStore` built from a repository's object store inherits the
+    /// repository's format gate — no call site can forget to thread a flag.
+    /// Defaults to false: plain stores (tests, scratch) stay pure fsmerkle.
+    fn hamt_dirs(&self) -> bool {
+        false
+    }
 }
 
 /// Convenience method: hash data and store it, returning the hash.
@@ -54,12 +63,23 @@ pub fn put_and_hash(cas: &dyn Cas, data: &[u8]) -> Result<B3Hash, CasError> {
 /// Thread-safe in-memory CAS implementation.
 pub struct MemoryCas {
     data: RwLock<HashMap<B3Hash, Vec<u8>>>,
+    hamt_dirs: bool,
 }
 
 impl MemoryCas {
     pub fn new() -> Self {
         Self {
             data: RwLock::new(HashMap::new()),
+            hamt_dirs: false,
+        }
+    }
+
+    /// In-memory CAS with HAMT directory encoding enabled, for tests that
+    /// exercise the format-2 write path.
+    pub fn with_hamt_dirs() -> Self {
+        Self {
+            data: RwLock::new(HashMap::new()),
+            hamt_dirs: true,
         }
     }
 
@@ -109,6 +129,10 @@ impl Cas for MemoryCas {
     fn has(&self, hash: B3Hash) -> Result<bool, CasError> {
         Ok(self.read().contains_key(&hash))
     }
+
+    fn hamt_dirs(&self) -> bool {
+        self.hamt_dirs
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -124,16 +148,29 @@ pub struct FileCas {
     /// fsync only what this process touched instead of all 256 shards
     /// (each `sync_all` is an F_FULLFSYNC on macOS).
     dirty_shards: std::sync::Mutex<std::collections::BTreeSet<PathBuf>>,
+    /// Repository format allows HAMT directories (see `Cas::hamt_dirs`).
+    hamt_dirs: bool,
 }
 
 impl FileCas {
     /// Create a new file-based CAS rooted at the given directory.
+    ///
+    /// A repository's object store lives at `.ivaldi/objects`, so the
+    /// repository FORMAT file sits in the parent directory; its version
+    /// decides whether directories written through this CAS may use the
+    /// HAMT encoding. A root with no adjacent FORMAT (plain stores, tests)
+    /// reads as format 0 and stays pure fsmerkle.
     pub fn new(root: impl AsRef<Path>) -> Result<Self, CasError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
+        let hamt_dirs = root
+            .parent()
+            .and_then(|ivaldi_dir| crate::forge::read_format(ivaldi_dir).ok())
+            .is_some_and(|fmt| fmt.version >= crate::forge::HAMT_DIRS_FORMAT);
         Ok(Self {
             root,
             dirty_shards: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            hamt_dirs,
         })
     }
 
@@ -248,6 +285,10 @@ impl Cas for FileCas {
 
     fn has(&self, hash: B3Hash) -> Result<bool, CasError> {
         Ok(self.object_path(hash).exists())
+    }
+
+    fn hamt_dirs(&self) -> bool {
+        self.hamt_dirs
     }
 }
 

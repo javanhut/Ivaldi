@@ -1028,9 +1028,21 @@ fn collect_objects_from_tree(
     if !seen_trees.insert(tree_hash) {
         return Ok(());
     }
-    out.insert(tree_hash); // ship the tree-node bytes too
-    let tree = store.load_tree(tree_hash)?;
-    for entry in &tree.entries {
+    let data = store.cas().get(tree_hash).map_err(crate::fsmerkle::FsMerkleError::from)?;
+    let entries = if crate::hamt::is_hamt_node(&data) {
+        // HAMT directory: interior node hashes are referenced only by other
+        // HAMT nodes, never by a directory entry — they must be shipped
+        // explicitly or the receiver cannot load the directory.
+        let (nodes, entries) = crate::hamt::HamtStore::new(store.cas())
+            .nodes_and_entries(tree_hash)
+            .map_err(crate::fsmerkle::FsMerkleError::from)?;
+        out.extend(nodes);
+        entries
+    } else {
+        out.insert(tree_hash); // ship the tree-node bytes too
+        crate::fsmerkle::parse_tree(&data)?.entries
+    };
+    for entry in &entries {
         match entry.kind {
             crate::fsmerkle::NodeKind::Blob => {
                 out.insert(entry.hash);
@@ -1628,6 +1640,49 @@ pub fn push_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transfer_set_includes_hamt_interior_nodes() {
+        use crate::cas::Cas;
+        use crate::fsmerkle::{Entry, FsStore, MODE_FILE, NodeKind};
+        let cas = crate::cas::MemoryCas::with_hamt_dirs();
+        let store = FsStore::new(&cas);
+        let entries: Vec<Entry> = (0..crate::fsmerkle::HAMT_DIR_THRESHOLD + 20)
+            .map(|i| Entry {
+                name: format!("f{:04}", i),
+                mode: MODE_FILE,
+                kind: NodeKind::Blob,
+                hash: B3Hash::digest(format!("blob {}", i).as_bytes()),
+            })
+            .collect();
+        let n = entries.len();
+        let root = store.put_tree(entries).unwrap();
+        assert!(crate::hamt::is_hamt_node(&cas.get(root).unwrap()));
+
+        let mut seen = BTreeSet::new();
+        let mut out = BTreeSet::new();
+        collect_objects_from_tree(&store, root, &mut seen, &mut out).unwrap();
+
+        // Every collected non-blob hash must be a real CAS object (the blobs
+        // were never stored), and there must be strictly more objects than
+        // entries: root + interior branches + leaf nodes + blob hashes.
+        assert!(out.contains(&root));
+        assert!(
+            out.len() > n * 2,
+            "expected node-per-entry plus interiors, got {} for {} entries",
+            out.len(),
+            n
+        );
+        let node_count = out
+            .iter()
+            .filter(|h| {
+                cas.get(**h)
+                    .map(|d| crate::hamt::is_hamt_node(&d))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(node_count > n, "interior nodes missing from transfer set");
+    }
 
     /// Tests in this module touch the global `IVALDI_KNOWN_PEERS` env var
     /// so the TOFU enforcer doesn't write to the developer's real

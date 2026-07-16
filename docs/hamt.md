@@ -2,11 +2,28 @@
 
 ## Status
 
-The HAMT is a production-quality, CAS-backed persistent directory index. It
-is fully implemented and tested, but **not yet wired into** the repository,
-workspace, synchronization, or Git interoperability paths — Ivaldi still
-stores directories as `fsmerkle` tree nodes. Integration is a separate,
-repo-format-gated step (see below).
+The HAMT is a production-quality, CAS-backed persistent directory index,
+**integrated into repository storage** behind the format-2 gate:
+
+- `FsStore::put_tree` stores any directory with more than
+  `HAMT_DIR_THRESHOLD` (256) entries as a HAMT root — when the repository
+  format allows it (`Cas::hamt_dirs`, true for format >= 2). The rule is
+  deterministic on content, so the same directory always produces the same
+  hash within a repository. The threshold is part of the on-disk format.
+- `FsStore::load_tree` transparently flattens a HAMT root back to a
+  `TreeNode`, so every reader (workspace, status, materialize, git export,
+  sync, pick, review, TUI) handles both encodings without knowing.
+- `diff_trees` takes a structural fast path when both sides of a directory
+  are HAMT roots — cost proportional to the change, not the directory size.
+- Encoding-aware walkers: the p2p transfer set ships HAMT interior nodes
+  (`collect_objects_from_tree`), `verify --full` walks and validates them as
+  a distinct object kind, and `rescue` recovers HAMT directories
+  best-effort (a bad interior node loses only its own subtrie).
+- Format gate: new repositories are stamped format 2 (`forge.rs`,
+  `HAMT_DIRS_FORMAT`). Format-1 repositories remain fully supported and
+  never receive HAMT objects; older binaries refuse format-2 repositories
+  with a clear error. `FileCas` reads `.ivaldi/FORMAT` next to its objects
+  directory at open, so every `FsStore` inherits the gate automatically.
 
 A directory is represented by the BLAKE3 hash of its root node. Every node is
 stored in the CAS under the hash of its canonical encoding, so:
@@ -67,18 +84,21 @@ the parser.
   fsmerkle remains faster at one-shot bulk build (one large object vs many
   small ones) and that is the trade-off integration must weigh.
 
-## Remaining work: integration
+## Remaining opportunities
 
-Switching repository directory storage to the HAMT requires:
+The integration is correctness-first; two optimizations are deliberately
+deferred:
 
-1. A repository-format gate: bump `CURRENT_FORMAT` (see `forge.rs`) or wire
-   the reserved `features` key in `.ivaldi/FORMAT`, with a forward migration
-   per `VERSIONING.md`.
-2. Rewiring workspace/status/diff paths and Git export (reusing
-   `git_tree_entry_order` in `git_export.rs` for canonical Git ordering —
-   `entries()` already returns plain name order).
-3. `FileCas::flush()` before any durable record references new HAMT nodes,
-   same as every other object write.
+- The seal path still rebuilds directory indexes from the full entry list
+  (`build_tree_from_hash_map` → `put_root`); unchanged nodes dedup in the
+  CAS so only changed-path nodes hit disk, but the CPU cost is O(n) per
+  seal. Incremental `HamtStore::insert`/`remove` against the parent root
+  would make it O(changed).
+- `load_tree` flattening of a large HAMT reads every node; hot read paths
+  that only need one entry could use `HamtStore::get` directly.
 
-Until then, `fsmerkle` remains Ivaldi's sole directory storage
-implementation.
+Note for mixed-format fleets: a directory's hash depends on its encoding,
+so the same content hashes differently in a format-1 and a format-2
+repository when it exceeds the threshold. Objects transfer verbatim over
+sync (no re-encode), so mixed histories interoperate; only independently
+re-imported content diverges.
