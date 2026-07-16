@@ -8,8 +8,8 @@ upgrades.
 `forge` writes `.ivaldi/FORMAT` as plain `key = value` lines:
 
 ```
-format = 1
-min_ivaldi = 0.1.1
+format = 2
+min_ivaldi = 0.1.2
 features =
 ```
 
@@ -33,13 +33,24 @@ simple version comparison:
 - A missing `FORMAT` file reads as **format 0**: repositories created before
   `FORMAT` existed still open.
 
+## Format history
+
+- **Format 1** — the original encoding set.
+- **Format 2** — directories with more than `HAMT_DIR_THRESHOLD` (256)
+  entries are stored as HAMT roots (see [hamt.md](hamt.md)). New repositories
+  are stamped format 2; format-1 repositories remain fully supported
+  read/write and never receive HAMT objects, so **no migration is needed** —
+  the older format is a permanent citizen, not a deprecated one. A binary too
+  old to know format 2 refuses such repositories via `FormatTooNew`.
+
 ## Bumping the format
 
 Increment `CURRENT_FORMAT` on any breaking change to a persisted encoding
 (leaves, trees, packs, journals, configuration, …). Older binaries will then
-correctly refuse the new repositories. A forward migration and pre-migration
-backup accompany the bump — see the roadmap in [`../plan.md`](../plan.md),
-Phase 1. Until a format 2 exists, no migration engine is needed.
+correctly refuse the new repositories. A bump that stops supporting an older
+format must ship a forward migration and pre-migration backup — see the
+roadmap in [`../plan.md`](../plan.md), Phase 1. Format 2 did not need one
+because format 1 stays fully supported.
 
 Related: [forge.md](forge.md) (writes `FORMAT`), [repo.md](repo.md) (checks it),
-[verify.md](verify.md) (reports it).
+[verify.md](verify.md) (reports it), [hamt.md](hamt.md) (format 2).
