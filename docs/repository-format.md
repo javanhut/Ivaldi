@@ -49,7 +49,7 @@ Increment `CURRENT_FORMAT` on any breaking change to a persisted encoding
 (leaves, trees, packs, journals, configuration, …). Older binaries will then
 correctly refuse the new repositories. A bump that stops supporting an older
 format must ship a forward migration and pre-migration backup — see the
-roadmap in [`../plan.md`](../plan.md), Phase 1. Format 2 did not need one
+roadmap in [`../plan.md`](../plan.md), Gate 3. Format 2 did not need one
 because format 1 stays fully supported.
 
 Related: [forge.md](forge.md) (writes `FORMAT`), [repo.md](repo.md) (checks it),

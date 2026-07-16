@@ -1,11 +1,15 @@
 # Dogfooding Ivaldi with a Git mirror
 
-Ivaldi's own repository is developed with Ivaldi as the primary VCS. Because
-Ivaldi is pre-1.0, every sealed timeline is continuously mirrored to a Git
-remote, and **that Git mirror — not the local `.ivaldi/` store — is the backup
-of record.** Ivaldi's on-disk format, recovery paths, and export are still being
-hardened (see [`plan.md`](../plan.md), Phases 1–4); Git is the escape hatch if a
-bug ever eats local history.
+Ivaldi's own repository is developed with Ivaldi as the primary VCS and
+authoritative working history. Every sealed timeline is additionally exported
+to a Git remote as an independent, cross-format disaster-recovery copy during
+the pre-1.0 compatibility period.
+
+This mirror is defense in depth, not an architectural dependency or backend.
+Git does not participate in Ivaldi's native storage, seals, timelines, fusion,
+recovery, or peer synchronization, and Ivaldi does not invoke Git for native VCS
+operations. The mirror exercises the optional compatibility bridge while also
+keeping an off-site copy in a separately implemented format.
 
 The workflow below is the one this repo actually uses.
 
@@ -92,5 +96,5 @@ tick after a transient network failure.
 is no `--portal` flag or "set default" command yet. So the Git mirror must be
 your default portal; the script verifies this and refuses to run (rather than
 push to the wrong remote) if it is not. Track/close this in
-[`plan.md`](../plan.md) Phase 7 when `upload --portal` lands, then the guard in
+[`plan.md`](../plan.md) Gate 7 when `upload --portal` lands, then the guard in
 `mirror-to-git.sh` can be deleted.

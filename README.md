@@ -2,6 +2,38 @@
 
 A modern version control system built in Rust, designed to replace Git — not copy it.
 
+## Project identity
+
+Ivaldi is a standalone version control system implemented from scratch in
+Rust. It is not a Git wrapper, Git frontend, or reimplementation of Git's
+internal architecture. Its native system has its own BLAKE3 content-addressed
+object store, transactional `redb` database, append-only Merkle Mountain Range
+history, Merkle filesystem with HAMT-backed large directories, timeline and
+shelving model, and authenticated peer-to-peer protocol.
+
+Git interoperability is an optional compatibility bridge at the boundary. It
+lets people migrate existing work and communicate with Git hosting services;
+Git does not participate in Ivaldi's native storage, history, timelines,
+fusion, recovery, or `ivaldi://` synchronization. Ivaldi does not invoke Git or
+embed libgit2 to perform native VCS operations.
+
+## The Ivaldi contract
+
+Ivaldi should be evaluated against the guarantees of its own design:
+
+1. Acknowledged work remains durable and recoverable.
+2. History is append-only and integrity-verifiable.
+3. Timeline switching preserves dirty work automatically.
+4. Interrupted mutations leave the old state, the new state, or an explicitly
+   recoverable state—never silently accepted partial state.
+5. Native synchronization authenticates peers and verifies received history
+   and content before making it authoritative.
+6. Corrupt or hostile input fails closed, while recovery preserves evidence
+   and every recoverable byte.
+
+Git feature parity is not an Ivaldi design goal. Git compatibility is evaluated
+separately as a migration and hosting bridge.
+
 ## Motivation
 
 Git won by being distributed, fast, and ubiquitous. But it carries twenty
@@ -58,7 +90,7 @@ trying to do:
   an encrypted, mutually authenticated channel (Noise XX, ed25519) — no
   hosting service required.
 
-## How it differs from Git
+## Migration guide for Git users
 
 | | Git | Ivaldi |
 |---|-----|--------|
@@ -94,6 +126,45 @@ tradition:
 > **Coming from git?** [`docs/rosetta.md`](docs/rosetta.md) is the full
 > translation table — every git command you reach for daily, mapped to its
 > Ivaldi equivalent.
+
+## Correctness evidence
+
+Ivaldi's safety properties are exercised at several levels:
+
+- unit tests for the CAS, database, MMR, HAMT, filesystem, timelines, fusion,
+  recovery, and native protocol;
+- property tests for canonical HAMT construction and randomized operations;
+- adversarial tests for corrupt objects, packs, trees, refs, and protocol data;
+- real multi-process writer races;
+- deterministic process-abort tests at mutation boundaries, followed by
+  reopen, full verification, safe retry, and idempotent recovery checks;
+- end-to-end native fetch and push over localhost, including authentication,
+  parent remapping, chunked blobs, interruption cleanup, and repeated transfer;
+- repository rescue and recovery after metadata and object corruption; and
+- fuzz targets for native parsers and compatibility-boundary formats.
+
+Run the complete suite, including deterministic crash injection, with:
+
+```bash
+cargo test --locked --all-targets --all-features
+```
+
+CI runs the all-features suite on Linux, macOS, and Windows. See the
+[test-evidence matrix](docs/test-matrix.md) for the guarantees exercised by
+each layer.
+
+## Maturity and versioning
+
+Ivaldi is an implemented and comprehensively tested standalone VCS. Its `0.x`
+version does not mean prototype, proof of concept, or Git-dependent frontend.
+It means that every CLI, repository-format, and network-protocol contract has
+not yet been frozen for long-term 1.0 compatibility.
+
+The [1.0 certification plan](plan.md) defines additional evidence, historical
+upgrade commitments, operating limits, release procedures, and independent
+review required before that contract is frozen. An unchecked certification
+item does not, by itself, mean the corresponding native feature is absent or
+untested; its stated evidence and acceptance criteria define what remains.
 
 ## Install
 
@@ -172,11 +243,12 @@ Both must pass. To verify an individual archive directly, use its own
   file chunking for large files
 - **redb** — pure-Rust, ACID, crash-safe embedded database for commits,
   timelines, and seal names
+- **Persistent HAMT directories** — format-2 repositories store directories
+  with more than 256 entries as canonical CAS-backed HAMTs; native transfer,
+  structural diff, verification, and rescue understand their interior nodes
 
-An in-memory HAMT prototype exists as a possible future backend for very large
-directories, but it is not part of the current repository storage path. See
-[`docs/hamt.md`](docs/hamt.md) for its status and the criteria for integrating
-it.
+See [`docs/hamt.md`](docs/hamt.md) for the encoding, format gate, validation,
+property tests, and performance characteristics.
 
 ## License
 

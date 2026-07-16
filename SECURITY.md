@@ -6,12 +6,16 @@ code execution as security issues.
 
 ## Supported versions
 
-Ivaldi is currently pre-1.0. Security fixes are applied to the latest release
-line and `main`; older pre-1.0 releases may require upgrading because their
-public and repository-format contracts are not yet stable.
+Ivaldi is a standalone, implemented VCS currently refining its pre-1.0 public
+contract. Security fixes are applied to the latest release line and `main`;
+older pre-1.0 releases may require upgrading as CLI, repository-format, and
+network-protocol contracts evolve. The `0.x` version is not a statement that
+Ivaldi is a prototype or depends on Git.
 
-No pre-1.0 release is represented as production-ready. The criteria for that
-designation are tracked in [plan.md](plan.md).
+The additional evidence and long-term support commitments required to freeze
+the 1.0 contract are tracked in the [1.0 certification plan](plan.md). Existing
+native guarantees and their tests are summarized in
+[`docs/test-matrix.md`](docs/test-matrix.md).
 
 ## Reporting a vulnerability
 

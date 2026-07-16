@@ -34,20 +34,24 @@ number:
   guessing.
 - No release ever discards recoverable data to complete an upgrade.
 
-See the repository-format and migration work in [`plan.md`](plan.md), Phase 1.
+See the repository-format and migration work in [`plan.md`](plan.md), Gate 3.
 
 ## Pre-1.0 (the current `0.x` series)
 
-While Ivaldi is below `1.0`, the public contract is **not yet stable**. During
-`0.x`:
+Ivaldi is an implemented, comprehensively tested standalone VCS. The `0.x`
+designation does not mean prototype, proof of concept, Git wrapper, or
+Git-dependent frontend. It means the complete long-term public contract has not
+yet been frozen. During `0.x`:
 
 - A **MINOR** bump (`0.1 → 0.2`) may include breaking changes.
 - A **PATCH** bump (`0.1.1 → 0.1.2`) is reserved for bug fixes.
 - The repository-format guarantee above still holds — even pre-1.0, upgrades do
   not lose data.
 
-The `1.0` release is defined by the production-readiness gates in
-[`plan.md`](plan.md); from `1.0` onward, the full semantic-versioning contract
+The `1.0` release is defined by the certification and long-term support gates in
+[`plan.md`](plan.md). Unchecked gates identify additional evidence or
+commitments; they do not by themselves classify implemented native features as
+absent or untested. From `1.0` onward, the full semantic-versioning contract
 applies.
 
 ## Releases are cut by the maintainer
