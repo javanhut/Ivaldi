@@ -16,9 +16,9 @@
 //! Wired into repository storage on format-2 repositories: `fsmerkle` routes
 //! directories above `HAMT_DIR_THRESHOLD` entries through here (see docs/hamt.md).
 
-use crate::cas::{put_and_hash, Cas, CasError};
+use crate::cas::{Cas, CasError, put_and_hash};
 use crate::filechunk::write_uvarint;
-use crate::fsmerkle::{validate_mode, validate_name, Entry, FsMerkleError, NodeKind};
+use crate::fsmerkle::{Entry, FsMerkleError, NodeKind, validate_mode, validate_name};
 use crate::hash::B3Hash;
 use crate::reader::ByteReader;
 use std::collections::HashSet;
@@ -314,10 +314,7 @@ impl<'a> HamtStore<'a> {
     /// entries. Object-graph walkers (sync transfer sets, reachability) use
     /// this to enumerate interior nodes, which no directory entry references
     /// directly — missing them would strand the receiver or GC them away.
-    pub fn nodes_and_entries(
-        &self,
-        root: B3Hash,
-    ) -> Result<(Vec<B3Hash>, Vec<Entry>), HamtError> {
+    pub fn nodes_and_entries(&self, root: B3Hash) -> Result<(Vec<B3Hash>, Vec<Entry>), HamtError> {
         let mut nodes = Vec::new();
         let mut entries = Vec::new();
         self.collect_nodes(root, 0, &mut nodes, &mut entries)?;
@@ -642,12 +639,24 @@ impl<'a> HamtStore<'a> {
             }
             // Leaf vs branch: route the leaf into the branch slot its digest
             // dictates at this level and recurse; other slots are one-sided.
-            (Some(HamtNode::Leaf(ea)), Some(HamtNode::Branch { bitmap, children })) => {
-                self.diff_leaf_vs_branch(a.expect("checked"), &ea, (bitmap, &children), level, false, out)
-            }
-            (Some(HamtNode::Branch { bitmap, children }), Some(HamtNode::Leaf(eb))) => {
-                self.diff_leaf_vs_branch(b.expect("checked"), &eb, (bitmap, &children), level, true, out)
-            }
+            (Some(HamtNode::Leaf(ea)), Some(HamtNode::Branch { bitmap, children })) => self
+                .diff_leaf_vs_branch(
+                    a.expect("checked"),
+                    &ea,
+                    (bitmap, &children),
+                    level,
+                    false,
+                    out,
+                ),
+            (Some(HamtNode::Branch { bitmap, children }), Some(HamtNode::Leaf(eb))) => self
+                .diff_leaf_vs_branch(
+                    b.expect("checked"),
+                    &eb,
+                    (bitmap, &children),
+                    level,
+                    true,
+                    out,
+                ),
             (
                 Some(HamtNode::Branch {
                     bitmap: ba,

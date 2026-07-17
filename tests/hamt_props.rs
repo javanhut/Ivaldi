@@ -11,8 +11,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use ivaldi::cas::{Cas, CasError, MemoryCas};
-use ivaldi::fsmerkle::{Entry, NodeKind, MODE_DIR, MODE_EXEC, MODE_FILE, MODE_SYMLINK};
-use ivaldi::hamt::{parse_node, HamtNode, HamtStore};
+use ivaldi::fsmerkle::{Entry, MODE_DIR, MODE_EXEC, MODE_FILE, MODE_SYMLINK, NodeKind};
+use ivaldi::hamt::{HamtNode, HamtStore, parse_node};
 use ivaldi::hash::B3Hash;
 
 /// Deterministic splitmix64 PRNG. Not for cryptography — just reproducible,
@@ -307,20 +307,55 @@ fn parse_rejects_every_malformed_node() {
     let cases: Vec<(&str, Vec<u8>)> = vec![
         ("empty", vec![]),
         ("magic only", vec![b'H']),
-        ("bad magic", raw_leaf(MODE_FILE as u64, b"a", 1, &zeros)[..].iter().enumerate().map(|(i, &b)| if i == 0 { b'X' } else { b }).collect()),
-        ("bad version", { let mut v = good_leaf.clone(); v[1] = 2; v }),
+        (
+            "bad magic",
+            raw_leaf(MODE_FILE as u64, b"a", 1, &zeros)[..]
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| if i == 0 { b'X' } else { b })
+                .collect(),
+        ),
+        ("bad version", {
+            let mut v = good_leaf.clone();
+            v[1] = 2;
+            v
+        }),
         ("bad tag", vec![b'H', 0x01, 0x03, 0x00]),
-        ("truncated leaf name", { let mut v = raw_leaf(MODE_FILE as u64, b"abcdef", 1, &zeros); v.truncate(8); v }),
-        ("truncated leaf hash", { let mut v = good_leaf.clone(); v.truncate(v.len() - 1); v }),
-        ("trailing bytes", { let mut v = good_leaf.clone(); v.push(0); v }),
+        ("truncated leaf name", {
+            let mut v = raw_leaf(MODE_FILE as u64, b"abcdef", 1, &zeros);
+            v.truncate(8);
+            v
+        }),
+        ("truncated leaf hash", {
+            let mut v = good_leaf.clone();
+            v.truncate(v.len() - 1);
+            v
+        }),
+        ("trailing bytes", {
+            let mut v = good_leaf.clone();
+            v.push(0);
+            v
+        }),
         ("empty name", raw_leaf(MODE_FILE as u64, b"", 1, &zeros)),
         ("dot name", raw_leaf(MODE_FILE as u64, b".", 1, &zeros)),
         ("dotdot name", raw_leaf(MODE_FILE as u64, b"..", 1, &zeros)),
-        ("slash in name", raw_leaf(MODE_FILE as u64, b"a/b", 1, &zeros)),
-        ("non-utf8 name", raw_leaf(MODE_FILE as u64, &[0xFF, 0xFE], 1, &zeros)),
+        (
+            "slash in name",
+            raw_leaf(MODE_FILE as u64, b"a/b", 1, &zeros),
+        ),
+        (
+            "non-utf8 name",
+            raw_leaf(MODE_FILE as u64, &[0xFF, 0xFE], 1, &zeros),
+        ),
         ("bad kind byte", raw_leaf(MODE_FILE as u64, b"a", 3, &zeros)),
-        ("mode/kind mismatch: dir mode on blob", raw_leaf(MODE_DIR as u64, b"a", 1, &zeros)),
-        ("mode/kind mismatch: file mode on tree", raw_leaf(MODE_FILE as u64, b"a", 2, &zeros)),
+        (
+            "mode/kind mismatch: dir mode on blob",
+            raw_leaf(MODE_DIR as u64, b"a", 1, &zeros),
+        ),
+        (
+            "mode/kind mismatch: file mode on tree",
+            raw_leaf(MODE_FILE as u64, b"a", 2, &zeros),
+        ),
         ("mode overflows u32", raw_leaf(1u64 << 33, b"a", 1, &zeros)),
         ("bitmap overflows u32", raw_branch(1u64 << 33, &[])),
         ("branch missing child", raw_branch(0b11, &[zeros])),
@@ -338,7 +373,11 @@ fn parse_rejects_every_malformed_node() {
     ];
 
     for (label, bytes) in cases {
-        assert!(parse_node(&bytes).is_err(), "case {:?} must be rejected", label);
+        assert!(
+            parse_node(&bytes).is_err(),
+            "case {:?} must be rejected",
+            label
+        );
     }
 }
 

@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use ivaldi::cas::{Cas, CasError, MemoryCas};
-use ivaldi::fsmerkle::{diff_trees, Entry, FsStore, NodeKind, MODE_FILE};
+use ivaldi::fsmerkle::{Entry, FsStore, MODE_FILE, NodeKind, diff_trees};
 use ivaldi::hamt::HamtStore;
 use ivaldi::hash::B3Hash;
 
@@ -56,7 +56,8 @@ impl CountingCas {
 impl Cas for CountingCas {
     fn put(&self, hash: B3Hash, data: &[u8]) -> Result<(), CasError> {
         self.puts.fetch_add(1, Ordering::Relaxed);
-        self.put_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.put_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
         self.inner.put(hash, data)
     }
     fn get(&self, hash: B3Hash) -> Result<Vec<u8>, CasError> {
@@ -121,10 +122,13 @@ fn run_size(n: usize) {
     cas.reset();
     let t = Instant::now();
     let hamt_add = hamt
-        .insert(hamt_edit, modified(Entry {
-            name: "zz_new_file.rs".into(),
-            ..target.clone()
-        }))
+        .insert(
+            hamt_edit,
+            modified(Entry {
+                name: "zz_new_file.rs".into(),
+                ..target.clone()
+            }),
+        )
         .unwrap();
     let add_h = format!("{} ({} objs)", ms(t), cas.puts());
 
@@ -145,7 +149,12 @@ fn run_size(n: usize) {
     for e in set.iter().take(100) {
         r = hamt.insert(r, modified(e.clone())).unwrap();
     }
-    let churn_h = format!("{} ({} objs, {} KB)", ms(t), cas.puts(), cas.put_bytes() / 1024);
+    let churn_h = format!(
+        "{} ({} objs, {} KB)",
+        ms(t),
+        cas.puts(),
+        cas.put_bytes() / 1024
+    );
 
     // --- fsmerkle -------------------------------------------------------
     // fsmerkle has no incremental update: every edit re-encodes the whole
@@ -168,7 +177,13 @@ fn run_size(n: usize) {
     cas.reset();
     let edit_set: Vec<Entry> = set
         .iter()
-        .map(|e| if e.name == target.name { modified(e.clone()) } else { e.clone() })
+        .map(|e| {
+            if e.name == target.name {
+                modified(e.clone())
+            } else {
+                e.clone()
+            }
+        })
         .collect();
     let t = Instant::now();
     let fsm_edit = fsm.put_tree(edit_set.clone()).unwrap();
@@ -185,7 +200,11 @@ fn run_size(n: usize) {
     let add_f = format!("{} ({} objs)", ms(t), cas.puts());
 
     cas.reset();
-    let remove_set: Vec<Entry> = edit_set.iter().filter(|e| e.name != target.name).cloned().collect();
+    let remove_set: Vec<Entry> = edit_set
+        .iter()
+        .filter(|e| e.name != target.name)
+        .cloned()
+        .collect();
     let t = Instant::now();
     fsm.put_tree(remove_set).unwrap();
     let remove_f = format!("{} ({} objs)", ms(t), cas.puts());
@@ -203,15 +222,48 @@ fn run_size(n: usize) {
         cur[i] = modified(cur[i].clone());
         fsm.put_tree(cur.clone()).unwrap();
     }
-    let churn_f = format!("{} ({} objs, {} KB)", ms(t), cas.puts(), cas.put_bytes() / 1024);
+    let churn_f = format!(
+        "{} ({} objs, {} KB)",
+        ms(t),
+        cas.puts(),
+        cas.put_bytes() / 1024
+    );
 
-    rows.push(Row { label: "build", hamt: format!("{} ({} objs, {} KB)", build_h, h_objs, h_bytes / 1024), fsm: format!("{} ({} objs, {} KB)", build_f, f_objs, f_bytes / 1024) });
-    rows.push(Row { label: "lookup (cold)", hamt: lookup_h, fsm: lookup_f });
-    rows.push(Row { label: "modify 1 entry", hamt: modify_h, fsm: modify_f });
-    rows.push(Row { label: "add 1 entry", hamt: add_h, fsm: add_f });
-    rows.push(Row { label: "remove 1 entry", hamt: remove_h, fsm: remove_f });
-    rows.push(Row { label: "diff (1 change)", hamt: diff_h, fsm: diff_f });
-    rows.push(Row { label: "100 updates", hamt: churn_h, fsm: churn_f });
+    rows.push(Row {
+        label: "build",
+        hamt: format!("{} ({} objs, {} KB)", build_h, h_objs, h_bytes / 1024),
+        fsm: format!("{} ({} objs, {} KB)", build_f, f_objs, f_bytes / 1024),
+    });
+    rows.push(Row {
+        label: "lookup (cold)",
+        hamt: lookup_h,
+        fsm: lookup_f,
+    });
+    rows.push(Row {
+        label: "modify 1 entry",
+        hamt: modify_h,
+        fsm: modify_f,
+    });
+    rows.push(Row {
+        label: "add 1 entry",
+        hamt: add_h,
+        fsm: add_f,
+    });
+    rows.push(Row {
+        label: "remove 1 entry",
+        hamt: remove_h,
+        fsm: remove_f,
+    });
+    rows.push(Row {
+        label: "diff (1 change)",
+        hamt: diff_h,
+        fsm: diff_f,
+    });
+    rows.push(Row {
+        label: "100 updates",
+        hamt: churn_h,
+        fsm: churn_f,
+    });
 
     println!("\n=== {} entries ===", n);
     println!("{:<16} | {:<40} | {:<40}", "operation", "HAMT", "fsmerkle");

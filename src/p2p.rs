@@ -1028,7 +1028,10 @@ fn collect_objects_from_tree(
     if !seen_trees.insert(tree_hash) {
         return Ok(());
     }
-    let data = store.cas().get(tree_hash).map_err(crate::fsmerkle::FsMerkleError::from)?;
+    let data = store
+        .cas()
+        .get(tree_hash)
+        .map_err(crate::fsmerkle::FsMerkleError::from)?;
     let entries = if crate::hamt::is_hamt_node(&data) {
         // HAMT directory: interior node hashes are referenced only by other
         // HAMT nodes, never by a directory entry — they must be shipped

@@ -272,8 +272,7 @@ fn verify_reachable_content(ivaldi_dir: &Path, store: Option<&Store>) -> Check {
                 match crate::hamt::parse_node(&bytes) {
                     Ok(crate::hamt::HamtNode::Branch { bitmap, children }) => {
                         if bitmap == 0 && expected_kind == ObjKind::HamtInterior {
-                            problems
-                                .push(format!("HAMT node {hash} is an empty non-root branch"));
+                            problems.push(format!("HAMT node {hash} is an empty non-root branch"));
                             continue;
                         }
                         for child in children {
@@ -289,8 +288,9 @@ fn verify_reachable_content(ivaldi_dir: &Path, store: Option<&Store>) -> Check {
                             },
                         ));
                     }
-                    Err(e) => problems
-                        .push(format!("HAMT node {hash} does not decode as a node: {e}")),
+                    Err(e) => {
+                        problems.push(format!("HAMT node {hash} does not decode as a node: {e}"))
+                    }
                 }
             }
             ObjKind::HamtInterior => {

@@ -750,7 +750,9 @@ mod tests {
         let cas = MemoryCas::with_hamt_dirs();
         let store = FsStore::new(&cas);
 
-        let small = store.put_tree(big_entries(HAMT_DIR_THRESHOLD, "a")).unwrap();
+        let small = store
+            .put_tree(big_entries(HAMT_DIR_THRESHOLD, "a"))
+            .unwrap();
         assert!(!crate::hamt::is_hamt_node(&cas.get(small).unwrap()));
 
         let big = store
