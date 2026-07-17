@@ -21,6 +21,7 @@ their source files document the release-mode commands used to run them.
 | Atomic metadata publication | `redb` batch validation, commit rollback tests, process-level failpoints, and reopen verification |
 | Writer isolation | Two-process seal races, same-timeline creation races, lock contention, and lock release after process abort |
 | Crash-safe local operations | Kill/reopen matrices for seal, gather, reseal, fuse, weld, undo, rewind, reverse, timeline removal and rename, and journaled timeline switching |
+| Repository format migration and rollback | Immutable format fixtures, contentful format-1 promotion, byte-and-mode exact rollback, checksummed full snapshots, corrupt source/backup rejection, too-new non-mutation, post-migration work protection, and process-abort retry at every migration and rollback publication boundary |
 | Old-or-new visibility | Failpoints before, during, and after publication assert that reopen exposes complete old state, complete new state, or a documented recovery state—never silently accepted partial state |
 | Idempotent recovery | Repeated crash, retry, resume, rollback, and reverse tests verify convergence without losing prior history or shelved work |
 | Automatic per-timeline shelving | CLI process tests and switch-journal tests verify dirty work is shelved, isolated, restored, and preserved through interruption |

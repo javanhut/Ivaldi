@@ -13,8 +13,8 @@
 //! always a single leaf node (never a branch wrapping a leaf). Branches with
 //! one *branch* child are allowed — shared hash-prefix chains force them.
 //!
-//! Not yet wired into repository storage; integration is gated on the
-//! benchmarks in `tests/hamt_bench.rs` beating `fsmerkle` (see docs/hamt.md).
+//! Wired into repository storage on format-2 repositories: `fsmerkle` routes
+//! directories above `HAMT_DIR_THRESHOLD` entries through here (see docs/hamt.md).
 
 use crate::cas::{put_and_hash, Cas, CasError};
 use crate::filechunk::write_uvarint;

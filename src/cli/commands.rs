@@ -154,6 +154,20 @@ fn cmd_doctor(args: DoctorArgs) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_migrate(args: MigrateArgs, quiet: bool) -> Result<(), String> {
+    let ctx = find_repo()?;
+    let report = if args.rollback {
+        crate::migration::rollback(&ctx.work_dir)
+    } else {
+        crate::migration::migrate_to_current(&ctx.work_dir)
+    }
+    .map_err(|e| e.to_string())?;
+    if !quiet {
+        println!("{}", report.message);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------

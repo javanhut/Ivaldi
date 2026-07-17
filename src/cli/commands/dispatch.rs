@@ -25,7 +25,8 @@ fn command_mutates(cmd: &Commands) -> bool {
         | Commands::Harvest(_)
         | Commands::Sync(_)
         | Commands::Upload(_)
-        | Commands::Exclude(_) => true,
+        | Commands::Exclude(_)
+        | Commands::Migrate(_) => true,
         Commands::Timeline(args) => !matches!(args.command, TimelineCommands::List(_)),
         Commands::Review(args) => !matches!(
             args.command,
@@ -61,6 +62,19 @@ pub fn run_command(cli: Cli) {
     } else {
         None
     };
+
+    // Once a format migration completes, automatic rollback is safe only
+    // until the first attempted mutation. Mark before dispatch so a failing or
+    // interrupted command cannot be silently overwritten by rollback.
+    if command_mutates(&cmd) && !matches!(&cmd, Commands::Migrate(_)) {
+        let marked = find_repo().and_then(|ctx| {
+            crate::migration::mark_changed_after_migration(&ctx.ivaldi_dir)
+                .map_err(|e| e.to_string())
+        });
+        if let Err(e) = marked {
+            exit_with_error(&e);
+        }
+    }
 
     let result = match cmd {
         Commands::Forge => cmd_forge(cli.quiet),
@@ -100,6 +114,7 @@ pub fn run_command(cli: Cli) {
         Commands::Rescue(args) => cmd_rescue(args),
         Commands::Recover(args) => cmd_recover(args),
         Commands::Doctor(args) => cmd_doctor(args),
+        Commands::Migrate(args) => cmd_migrate(args, cli.quiet),
     };
     if let Err(e) = result {
         exit_with_error(&e);

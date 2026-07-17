@@ -28,6 +28,7 @@ pub mod leaf;
 pub mod lock;
 pub mod log;
 pub mod logging;
+pub mod migration;
 pub mod mmr;
 pub mod oauth_device;
 pub mod p2p;

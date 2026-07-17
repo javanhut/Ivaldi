@@ -107,6 +107,14 @@ impl Report {
 /// repository is reported as failed checks, not a returned error, so callers
 /// can always print a diagnosis.
 pub fn verify(work_dir: &Path, full: bool) -> Report {
+    verify_impl(work_dir, full, false)
+}
+
+pub(crate) fn verify_while_migrating(work_dir: &Path, full: bool) -> Report {
+    verify_impl(work_dir, full, true)
+}
+
+fn verify_impl(work_dir: &Path, full: bool, migrating: bool) -> Report {
     let ivaldi_dir = work_dir.join(".ivaldi");
     let mut checks = Vec::new();
 
@@ -130,18 +138,29 @@ pub fn verify(work_dir: &Path, full: bool) -> Report {
 
     // Structure: reuse Repo::open, which validates the MMR index sequence,
     // size/root checkpoints, leaf parsing, and the rebuilt root.
-    match Repo::open(work_dir) {
-        Ok(_) => checks.push(Check {
-            name: "structure".into(),
-            ok: true,
-            detail: "MMR, leaves, and root checkpoint are consistent".into(),
-        }),
-        Err(e) => checks.push(Check {
+    let opened = if migrating {
+        Repo::open_for_migration(work_dir)
+    } else {
+        Repo::open(work_dir)
+    };
+    let structure = match opened {
+        Ok(repo) => {
+            // redb permits one open Database handle per process. Release the
+            // structural-check handle before the full pass opens Store again.
+            drop(repo);
+            Check {
+                name: "structure".into(),
+                ok: true,
+                detail: "MMR, leaves, and root checkpoint are consistent".into(),
+            }
+        }
+        Err(e) => Check {
             name: "structure".into(),
             ok: false,
             detail: e.to_string(),
-        }),
-    }
+        },
+    };
+    checks.push(structure);
 
     // Content: re-hash every CAS object (opt-in; O(total bytes)).
     if full {

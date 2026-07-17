@@ -29,12 +29,27 @@ pub struct Repo {
 impl Repo {
     /// Open an existing Ivaldi repository.
     pub fn open(work_dir: &Path) -> Result<Self, RepoError> {
+        Self::open_impl(work_dir, false)
+    }
+
+    /// Open while the migration engine owns the process lock and has placed a
+    /// pending marker. Not public API: ordinary opens must fail closed.
+    pub(crate) fn open_for_migration(work_dir: &Path) -> Result<Self, RepoError> {
+        Self::open_impl(work_dir, true)
+    }
+
+    fn open_impl(work_dir: &Path, migrating: bool) -> Result<Self, RepoError> {
         let ivaldi_dir = work_dir.join(".ivaldi");
         if !ivaldi_dir.join("HEAD").exists() {
             return Err(RepoError::NotARepo);
         }
         // Refuse a repository written by a newer Ivaldi before touching it.
-        forge::check_format(&ivaldi_dir).map_err(|e| RepoError::Other(e.to_string()))?;
+        if migrating {
+            forge::check_format_while_migrating(&ivaldi_dir)
+        } else {
+            forge::check_format(&ivaldi_dir)
+        }
+        .map_err(|e| RepoError::Other(e.to_string()))?;
 
         // Validate HEAD before Store::open, which can create a missing store.
         // Merely attempting to open a malformed repository must not mutate it.

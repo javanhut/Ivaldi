@@ -174,6 +174,16 @@ pub enum Commands {
 
     /// Diagnose a repository and print recovery guidance
     Doctor(DoctorArgs),
+
+    /// Upgrade an older repository format with a verified rollback snapshot
+    Migrate(MigrateArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct MigrateArgs {
+    /// Restore the verified pre-migration snapshot. Refused after new work.
+    #[arg(long)]
+    pub rollback: bool,
 }
 
 #[derive(clap::Args, Debug)]

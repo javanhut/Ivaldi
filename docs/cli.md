@@ -142,7 +142,18 @@ ivaldi download --strict-peer ivaldi://1.2.3.4:9418/main       # refuse unknowns
 
 # Ignore patterns
 ivaldi exclude "*.log" "build/" "node_modules/"
+
+# Explicit repository-format upgrade and verified rollback
+ivaldi migrate
+ivaldi migrate --rollback
 ```
+
+`migrate` promotes an older, still-readable repository to the current write
+format. It creates and verifies a complete checksummed snapshot before changing
+the repository. Rollback is available until the first attempted mutating
+command; read-only inspection does not invalidate it. See
+[repository-format.md](repository-format.md) for interruption and recovery
+semantics.
 
 ## Config flags
 

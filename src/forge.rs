@@ -188,6 +188,19 @@ pub fn read_format(ivaldi_dir: &Path) -> Result<RepoFormat, ForgeError> {
 
 /// Refuse to open a repository whose format is newer than this binary supports.
 pub fn check_format(ivaldi_dir: &Path) -> Result<(), ForgeError> {
+    if ivaldi_dir.join("migrations/PENDING").exists() {
+        return Err(ForgeError::MigrationPending);
+    }
+    check_format_version(ivaldi_dir)
+}
+
+/// Format gate used only by the migration engine while its pending marker is
+/// deliberately present. Normal callers must use [`check_format`].
+pub(crate) fn check_format_while_migrating(ivaldi_dir: &Path) -> Result<(), ForgeError> {
+    check_format_version(ivaldi_dir)
+}
+
+fn check_format_version(ivaldi_dir: &Path) -> Result<(), ForgeError> {
     let fmt = read_format(ivaldi_dir)?;
     if fmt.version > CURRENT_FORMAT {
         return Err(ForgeError::FormatTooNew {
@@ -356,6 +369,10 @@ pub enum ForgeError {
         supported: u32,
         min_ivaldi: String,
     },
+    #[error(
+        "repository has an interrupted format migration; run `ivaldi migrate` to restore and retry, or `ivaldi migrate --rollback`"
+    )]
+    MigrationPending,
 }
 
 #[cfg(test)]
