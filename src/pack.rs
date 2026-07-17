@@ -148,7 +148,8 @@ impl PackWriter {
 
         let pack_hash = B3Hash::digest(&buf);
         let pack_path = pack_dir.join(format!("{}.pack", pack_hash.short(16)));
-        fs::write(&pack_path, &buf).map_err(PackError::Io)?;
+        crate::atomic_io::atomic_write(&pack_path, &buf).map_err(PackError::Io)?;
+        crate::failpoint::fail_point("pack.after_pack_publish");
 
         // Write index file
         let idx_path = pack_dir.join(format!("{}.idx", pack_hash.short(16)));
@@ -162,7 +163,8 @@ impl PackWriter {
                 entry
             })
             .collect();
-        fs::write(&idx_path, &idx_data).map_err(PackError::Io)?;
+        crate::atomic_io::atomic_write(&idx_path, &idx_data).map_err(PackError::Io)?;
+        crate::failpoint::fail_point("pack.after_index_publish");
 
         Ok(pack_hash)
     }
@@ -222,7 +224,8 @@ impl PackWriter {
 
         let pack_hash = B3Hash::digest(&buf);
         let pack_path = pack_dir.join(format!("{}.pack", pack_hash.short(16)));
-        fs::write(&pack_path, &buf).map_err(PackError::Io)?;
+        crate::atomic_io::atomic_write(&pack_path, &buf).map_err(PackError::Io)?;
+        crate::failpoint::fail_point("pack.after_pack_publish");
 
         // Write v2 index file
         let idx_path = pack_dir.join(format!("{}.idx", pack_hash.short(16)));
@@ -237,7 +240,8 @@ impl PackWriter {
                 entry
             })
             .collect();
-        fs::write(&idx_path, &idx_data).map_err(PackError::Io)?;
+        crate::atomic_io::atomic_write(&idx_path, &idx_data).map_err(PackError::Io)?;
+        crate::failpoint::fail_point("pack.after_index_publish");
 
         Ok(pack_hash)
     }
@@ -333,6 +337,7 @@ impl PackReader {
                             cas.put(hash, obj_data)
                                 .map_err(|e| PackError::Other(e.to_string()))?;
                             count += 1;
+                            crate::failpoint::fail_point("pack.after_object_extract");
                         }
                     }
                 }
@@ -386,6 +391,7 @@ impl PackReader {
                         cas.put(*hash, &obj_data)
                             .map_err(|e| PackError::Other(e.to_string()))?;
                         count += 1;
+                        crate::failpoint::fail_point("pack.after_object_extract");
                     }
                 }
                 _ => continue,

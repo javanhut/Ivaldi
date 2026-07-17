@@ -142,6 +142,7 @@ pub(super) fn import_full_history_into(
     // Fetch commits (newest-first from GitHub), then reverse to oldest-first
     // for correct parent ordering.
     let mut commits = client.list_commits(owner, repo_name, remote_branch, depth)?;
+    let remote_tip_sha = commits.first().map(|commit| commit.sha.clone());
     commits.reverse();
 
     let cas = FileCas::new(repo.ivaldi_dir.join("objects"))?;
@@ -178,6 +179,16 @@ pub(super) fn import_full_history_into(
         // --- Phase 4: Commit loop using build_tree_from_hash_map ---
         // Track SHA1 → leaf index for parent resolution
         let mut sha_to_idx: HashMap<String, u64> = HashMap::new();
+        // Recover the database→mapping-file crash window from authenticated
+        // leaf metadata. A landed commit is reused, never appended twice.
+        for idx in 0..repo.commit_count() {
+            if let Some(leaf) = repo.get_leaf(idx)?
+                && let Some(git_sha) = leaf.meta.get("git.sha1")
+            {
+                hash_mapping.insert(git_sha, leaf.hash());
+                sha_to_idx.insert(git_sha.clone(), idx);
+            }
+        }
         // Cache tree SHA → Ivaldi tree hash to avoid re-downloading identical trees
         let mut tree_cache: HashMap<String, B3Hash> = HashMap::new();
 
@@ -255,6 +266,19 @@ pub(super) fn import_full_history_into(
         Err(e) => crate::logging::warn(&format!("failed to save hash mapping: {}", e)),
     }
     let (blobs_downloaded, commits_imported, commits_skipped) = import_result?;
+
+    // A crash can land every leaf but die before the temporary timeline head
+    // is durably useful to the outer sync. On retry those leaves are recovered
+    // from authenticated `git.sha1` metadata and skipped, so explicitly point
+    // the requested timeline at the recovered remote tip as the final import
+    // publication step. Without this, an all-skipped retry leaves an empty
+    // temporary timeline and cannot complete a diverged fusion.
+    if let Some(remote_tip_sha) = remote_tip_sha
+        && let Some(remote_tip_hash) = hash_mapping.get_blake3(&remote_tip_sha)
+        && let Some(remote_tip_idx) = find_leaf_idx_by_hash(repo, remote_tip_hash)
+    {
+        repo.set_timeline_head(local_timeline, remote_tip_idx)?;
+    }
 
     Ok(ImportResult {
         commits_imported,
@@ -590,6 +614,7 @@ fn build_import_leaf(
     );
     leaf.prev_idx = prev_idx;
     leaf.merge_idxs = merge_idxs;
+    leaf.meta.insert("git.sha1".into(), commit.sha.clone());
     Ok(leaf)
 }
 

@@ -1532,7 +1532,16 @@ pub fn import_fetch_result(
 
     for idx in 0..repo.commit_count() {
         if let Ok(Some(leaf)) = repo.get_leaf(idx) {
-            leaf_idx_by_hash.insert(leaf.hash(), idx);
+            let leaf_hash = leaf.hash();
+            leaf_idx_by_hash.insert(leaf_hash, idx);
+            // A process can die after the append-only leaf transaction commits
+            // but before the separate Git↔Ivaldi mapping file is published.
+            // The source SHA is authenticated leaf metadata, so reconstruct
+            // the mapping from history instead of appending a duplicate leaf.
+            if let Some(git_sha) = leaf.meta.get("git.sha1") {
+                mapping.insert(git_sha, leaf_hash);
+                leaf_idx_by_sha.insert(git_sha.clone(), idx);
+            }
         }
     }
 
@@ -1634,6 +1643,10 @@ pub fn import_fetch_result(
         );
         leaf.prev_idx = prev_idx;
         leaf.merge_idxs = merge_idxs;
+        // Recovery anchor for the unavoidable database↔mapping-file crash
+        // window. On retry this makes an already-landed leaf discoverable by
+        // its remote identity without guessing from content or position.
+        leaf.meta.insert("git.sha1".into(), sha.clone());
 
         // Preserve git fidelity that doesn't fit Leaf's typed fields. Stored
         // under reserved `git.*` meta keys; the canonical leaf encoding

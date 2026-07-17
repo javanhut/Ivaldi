@@ -53,6 +53,13 @@ pub fn run_command(cli: Cli) {
             if !is_switch {
                 ensure_no_interrupted_switch(&ctx.ivaldi_dir)?;
             }
+            let is_sync = matches!(&cmd, Commands::Sync(_));
+            if !is_sync && ctx.ivaldi_dir.join("sync-journal.json").exists() {
+                return Err(
+                    "an interrupted sync must be finalized before other mutations; run `ivaldi sync` again"
+                        .into(),
+                );
+            }
             Ok(lock)
         });
         match setup {

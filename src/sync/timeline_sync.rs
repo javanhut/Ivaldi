@@ -19,6 +19,17 @@ use super::{
     get_tree_files,
 };
 
+const SYNC_JOURNAL: &str = "sync-journal.json";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SyncJournal {
+    timeline: String,
+    temp_timeline: String,
+    remote_tip_sha: String,
+    local_head: u64,
+    remote_head: u64,
+}
+
 /// Result of a sync (delta update) operation.
 #[derive(Debug)]
 pub struct SyncResult {
@@ -50,6 +61,7 @@ pub fn sync_timeline(
     timeline: &str,
     consent: &mut dyn FnMut(usize, usize) -> bool,
 ) -> Result<SyncResult, SyncError> {
+    recover_interrupted_sync(repo)?;
     let branches = client.list_branches(owner, repo_name)?;
     let branch = branches
         .iter()
@@ -271,6 +283,17 @@ fn remote_tip_mapping_is_stale(
     remote_tip: &CommitInfo,
     ca_idx: u64,
 ) -> Result<bool, SyncError> {
+    if repo
+        .get_leaf(ca_idx)?
+        .and_then(|leaf| leaf.meta.get("sync.remote_tip").cloned())
+        .as_deref()
+        == Some(remote_tip.sha.as_str())
+    {
+        // A fuse intentionally contains local paths that are absent remotely.
+        // Its authenticated marker distinguishes that from an accidental
+        // mapping of an ordinary imported commit to the wrong tree.
+        return Ok(false);
+    }
     let remote_tree = client.get_tree(owner, repo_name, &remote_tip.commit.tree.sha)?;
     let remote_paths: BTreeSet<&str> = remote_tree
         .tree
@@ -466,10 +489,23 @@ fn sync_diverged(
     if their_head != crate::leaf::NO_PARENT {
         fuse_leaf.merge_idxs = vec![their_head];
     }
+    fuse_leaf
+        .meta
+        .insert("sync.remote_tip".into(), remote_tip_sha.to_string());
 
     // The merged tree nodes were written to the CAS without their directory
     // entries being durable; flush before the commit record references them.
     cas.flush()?;
+    let journal = SyncJournal {
+        timeline: timeline.to_string(),
+        temp_timeline: temp_timeline.clone(),
+        remote_tip_sha: remote_tip_sha.to_string(),
+        local_head: our_head,
+        remote_head: their_head,
+    };
+    let journal_bytes = serde_json::to_vec(&journal)
+        .map_err(|e| SyncError::Other(format!("cannot encode sync journal: {e}")))?;
+    atomic_write(&repo.ivaldi_dir.join(SYNC_JOURNAL), &journal_bytes)?;
     repo.commit_raw(fuse_leaf, timeline)?;
     crate::failpoint::fail_point("sync.after_fuse_commit");
 
@@ -481,6 +517,7 @@ fn sync_diverged(
     map_remote_tip_to_head(repo, timeline, remote_tip_sha)?;
 
     cleanup_temp_timeline(repo, &temp_timeline);
+    let _ = fs::remove_file(repo.ivaldi_dir.join(SYNC_JOURNAL));
     crate::failpoint::fail_point("sync.after_cleanup");
 
     let (added, modified, deleted) = compute_file_changes(&base_files, &fuse_result.merged_files);
@@ -494,6 +531,41 @@ fn sync_diverged(
         was_fused: true,
         conflicts: vec![],
     })
+}
+
+/// Finish or roll back the small cross-file window around a diverged sync.
+/// The append-only fuse transaction is authoritative only when its parents
+/// exactly match the journal; otherwise no fuse landed and the temp state is
+/// discarded. Repeating this recovery is harmless.
+fn recover_interrupted_sync(repo: &mut Repo) -> Result<(), SyncError> {
+    let path = repo.ivaldi_dir.join(SYNC_JOURNAL);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let journal: SyncJournal = serde_json::from_slice(&bytes)
+        .map_err(|e| SyncError::Other(format!("corrupt sync journal: {e}")))?;
+    crate::refname::validate_timeline_name(&journal.timeline)
+        .map_err(|e| SyncError::Other(format!("unsafe sync journal timeline: {e}")))?;
+    crate::refname::validate_timeline_name(&journal.temp_timeline)
+        .map_err(|e| SyncError::Other(format!("unsafe sync journal temp timeline: {e}")))?;
+
+    let landed = repo
+        .get_timeline_head(&journal.timeline)?
+        .and_then(|idx| repo.get_leaf(idx).ok().flatten().map(|leaf| (idx, leaf)))
+        .filter(|(_, leaf)| {
+            leaf.prev_idx == journal.local_head && leaf.merge_idxs.contains(&journal.remote_head)
+        });
+    if landed.is_some() {
+        map_remote_tip_to_head(repo, &journal.timeline, &journal.remote_tip_sha)?;
+        let cas = FileCas::new(repo.ivaldi_dir.join("objects"))?;
+        let store = FsStore::new(&cas);
+        checkout_tree_to_workspace(repo, &store, &journal.timeline)?;
+    }
+    cleanup_temp_timeline(repo, &journal.temp_timeline);
+    fs::remove_file(&path)?;
+    Ok(())
 }
 
 /// Create the temp sync timeline pointing at the common ancestor.

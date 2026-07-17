@@ -215,6 +215,7 @@ fn recover_mmr_checkpoint(store: &Store, report: &mut RecoverReport, dry_run: bo
         );
         return;
     }
+    crate::failpoint::fail_point("recover.before_checkpoint");
     match store.set_mmr_checkpoint(actual_size, actual_root) {
         Ok(()) => report.act(
             "mmr-checkpoint",
@@ -226,6 +227,7 @@ fn recover_mmr_checkpoint(store: &Store, report: &mut RecoverReport, dry_run: bo
             .problems
             .push(format!("failed to write MMR checkpoint: {e}")),
     }
+    crate::failpoint::fail_point("recover.after_checkpoint");
 }
 
 /// Recreate any `refs/heads/<name>` file the store knows a head for but that is
@@ -269,6 +271,7 @@ fn recover_timeline_refs(
         // index lives in the store. Create the immediate parent as timeline
         // names may contain path components such as `feature/parser`.
         let parent = ref_path.parent().unwrap_or(ivaldi_dir);
+        crate::failpoint::fail_point("recover.before_ref_write");
         let written = std::fs::create_dir_all(parent).and_then(|_| atomic_write(&ref_path, b""));
         match written {
             Ok(()) => report.act("timeline-ref", name, "recreated missing ref file", true),
@@ -276,6 +279,7 @@ fn recover_timeline_refs(
                 .problems
                 .push(format!("failed to recreate ref '{name}': {e}")),
         }
+        crate::failpoint::fail_point("recover.after_ref_write");
     }
 }
 
@@ -351,6 +355,7 @@ fn quarantine_corrupt_objects(ivaldi_dir: &Path, report: &mut RecoverReport, dry
                 ));
                 continue;
             }
+            crate::failpoint::fail_point("recover.before_quarantine");
             let moved = std::fs::create_dir_all(quarantine_dir.join(&prefix))
                 .and_then(|_| std::fs::rename(&src, &dest));
             match moved {
@@ -364,6 +369,7 @@ fn quarantine_corrupt_objects(ivaldi_dir: &Path, report: &mut RecoverReport, dry
                     "failed to quarantine {expected}: {e} (left in place)"
                 )),
             }
+            crate::failpoint::fail_point("recover.after_quarantine");
         }
     }
 }

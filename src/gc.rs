@@ -70,6 +70,7 @@ pub fn collect_garbage(
                 if fs::remove_file(path).is_ok() {
                     removed += 1;
                     freed += size;
+                    crate::failpoint::fail_point("gc.after_object_remove");
                 }
             }
         }
@@ -83,6 +84,7 @@ pub fn collect_garbage(
             }
         }
     }
+    crate::failpoint::fail_point("gc.after_shard_cleanup");
 
     Ok(GcResult {
         total_objects: total,
