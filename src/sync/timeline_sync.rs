@@ -27,7 +27,8 @@ struct SyncJournal {
     temp_timeline: String,
     remote_tip_sha: String,
     local_head: u64,
-    remote_head: u64,
+    #[serde(default)]
+    remote_head: Option<u64>,
 }
 
 /// Result of a sync (delta update) operation.
@@ -406,12 +407,21 @@ fn sync_diverged(
     // there and here mutates this timeline's head.
     let local_head_idx = repo.get_timeline_head(timeline)?;
 
-    let temp_timeline = format!("__sync_{}", timeline);
-
-    // A previous sync that crashed after its fuse commit leaves the temp
-    // timeline stranded (cleanup is best-effort). Remove any leftover before
-    // reuse so stale state can't leak into this sync.
-    cleanup_temp_timeline(repo, &temp_timeline);
+    // Never assume that a name which looks internal belongs to sync: older
+    // versions allowed users to create `__sync_*` timelines. Select a free
+    // scratch name, then publish ownership before creating anything under it.
+    let temp_timeline = allocate_temp_timeline(repo, timeline)?;
+    let our_head = local_head_idx.unwrap_or(crate::leaf::NO_PARENT);
+    write_sync_journal(
+        repo,
+        &SyncJournal {
+            timeline: timeline.to_string(),
+            temp_timeline: temp_timeline.clone(),
+            remote_tip_sha: remote_tip_sha.to_string(),
+            local_head: our_head,
+            remote_head: None,
+        },
+    )?;
 
     // Create temp timeline pointing at the common ancestor, if known
     if let Some(ancestor_idx) = common_ancestor_idx {
@@ -462,14 +472,18 @@ fn sync_diverged(
             .iter()
             .map(|c| c.path.clone())
             .collect();
-        return save_sync_conflicts(repo, &temp_timeline, timeline, conflicts);
+        let result = save_sync_conflicts(repo, &temp_timeline, timeline, conflicts)?;
+        // The successfully published merge-state record now owns the temporary
+        // timeline. Leaving the sync journal would block `fuse --continue`,
+        // which is the command needed to resolve this documented state.
+        fs::remove_file(repo.ivaldi_dir.join(SYNC_JOURNAL))?;
+        return Ok(result);
     }
 
     // Build merged tree
     let merged_tree = store.build_tree_from_hash_map(&fuse_result.merged_files)?;
 
     // Create fuse commit
-    let our_head = local_head_idx.unwrap_or(crate::leaf::NO_PARENT);
     let their_head = their_head_idx.unwrap_or(crate::leaf::NO_PARENT);
 
     let mut fuse_leaf = Leaf::new(
@@ -496,16 +510,16 @@ fn sync_diverged(
     // The merged tree nodes were written to the CAS without their directory
     // entries being durable; flush before the commit record references them.
     cas.flush()?;
-    let journal = SyncJournal {
-        timeline: timeline.to_string(),
-        temp_timeline: temp_timeline.clone(),
-        remote_tip_sha: remote_tip_sha.to_string(),
-        local_head: our_head,
-        remote_head: their_head,
-    };
-    let journal_bytes = serde_json::to_vec(&journal)
-        .map_err(|e| SyncError::Other(format!("cannot encode sync journal: {e}")))?;
-    atomic_write(&repo.ivaldi_dir.join(SYNC_JOURNAL), &journal_bytes)?;
+    write_sync_journal(
+        repo,
+        &SyncJournal {
+            timeline: timeline.to_string(),
+            temp_timeline: temp_timeline.clone(),
+            remote_tip_sha: remote_tip_sha.to_string(),
+            local_head: our_head,
+            remote_head: Some(their_head),
+        },
+    )?;
     repo.commit_raw(fuse_leaf, timeline)?;
     crate::failpoint::fail_point("sync.after_fuse_commit");
 
@@ -551,12 +565,17 @@ fn recover_interrupted_sync(repo: &mut Repo) -> Result<(), SyncError> {
     crate::refname::validate_timeline_name(&journal.temp_timeline)
         .map_err(|e| SyncError::Other(format!("unsafe sync journal temp timeline: {e}")))?;
 
-    let landed = repo
-        .get_timeline_head(&journal.timeline)?
-        .and_then(|idx| repo.get_leaf(idx).ok().flatten().map(|leaf| (idx, leaf)))
-        .filter(|(_, leaf)| {
-            leaf.prev_idx == journal.local_head && leaf.merge_idxs.contains(&journal.remote_head)
-        });
+    let landed = if let Some(remote_head) = journal.remote_head {
+        if let Some(idx) = repo.get_timeline_head(&journal.timeline)? {
+            repo.get_leaf(idx)?.filter(|leaf| {
+                leaf.prev_idx == journal.local_head && leaf.merge_idxs.contains(&remote_head)
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     if landed.is_some() {
         map_remote_tip_to_head(repo, &journal.timeline, &journal.remote_tip_sha)?;
         let cas = FileCas::new(repo.ivaldi_dir.join("objects"))?;
@@ -566,6 +585,36 @@ fn recover_interrupted_sync(repo: &mut Repo) -> Result<(), SyncError> {
     cleanup_temp_timeline(repo, &journal.temp_timeline);
     fs::remove_file(&path)?;
     Ok(())
+}
+
+fn write_sync_journal(repo: &Repo, journal: &SyncJournal) -> Result<(), SyncError> {
+    let journal_bytes = serde_json::to_vec(journal)
+        .map_err(|e| SyncError::Other(format!("cannot encode sync journal: {e}")))?;
+    atomic_write(&repo.ivaldi_dir.join(SYNC_JOURNAL), &journal_bytes)?;
+    Ok(())
+}
+
+/// Choose a scratch timeline without claiming any pre-existing user name.
+/// The repository process lock serializes CLI callers between this check and
+/// journal publication; direct library callers must provide the same writer
+/// isolation required by every other mutating repository operation.
+fn allocate_temp_timeline(repo: &Repo, timeline: &str) -> Result<String, SyncError> {
+    let base = format!("__sync_{timeline}");
+    for suffix in 0..=10_000u32 {
+        let candidate = if suffix == 0 {
+            base.clone()
+        } else {
+            format!("{base}_{suffix}")
+        };
+        let ref_path = timeline_ref_path(&repo.ivaldi_dir, &candidate)
+            .map_err(|e| SyncError::Other(e.to_string()))?;
+        if repo.get_timeline_head(&candidate)?.is_none() && !ref_path.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(SyncError::Other(format!(
+        "cannot allocate a temporary timeline for {timeline:?}: all candidate names are occupied"
+    )))
 }
 
 /// Create the temp sync timeline pointing at the common ancestor.

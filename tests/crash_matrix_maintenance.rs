@@ -331,6 +331,83 @@ fn setup_diverged_sync_repo() -> tempfile::TempDir {
 }
 
 #[test]
+fn sync_never_claims_or_deletes_a_user_owned_temporary_namespace_timeline() {
+    let dir = setup_diverged_sync_repo();
+    let protected_name = "__sync_main";
+    let protected_marker = dir.path().join(".ivaldi/refs/heads/__sync_main");
+
+    // This is a genuine user timeline accepted by the public repository API,
+    // not debris manufactured by a previous sync. Give it its own head so
+    // replacing or deleting its authority cannot be mistaken for harmless
+    // cleanup of an empty marker.
+    let mut repo = Repo::open(dir.path()).unwrap();
+    repo.create_timeline(protected_name, Some("main")).unwrap();
+    let main_head = repo.get_timeline_head("main").unwrap().unwrap();
+    let main_leaf = repo.get_leaf(main_head).unwrap().unwrap();
+    let mut protected_leaf = ivaldi::leaf::Leaf::new(
+        main_leaf.tree_root,
+        protected_name,
+        "Timeline Owner",
+        3,
+        "user-owned protected timeline",
+    );
+    protected_leaf.prev_idx = main_head;
+    let protected_head = repo
+        .commit_raw(protected_leaf, protected_name)
+        .unwrap()
+        .index;
+    assert_eq!(
+        repo.get_timeline_head(protected_name).unwrap(),
+        Some(protected_head)
+    );
+    assert!(protected_marker.exists());
+    drop(repo);
+
+    let output = child(dir.path(), "sync", "sync.after_temp_timeline");
+    assert_aborted(&output, "sync.after_temp_timeline");
+    verify_full_ok(dir.path());
+
+    // Even while the process-owned alternate scratch timeline is stranded,
+    // the colliding user timeline remains authoritative. The journal must
+    // identify a different name so recovery has explicit cleanup authority.
+    let interrupted = Repo::open(dir.path()).unwrap();
+    assert_eq!(
+        interrupted.get_timeline_head(protected_name).unwrap(),
+        Some(protected_head)
+    );
+    assert!(protected_marker.exists());
+    drop(interrupted);
+    let journal = std::fs::read_to_string(dir.path().join(".ivaldi/sync-journal.json")).unwrap();
+    assert!(journal.contains(r#""temp_timeline":"__sync_main_1""#));
+
+    run_sync(dir.path());
+    run_sync(dir.path());
+    verify_full_ok(dir.path());
+
+    // Sync may complete, refuse the collision, or choose another internal
+    // namespace. It may never reinterpret a valid user timeline as its own
+    // scratch state. Both pieces of timeline authority must survive exactly.
+    let reopened = Repo::open(dir.path()).unwrap();
+    assert_eq!(
+        reopened.get_timeline_head(protected_name).unwrap(),
+        Some(protected_head),
+        "sync deleted or replaced a user-owned timeline head"
+    );
+    assert!(
+        protected_marker.exists(),
+        "sync deleted a user-owned timeline ref marker"
+    );
+    let protected_leaf = reopened.get_leaf(protected_head).unwrap().unwrap();
+    assert_eq!(protected_leaf.message, "user-owned protected timeline");
+    assert_eq!(
+        reopened.list_timelines().unwrap(),
+        vec![(protected_name.into(), protected_head), ("main".into(), 4)],
+        "sync left a scratch timeline authoritative after avoiding the collision"
+    );
+    assert!(!dir.path().join(".ivaldi/sync-journal.json").exists());
+}
+
+#[test]
 fn diverged_sync_crashes_finalize_one_fuse_and_clean_temporary_authority() {
     for failpoint in [
         "sync.after_temp_timeline",
