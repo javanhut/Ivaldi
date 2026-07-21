@@ -78,6 +78,13 @@ pub(super) fn cmd_status(args: StatusArgs) -> Result<(), String> {
         );
     }
 
+    if !ws.skipped.is_empty() {
+        println!(
+            "Excluded from staging: {} path(s) ('ivaldi skip --list' to show)",
+            ws.skipped.iter().count()
+        );
+    }
+
     let staged: Vec<_> = status
         .iter()
         .filter(|f| f.state == FileState::Staged)

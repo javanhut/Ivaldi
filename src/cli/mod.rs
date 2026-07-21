@@ -111,6 +111,12 @@ pub enum Commands {
     #[command(alias = "ex")]
     Exclude(ExcludeArgs),
 
+    /// Temporarily exclude paths from staging (repo-local; does not edit .ivaldiignore)
+    Skip(SkipArgs),
+
+    /// Remove paths from the temporary staging exclusion list
+    Unskip(UnskipArgs),
+
     /// Manage GitHub/GitLab repository connections
     #[command(alias = "pt")]
     Portal(PortalArgs),
@@ -739,6 +745,24 @@ pub struct ExcludeArgs {
 }
 
 #[derive(clap::Args, Debug)]
+pub struct SkipArgs {
+    /// Paths to exclude from staging until `ivaldi unskip`
+    #[arg(required_unless_present = "list")]
+    pub paths: Vec<String>,
+
+    /// List currently skipped paths
+    #[arg(long)]
+    pub list: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct UnskipArgs {
+    /// Paths to stop excluding from staging
+    #[arg(required = true, num_args = 1..)]
+    pub paths: Vec<String>,
+}
+
+#[derive(clap::Args, Debug)]
 pub struct PortalArgs {
     #[command(subcommand)]
     pub command: PortalCommands,
@@ -1151,6 +1175,36 @@ mod tests {
         // git muscle memory works.
         let cli = Cli::try_parse_from(["ivaldi", "cherry-pick", "abc123"]).unwrap();
         assert!(matches!(cli.command.unwrap(), Commands::Pluck(_)));
+    }
+
+    #[test]
+    fn parse_skip_and_unskip() {
+        let cli = Cli::try_parse_from(["ivaldi", "skip", "Cargo.lock", "out.log"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Skip(args) => {
+                assert_eq!(args.paths, ["Cargo.lock", "out.log"]);
+                assert!(!args.list);
+            }
+            _ => panic!("expected Skip"),
+        }
+
+        let cli = Cli::try_parse_from(["ivaldi", "skip", "--list"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Skip(args) => {
+                assert!(args.paths.is_empty());
+                assert!(args.list);
+            }
+            _ => panic!("expected Skip"),
+        }
+
+        // Paths are required unless --list is given.
+        assert!(Cli::try_parse_from(["ivaldi", "skip"]).is_err());
+
+        let cli = Cli::try_parse_from(["ivaldi", "unskip", "Cargo.lock"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Unskip(args) => assert_eq!(args.paths, ["Cargo.lock"]),
+            _ => panic!("expected Unskip"),
+        }
     }
 
     #[test]

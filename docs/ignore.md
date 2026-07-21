@@ -43,6 +43,27 @@ surprises users coming from git:
   covers hidden files; the ignore file is for non-hidden paths like
   `build/` or `*.log` (managed with `ivaldi exclude <pattern>`).
 
+## Temporary Exclusion: `ivaldi skip`
+
+`.ivaldiignore` is the committed, pattern-based mechanism — right for things
+that should never be tracked by anyone. For the opposite case — a tracked
+file you changed locally but don't want to seal or push right now (a
+regenerated lockfile, debug or test output) — use `ivaldi skip` instead of
+editing the ignore file back and forth:
+
+- `ivaldi skip <path>` excludes the path from `gather` (bulk and explicit)
+  and `gather -p`, and hides it from `status`. A skipped tracked file is
+  never staged as a deletion either. Skipping a directory excludes
+  everything beneath it.
+- `ivaldi skip --list` shows the current set; `ivaldi unskip <path>` removes
+  entries.
+- The set lives in `.ivaldi/skipped` — repo-local, never committed, so it
+  never reaches remotes or clones.
+- Skipping a path that is **already staged** does not unstage it — run
+  `ivaldi discard <path>` first if it is already gathered.
+- Autoshelve still preserves a skipped file's uncommitted edits across
+  timeline switches; skip only affects staging.
+
 ## Built-In Defaults
 
 Always excluded (VCS/tool directories):

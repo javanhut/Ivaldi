@@ -26,6 +26,8 @@ fn command_mutates(cmd: &Commands) -> bool {
         | Commands::Sync(_)
         | Commands::Upload(_)
         | Commands::Exclude(_)
+        | Commands::Skip(_)
+        | Commands::Unskip(_)
         | Commands::Migrate(_) => true,
         Commands::Timeline(args) => !matches!(args.command, TimelineCommands::List(_)),
         Commands::Review(args) => !matches!(
@@ -104,6 +106,8 @@ pub fn run_command(cli: Cli) {
         Commands::Weld(args) => cmd_weld(args, cli.quiet),
         Commands::Config(args) => cmd_config(args),
         Commands::Exclude(args) => cmd_exclude(args, cli.quiet),
+        Commands::Skip(args) => cmd_skip(args, cli.quiet),
+        Commands::Unskip(args) => cmd_unskip(args, cli.quiet),
         Commands::Portal(args) => cmd_portal(args, cli.quiet),
         Commands::Auth(args) => cmd_auth(args),
         Commands::Download(args) => cmd_download(args, cli.quiet),

@@ -34,7 +34,7 @@ their source files document the release-mode commands used to run them.
 | Fail-closed repository verification | Corrupt objects, malformed and dangling refs, missing reachable trees/blobs, invalid parents, unsafe persisted names, and mismatched checkpoints |
 | Evidence-preserving recovery | Destroyed refs, corrupt stores, orphan sweeping, tampered-object quarantine, path-traversal rejection, nested timelines, shared subtrees, excessive depth, and HAMT recovery |
 | Hostile-input resistance | Bounded readers, overflowing/truncated varints, forged sizes and entry counts, delta bombs and cycles, excessive nesting, malformed packs, invalid tree/HAMT nodes, and malformed protocol messages |
-| Command-level behavior | Multi-process CLI smoke tests cover forge, status, timelines, automatic shelving, divergent fusion, error exit status, and malformed-state reporting without repository damage |
+| Command-level behavior | Multi-process CLI smoke tests cover forge, status, timelines, automatic shelving, divergent fusion, temporary staging exclusion (`skip`/`unskip`, including explicit-gather refusal and deletion guard), error exit status, and malformed-state reporting without repository damage |
 
 In addition to the deterministic suite, `fuzz/` contains targets for native
 readers and encodings, HAMT nodes, and compatibility-boundary pack and delta

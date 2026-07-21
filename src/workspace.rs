@@ -174,6 +174,7 @@ pub struct Workspace<'a> {
     work_dir: PathBuf,
     ivaldi_dir: PathBuf,
     pub staging: StagingArea,
+    pub skipped: SkipSet,
 }
 
 impl<'a> Workspace<'a> {
@@ -184,6 +185,7 @@ impl<'a> Workspace<'a> {
             work_dir: work_dir.as_ref().to_path_buf(),
             ivaldi_dir: ivaldi_dir.clone(),
             staging: StagingArea::load(&ivaldi_dir),
+            skipped: SkipSet::load(&ivaldi_dir),
         }
     }
 
@@ -261,6 +263,7 @@ impl<'a> Workspace<'a> {
     ) -> Result<GatherResult, WorkspaceError> {
         let mut gathered = Vec::new();
         let mut needs_confirmation = Vec::new();
+        let mut skipped = Vec::new();
         // Loaded lazily the first time a directory argument needs expanding.
         let mut ignore: Option<PatternCache> = None;
 
@@ -268,6 +271,13 @@ impl<'a> Workspace<'a> {
             // Hard block: security-pattern files can never be staged
             if crate::ignore::is_security_blocked(path) {
                 return Err(WorkspaceError::SecurityBlocked(path.to_string()));
+            }
+
+            // Paths marked with `ivaldi skip` are never staged, even when
+            // named explicitly; the caller reports them as a warning.
+            if self.skipped.covers(path) {
+                skipped.push(path.to_string());
+                continue;
             }
 
             let full_path = self.work_dir.join(path);
@@ -298,6 +308,9 @@ impl<'a> Workspace<'a> {
                 let cache = &*ignore
                     .get_or_insert_with(|| crate::ignore::load_pattern_cache(&self.work_dir));
                 for rel in self.expand_dir(path, cache)? {
+                    if self.skipped.covers(&rel) {
+                        continue;
+                    }
                     self.stage_path(&rel, on)?;
                     gathered.push(rel);
                 }
@@ -311,6 +324,7 @@ impl<'a> Workspace<'a> {
         Ok(GatherResult {
             gathered,
             needs_confirmation,
+            skipped,
         })
     }
 
@@ -360,6 +374,11 @@ impl<'a> Workspace<'a> {
                 return Err(WorkspaceError::SecurityBlocked(path.to_string()));
             }
 
+            // `ivaldi skip` wins over a dotfile confirmation.
+            if self.skipped.covers(path) {
+                continue;
+            }
+
             let full_path = self.work_dir.join(path);
             if !full_path.exists() {
                 continue;
@@ -371,6 +390,9 @@ impl<'a> Workspace<'a> {
                 let cache = &*ignore
                     .get_or_insert_with(|| crate::ignore::load_pattern_cache(&self.work_dir));
                 for rel in self.expand_dir(path, cache)? {
+                    if self.skipped.covers(&rel) {
+                        continue;
+                    }
                     self.stage_path(&rel, &mut |_| {})?;
                     gathered.push(rel);
                 }
@@ -398,7 +420,11 @@ impl<'a> Workspace<'a> {
         ignore: &PatternCache,
         on: &mut dyn FnMut(&str),
     ) -> Result<GatherResult, WorkspaceError> {
-        let files = self.scan(ignore)?;
+        let files: Vec<String> = self
+            .scan(ignore)?
+            .into_iter()
+            .filter(|path| !self.skipped.covers(path))
+            .collect();
         // scan() already excludes dotfiles via is_ignored(), so no allowlist needed
         let allowlist = DotfileAllowlist::load(&self.ivaldi_dir);
         let result = self.gather_with_progress(
@@ -408,11 +434,12 @@ impl<'a> Workspace<'a> {
         )?;
 
         // Discover dotfiles that were skipped so the caller can report them
-        let skipped = self.find_dotfiles(ignore)?;
+        let skipped_dotfiles = self.find_dotfiles(ignore)?;
 
         Ok(GatherResult {
             gathered: result.gathered,
-            needs_confirmation: skipped,
+            needs_confirmation: skipped_dotfiles,
+            skipped: result.skipped,
         })
     }
 
@@ -549,7 +576,12 @@ impl<'a> Workspace<'a> {
         last_tree: Option<B3Hash>,
         ignore: &PatternCache,
     ) -> Result<Vec<WorkspaceFile>, WorkspaceError> {
-        let disk_files = self.scan(ignore)?;
+        // Paths marked with `ivaldi skip` are hidden from status entirely.
+        let disk_files: Vec<String> = self
+            .scan(ignore)?
+            .into_iter()
+            .filter(|path| !self.skipped.covers(path))
+            .collect();
         let mut result = Vec::new();
 
         // Build set of known files from last seal
@@ -588,9 +620,11 @@ impl<'a> Workspace<'a> {
             });
         }
 
-        // Check for deleted files (in last seal but not on disk)
+        // Check for deleted files (in last seal but not on disk). Skipped
+        // paths never report as deleted even though the filtered scan above
+        // doesn't list them.
         for (path, hash) in &known_files {
-            if !disk_set.contains(path.as_str()) {
+            if !disk_set.contains(path.as_str()) && !self.skipped.covers(path) {
                 result.push(WorkspaceFile {
                     path: path.clone(),
                     state: FileState::Deleted,
@@ -901,6 +935,9 @@ pub struct GatherResult {
     pub gathered: Vec<String>,
     /// Dotfiles that need explicit user confirmation before staging.
     pub needs_confirmation: Vec<String>,
+    /// Explicitly requested paths refused because they are marked with
+    /// `ivaldi skip`. Bulk scans exclude skipped paths silently instead.
+    pub skipped: Vec<String>,
 }
 
 /// Manages the persistent allowlist of dotfiles the user has explicitly
@@ -934,6 +971,60 @@ impl DotfileAllowlist {
 
     pub fn save(&self) -> Result<(), std::io::Error> {
         let content: String = self.allowed.iter().map(|s| format!("{}\n", s)).collect();
+        crate::atomic_io::atomic_write(&self.path, content.as_bytes())
+    }
+}
+
+/// Manages the persistent set of paths temporarily excluded from staging
+/// (`ivaldi skip` / `ivaldi unskip`). Stored in `.ivaldi/skipped`, one path
+/// per line. The file is repo-local and never committed, so the exclusion
+/// never leaks to clones or remotes.
+pub struct SkipSet {
+    paths: BTreeSet<String>,
+    path: PathBuf,
+}
+
+impl SkipSet {
+    pub fn load(ivaldi_dir: &Path) -> Self {
+        let path = ivaldi_dir.join("skipped");
+        let paths = match fs::read_to_string(&path) {
+            Ok(content) => content
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect(),
+            Err(_) => BTreeSet::new(),
+        };
+        Self { paths, path }
+    }
+
+    /// True when `path` is excluded from staging: either an exact entry or
+    /// covered by a skipped directory prefix.
+    pub fn covers(&self, path: &str) -> bool {
+        self.paths
+            .iter()
+            .any(|entry| path == entry || path.starts_with(&format!("{}/", entry)))
+    }
+
+    pub fn add(&mut self, path: &str) {
+        self.paths.insert(path.to_string());
+    }
+
+    /// Remove a path from the set. Returns true if it was present.
+    pub fn remove(&mut self, path: &str) -> bool {
+        self.paths.remove(path)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &String> {
+        self.paths.iter()
+    }
+
+    pub fn save(&self) -> Result<(), std::io::Error> {
+        let content: String = self.paths.iter().map(|s| format!("{}\n", s)).collect();
         crate::atomic_io::atomic_write(&self.path, content.as_bytes())
     }
 }

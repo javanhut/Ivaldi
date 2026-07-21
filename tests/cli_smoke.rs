@@ -202,3 +202,66 @@ fn divergent_timelines_merge_and_persist_through_cli_processes() {
     assert!(entries.iter().any(|entry| entry["message"] == "main work"));
     assert!(entries.iter().any(|entry| entry["message"] == "base"));
 }
+
+#[test]
+fn skip_excludes_paths_from_staging_until_unskip() {
+    let dir = tempfile::tempdir().unwrap();
+    forge_with_identity(dir.path());
+
+    std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+    std::fs::write(dir.path().join("debug.log"), "base\n").unwrap();
+    seal_all(dir.path(), "base");
+
+    // Mark both a tracked file and a would-be test-output file as skipped.
+    ivaldi_ok(dir.path(), &["skip", "a.txt", "debug.log"]);
+
+    let list = ivaldi_ok(dir.path(), &["skip", "--list"]);
+    let list_stdout = String::from_utf8_lossy(&list.stdout);
+    assert!(list_stdout.contains("a.txt"), "{list_stdout}");
+    assert!(list_stdout.contains("debug.log"), "{list_stdout}");
+
+    // Bulk gather must not stage a skipped file, whether it was modified on
+    // disk or (for a tracked file) appears missing from the filtered scan —
+    // it must never turn into a staged deletion either.
+    std::fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+    std::fs::write(dir.path().join("debug.log"), "test output\n").unwrap();
+    let gather = ivaldi_ok(dir.path(), &["gather", "."]);
+    let gather_stdout = String::from_utf8_lossy(&gather.stdout);
+    assert!(
+        gather_stdout.contains("Nothing to gather"),
+        "{gather_stdout}"
+    );
+
+    let status = ivaldi_ok(dir.path(), &["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["files"], serde_json::json!([]));
+    assert_eq!(status["staged_deletions"], serde_json::json!([]));
+
+    // With nothing staged, sealing must refuse.
+    let seal = ivaldi(dir.path(), &["seal", "should fail"]);
+    assert!(!seal.status.success());
+
+    // Naming a skipped file explicitly warns and still does not stage it.
+    let explicit = ivaldi_ok(dir.path(), &["gather", "a.txt"]);
+    let explicit_stderr = String::from_utf8_lossy(&explicit.stderr);
+    assert!(explicit_stderr.contains("skipped"), "{explicit_stderr}");
+    let status = ivaldi_ok(dir.path(), &["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["files"], serde_json::json!([]));
+
+    // Unskip restores normal staging behavior.
+    ivaldi_ok(dir.path(), &["unskip", "a.txt"]);
+    let gather = ivaldi_ok(dir.path(), &["gather", "."]);
+    let gather_stdout = String::from_utf8_lossy(&gather.stdout);
+    assert!(gather_stdout.contains("modified: a.txt"), "{gather_stdout}");
+    ivaldi_ok(dir.path(), &["seal", "update a"]);
+
+    let log = ivaldi_ok(dir.path(), &["log", "--format", "json"]);
+    let log: serde_json::Value = serde_json::from_slice(&log.stdout).unwrap();
+    assert_eq!(log.as_array().unwrap().len(), 2);
+
+    // debug.log stayed skipped: it was never sealed into any tree.
+    let status = ivaldi_ok(dir.path(), &["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["files"], serde_json::json!([]));
+}

@@ -105,8 +105,10 @@ pub(super) fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
         all_gathered = result.gathered;
 
         // Anything in the parent tree but missing from disk is a deletion.
+        // Skipped paths are never staged as deletions: they were filtered
+        // out of the scan, so they would otherwise look missing here.
         for path in parent_tree_files.keys() {
-            if !on_disk.contains(path.as_str()) {
+            if !on_disk.contains(path.as_str()) && !ws.skipped.covers(path) {
                 ws.staging.stage_deletion(path.clone());
                 all_deleted.push(path.clone());
             }
@@ -138,12 +140,20 @@ pub(super) fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
         }
         all_gathered = result.gathered;
 
+        for path in &result.skipped {
+            eprintln!(
+                "skipped: {} (excluded from staging; 'ivaldi unskip {}' to re-enable)",
+                path, path
+            );
+        }
+
         // For each requested path that wasn't gathered (because it's missing
         // from disk), record it as a deletion if it was present in the parent
-        // tree; otherwise it matched nothing at all.
+        // tree; otherwise it matched nothing at all. Skipped paths are
+        // excluded from both treatments.
         let mut unmatched: Vec<&str> = Vec::new();
         for path in &refs {
-            if ws.staging.is_staged(path) {
+            if ws.staging.is_staged(path) || ws.skipped.covers(path) {
                 continue;
             }
             let full_path = ws.work_dir().join(path);
@@ -345,6 +355,7 @@ pub(super) fn run_patch_session(
             let basename = path.rsplit('/').next().unwrap_or(path);
             !basename.starts_with('.') || basename == ".ivaldiignore"
         })
+        .filter(|path| !ws.skipped.covers(path))
         .filter(|path| file_filter.is_empty() || file_filter.iter().any(|f| f == path || f == "."))
         .collect();
 
@@ -467,5 +478,59 @@ pub(super) fn cmd_exclude(args: ExcludeArgs, quiet: bool) -> Result<(), String> 
         }
     }
     crate::atomic_io::atomic_write(&ignore_path, content.as_bytes()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Normalize a user-supplied path for the skip list: drop a leading `./` and
+/// any trailing slashes so directory entries match `SkipSet::covers`.
+fn normalize_skip_path(raw: &str) -> &str {
+    let path = raw.strip_prefix("./").unwrap_or(raw);
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() { path } else { trimmed }
+}
+
+pub(super) fn cmd_skip(args: SkipArgs, quiet: bool) -> Result<(), String> {
+    let ctx = find_repo()?;
+    let mut skipped = crate::workspace::SkipSet::load(&ctx.ivaldi_dir);
+
+    if args.list {
+        if skipped.is_empty() {
+            if !quiet {
+                println!("No paths skipped from staging.");
+            }
+        } else {
+            for path in skipped.iter() {
+                println!("{}", path);
+            }
+        }
+        return Ok(());
+    }
+
+    for raw in &args.paths {
+        let path = normalize_skip_path(raw);
+        skipped.add(path);
+        if !quiet {
+            println!("  skipped: {}", path);
+        }
+    }
+    skipped.save().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub(super) fn cmd_unskip(args: UnskipArgs, quiet: bool) -> Result<(), String> {
+    let ctx = find_repo()?;
+    let mut skipped = crate::workspace::SkipSet::load(&ctx.ivaldi_dir);
+
+    for raw in &args.paths {
+        let path = normalize_skip_path(raw);
+        if skipped.remove(path) {
+            if !quiet {
+                println!("  unskipped: {}", path);
+            }
+        } else {
+            eprintln!("warning: '{}' was not skipped", path);
+        }
+    }
+    skipped.save().map_err(|e| e.to_string())?;
     Ok(())
 }

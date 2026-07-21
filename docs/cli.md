@@ -27,6 +27,8 @@ Command-line interface for Ivaldi VCS, built with `clap`.
 | `weld --last N` / `weld START to END` | `w` | Combine seal range into one (linear history) |
 | `config` | | View/modify settings |
 | `exclude <patterns>` | | Add to .ivaldiignore |
+| `skip <paths>` / `skip --list` | | Temporarily exclude paths from staging (repo-local, never committed or pushed) |
+| `unskip <paths>` | | Stop excluding paths from staging |
 | `portal add/list/remove/set-default` | | Manage remotes (HTTPS / SSH / `ivaldi://`); the default portal is the upload/sync target |
 | `auth login/status/logout [--gitlab]` | | OAuth (GitHub or GitLab device flow) |
 | `download <url>` | | Clone via HTTPS / SSH / `ivaldi://` (auto-detected from URL) |
@@ -79,6 +81,12 @@ ivaldi reseal "better message"             # and/or replace the message
 
 # Stage only some hunks of a file
 ivaldi gather -p src/main.rs               # y/n per hunk; a=rest, d=skip rest, q=quit
+
+# Keep a file out of seals temporarily (e.g. a lockfile or test output that
+# changed locally but shouldn't be pushed) — no .ivaldiignore edit needed
+ivaldi skip Cargo.lock                     # gather/seal ignore it from now on
+ivaldi skip --list                         # show what's excluded
+ivaldi unskip Cargo.lock                   # back to normal staging
 
 # Going back
 ivaldi undo swift-eagle                    # new seal that removes swift-eagle's changes
