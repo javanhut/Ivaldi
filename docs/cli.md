@@ -33,7 +33,7 @@ Command-line interface for Ivaldi VCS, built with `clap`.
 | `upload` | | Push via HTTPS / SSH / `ivaldi://` (auto-detected from portal) |
 | `scout` | | Discover remote branches (HTTPS / SSH) |
 | `harvest <name>` | | Fetch specific branches (HTTPS / SSH) |
-| `sync [branch]` | | Pull remote changes, delta only (HTTPS) |
+| `sync [branch] [--force]` | | Pull remote changes, delta only (HTTPS; `--force` discards uncommitted changes instead of refusing) |
 | `serve [--bind addr:port]` | | Run an `ivaldi://` peer server |
 | `peer trust/list/forget/whoami/known` | | Manage peer pubkey allowlists + TOFU known servers |
 | `review create/list/show/diff/comment/approve/request-changes/merge/close/reopen` | `rv` | Local code review system |

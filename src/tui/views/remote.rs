@@ -351,6 +351,7 @@ impl RemoteView {
                         &repo_name,
                         &timeline,
                         &mut |_, _| true,
+                        false,
                     )
                     .map(|_| "Sync complete".to_string())
                     .map_err(|e| e.to_string())

@@ -253,8 +253,15 @@ fn run_sync(dir: &Path) {
     let base = format!("http://{address}");
     let client = ivaldi::github::GitHubClient::with_base_urls(&base, &base);
     let mut repo = Repo::open(dir).unwrap();
-    let result =
-        ivaldi::sync::sync_timeline(&client, &mut repo, "o", "r", "main", &mut |_, _| true);
+    let result = ivaldi::sync::sync_timeline(
+        &client,
+        &mut repo,
+        "o",
+        "r",
+        "main",
+        &mut |_, _| true,
+        false,
+    );
     done.store(true, Ordering::Release);
     server.join().unwrap();
     result.unwrap();

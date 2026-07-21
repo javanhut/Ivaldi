@@ -894,6 +894,9 @@ pub struct SyncArgs {
     /// Integrate incoming seals without asking
     #[arg(long, short = 'y')]
     pub yes: bool,
+    /// Discard uncommitted changes and overwrite them with the remote state
+    #[arg(long, short = 'f', visible_alias = "overwrite")]
+    pub force: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1155,6 +1158,37 @@ mod tests {
             _ => panic!("expected Reverse"),
         }
         assert!(Cli::try_parse_from(["ivaldi", "reverse"]).is_err());
+    }
+
+    #[test]
+    fn parse_sync_force() {
+        let cli = Cli::try_parse_from(["ivaldi", "sync"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Sync(args) => {
+                assert!(args.timeline.is_none());
+                assert!(!args.yes);
+                assert!(!args.force);
+            }
+            _ => panic!("expected Sync"),
+        }
+
+        let cli = Cli::try_parse_from(["ivaldi", "sync", "main", "--force"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Sync(args) => {
+                assert_eq!(args.timeline.as_deref(), Some("main"));
+                assert!(args.force);
+            }
+            _ => panic!("expected Sync"),
+        }
+
+        // --overwrite works as an alias, -f as the short flag.
+        for argv in [["ivaldi", "sync", "--overwrite"], ["ivaldi", "sync", "-f"]] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            match cli.command.unwrap() {
+                Commands::Sync(args) => assert!(args.force),
+                _ => panic!("expected Sync"),
+            }
+        }
     }
 
     #[test]

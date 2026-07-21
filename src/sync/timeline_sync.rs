@@ -54,6 +54,11 @@ pub struct SyncResult {
 /// the incoming/local seal counts are known and integration would mutate
 /// the timeline, `consent(incoming, local)` is asked exactly once —
 /// `false` aborts with [`SyncError::Declined`] and no local mutation.
+///
+/// `force` is the CLI `--force`: instead of refusing when the working tree
+/// has uncommitted changes, sync overwrites them — the integration checkout
+/// rewrites the workspace to the incoming tree either way — and drops staged
+/// entries gathered against the pre-sync state.
 pub fn sync_timeline(
     client: &GitHubClient,
     repo: &mut Repo,
@@ -61,6 +66,7 @@ pub fn sync_timeline(
     repo_name: &str,
     timeline: &str,
     consent: &mut dyn FnMut(usize, usize) -> bool,
+    force: bool,
 ) -> Result<SyncResult, SyncError> {
     recover_interrupted_sync(repo)?;
     let branches = client.list_branches(owner, repo_name)?;
@@ -127,14 +133,22 @@ pub fn sync_timeline(
 
     // Sync rewrites the workspace to match the incoming tree (overwriting and
     // deleting files), so any uncommitted change would be silently lost.
-    // Refuse before touching anything if the working tree is dirty.
-    ensure_workspace_clean(repo, local_head_idx)?;
+    // Refuse before touching anything if the working tree is dirty — unless
+    // forced, since the user has then already consented to the overwrite on
+    // the command line.
+    if !force {
+        ensure_workspace_clean(repo, local_head_idx)?;
+    }
 
     // Consent gate: everything above only fetched and compared; everything
     // below mutates the user's timeline. Ivaldi never integrates remote
     // changes without permission.
     if !consent(new_remote_count, new_local_count as usize) {
         return Err(SyncError::Declined);
+    }
+
+    if force {
+        discard_staged_changes(repo)?;
     }
 
     // Classify: fast-forward or diverged
@@ -199,6 +213,21 @@ fn ensure_workspace_clean(repo: &Repo, local_head_idx: Option<u64>) -> Result<()
         shown.join("\n  "),
         suffix
     )))
+}
+
+/// Forced-sync counterpart to [`ensure_workspace_clean`]: drops the uncommitted
+/// state the integration checkout cannot fix up itself. Working-tree files are
+/// overwritten or deleted by the checkout; staged entries were gathered
+/// against the pre-sync state and would otherwise resurrect discarded content
+/// in the next seal.
+fn discard_staged_changes(repo: &Repo) -> Result<(), SyncError> {
+    let cas = FileCas::new(repo.ivaldi_dir.join("objects"))?;
+    let mut ws = crate::workspace::Workspace::new(&cas, &repo.work_dir, &repo.ivaldi_dir);
+    if !ws.staging.is_empty() {
+        ws.staging.clear();
+        ws.save().map_err(|e| SyncError::Other(e.to_string()))?;
+    }
+    Ok(())
 }
 
 /// A `SyncResult` for the nothing-to-do case.
@@ -834,6 +863,31 @@ mod tests {
         fs::write(dir.path().join("a.txt"), b"hello").unwrap();
         fs::write(dir.path().join("new.txt"), b"local only").unwrap();
         assert!(ensure_workspace_clean(&repo, head).is_err());
+    }
+
+    /// Forced sync drops staged entries gathered against the pre-sync state;
+    /// the clear must persist so a reloaded workspace stays clean.
+    #[test]
+    fn discard_staged_changes_clears_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let repo = Repo::open(dir.path()).unwrap();
+        let cas = FileCas::new(dir.path().join(".ivaldi/objects")).unwrap();
+        let store = FsStore::new(&cas);
+        let (blob, _) = store.put_blob(b"staged body").unwrap();
+
+        let mut ws = crate::workspace::Workspace::new(&cas, dir.path(), &repo.ivaldi_dir);
+        ws.staging.stage("a.txt", blob);
+        ws.save().unwrap();
+        assert!(!ws.staging.is_empty());
+
+        discard_staged_changes(&repo).unwrap();
+
+        let ws = crate::workspace::Workspace::new(&cas, dir.path(), &repo.ivaldi_dir);
+        assert!(ws.staging.is_empty(), "staging must stay cleared on reload");
+
+        // Nothing staged is not an error.
+        discard_staged_changes(&repo).unwrap();
     }
 
     /// A stranded `__sync_<name>` timeline from a crashed sync must be

@@ -733,6 +733,12 @@ pub(super) fn cmd_sync(args: SyncArgs, quiet: bool) -> Result<(), String> {
             portal.owner,
             portal.repo
         );
+        if args.force {
+            println!(
+                "{}",
+                color::yellow("--force: uncommitted changes will be overwritten")
+            );
+        }
     }
 
     // Consent-first: the sync fetches and reports what's incoming, then asks
@@ -779,6 +785,7 @@ pub(super) fn cmd_sync(args: SyncArgs, quiet: bool) -> Result<(), String> {
         &portal.repo,
         &timeline,
         &mut consent,
+        args.force,
     ) {
         Ok(result) => result,
         // Declining is a clean outcome, not a failure: nothing was mutated.
