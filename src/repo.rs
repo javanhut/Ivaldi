@@ -923,6 +923,13 @@ impl Repo {
     pub fn root(&self) -> B3Hash {
         self.mmr.root()
     }
+
+    /// MMR inclusion proof for the leaf at `idx`, or `None` when `idx` is
+    /// out of range. The proof verifies against [`Self::root`] at the time
+    /// it was generated; see [`crate::mmr::Mmr::verify`].
+    pub fn inclusion_proof(&self, idx: u64) -> Option<crate::mmr::Proof> {
+        self.mmr.proof(idx)
+    }
 }
 
 /// Result of a commit operation.

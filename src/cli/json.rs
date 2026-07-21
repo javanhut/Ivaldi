@@ -77,6 +77,8 @@ pub struct PortalJson {
     pub platform: String,
     /// Custom instance URL, if configured.
     pub url: Option<String>,
+    /// True for the default portal (the one `upload`/`sync` target).
+    pub default: bool,
 }
 
 #[cfg(test)]

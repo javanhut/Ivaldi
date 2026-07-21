@@ -27,17 +27,18 @@ Command-line interface for Ivaldi VCS, built with `clap`.
 | `weld --last N` / `weld START to END` | `w` | Combine seal range into one (linear history) |
 | `config` | | View/modify settings |
 | `exclude <patterns>` | | Add to .ivaldiignore |
-| `portal add/list/remove` | | Manage remotes (HTTPS / SSH / `ivaldi://`) |
+| `portal add/list/remove/set-default` | | Manage remotes (HTTPS / SSH / `ivaldi://`); the default portal is the upload/sync target |
 | `auth login/status/logout [--gitlab]` | | OAuth (GitHub or GitLab device flow) |
 | `download <url>` | | Clone via HTTPS / SSH / `ivaldi://` (auto-detected from URL) |
-| `upload` | | Push via HTTPS / SSH / `ivaldi://` (auto-detected from portal) |
+| `upload [--portal P]` | | Push via HTTPS / SSH / `ivaldi://` (auto-detected from portal; default portal unless `--portal` names one) |
 | `scout` | | Discover remote branches (HTTPS / SSH) |
 | `harvest <name>` | | Fetch specific branches (HTTPS / SSH) |
-| `sync [branch] [--force]` | | Pull remote changes, delta only (HTTPS; `--force` discards uncommitted changes instead of refusing) |
+| `sync [branch] [--force] [--portal P]` | | Pull remote changes, delta only (HTTPS; `--force` discards uncommitted changes instead of refusing) |
 | `serve [--bind addr:port]` | | Run an `ivaldi://` peer server |
 | `peer trust/list/forget/whoami/known` | | Manage peer pubkey allowlists + TOFU known servers |
 | `review create/list/show/diff/comment/approve/request-changes/merge/close/reopen` | `rv` | Local code review system |
 | `verify [--full] [--json]` | | Check repository integrity (`--full` re-hashes every stored object) |
+| `prove <seal>` / `prove --check R [--root HEX]` | | Emit or verify an MMR inclusion receipt for a seal (no git equivalent) |
 | `rescue [--out dir] [--json]` | | Recover files from a damaged repository, bypassing refs and the MMR |
 | `doctor [--quick] [--json]` | | Diagnose a repository and print recovery guidance |
 | `completions <shell>` | | Print a bash/zsh/fish/powershell/elvish completion script |

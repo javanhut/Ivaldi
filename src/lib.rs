@@ -38,6 +38,7 @@ pub mod peers;
 pub mod pick;
 pub mod portal;
 pub mod progress;
+pub mod proof;
 pub mod reader;
 pub mod recover;
 pub mod refname;

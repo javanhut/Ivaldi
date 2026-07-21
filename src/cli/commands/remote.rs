@@ -2,6 +2,40 @@
 
 use super::*;
 
+/// "portal 'x' not found" error naming the configured portals, so a typo is
+/// fixable from the message alone.
+fn portal_not_found(mgr: &PortalManager, repr: &str) -> String {
+    let available: Vec<String> = match mgr.list() {
+        Ok(portals) => portals.iter().map(|p| p.to_string_repr()).collect(),
+        Err(_) => Vec::new(),
+    };
+    if available.is_empty() {
+        format!(
+            "portal '{repr}' not found — no portals configured. Run 'ivaldi portal add owner/repo'."
+        )
+    } else {
+        format!(
+            "portal '{repr}' not found. Configured portals: {}",
+            available.join(", ")
+        )
+    }
+}
+
+/// Resolve which portal a remote command targets: the one named by
+/// `--portal`, else the configured default (the first portal).
+fn resolve_portal(mgr: &PortalManager, name: Option<&str>) -> Result<Portal, String> {
+    match name {
+        Some(repr) => mgr
+            .get(repr)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| portal_not_found(mgr, repr)),
+        None => mgr
+            .get_default()
+            .map_err(|e| e.to_string())?
+            .ok_or("no portal configured. Run 'ivaldi portal add owner/repo'.".into()),
+    }
+}
+
 pub(super) fn cmd_portal(args: PortalArgs, quiet: bool) -> Result<(), String> {
     let ctx = find_repo()?;
     let mgr = PortalManager::new(&ctx.ivaldi_dir);
@@ -52,7 +86,8 @@ pub(super) fn cmd_portal(args: PortalArgs, quiet: bool) -> Result<(), String> {
             if list_args.json {
                 let out: Vec<json::PortalJson> = portals
                     .iter()
-                    .map(|p| json::PortalJson {
+                    .enumerate()
+                    .map(|(i, p)| json::PortalJson {
                         repo: p.to_string_repr(),
                         platform: match p.platform {
                             Platform::GitHub => "github",
@@ -60,6 +95,7 @@ pub(super) fn cmd_portal(args: PortalArgs, quiet: bool) -> Result<(), String> {
                         }
                         .to_string(),
                         url: p.base_url.clone(),
+                        default: i == 0,
                     })
                     .collect();
                 println!(
@@ -70,7 +106,7 @@ pub(super) fn cmd_portal(args: PortalArgs, quiet: bool) -> Result<(), String> {
                 println!("No portals configured.");
             } else {
                 println!("Configured portals:");
-                for p in &portals {
+                for (i, p) in portals.iter().enumerate() {
                     let plat = match p.platform {
                         Platform::GitHub => "github",
                         Platform::GitLab => "gitlab",
@@ -78,6 +114,9 @@ pub(super) fn cmd_portal(args: PortalArgs, quiet: bool) -> Result<(), String> {
                     print!("  {} ({})", p.to_string_repr(), plat);
                     if let Some(url) = &p.base_url {
                         print!(" [{}]", url);
+                    }
+                    if i == 0 {
+                        print!(" (default)");
                     }
                     println!();
                 }
@@ -91,6 +130,20 @@ pub(super) fn cmd_portal(args: PortalArgs, quiet: bool) -> Result<(), String> {
                 } else {
                     println!("Portal not found: {}", remove_args.repo);
                 }
+            }
+        }
+        PortalCommands::SetDefault(sd_args) => {
+            if !mgr.set_default(&sd_args.repo).map_err(|e| e.to_string())? {
+                return Err(portal_not_found(&mgr, &sd_args.repo));
+            }
+            if !quiet {
+                // Show the canonical stored casing, not the user's spelling.
+                let repr = mgr
+                    .get(&sd_args.repo)
+                    .map_err(|e| e.to_string())?
+                    .map(|p| p.to_string_repr())
+                    .unwrap_or_else(|| sd_args.repo.clone());
+                println!("Default portal set to: {repr}");
             }
         }
     }
@@ -436,10 +489,7 @@ pub(super) fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
     let mut repo = open_repo()?;
 
     let portal_mgr = PortalManager::new(&repo.ivaldi_dir);
-    let portal = portal_mgr
-        .get_default()
-        .map_err(|e| e.to_string())?
-        .ok_or("no portal configured. Run 'ivaldi portal add owner/repo'.")?;
+    let portal = resolve_portal(&portal_mgr, args.portal.as_deref())?;
 
     // SSH push — bypass the GitHub auth check entirely.
     if let Transport::Ssh(target) = portal.transport() {
@@ -717,10 +767,7 @@ pub(super) fn cmd_sync(args: SyncArgs, quiet: bool) -> Result<(), String> {
     let mut repo = open_repo()?;
     let client = GitHubClient::new();
     let portal_mgr = PortalManager::new(&repo.ivaldi_dir);
-    let portal = portal_mgr
-        .get_default()
-        .map_err(|e| e.to_string())?
-        .ok_or("no portal configured. Run 'ivaldi portal add owner/repo'.")?;
+    let portal = resolve_portal(&portal_mgr, args.portal.as_deref())?;
 
     let timeline = args
         .timeline

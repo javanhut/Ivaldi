@@ -166,6 +166,9 @@ pub enum Commands {
     /// Check repository integrity
     Verify(VerifyArgs),
 
+    /// Prove a seal is included in the append-only history (MMR receipt)
+    Prove(ProveArgs),
+
     /// Recover files from a damaged repository, bypassing refs and the MMR
     Rescue(RescueArgs),
 
@@ -217,6 +220,21 @@ pub struct VerifyArgs {
     /// Emit the report as JSON.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ProveArgs {
+    /// Seal to prove inclusion for (name or hash prefix)
+    #[arg(required_unless_present = "check", conflicts_with = "check")]
+    pub seal: Option<String>,
+
+    /// Verify a receipt file instead of generating one ('-' reads stdin)
+    #[arg(long, value_name = "RECEIPT")]
+    pub check: Option<String>,
+
+    /// Trusted MMR root (hex) the receipt must match — the out-of-band anchor
+    #[arg(long, requires = "check", value_name = "HEX")]
+    pub root: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -739,6 +757,9 @@ pub enum PortalCommands {
     /// Remove a portal
     #[command(alias = "rm")]
     Remove(PortalRemoveArgs),
+
+    /// Set the default portal that upload/sync target
+    SetDefault(PortalSetDefaultArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -765,6 +786,12 @@ pub struct PortalAddArgs {
 #[derive(clap::Args, Debug)]
 pub struct PortalRemoveArgs {
     /// Repository to remove (owner/repo)
+    pub repo: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct PortalSetDefaultArgs {
+    /// Portal to make the default (owner/repo)
     pub repo: String,
 }
 
@@ -867,6 +894,10 @@ pub struct UploadArgs {
     /// Force push (overwrites remote history)
     #[arg(long)]
     pub force: bool,
+
+    /// Push to this portal (owner/repo) instead of the default
+    #[arg(long)]
+    pub portal: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -897,6 +928,9 @@ pub struct SyncArgs {
     /// Discard uncommitted changes and overwrite them with the remote state
     #[arg(long, short = 'f', visible_alias = "overwrite")]
     pub force: bool,
+    /// Sync from this portal (owner/repo) instead of the default
+    #[arg(long)]
+    pub portal: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -1189,6 +1223,73 @@ mod tests {
                 _ => panic!("expected Sync"),
             }
         }
+    }
+
+    #[test]
+    fn parse_portal_selection() {
+        // upload/sync default to no named portal.
+        let cli = Cli::try_parse_from(["ivaldi", "upload"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Upload(args) => assert!(args.portal.is_none()),
+            _ => panic!("expected Upload"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["ivaldi", "upload", "main", "--portal", "me/mirror"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Upload(args) => {
+                assert_eq!(args.branch.as_deref(), Some("main"));
+                assert_eq!(args.portal.as_deref(), Some("me/mirror"));
+            }
+            _ => panic!("expected Upload"),
+        }
+
+        let cli = Cli::try_parse_from(["ivaldi", "sync", "--portal", "me/mirror"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Sync(args) => assert_eq!(args.portal.as_deref(), Some("me/mirror")),
+            _ => panic!("expected Sync"),
+        }
+
+        let cli = Cli::try_parse_from(["ivaldi", "portal", "set-default", "me/mirror"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Portal(args) => match args.command {
+                PortalCommands::SetDefault(sd) => assert_eq!(sd.repo, "me/mirror"),
+                _ => panic!("expected SetDefault"),
+            },
+            _ => panic!("expected Portal"),
+        }
+    }
+
+    #[test]
+    fn parse_prove() {
+        let cli = Cli::try_parse_from(["ivaldi", "prove", "swift-eagle"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Prove(args) => {
+                assert_eq!(args.seal.as_deref(), Some("swift-eagle"));
+                assert!(args.check.is_none());
+                assert!(args.root.is_none());
+            }
+            _ => panic!("expected Prove"),
+        }
+
+        let cli = Cli::try_parse_from(["ivaldi", "prove", "--check", "r.json"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Prove(args) => assert_eq!(args.check.as_deref(), Some("r.json")),
+            _ => panic!("expected Prove"),
+        }
+
+        // --root only makes sense pinned to a receipt check.
+        let cli = Cli::try_parse_from(["ivaldi", "prove", "--check", "r.json", "--root", "ab12"])
+            .unwrap();
+        match cli.command.unwrap() {
+            Commands::Prove(args) => assert_eq!(args.root.as_deref(), Some("ab12")),
+            _ => panic!("expected Prove"),
+        }
+
+        // A seal and --check conflict; one of the two is required.
+        assert!(Cli::try_parse_from(["ivaldi", "prove", "x", "--check", "r.json"]).is_err());
+        assert!(Cli::try_parse_from(["ivaldi", "prove"]).is_err());
+        assert!(Cli::try_parse_from(["ivaldi", "prove", "--root", "ab12"]).is_err());
     }
 
     #[test]

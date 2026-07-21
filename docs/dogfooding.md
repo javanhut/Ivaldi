@@ -60,9 +60,9 @@ diverged mirror fails loudly rather than being overwritten.
 scripts/mirror-to-git.sh git@github.com:you/repo.git
 ```
 
-The script adds the remote as an Ivaldi portal (idempotent), checks it is the
-**default** portal — `ivaldi upload` can only target the default one today (see
-"Known gap" below) — then uploads each timeline non-force.
+The script adds the remote as an Ivaldi portal (idempotent), then uploads
+each timeline non-force with `upload --portal` — the mirror works no matter
+which portal is the default.
 
 ## 4. Make it continuous
 
@@ -90,11 +90,9 @@ tick after a transient network failure.
 | `ivaldi seal` your work | Manual (that's the point) |
 | Recover *from* the Git mirror after local loss | Manual: `ivaldi download <remote>` into a fresh checkout |
 
-## Known gap
+## Portal selection
 
-`ivaldi upload` pushes to the **default (first) configured portal** only — there
-is no `--portal` flag or "set default" command yet. So the Git mirror must be
-your default portal; the script verifies this and refuses to run (rather than
-push to the wrong remote) if it is not. Track/close this in
-[`plan.md`](../plan.md) Gate 7 when `upload --portal` lands, then the guard in
-`mirror-to-git.sh` can be deleted.
+`ivaldi upload` and `ivaldi sync` target the default (first) portal unless
+`--portal owner/repo` names another; `ivaldi portal set-default owner/repo`
+changes which portal is the default. The mirror script passes `--portal`
+explicitly, so the mirror does not need to be the default portal.
