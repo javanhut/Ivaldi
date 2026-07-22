@@ -92,7 +92,7 @@ ivaldi reseal "Better message"     # Redo the last seal (message and/or staged c
 ivaldi status                      # Check workspace state
 ivaldi log --oneline               # View history
 ivaldi diff                        # Compare changes
-ivaldi whodidit src/main.rs        # Which seal last touched each line (blame)
+ivaldi whodidit src/main.rs        # Which seal last touched each line (alias: wdi)
 ivaldi whereami                    # Show current position (alias: wai)
 ivaldi exclude "*.tmp"             # Add patterns to .ivaldiignore
 ```
@@ -323,7 +323,7 @@ Deep dives: [verify.md](verify.md), [rescue.md](rescue.md).
 | `status` | | Show workspace state |
 | `whereami` | `wai` | Show current position |
 | `log` | | View commit history |
-| `whodidit <file>` | `blame` | Show which seal last touched each line of a file |
+| `whodidit <file>` | `wdi` | Show which seal last touched each line of a file |
 | `diff` | | Compare changes |
 | `reseal` | | Redo the most recent seal (new message and/or staged changes) |
 | `discard [files]` | | Remove files from the gathered set (none = everything) |

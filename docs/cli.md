@@ -13,7 +13,7 @@ Command-line interface for Ivaldi VCS, built with `clap`.
 | `status [--json]` | | Show repository status |
 | `whereami` | `wai` | Show current position |
 | `log [--format short\|medium\|full\|json]` | | View commit history |
-| `whodidit <file> [--summary]` | `blame` | Line-by-line seal attribution |
+| `whodidit <file> [--summary]` | `wdi` | Line-by-line seal attribution |
 | `diff` | | Compare changes |
 | `discard [files]` | | Remove files from the gathered set (none = everything) |
 | `reverse --all` | | Throw away all uncommitted changes, restore from last seal (destructive!) |

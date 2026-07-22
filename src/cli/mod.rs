@@ -60,7 +60,7 @@ pub enum Commands {
     Log(LogArgs),
 
     /// Show, line-by-line, which seal last touched each line of a file
-    #[command(aliases = ["blame", "wd"])]
+    #[command(alias = "wdi")]
     Whodidit(WhodiditArgs),
 
     /// Compare changes

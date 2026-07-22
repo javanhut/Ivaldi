@@ -180,7 +180,7 @@ tradition. Common aliases are shown in parentheses.
 | `ivaldi status [--json]` | `st` | Show repository status |
 | `ivaldi whereami` | `wai` | Show current timeline and position |
 | `ivaldi log` | `lg` | View commit history |
-| `ivaldi whodidit <file>` | `blame` | Line-by-line seal attribution |
+| `ivaldi whodidit <file>` | `wdi` | Line-by-line seal attribution |
 | `ivaldi diff` | `df` | Compare changes |
 | `ivaldi discard [files]` | `dc` | Unstage files (none = everything) |
 | `ivaldi skip <paths>` / `ivaldi skip --list` | | Temporarily exclude paths from staging (repo-local) |
