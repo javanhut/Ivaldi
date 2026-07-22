@@ -55,7 +55,10 @@ fn atomic_write_impl(path: &Path, bytes: &[u8], _secret: bool) -> std::io::Resul
         let mut f = options.open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
-        replace_file(&tmp, path)
+        crate::failpoint::fail_point("atomic_write.before_rename");
+        let replaced = replace_file(&tmp, path);
+        crate::failpoint::fail_point("atomic_write.after_rename");
+        replaced
     })();
 
     if result.is_err() {

@@ -15,10 +15,19 @@ pub trait Cas {
     fn put(&self, hash: B3Hash, data: &[u8]) -> Result<(), CasError>;
     fn get(&self, hash: B3Hash) -> Result<Vec<u8>, CasError>;
     fn has(&self, hash: B3Hash) -> Result<bool, CasError>;
+    fn hamt_dirs(&self) -> bool { false }
 }
 ```
 
 **Hash Verification:** `put` always verifies that the provided hash matches `BLAKE3(data)`. Mismatches are rejected with `CasError::HashMismatch`.
+
+**`hamt_dirs`:** whether directories written through this CAS may use the
+HAMT encoding (repository format >= 2 — see
+[repository-format.md](repository-format.md) and [hamt.md](hamt.md)). The
+flag rides on the CAS so every `FsStore` built from a repository's object
+store inherits the repository's format gate; plain stores default to false.
+`FileCas` sets it by reading the `FORMAT` file next to its objects
+directory; `MemoryCas::with_hamt_dirs()` enables it for tests.
 
 ### Helper
 

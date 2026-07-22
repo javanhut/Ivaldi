@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::cas::Cas;
+use crate::cas::FileCas;
 use crate::fsmerkle::{FsStore, NodeKind};
 use crate::fuse::{FuseEngine, Strategy};
 use crate::hash::B3Hash;
@@ -77,7 +77,7 @@ pub fn tree_files(
 /// no-op. The caller materializes the new tree to the working directory.
 pub fn three_way_seal(
     repo: &mut Repo,
-    cas: &dyn Cas,
+    cas: &FileCas,
     base: &BTreeMap<String, B3Hash>,
     theirs: &BTreeMap<String, B3Hash>,
     author: &str,
@@ -106,9 +106,15 @@ pub fn three_way_seal(
     let merged_tree = store
         .build_tree_from_hash_map(&result.merged_files)
         .map_err(|e| e.to_string())?;
+    // The merged tree nodes were just written to the CAS without fsync; make
+    // them durable before the commit record that references them lands, so a
+    // power loss cannot persist a seal whose tree is missing.
+    cas.flush().map_err(|e| e.to_string())?;
+    crate::failpoint::fail_point("pick.before_commit");
     let commit = repo
         .commit(merged_tree, author, message)
         .map_err(|e| e.to_string())?;
+    crate::failpoint::fail_point("pick.after_commit");
     Ok(ApplyOutcome::Applied(commit))
 }
 

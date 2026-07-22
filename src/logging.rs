@@ -85,34 +85,32 @@ pub fn debug(msg: &str) {
 mod tests {
     use super::*;
 
+    // One test, not four: `should_log` reads process-global atomics, so
+    // separate #[test] fns race under cargo's parallel runner. Running the
+    // states sequentially in a single test removes the race at the source.
     #[test]
-    fn default_verbosity() {
+    fn should_log_by_level() {
+        // Default: errors only.
         init(0, false);
         assert!(should_log(Level::Error));
         assert!(!should_log(Level::Info));
         assert!(!should_log(Level::Debug));
-    }
 
-    #[test]
-    fn verbose_once() {
+        // -v: info + warn, not debug.
         init(1, false);
         assert!(should_log(Level::Error));
-        assert!(should_log(Level::Info));
         assert!(should_log(Level::Warn));
+        assert!(should_log(Level::Info));
         assert!(!should_log(Level::Debug));
-    }
 
-    #[test]
-    fn verbose_twice() {
+        // -vv: debug too.
         init(2, false);
         assert!(should_log(Level::Debug));
-    }
 
-    #[test]
-    fn quiet_mode() {
+        // --quiet: everything but errors is suppressed, even at -vv.
         init(2, true);
-        assert!(should_log(Level::Error)); // errors always
-        assert!(!should_log(Level::Info)); // suppressed
-        assert!(!should_log(Level::Debug)); // suppressed
+        assert!(should_log(Level::Error));
+        assert!(!should_log(Level::Info));
+        assert!(!should_log(Level::Debug));
     }
 }

@@ -3,15 +3,21 @@ BINDIR = $(PREFIX)/bin
 BINARY = ivaldi
 TARGET = target/release/$(BINARY)
 
-.PHONY: build test install install-extras install-raven-completions uninstall clean help
+.PHONY: build check test install install-extras install-raven-completions uninstall clean help
 
 ## Build release binary
 build:
-	cargo build --release
+	cargo build --locked --release
+
+## Run the same local quality gates required by CI
+check:
+	cargo fmt --check
+	cargo clippy --locked --all-targets -- -D warnings
+	cargo test --locked --all-targets
 
 ## Run all tests
 test:
-	cargo test
+	cargo test --locked --all-targets
 
 ## Install ivaldi to $(PREFIX)/bin (default: /usr/local/bin)
 install: build
@@ -58,6 +64,7 @@ help:
 	@echo "Ivaldi VCS — Makefile targets:"
 	@echo ""
 	@echo "  make build      Build release binary"
+	@echo "  make check      Run formatting, Clippy, and the full locked test suite"
 	@echo "  make test       Run all tests"
 	@echo "  make install    Install to $(BINDIR) (may need sudo)"
 	@echo "  make install-extras  Install man pages and bash/zsh/fish completions (may need sudo)"

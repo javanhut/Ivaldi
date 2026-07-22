@@ -9,6 +9,16 @@
 
 use crate::cas::{Cas, CasError};
 use crate::hash::B3Hash;
+use crate::reader::{ByteReader, ReadError};
+
+/// Wrap a decode error as an `InvalidData` I/O error for the CAS layer.
+fn invalid_data(e: ReadError) -> CasError {
+    CasError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+fn invalid_data_msg(msg: &'static str) -> CasError {
+    CasError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
+}
 
 /// Default chunk size: 64 KiB.
 pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
@@ -149,44 +159,27 @@ impl<'a> ChunkLoader<'a> {
     }
 
     fn read_leaf(&self, data: &[u8], out: &mut Vec<u8>) -> Result<(), CasError> {
-        if data.is_empty() || data[0] != LEAF_MARKER {
-            return Err(CasError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid leaf node encoding",
-            )));
+        let mut r = ByteReader::new(data);
+        if r.u8().map_err(invalid_data)? != LEAF_MARKER {
+            return Err(invalid_data_msg("invalid leaf node encoding"));
         }
-        let (chunk_len, bytes_read) = read_uvarint(&data[1..]);
-        let start = 1 + bytes_read;
-        let end = start + chunk_len as usize;
-        if end > data.len() {
-            return Err(CasError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "truncated leaf chunk data",
-            )));
-        }
-        out.extend_from_slice(&data[start..end]);
+        // Bounded reader: a hostile chunk length cannot overflow the offset math
+        // (the old `start + chunk_len` could wrap and panic on the slice).
+        let chunk_len = r.uvarint().map_err(invalid_data)? as usize;
+        let chunk = r.take(chunk_len).map_err(invalid_data)?;
+        out.extend_from_slice(chunk);
         Ok(())
     }
 
     fn read_internal(&self, data: &[u8], out: &mut Vec<u8>) -> Result<(), CasError> {
-        if data.is_empty() || data[0] != NODE_MARKER {
-            return Err(CasError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid internal node encoding",
-            )));
+        let mut r = ByteReader::new(data);
+        if r.u8().map_err(invalid_data)? != NODE_MARKER {
+            return Err(invalid_data_msg("invalid internal node encoding"));
         }
-        let (child_count, bytes_read) = read_uvarint(&data[1..]);
-        let mut offset = 1 + bytes_read;
+        let child_count = r.uvarint().map_err(invalid_data)?;
 
         for _ in 0..child_count {
-            if offset + 32 > data.len() {
-                return Err(CasError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "truncated child hash",
-                )));
-            }
-            let child_hash = B3Hash::from_slice(&data[offset..offset + 32]).unwrap();
-            offset += 32;
+            let child_hash = B3Hash::from_bytes(r.array::<32>().map_err(invalid_data)?);
 
             // Determine child kind by reading its data
             let child_data = self.cas.get(child_hash)?;

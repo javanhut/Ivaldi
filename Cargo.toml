@@ -1,14 +1,20 @@
 [package]
 name = "ivaldi"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Ivaldi Version Control System"
+license = "AGPL-3.0-only"
 readme = "README.md"
 repository = "https://github.com/javanhut/ivaldi"
 homepage = "https://github.com/javanhut/ivaldi"
 rust-version = "1.89"
 keywords = ["version-control", "vcs", "git", "distributed"]
 categories = ["command-line-utilities", "development-tools"]
+
+[features]
+# Test-only deterministic crash injection (see src/failpoint.rs and
+# tests/crash_matrix.rs). Never enable in release builds.
+failpoints = []
 
 [dependencies]
 blake3 = "1"
@@ -27,6 +33,7 @@ crossterm = "0.29"
 indicatif = "0.18.4"
 rayon = "1"
 flate2 = "1"
+prost = "0.14"
 sha1 = "0.10"
 snow = "0.9"
 rand_core = { version = "0.6", features = ["getrandom"] }

@@ -19,8 +19,15 @@ The `forge` command creates a new Ivaldi repository by initializing the `.ivaldi
 ├── butterflies/    # Butterfly metadata
 ├── stage/          # Staging area
 ├── config          # Repository configuration
+├── FORMAT          # On-disk format version + minimum compatible Ivaldi
 └── HEAD            # Current timeline pointer → "ref: refs/heads/main"
 ```
+
+`FORMAT` is written at forge time as plain `key = value` lines (`format`,
+`min_ivaldi`, `features`). It lets a newer repository be refused by an older
+binary with a clear error rather than being misread. A repository created
+before `FORMAT` existed is treated as format 0 and still opens. See
+[`repository-format.md`](repository-format.md).
 
 ## Usage
 

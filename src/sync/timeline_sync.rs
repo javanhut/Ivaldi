@@ -9,6 +9,7 @@ use crate::cas::FileCas;
 use crate::fsmerkle::FsStore;
 use crate::github::{CommitInfo, GitHubClient};
 use crate::leaf::Leaf;
+use crate::refname::timeline_ref_path;
 use crate::remote::HashMapping;
 use crate::repo::Repo;
 
@@ -17,6 +18,18 @@ use super::{
     SyncError, checkout_tree_to_workspace, compute_file_changes, compute_workspace_delta,
     get_tree_files,
 };
+
+const SYNC_JOURNAL: &str = "sync-journal.json";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SyncJournal {
+    timeline: String,
+    temp_timeline: String,
+    remote_tip_sha: String,
+    local_head: u64,
+    #[serde(default)]
+    remote_head: Option<u64>,
+}
 
 /// Result of a sync (delta update) operation.
 #[derive(Debug)]
@@ -35,14 +48,27 @@ pub struct SyncResult {
 /// Detects whether the local and remote have diverged:
 /// - **Up to date:** no new remote commits → no-op
 /// - **Fast-forward:** remote has new commits, local hasn't diverged → import + advance
-/// - **Diverged:** both have new commits → auto-fuse (Ivaldi's auto-merge philosophy)
+/// - **Diverged:** both have new commits → fuse
+///
+/// Consent-first: fetching and inspecting remote state is free, but once
+/// the incoming/local seal counts are known and integration would mutate
+/// the timeline, `consent(incoming, local)` is asked exactly once —
+/// `false` aborts with [`SyncError::Declined`] and no local mutation.
+///
+/// `force` is the CLI `--force`: instead of refusing when the working tree
+/// has uncommitted changes, sync overwrites them — the integration checkout
+/// rewrites the workspace to the incoming tree either way — and drops staged
+/// entries gathered against the pre-sync state.
 pub fn sync_timeline(
     client: &GitHubClient,
     repo: &mut Repo,
     owner: &str,
     repo_name: &str,
     timeline: &str,
+    consent: &mut dyn FnMut(usize, usize) -> bool,
+    force: bool,
 ) -> Result<SyncResult, SyncError> {
+    recover_interrupted_sync(repo)?;
     let branches = client.list_branches(owner, repo_name)?;
     let branch = branches
         .iter()
@@ -105,6 +131,26 @@ pub fn sync_timeline(
         return Ok(up_to_date_result());
     }
 
+    // Sync rewrites the workspace to match the incoming tree (overwriting and
+    // deleting files), so any uncommitted change would be silently lost.
+    // Refuse before touching anything if the working tree is dirty — unless
+    // forced, since the user has then already consented to the overwrite on
+    // the command line.
+    if !force {
+        ensure_workspace_clean(repo, local_head_idx)?;
+    }
+
+    // Consent gate: everything above only fetched and compared; everything
+    // below mutates the user's timeline. Ivaldi never integrates remote
+    // changes without permission.
+    if !consent(new_remote_count, new_local_count as usize) {
+        return Err(SyncError::Declined);
+    }
+
+    if force {
+        discard_staged_changes(repo)?;
+    }
+
     // Classify: fast-forward or diverged
     if new_local_count == 0 {
         return sync_fast_forward(
@@ -126,6 +172,62 @@ pub fn sync_timeline(
         common_ancestor_idx,
         &branch.commit.sha,
     )
+}
+
+/// `checkout_tree_to_workspace` (used by every sync path) makes the workspace
+/// exactly match the incoming tree: it overwrites modified files and deletes any
+/// on-disk file not in that tree, including untracked ones. That is only safe
+/// when the working tree already matches HEAD. Enforce that precondition so sync
+/// can never destroy uncommitted work.
+fn ensure_workspace_clean(repo: &Repo, local_head_idx: Option<u64>) -> Result<(), SyncError> {
+    let head_tree = match local_head_idx {
+        Some(idx) => repo.get_leaf(idx)?.map(|l| l.tree_root),
+        None => None,
+    };
+
+    let cas = FileCas::new(repo.ivaldi_dir.join("objects"))?;
+    let ws = crate::workspace::Workspace::new(&cas, &repo.work_dir, &repo.ivaldi_dir);
+    let ignore = crate::ignore::load_pattern_cache(&repo.work_dir);
+    let dirty: Vec<String> = ws
+        .status(head_tree, &ignore)
+        .map_err(|e| SyncError::Other(e.to_string()))?
+        .into_iter()
+        .filter(|f| f.state != crate::workspace::FileState::Unmodified)
+        .map(|f| f.path)
+        .collect();
+
+    if dirty.is_empty() {
+        return Ok(());
+    }
+
+    let shown: Vec<String> = dirty.iter().take(10).cloned().collect();
+    let more = dirty.len() - shown.len();
+    let suffix = if more > 0 {
+        format!("\n  ... and {} more", more)
+    } else {
+        String::new()
+    };
+    Err(SyncError::Other(format!(
+        "you have uncommitted changes that sync would overwrite:\n  {}{}\n\n\
+         Seal them ('ivaldi seal') or throw them away ('ivaldi discard') before syncing.",
+        shown.join("\n  "),
+        suffix
+    )))
+}
+
+/// Forced-sync counterpart to [`ensure_workspace_clean`]: drops the uncommitted
+/// state the integration checkout cannot fix up itself. Working-tree files are
+/// overwritten or deleted by the checkout; staged entries were gathered
+/// against the pre-sync state and would otherwise resurrect discarded content
+/// in the next seal.
+fn discard_staged_changes(repo: &Repo) -> Result<(), SyncError> {
+    let cas = FileCas::new(repo.ivaldi_dir.join("objects"))?;
+    let mut ws = crate::workspace::Workspace::new(&cas, &repo.work_dir, &repo.ivaldi_dir);
+    if !ws.staging.is_empty() {
+        ws.staging.clear();
+        ws.save().map_err(|e| SyncError::Other(e.to_string()))?;
+    }
+    Ok(())
 }
 
 /// A `SyncResult` for the nothing-to-do case.
@@ -211,6 +313,17 @@ fn remote_tip_mapping_is_stale(
     remote_tip: &CommitInfo,
     ca_idx: u64,
 ) -> Result<bool, SyncError> {
+    if repo
+        .get_leaf(ca_idx)?
+        .and_then(|leaf| leaf.meta.get("sync.remote_tip").cloned())
+        .as_deref()
+        == Some(remote_tip.sha.as_str())
+    {
+        // A fuse intentionally contains local paths that are absent remotely.
+        // Its authenticated marker distinguishes that from an accidental
+        // mapping of an ordinary imported commit to the wrong tree.
+        return Ok(false);
+    }
     let remote_tree = client.get_tree(owner, repo_name, &remote_tip.commit.tree.sha)?;
     let remote_paths: BTreeSet<&str> = remote_tree
         .tree
@@ -323,12 +436,27 @@ fn sync_diverged(
     // there and here mutates this timeline's head.
     let local_head_idx = repo.get_timeline_head(timeline)?;
 
-    let temp_timeline = format!("__sync_{}", timeline);
+    // Never assume that a name which looks internal belongs to sync: older
+    // versions allowed users to create `__sync_*` timelines. Select a free
+    // scratch name, then publish ownership before creating anything under it.
+    let temp_timeline = allocate_temp_timeline(repo, timeline)?;
+    let our_head = local_head_idx.unwrap_or(crate::leaf::NO_PARENT);
+    write_sync_journal(
+        repo,
+        &SyncJournal {
+            timeline: timeline.to_string(),
+            temp_timeline: temp_timeline.clone(),
+            remote_tip_sha: remote_tip_sha.to_string(),
+            local_head: our_head,
+            remote_head: None,
+        },
+    )?;
 
     // Create temp timeline pointing at the common ancestor, if known
     if let Some(ancestor_idx) = common_ancestor_idx {
         create_temp_timeline(repo, &temp_timeline, ancestor_idx)?;
     }
+    crate::failpoint::fail_point("sync.after_temp_timeline");
 
     // Import remote history into temp timeline (fetch from real remote branch)
     let _import =
@@ -373,14 +501,18 @@ fn sync_diverged(
             .iter()
             .map(|c| c.path.clone())
             .collect();
-        return save_sync_conflicts(repo, &temp_timeline, timeline, conflicts);
+        let result = save_sync_conflicts(repo, &temp_timeline, timeline, conflicts)?;
+        // The successfully published merge-state record now owns the temporary
+        // timeline. Leaving the sync journal would block `fuse --continue`,
+        // which is the command needed to resolve this documented state.
+        fs::remove_file(repo.ivaldi_dir.join(SYNC_JOURNAL))?;
+        return Ok(result);
     }
 
     // Build merged tree
     let merged_tree = store.build_tree_from_hash_map(&fuse_result.merged_files)?;
 
     // Create fuse commit
-    let our_head = local_head_idx.unwrap_or(crate::leaf::NO_PARENT);
     let their_head = their_head_idx.unwrap_or(crate::leaf::NO_PARENT);
 
     let mut fuse_leaf = Leaf::new(
@@ -389,8 +521,8 @@ fn sync_diverged(
         "ivaldi-sync",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64,
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
         format!(
             "Fused sync from {}/{} (branch: {})",
             owner, repo_name, timeline
@@ -400,16 +532,36 @@ fn sync_diverged(
     if their_head != crate::leaf::NO_PARENT {
         fuse_leaf.merge_idxs = vec![their_head];
     }
+    fuse_leaf
+        .meta
+        .insert("sync.remote_tip".into(), remote_tip_sha.to_string());
 
+    // The merged tree nodes were written to the CAS without their directory
+    // entries being durable; flush before the commit record references them.
+    cas.flush()?;
+    write_sync_journal(
+        repo,
+        &SyncJournal {
+            timeline: timeline.to_string(),
+            temp_timeline: temp_timeline.clone(),
+            remote_tip_sha: remote_tip_sha.to_string(),
+            local_head: our_head,
+            remote_head: Some(their_head),
+        },
+    )?;
     repo.commit_raw(fuse_leaf, timeline)?;
+    crate::failpoint::fail_point("sync.after_fuse_commit");
 
     // Update workspace
     checkout_tree_to_workspace(repo, &store, timeline)?;
 
     // Map remote tip SHA to the fuse commit so the next sync recognizes it
+    crate::failpoint::fail_point("sync.before_tip_remap");
     map_remote_tip_to_head(repo, timeline, remote_tip_sha)?;
 
     cleanup_temp_timeline(repo, &temp_timeline);
+    let _ = fs::remove_file(repo.ivaldi_dir.join(SYNC_JOURNAL));
+    crate::failpoint::fail_point("sync.after_cleanup");
 
     let (added, modified, deleted) = compute_file_changes(&base_files, &fuse_result.merged_files);
 
@@ -424,13 +576,84 @@ fn sync_diverged(
     })
 }
 
+/// Finish or roll back the small cross-file window around a diverged sync.
+/// The append-only fuse transaction is authoritative only when its parents
+/// exactly match the journal; otherwise no fuse landed and the temp state is
+/// discarded. Repeating this recovery is harmless.
+fn recover_interrupted_sync(repo: &mut Repo) -> Result<(), SyncError> {
+    let path = repo.ivaldi_dir.join(SYNC_JOURNAL);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let journal: SyncJournal = serde_json::from_slice(&bytes)
+        .map_err(|e| SyncError::Other(format!("corrupt sync journal: {e}")))?;
+    crate::refname::validate_timeline_name(&journal.timeline)
+        .map_err(|e| SyncError::Other(format!("unsafe sync journal timeline: {e}")))?;
+    crate::refname::validate_timeline_name(&journal.temp_timeline)
+        .map_err(|e| SyncError::Other(format!("unsafe sync journal temp timeline: {e}")))?;
+
+    let landed = if let Some(remote_head) = journal.remote_head {
+        if let Some(idx) = repo.get_timeline_head(&journal.timeline)? {
+            repo.get_leaf(idx)?.filter(|leaf| {
+                leaf.prev_idx == journal.local_head && leaf.merge_idxs.contains(&remote_head)
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if landed.is_some() {
+        map_remote_tip_to_head(repo, &journal.timeline, &journal.remote_tip_sha)?;
+        let cas = FileCas::new(repo.ivaldi_dir.join("objects"))?;
+        let store = FsStore::new(&cas);
+        checkout_tree_to_workspace(repo, &store, &journal.timeline)?;
+    }
+    cleanup_temp_timeline(repo, &journal.temp_timeline);
+    fs::remove_file(&path)?;
+    Ok(())
+}
+
+fn write_sync_journal(repo: &Repo, journal: &SyncJournal) -> Result<(), SyncError> {
+    let journal_bytes = serde_json::to_vec(journal)
+        .map_err(|e| SyncError::Other(format!("cannot encode sync journal: {e}")))?;
+    atomic_write(&repo.ivaldi_dir.join(SYNC_JOURNAL), &journal_bytes)?;
+    Ok(())
+}
+
+/// Choose a scratch timeline without claiming any pre-existing user name.
+/// The repository process lock serializes CLI callers between this check and
+/// journal publication; direct library callers must provide the same writer
+/// isolation required by every other mutating repository operation.
+fn allocate_temp_timeline(repo: &Repo, timeline: &str) -> Result<String, SyncError> {
+    let base = format!("__sync_{timeline}");
+    for suffix in 0..=10_000u32 {
+        let candidate = if suffix == 0 {
+            base.clone()
+        } else {
+            format!("{base}_{suffix}")
+        };
+        let ref_path = timeline_ref_path(&repo.ivaldi_dir, &candidate)
+            .map_err(|e| SyncError::Other(e.to_string()))?;
+        if repo.get_timeline_head(&candidate)?.is_none() && !ref_path.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(SyncError::Other(format!(
+        "cannot allocate a temporary timeline for {timeline:?}: all candidate names are occupied"
+    )))
+}
+
 /// Create the temp sync timeline pointing at the common ancestor.
 fn create_temp_timeline(
     repo: &Repo,
     temp_timeline: &str,
     ancestor_idx: u64,
 ) -> Result<(), SyncError> {
-    let ref_path = repo.ivaldi_dir.join("refs/heads").join(temp_timeline);
+    let ref_path = timeline_ref_path(&repo.ivaldi_dir, temp_timeline)
+        .map_err(|e| SyncError::Other(e.to_string()))?;
     if let Some(parent) = ref_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -442,7 +665,9 @@ fn create_temp_timeline(
 /// Best-effort removal of the temp sync timeline (head entry + ref file).
 fn cleanup_temp_timeline(repo: &Repo, temp_timeline: &str) {
     let _ = repo.store.remove_timeline_head(temp_timeline);
-    let _ = fs::remove_file(repo.ivaldi_dir.join("refs/heads").join(temp_timeline));
+    if let Ok(path) = timeline_ref_path(&repo.ivaldi_dir, temp_timeline) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 /// Map the remote tip SHA to the freshly created fuse commit at the timeline
@@ -489,4 +714,199 @@ fn save_sync_conflicts(
         was_fused: false,
         conflicts,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::{AuthorInfo, CommitDetail, ParentRef, TreeRef};
+
+    fn commit_info(sha: &str, parents: &[&str]) -> CommitInfo {
+        CommitInfo {
+            sha: sha.to_string(),
+            commit: CommitDetail {
+                message: "msg".into(),
+                author: AuthorInfo {
+                    name: "A".into(),
+                    email: "a@x".into(),
+                    date: None,
+                },
+                tree: TreeRef { sha: "t".into() },
+            },
+            parents: parents
+                .iter()
+                .map(|p| ParentRef { sha: p.to_string() })
+                .collect(),
+        }
+    }
+
+    /// Forge a repo with a 3-seal chain on main; returns the repo.
+    fn repo_with_chain() -> (tempfile::TempDir, Repo) {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let mut repo = Repo::open(dir.path()).unwrap();
+        let cas = FileCas::new(dir.path().join(".ivaldi/objects")).unwrap();
+        let store = FsStore::new(&cas);
+        for i in 0..3u8 {
+            let (blob, _) = store.put_blob(&[i]).unwrap();
+            use crate::fsmerkle::{Entry, MODE_FILE, NodeKind};
+            let tree = store
+                .put_tree(vec![Entry {
+                    name: "f".into(),
+                    mode: MODE_FILE,
+                    kind: NodeKind::Blob,
+                    hash: blob,
+                }])
+                .unwrap();
+            repo.commit(tree, "t <t@x>", &format!("c{}", i)).unwrap();
+        }
+        (dir, repo)
+    }
+
+    #[test]
+    fn count_new_remote_commits_stops_at_common_ancestor() {
+        let commits = vec![
+            commit_info("tip", &["mid"]),
+            commit_info("mid", &["base"]),
+            commit_info("base", &[]),
+        ];
+        assert_eq!(count_new_remote_commits(&commits, Some("mid")), 1);
+        assert_eq!(count_new_remote_commits(&commits, Some("tip")), 0);
+        assert_eq!(count_new_remote_commits(&commits, None), 3);
+        assert_eq!(count_new_remote_commits(&commits, Some("unknown")), 3);
+    }
+
+    #[test]
+    fn collect_local_reachable_walks_prev_chain() {
+        let (_dir, repo) = repo_with_chain();
+        let reachable = collect_local_reachable(&repo, Some(2));
+        assert!(reachable.contains(&0) && reachable.contains(&1) && reachable.contains(&2));
+        assert_eq!(collect_local_reachable(&repo, None).len(), 0);
+    }
+
+    #[test]
+    fn count_new_local_commits_counts_steps_to_ancestor() {
+        let (_dir, repo) = repo_with_chain();
+        assert_eq!(
+            count_new_local_commits(&repo, "main", Some(2), Some(0)).unwrap(),
+            2
+        );
+        assert_eq!(
+            count_new_local_commits(&repo, "main", Some(2), Some(2)).unwrap(),
+            0
+        );
+        // No common ancestor: every local commit is new.
+        assert_eq!(
+            count_new_local_commits(&repo, "main", Some(2), None).unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn find_common_ancestor_skips_stale_and_unreachable() {
+        let (_dir, repo) = repo_with_chain();
+        let mut mapping = HashMapping::new(&repo.ivaldi_dir);
+        let leaf1 = repo.get_leaf(1).unwrap().unwrap();
+        mapping.insert("remote-mid", leaf1.hash());
+        // Also map the tip to a leaf NOT reachable from the searched head.
+        let leaf2 = repo.get_leaf(2).unwrap().unwrap();
+        mapping.insert("remote-tip", leaf2.hash());
+
+        let commits = vec![
+            commit_info("remote-tip", &["remote-mid"]),
+            commit_info("remote-mid", &["remote-base"]),
+        ];
+        // Reachable set limited to leaves 0-1: the tip's mapping (leaf 2) is
+        // outside it, so the mid commit must win.
+        let reachable: BTreeSet<u64> = [0u64, 1].into();
+        let (sha, idx) =
+            find_common_ancestor(&repo, &commits, &mapping, &reachable, &BTreeSet::new());
+        assert_eq!(sha.as_deref(), Some("remote-mid"));
+        assert_eq!(idx, Some(1));
+
+        // Marking the mid stale skips it entirely.
+        let stale: BTreeSet<String> = ["remote-mid".to_string(), "remote-tip".to_string()].into();
+        let (sha, idx) = find_common_ancestor(&repo, &commits, &mapping, &reachable, &stale);
+        assert_eq!(sha, None);
+        assert_eq!(idx, None);
+    }
+
+    /// Sync must refuse when the workspace has uncommitted changes, since the
+    /// checkout would overwrite modified files and delete untracked ones.
+    #[test]
+    fn ensure_workspace_clean_refuses_uncommitted_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let mut repo = Repo::open(dir.path()).unwrap();
+        let cas = FileCas::new(dir.path().join(".ivaldi/objects")).unwrap();
+        let store = FsStore::new(&cas);
+
+        let mut files = BTreeMap::new();
+        files.insert("a.txt".to_string(), b"hello".to_vec());
+        let tree = store.build_tree_from_map(&files).unwrap();
+        repo.commit(tree, "author", "init").unwrap();
+        let head = repo.get_timeline_head("main").unwrap();
+
+        // Make the workspace match HEAD, then it must pass.
+        checkout_tree_to_workspace(&repo, &store, "main").unwrap();
+        assert!(ensure_workspace_clean(&repo, head).is_ok());
+
+        // An uncommitted edit must block sync, naming the file.
+        fs::write(dir.path().join("a.txt"), b"local edit").unwrap();
+        let err = ensure_workspace_clean(&repo, head).unwrap_err();
+        assert!(
+            err.to_string().contains("a.txt"),
+            "error should name the dirty file: {err}"
+        );
+
+        // An untracked file must also block sync (it would be deleted).
+        fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        fs::write(dir.path().join("new.txt"), b"local only").unwrap();
+        assert!(ensure_workspace_clean(&repo, head).is_err());
+    }
+
+    /// Forced sync drops staged entries gathered against the pre-sync state;
+    /// the clear must persist so a reloaded workspace stays clean.
+    #[test]
+    fn discard_staged_changes_clears_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let repo = Repo::open(dir.path()).unwrap();
+        let cas = FileCas::new(dir.path().join(".ivaldi/objects")).unwrap();
+        let store = FsStore::new(&cas);
+        let (blob, _) = store.put_blob(b"staged body").unwrap();
+
+        let mut ws = crate::workspace::Workspace::new(&cas, dir.path(), &repo.ivaldi_dir);
+        ws.staging.stage("a.txt", blob);
+        ws.save().unwrap();
+        assert!(!ws.staging.is_empty());
+
+        discard_staged_changes(&repo).unwrap();
+
+        let ws = crate::workspace::Workspace::new(&cas, dir.path(), &repo.ivaldi_dir);
+        assert!(ws.staging.is_empty(), "staging must stay cleared on reload");
+
+        // Nothing staged is not an error.
+        discard_staged_changes(&repo).unwrap();
+    }
+
+    /// A stranded `__sync_<name>` timeline from a crashed sync must be
+    /// removable, and cleanup must leave the repo fully consistent.
+    #[test]
+    fn stranded_temp_timeline_cleanup_is_safe() {
+        let (dir, repo) = repo_with_chain();
+        create_temp_timeline(&repo, "__sync_main", 1).unwrap();
+        assert_eq!(repo.get_timeline_head("__sync_main").unwrap(), Some(1));
+
+        cleanup_temp_timeline(&repo, "__sync_main");
+        assert!(repo.get_timeline_head("__sync_main").unwrap().is_none());
+        assert!(
+            !timeline_ref_path(&repo.ivaldi_dir, "__sync_main")
+                .unwrap()
+                .exists()
+        );
+        drop(repo);
+        let report = crate::verify::verify(dir.path(), true);
+        assert!(report.ok, "verify --full failed: {:?}", report.checks);
+    }
 }

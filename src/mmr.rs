@@ -34,6 +34,7 @@ struct Peak {
 ///
 /// Internally tracks leaves and a stack of peaks. When two peaks of the
 /// same height exist, they merge into one peak of height+1.
+#[derive(Clone)]
 pub struct Mmr {
     leaves: Vec<Leaf>,
     /// Stack of peaks, each representing a complete binary subtree.
@@ -158,6 +159,44 @@ impl Mmr {
         compute_root_from_peaks(&proof.peaks) == root
     }
 
+    /// Like [`Self::verify`], but additionally binds the claimed leaf index:
+    /// the replayed path must land on the specific peak whose leaf range
+    /// covers `proof.leaf_index` (derived from `size`), not on just any peak.
+    /// Prefer this when the index comes from an untrusted source — a
+    /// siblingless proof (the odd tail leaf) otherwise verifies under any
+    /// claimed index.
+    pub fn verify_for_size(
+        &self,
+        leaf_hash: B3Hash,
+        proof: &Proof,
+        root: B3Hash,
+        size: u64,
+    ) -> bool {
+        // The index must exist, and an MMR of `size` leaves has exactly
+        // popcount(size) peaks.
+        if proof.leaf_index >= size || proof.peaks.len() != size.count_ones() as usize {
+            return false;
+        }
+
+        let mut current = compute_leaf_hash(leaf_hash);
+        let mut pos_in_tree = proof.leaf_index;
+        for sibling in &proof.siblings {
+            current = if pos_in_tree.is_multiple_of(2) {
+                compute_internal_hash(current, *sibling)
+            } else {
+                compute_internal_hash(*sibling, current)
+            };
+            pos_in_tree /= 2;
+        }
+
+        match peak_covering(size, proof.leaf_index) {
+            Some(k) if proof.peaks.get(k) == Some(&current) => {}
+            _ => return false,
+        }
+
+        compute_root_from_peaks(&proof.peaks) == root
+    }
+
     /// Collect sibling hashes for an inclusion proof by replaying construction.
     fn collect_siblings(&self, target_leaf: usize) -> Vec<B3Hash> {
         // Replay the MMR and track which subtree the target leaf falls into.
@@ -247,12 +286,68 @@ fn compute_root_from_peaks(peaks: &[B3Hash]) -> B3Hash {
     }
 }
 
+/// Index of the peak whose leaf range covers `leaf_idx`, for an MMR of
+/// `size` leaves. Peaks are stored left-to-right by leaf range (decreasing
+/// height), and the ranges follow the binary decomposition of `size`: each
+/// set bit contributes one peak spanning 2^bit leaves.
+fn peak_covering(size: u64, leaf_idx: u64) -> Option<usize> {
+    if leaf_idx >= size {
+        return None;
+    }
+    let mut pos = 0u64;
+    let mut peak_k = 0usize;
+    for h in (0..64).rev() {
+        let span = 1u64 << h;
+        if size & span != 0 {
+            if leaf_idx < pos + span {
+                return Some(peak_k);
+            }
+            pos += span;
+            peak_k += 1;
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn make_leaf(msg: &str) -> Leaf {
         Leaf::new(B3Hash::digest(msg.as_bytes()), "main", "Author", 1000, msg)
+    }
+
+    #[test]
+    fn verify_for_size_binds_index_to_its_peak() {
+        for n in 1..=8u64 {
+            let mut mmr = Mmr::new();
+            let mut hashes = Vec::new();
+            for i in 0..n {
+                let leaf = make_leaf(&format!("c{i}"));
+                hashes.push(leaf.hash());
+                mmr.append_leaf(leaf);
+            }
+            for idx in 0..n {
+                let proof = mmr.proof(idx).unwrap();
+                assert!(
+                    mmr.verify_for_size(hashes[idx as usize], &proof, mmr.root(), n),
+                    "honest proof rejected (n={n}, idx={idx})"
+                );
+                // Claiming any other index must fail — including for the odd
+                // tail leaf, whose proof has no siblings to bind it.
+                for wrong in 0..n {
+                    if wrong == idx {
+                        continue;
+                    }
+                    let mut p = proof.clone();
+                    p.leaf_index = wrong;
+                    assert!(
+                        !mmr.verify_for_size(hashes[idx as usize], &p, mmr.root(), n),
+                        "index slide accepted (n={n}, {idx}->{wrong})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

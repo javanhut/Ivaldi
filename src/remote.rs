@@ -110,21 +110,29 @@ impl HashMapping {
     }
 
     /// Save mappings to disk.
+    ///
+    /// Uses [`atomic_write`](crate::atomic_io::atomic_write) so a crash
+    /// mid-save can never leave a truncated SHA1↔BLAKE3 map behind — a torn
+    /// map silently breaks duplicate detection on the next import.
     pub fn save(&self) -> Result<(), RemoteError> {
         let mut lines = Vec::with_capacity(self.sha1_to_blake3.len());
         for (sha1, blake3) in &self.sha1_to_blake3 {
             lines.push(format!("{} {}", sha1, blake3.to_hex()));
         }
-        fs::write(&self.map_path, lines.join("\n") + "\n").map_err(RemoteError::Io)
+        crate::atomic_io::atomic_write(&self.map_path, (lines.join("\n") + "\n").as_bytes())
+            .map_err(RemoteError::Io)
     }
 
-    /// Load mappings from disk.
+    /// Load mappings from disk. Malformed lines are counted and surfaced as a
+    /// warning instead of being skipped silently — a damaged map means sync
+    /// classification (scout/harvest skip checks) can no longer be trusted.
     fn load(&mut self) {
         let content = match fs::read_to_string(&self.map_path) {
             Ok(c) => c,
             Err(_) => return,
         };
 
+        let mut malformed = 0usize;
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() {
@@ -135,7 +143,17 @@ impl HashMapping {
             {
                 self.sha1_to_blake3.insert(sha1.to_string(), blake3);
                 self.blake3_to_sha1.insert(blake3, sha1.to_string());
+            } else {
+                malformed += 1;
             }
+        }
+        if malformed > 0 {
+            crate::logging::warn(&format!(
+                "{} malformed line(s) in {} — the SHA1↔BLAKE3 map may be damaged; \
+                 the next sync may re-import already-synced seals",
+                malformed,
+                self.map_path.display()
+            ));
         }
     }
 }
@@ -208,6 +226,54 @@ mod tests {
         let mapping2 = HashMapping::new(&ivaldi_dir);
         assert_eq!(mapping2.get_blake3(sha1), Some(blake3));
         assert_eq!(mapping2.get_sha1(blake3), Some(sha1));
+    }
+
+    #[test]
+    fn hash_mapping_tolerates_torn_file_and_keeps_valid_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let ivaldi_dir = dir.path().join(".ivaldi");
+        fs::create_dir_all(&ivaldi_dir).unwrap();
+
+        let good_sha = "abc123def456789012345678901234567890abcd";
+        let good_b3 = B3Hash::digest(b"good");
+        // Simulate a torn write: one valid line, one truncated, one bogus hex.
+        fs::write(
+            ivaldi_dir.join("hash-map"),
+            format!(
+                "{} {}\n{} deadbeef\nffff",
+                good_sha,
+                good_b3.to_hex(),
+                good_sha
+            ),
+        )
+        .unwrap();
+
+        let mapping = HashMapping::new(&ivaldi_dir);
+        assert_eq!(mapping.get_blake3(good_sha), Some(good_b3));
+        assert_eq!(mapping.len(), 1);
+    }
+
+    #[test]
+    fn hash_mapping_save_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let ivaldi_dir = dir.path().join(".ivaldi");
+        fs::create_dir_all(&ivaldi_dir).unwrap();
+
+        let mut mapping = HashMapping::new(&ivaldi_dir);
+        mapping.insert(
+            "abc123def456789012345678901234567890abcd",
+            B3Hash::digest(b"x"),
+        );
+        mapping.save().unwrap();
+
+        let leftovers: Vec<_> = fs::read_dir(&ivaldi_dir)
+            .unwrap()
+            .filter_map(|e| {
+                let name = e.unwrap().file_name().to_string_lossy().into_owned();
+                name.contains(".tmp.").then_some(name)
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {:?}", leftovers);
     }
 
     #[test]

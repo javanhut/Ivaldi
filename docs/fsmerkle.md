@@ -80,6 +80,15 @@ Modes must match their kind:
 - `Blob` entries must use `MODE_FILE` (0o100644)
 - `Tree` entries must use `MODE_DIR` (0o040000)
 
+## Two directory encodings
+
+`FsStore::put_tree` stores a directory with more than `HAMT_DIR_THRESHOLD`
+(256) entries as a HAMT root instead of a tree node — when the repository
+format allows it (`Cas::hamt_dirs`, format >= 2). `FsStore::load_tree`
+transparently flattens a HAMT root back to a `TreeNode`, and `diff_trees`
+takes a structural fast path when both sides are HAMT. Callers see one
+directory model either way. See [hamt.md](hamt.md).
+
 ## Usage
 
 ### Storing and loading blobs

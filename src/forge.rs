@@ -15,6 +15,7 @@
 //! ├── butterflies/    # Butterfly metadata
 //! ├── stage/          # Staging area
 //! ├── config          # Repository configuration
+//! ├── FORMAT          # On-disk format version + compatibility
 //! └── HEAD            # Current timeline pointer
 //! ```
 
@@ -22,6 +23,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
+use crate::hash::B3Hash;
 
 /// Result of a forge operation.
 #[derive(Debug)]
@@ -77,7 +79,11 @@ pub fn forge(work_dir: &Path) -> Result<ForgeResult, ForgeError> {
 
     // Create HEAD pointing to main
     let head_path = ivaldi_dir.join("HEAD");
-    fs::write(&head_path, "ref: refs/heads/main\n").map_err(ForgeError::Io)?;
+    crate::atomic_io::atomic_write(&head_path, b"ref: refs/heads/main\n")
+        .map_err(ForgeError::Io)?;
+
+    // Stamp the on-disk format so newer repos can be refused by older binaries.
+    write_format(&ivaldi_dir).map_err(ForgeError::Io)?;
 
     // Create default config
     let config = Config::new();
@@ -96,6 +102,116 @@ pub fn forge(work_dir: &Path) -> Result<ForgeResult, ForgeError> {
     })
 }
 
+/// On-disk repository format this binary writes and can open. Bump on any
+/// breaking change to a persisted encoding; a repository stamped higher than
+/// this is refused. See plan.md Phase 1.
+///
+/// Format history:
+/// - 1: original encoding set.
+/// - 2: directories with more than `fsmerkle::HAMT_DIR_THRESHOLD` entries
+///   are stored as HAMT roots (see docs/hamt.md). Format-1 repositories
+///   remain fully supported read/write and never receive HAMT objects.
+pub const CURRENT_FORMAT: u32 = 2;
+
+/// First repository format whose directories may use the HAMT encoding.
+pub const HAMT_DIRS_FORMAT: u32 = 2;
+
+/// Oldest Ivaldi version that understands `CURRENT_FORMAT`. Written into
+/// `.ivaldi/FORMAT` purely so the "too new" error can name a version to
+/// install; the actual gate is the format number.
+const MIN_IVALDI: &str = "0.1.2";
+
+/// Parsed `.ivaldi/FORMAT`. A missing file means format 0 (repositories
+/// created before FORMAT existed) and is always openable.
+#[derive(Debug, Clone)]
+pub struct RepoFormat {
+    pub version: u32,
+    pub min_ivaldi: String,
+}
+
+/// Write `.ivaldi/FORMAT` as plain `key = value` lines. The line format is
+/// deliberate: an older or newer binary can read the keys it knows and ignore
+/// the rest, which a strict struct decode could not.
+fn write_format(ivaldi_dir: &Path) -> std::io::Result<()> {
+    // ponytail: `features` is empty until a real optional feature exists;
+    // add feature-gating on open when one does.
+    let body = format!("format = {CURRENT_FORMAT}\nmin_ivaldi = {MIN_IVALDI}\nfeatures =\n");
+    crate::atomic_io::atomic_write(&ivaldi_dir.join("FORMAT"), body.as_bytes())
+}
+
+/// Read `.ivaldi/FORMAT`. A missing file is format 0, not an error.
+pub fn read_format(ivaldi_dir: &Path) -> Result<RepoFormat, ForgeError> {
+    let path = ivaldi_dir.join("FORMAT");
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RepoFormat {
+                version: 0,
+                min_ivaldi: String::new(),
+            });
+        }
+        Err(e) => return Err(ForgeError::Io(e)),
+    };
+
+    let mut version = None;
+    let mut min_ivaldi = String::new();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "format" => {
+                version = Some(value.trim().parse::<u32>().map_err(|_| {
+                    ForgeError::Io(std::io::Error::other(format!(
+                        "{}: invalid format version {:?}",
+                        path.display(),
+                        value.trim()
+                    )))
+                })?);
+            }
+            "min_ivaldi" => min_ivaldi = value.trim().to_string(),
+            _ => {} // unknown key: forward-compatible, ignore
+        }
+    }
+
+    match version {
+        Some(version) => Ok(RepoFormat {
+            version,
+            min_ivaldi,
+        }),
+        None => Err(ForgeError::Io(std::io::Error::other(format!(
+            "{}: missing 'format' field",
+            path.display()
+        )))),
+    }
+}
+
+/// Refuse to open a repository whose format is newer than this binary supports.
+pub fn check_format(ivaldi_dir: &Path) -> Result<(), ForgeError> {
+    if ivaldi_dir.join("migrations/PENDING").exists() {
+        return Err(ForgeError::MigrationPending);
+    }
+    check_format_version(ivaldi_dir)
+}
+
+/// Format gate used only by the migration engine while its pending marker is
+/// deliberately present. Normal callers must use [`check_format`].
+pub(crate) fn check_format_while_migrating(ivaldi_dir: &Path) -> Result<(), ForgeError> {
+    check_format_version(ivaldi_dir)
+}
+
+fn check_format_version(ivaldi_dir: &Path) -> Result<(), ForgeError> {
+    let fmt = read_format(ivaldi_dir)?;
+    if fmt.version > CURRENT_FORMAT {
+        return Err(ForgeError::FormatTooNew {
+            found: fmt.version,
+            supported: CURRENT_FORMAT,
+            min_ivaldi: fmt.min_ivaldi,
+        });
+    }
+    Ok(())
+}
+
 /// Detect a .git/ directory and import basic refs info.
 /// Returns number of branches found, or 0 if no .git/.
 fn detect_and_import_git(work_dir: &Path, ivaldi_dir: &Path) -> usize {
@@ -109,24 +225,55 @@ fn detect_and_import_git(work_dir: &Path, ivaldi_dir: &Path) -> usize {
     // Import HEAD
     if let Ok(head_content) = fs::read_to_string(git_dir.join("HEAD")) {
         let head = head_content.trim();
-        if let Some(ref_path) = head.strip_prefix("ref: refs/heads/") {
-            // Write Ivaldi HEAD pointing to same branch
-            let _ = fs::write(
-                ivaldi_dir.join("HEAD"),
-                format!("ref: refs/heads/{}\n", ref_path),
+        if let Some(ref_path) = head.strip_prefix("ref: refs/heads/")
+            && crate::refname::validate_timeline_name(ref_path).is_ok()
+        {
+            // Write Ivaldi HEAD pointing to the same safe branch.
+            let _ = crate::atomic_io::atomic_write(
+                &ivaldi_dir.join("HEAD"),
+                format!("ref: refs/heads/{}\n", ref_path).as_bytes(),
             );
         }
     }
 
-    // Import branch names from .git/refs/heads/
+    // Import loose branch names recursively from .git/refs/heads/. Git branch
+    // names commonly contain slashes, so scanning only the first directory
+    // level silently omitted branches such as `feature/parser`.
     let git_heads = git_dir.join("refs").join("heads");
-    if let Ok(entries) = fs::read_dir(&git_heads) {
+    let mut pending = vec![git_heads.clone()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
-            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let ivaldi_ref = ivaldi_dir.join("refs/heads").join(&name);
-                // Create empty ref file (will be populated on first commit)
-                let _ = fs::write(&ivaldi_ref, "");
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let Ok(relative) = entry.path().strip_prefix(&git_heads).map(Path::to_path_buf) else {
+                continue;
+            };
+            let Some(name) = relative
+                .to_str()
+                .map(|name| name.replace(std::path::MAIN_SEPARATOR, "/"))
+            else {
+                continue;
+            };
+            let Ok(ivaldi_ref) = crate::refname::timeline_ref_path(ivaldi_dir, &name) else {
+                continue;
+            };
+            if let Some(parent) = ivaldi_ref.parent()
+                && fs::create_dir_all(parent).is_err()
+            {
+                continue;
+            }
+            if crate::atomic_io::atomic_write(&ivaldi_ref, b"").is_ok() {
                 imported += 1;
             }
         }
@@ -143,8 +290,16 @@ pub fn read_head(ivaldi_dir: &Path) -> Result<HeadRef, ForgeError> {
     let content = content.trim();
 
     if let Some(ref_path) = content.strip_prefix("ref: refs/heads/") {
+        crate::refname::validate_timeline_name(ref_path)
+            .map_err(|e| ForgeError::Io(std::io::Error::other(e.to_string())))?;
         Ok(HeadRef::Timeline(ref_path.to_string()))
     } else {
+        B3Hash::from_hex(content).ok_or_else(|| {
+            ForgeError::Io(std::io::Error::other(format!(
+                "{}: detached HEAD is not a full BLAKE3 hash",
+                head_path.display()
+            )))
+        })?;
         Ok(HeadRef::Detached(content.to_string()))
     }
 }
@@ -153,9 +308,21 @@ pub fn read_head(ivaldi_dir: &Path) -> Result<HeadRef, ForgeError> {
 pub fn write_head(ivaldi_dir: &Path, head: &HeadRef) -> Result<(), ForgeError> {
     let head_path = ivaldi_dir.join("HEAD");
     let content = match head {
-        HeadRef::Timeline(name) => format!("ref: refs/heads/{}\n", name),
-        HeadRef::Detached(hash) => format!("{}\n", hash),
+        HeadRef::Timeline(name) => {
+            crate::refname::validate_timeline_name(name)
+                .map_err(|e| ForgeError::Io(std::io::Error::other(e.to_string())))?;
+            format!("ref: refs/heads/{}\n", name)
+        }
+        HeadRef::Detached(hash) => {
+            B3Hash::from_hex(hash).ok_or_else(|| {
+                ForgeError::Io(std::io::Error::other(
+                    "detached HEAD must be a full BLAKE3 hash",
+                ))
+            })?;
+            format!("{}\n", hash)
+        }
     };
+    crate::failpoint::fail_point("head.before_write");
     crate::atomic_io::atomic_write(&head_path, content.as_bytes()).map_err(ForgeError::Io)
 }
 
@@ -194,6 +361,18 @@ pub enum ForgeError {
     AlreadyExists(PathBuf),
     #[error("not an Ivaldi repository")]
     NotARepo,
+    #[error(
+        "repository format v{found} is newer than this Ivaldi supports (up to v{supported}); upgrade to Ivaldi >= {min_ivaldi}"
+    )]
+    FormatTooNew {
+        found: u32,
+        supported: u32,
+        min_ivaldi: String,
+    },
+    #[error(
+        "repository has an interrupted format migration; run `ivaldi migrate` to restore and retry, or `ivaldi migrate --rollback`"
+    )]
+    MigrationPending,
 }
 
 #[cfg(test)]
@@ -219,6 +398,60 @@ mod tests {
         assert!(ivaldi.join("stage").is_dir());
         assert!(ivaldi.join("HEAD").is_file());
         assert!(ivaldi.join("config").is_file());
+        assert!(ivaldi.join("FORMAT").is_file());
+    }
+
+    #[test]
+    fn format_roundtrips_current() {
+        let dir = tempfile::tempdir().unwrap();
+        forge(dir.path()).unwrap();
+        let ivaldi = dir.path().join(".ivaldi");
+
+        let fmt = read_format(&ivaldi).unwrap();
+        assert_eq!(fmt.version, CURRENT_FORMAT);
+        assert_eq!(fmt.min_ivaldi, MIN_IVALDI);
+        check_format(&ivaldi).unwrap(); // current format opens fine
+    }
+
+    #[test]
+    fn missing_format_is_version_zero() {
+        // Pre-FORMAT repositories have no FORMAT file and must still open.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path()).unwrap();
+        assert_eq!(read_format(dir.path()).unwrap().version, 0);
+        check_format(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn newer_format_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("FORMAT"),
+            format!("format = {}\nmin_ivaldi = 9.9.9\n", CURRENT_FORMAT + 1),
+        )
+        .unwrap();
+
+        match check_format(dir.path()) {
+            Err(ForgeError::FormatTooNew {
+                found, min_ivaldi, ..
+            }) => {
+                assert_eq!(found, CURRENT_FORMAT + 1);
+                assert_eq!(min_ivaldi, "9.9.9");
+            }
+            other => panic!("expected FormatTooNew, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored() {
+        // Forward compatibility: a future key must not break an older reader.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("FORMAT"),
+            format!("format = {CURRENT_FORMAT}\nfuture_thing = enabled\n"),
+        )
+        .unwrap();
+        assert_eq!(read_format(dir.path()).unwrap().version, CURRENT_FORMAT);
     }
 
     #[test]
@@ -228,6 +461,28 @@ mod tests {
 
         let head = read_head(&dir.path().join(".ivaldi")).unwrap();
         assert_eq!(head, HeadRef::Timeline("main".to_string()));
+    }
+
+    #[test]
+    fn forge_imports_nested_loose_git_branches() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = dir.path().join(".git");
+        fs::create_dir_all(git.join("refs/heads/feature")).unwrap();
+        fs::write(git.join("HEAD"), "ref: refs/heads/feature/parser\n").unwrap();
+        fs::write(
+            git.join("refs/heads/feature/parser"),
+            "0000000000000000000000000000000000000000\n",
+        )
+        .unwrap();
+
+        let result = forge(dir.path()).unwrap();
+        assert_eq!(result.git_imported, 1);
+        let ivaldi = dir.path().join(".ivaldi");
+        assert_eq!(
+            read_head(&ivaldi).unwrap(),
+            HeadRef::Timeline("feature/parser".into())
+        );
+        assert!(ivaldi.join("refs/heads/feature/parser").is_file());
     }
 
     #[test]
@@ -273,6 +528,17 @@ mod tests {
 
         let head = read_head(&ivaldi_dir).unwrap();
         assert_eq!(head, HeadRef::Detached(hash.to_string()));
+    }
+
+    #[test]
+    fn detached_head_requires_full_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        forge(dir.path()).unwrap();
+        let ivaldi_dir = dir.path().join(".ivaldi");
+
+        assert!(write_head(&ivaldi_dir, &HeadRef::Detached("short".into())).is_err());
+        fs::write(ivaldi_dir.join("HEAD"), "not-a-hash\n").unwrap();
+        assert!(read_head(&ivaldi_dir).is_err());
     }
 
     #[test]

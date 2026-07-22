@@ -13,7 +13,7 @@ Command-line interface for Ivaldi VCS, built with `clap`.
 | `status [--json]` | | Show repository status |
 | `whereami` | `wai` | Show current position |
 | `log [--format short\|medium\|full\|json]` | | View commit history |
-| `whodidit <file> [--summary]` | `blame` | Line-by-line seal attribution |
+| `whodidit <file> [--summary]` | `wdi` | Line-by-line seal attribution |
 | `diff` | | Compare changes |
 | `discard [files]` | | Remove files from the gathered set (none = everything) |
 | `reverse --all` | | Throw away all uncommitted changes, restore from last seal (destructive!) |
@@ -27,21 +27,29 @@ Command-line interface for Ivaldi VCS, built with `clap`.
 | `weld --last N` / `weld START to END` | `w` | Combine seal range into one (linear history) |
 | `config` | | View/modify settings |
 | `exclude <patterns>` | | Add to .ivaldiignore |
-| `portal add/list/remove` | | Manage remotes (HTTPS / SSH / `ivaldi://`) |
+| `skip <paths>` / `skip --list` | | Temporarily exclude paths from staging (repo-local, never committed or pushed) |
+| `unskip <paths>` | | Stop excluding paths from staging |
+| `portal add/list/remove/set-default` | | Manage remotes (HTTPS / SSH / `ivaldi://`); the default portal is the upload/sync target |
 | `auth login/status/logout [--gitlab]` | | OAuth (GitHub or GitLab device flow) |
 | `download <url>` | | Clone via HTTPS / SSH / `ivaldi://` (auto-detected from URL) |
-| `upload` | | Push via HTTPS / SSH / `ivaldi://` (auto-detected from portal) |
+| `upload [--portal P]` | | Push via HTTPS / SSH / `ivaldi://` (auto-detected from portal; default portal unless `--portal` names one) |
 | `scout` | | Discover remote branches (HTTPS / SSH) |
 | `harvest <name>` | | Fetch specific branches (HTTPS / SSH) |
-| `sync [branch]` | | Pull remote changes, delta only (HTTPS) |
+| `sync [branch] [--force] [--portal P]` | | Pull remote changes, delta only (HTTPS; `--force` discards uncommitted changes instead of refusing) |
 | `serve [--bind addr:port]` | | Run an `ivaldi://` peer server |
 | `peer trust/list/forget/whoami/known` | | Manage peer pubkey allowlists + TOFU known servers |
 | `review create/list/show/diff/comment/approve/request-changes/merge/close/reopen` | `rv` | Local code review system |
+| `verify [--full] [--json]` | | Check repository integrity (`--full` re-hashes every stored object) |
+| `prove <seal>` / `prove --check R [--root HEX]` | | Emit or verify an MMR inclusion receipt for a seal (no git equivalent) |
+| `rescue [--out dir] [--json]` | | Recover files from a damaged repository, bypassing refs and the MMR |
+| `doctor [--quick] [--json]` | | Diagnose a repository and print recovery guidance |
 | `completions <shell>` | | Print a bash/zsh/fish/powershell/elvish completion script |
 | `man [--out dir]` | | Generate man pages (used by `make install-extras`) |
 
 `timeline list`, `portal list`, and `status` accept `--json` for scripting;
-`log --format json` does the same for history.
+`log --format json` does the same for history. `verify`, `rescue`, and
+`doctor` all accept `--json`, and `verify`/`doctor` exit non-zero when the
+repository has problems.
 
 ## Global Flags
 
@@ -73,6 +81,12 @@ ivaldi reseal "better message"             # and/or replace the message
 
 # Stage only some hunks of a file
 ivaldi gather -p src/main.rs               # y/n per hunk; a=rest, d=skip rest, q=quit
+
+# Keep a file out of seals temporarily (e.g. a lockfile or test output that
+# changed locally but shouldn't be pushed) — no .ivaldiignore edit needed
+ivaldi skip Cargo.lock                     # gather/seal ignore it from now on
+ivaldi skip --list                         # show what's excluded
+ivaldi unskip Cargo.lock                   # back to normal staging
 
 # Going back
 ivaldi undo swift-eagle                    # new seal that removes swift-eagle's changes
@@ -137,7 +151,18 @@ ivaldi download --strict-peer ivaldi://1.2.3.4:9418/main       # refuse unknowns
 
 # Ignore patterns
 ivaldi exclude "*.log" "build/" "node_modules/"
+
+# Explicit repository-format upgrade and verified rollback
+ivaldi migrate
+ivaldi migrate --rollback
 ```
+
+`migrate` promotes an older, still-readable repository to the current write
+format. It creates and verifies a complete checksummed snapshot before changing
+the repository. Rollback is available until the first attempted mutating
+command; read-only inspection does not invalidate it. See
+[repository-format.md](repository-format.md) for interruption and recovery
+semantics.
 
 ## Config flags
 

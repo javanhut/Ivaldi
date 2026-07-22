@@ -339,9 +339,22 @@ impl RemoteView {
                     }
                     let mut repo = crate::repo::Repo::open(&work_dir).map_err(|e| e.to_string())?;
                     let timeline = repo.current_timeline().map_err(|e| e.to_string())?;
-                    crate::sync::sync_timeline(&client, &mut repo, &owner, &repo_name, &timeline)
-                        .map(|_| "Sync complete".to_string())
-                        .map_err(|e| e.to_string())
+                    // The user explicitly triggered this sync from the TUI,
+                    // which is their consent (equivalent to `sync --yes`);
+                    // this background thread has no stdin to prompt on.
+                    // ponytail: a proper in-TUI confirm dialog showing the
+                    // incoming count is the upgrade path.
+                    crate::sync::sync_timeline(
+                        &client,
+                        &mut repo,
+                        &owner,
+                        &repo_name,
+                        &timeline,
+                        &mut |_, _| true,
+                        false,
+                    )
+                    .map(|_| "Sync complete".to_string())
+                    .map_err(|e| e.to_string())
                 })();
                 let _ = tx.send(BgResult::SyncDone(result));
             });

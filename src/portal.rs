@@ -408,6 +408,22 @@ impl PortalManager {
             .find(|p| p.matches_repr(owner_repo)))
     }
 
+    /// Make `owner_repo` the default portal by moving it to the front of the
+    /// list (the default is the first entry). Returns false if no such portal
+    /// is configured; the list is left unchanged in that case.
+    pub fn set_default(&self, owner_repo: &str) -> Result<bool, PortalError> {
+        let mut portals = self.list()?;
+        let Some(pos) = portals.iter().position(|p| p.matches_repr(owner_repo)) else {
+            return Ok(false);
+        };
+        if pos > 0 {
+            let portal = portals.remove(pos);
+            portals.insert(0, portal);
+            self.save(&portals)?;
+        }
+        Ok(true)
+    }
+
     fn save(&self, portals: &[Portal]) -> Result<(), PortalError> {
         let mut lines = Vec::new();
         for portal in portals {
@@ -815,6 +831,45 @@ mod tests {
 
         let default = mgr.get_default().unwrap().unwrap();
         assert_eq!(default.to_string_repr(), "first/repo");
+    }
+
+    #[test]
+    fn set_default_reorders_and_persists() {
+        let (_dir, mgr) = setup();
+        mgr.add(&Portal::parse("first/repo").unwrap()).unwrap();
+        mgr.add(&Portal::parse("second/repo").unwrap()).unwrap();
+        mgr.add(
+            &Portal::parse("third/repo")
+                .unwrap()
+                .with_base_url("git@example.com:third/repo.git"),
+        )
+        .unwrap();
+
+        // Unknown portal is a miss; the order is unchanged.
+        assert!(!mgr.set_default("nope/repo").unwrap());
+        assert_eq!(
+            mgr.get_default().unwrap().unwrap().to_string_repr(),
+            "first/repo"
+        );
+
+        // Case-insensitive, and the new order persists to disk (list()
+        // re-reads the file on every call).
+        assert!(mgr.set_default("SECOND/REPO").unwrap());
+        let list = mgr.list().unwrap();
+        let order: Vec<String> = list.iter().map(|p| p.to_string_repr()).collect();
+        assert_eq!(order, vec!["second/repo", "first/repo", "third/repo"]);
+        // Reordering must not drop per-portal extras like an SSH base URL.
+        assert_eq!(
+            list[2].base_url.as_deref(),
+            Some("git@example.com:third/repo.git")
+        );
+
+        // Already the default: a no-op success.
+        assert!(mgr.set_default("second/repo").unwrap());
+        assert_eq!(
+            mgr.get_default().unwrap().unwrap().to_string_repr(),
+            "second/repo"
+        );
     }
 
     #[test]

@@ -14,8 +14,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use crate::cas::{Cas, CasError};
-use crate::filechunk::{read_uvarint, write_uvarint};
+use crate::filechunk::write_uvarint;
 use crate::hash::B3Hash;
+use crate::reader::ByteReader;
 
 /// The kind of a filesystem node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +34,13 @@ impl fmt::Display for NodeKind {
         }
     }
 }
+
+/// Directories with MORE than this many entries are stored as HAMT roots
+/// (when the repository format allows it — `Cas::hamt_dirs`). The rule is
+/// part of the on-disk format: it must be deterministic on content so the
+/// same directory always produces the same root hash. Never change this
+/// value without a repository format bump.
+pub const HAMT_DIR_THRESHOLD: usize = 256;
 
 /// File mode constants.
 pub const MODE_FILE: u32 = 0o100644;
@@ -142,53 +150,41 @@ impl TreeNode {
 }
 
 /// Parse canonical tree bytes back into a TreeNode.
+///
+/// Bounds-checked throughout: a truncated buffer or a bogus entry count returns
+/// a typed error instead of panicking or pre-allocating from the count.
 pub fn parse_tree(data: &[u8]) -> Result<TreeNode, FsMerkleError> {
-    let mut offset = 0;
+    let mut r = ByteReader::new(data);
 
-    let (count, n) = read_uvarint(&data[offset..]);
-    offset += n;
-
-    let mut entries = Vec::with_capacity(count as usize);
+    let count = r.uvarint()?;
+    let mut entries = Vec::new();
     for _ in 0..count {
-        let (mode, n) = read_uvarint(&data[offset..]);
-        offset += n;
-
-        let (name_len, n) = read_uvarint(&data[offset..]);
-        offset += n;
-
-        let name_end = offset + name_len as usize;
-        if name_end > data.len() {
-            return Err(FsMerkleError::InvalidData("truncated entry name".into()));
-        }
-        let name = String::from_utf8(data[offset..name_end].to_vec())
-            .map_err(|_| FsMerkleError::InvalidData("invalid UTF-8 in name".into()))?;
-        offset = name_end;
-
-        if offset >= data.len() {
-            return Err(FsMerkleError::InvalidData("truncated entry kind".into()));
-        }
-        let kind = match data[offset] {
+        let mode = r.uvarint()? as u32;
+        let name = r.string("name")?;
+        let kind = match r.u8()? {
             1 => NodeKind::Blob,
             2 => NodeKind::Tree,
             k => return Err(FsMerkleError::InvalidData(format!("unknown kind: {}", k))),
         };
-        offset += 1;
-
-        if offset + 32 > data.len() {
-            return Err(FsMerkleError::InvalidData("truncated entry hash".into()));
-        }
-        let hash = B3Hash::from_slice(&data[offset..offset + 32]).unwrap();
-        offset += 32;
-
+        let hash = B3Hash::from_bytes(r.array::<32>()?);
         entries.push(Entry {
             name,
-            mode: mode as u32,
+            mode,
             kind,
             hash,
         });
     }
 
-    Ok(TreeNode { entries })
+    r.finish()?; // reject trailing data after the tree
+
+    // Decode-side validation, not just encode-side: tree-node bytes arrive
+    // verbatim from remote peers (the CAS only checks the hash), and every
+    // materialize path joins entry names into filesystem paths. Rejecting
+    // "../", "/", ".", duplicates, and bad modes here protects every
+    // consumer of decoded trees at once — no bypass via a hostile peer.
+    let node = TreeNode { entries };
+    node.validate()?;
+    Ok(node)
 }
 
 /// Parse canonical blob bytes back into content.
@@ -232,6 +228,12 @@ impl<'a> FsStore<'a> {
         Self { cas }
     }
 
+    /// The underlying CAS, for walkers that must see raw object bytes
+    /// (encoding-aware traversal) rather than the flattened directory view.
+    pub fn cas(&self) -> &'a dyn Cas {
+        self.cas
+    }
+
     /// Store a blob, returning its hash and size.
     pub fn put_blob(&self, content: &[u8]) -> Result<(B3Hash, usize), FsMerkleError> {
         let canonical = BlobNode::canonical_bytes(content);
@@ -240,8 +242,15 @@ impl<'a> FsStore<'a> {
         Ok((hash, content.len()))
     }
 
-    /// Store a tree from entries, returning its hash.
+    /// Store a directory from entries, returning its hash. Directories over
+    /// `HAMT_DIR_THRESHOLD` entries are stored as HAMT roots when the
+    /// repository format allows it (`Cas::hamt_dirs`); everything else is a
+    /// classic tree node. The rule is deterministic on content, so the same
+    /// directory always gets the same hash within a repository.
     pub fn put_tree(&self, entries: Vec<Entry>) -> Result<B3Hash, FsMerkleError> {
+        if self.cas.hamt_dirs() && entries.len() > HAMT_DIR_THRESHOLD {
+            return Ok(crate::hamt::HamtStore::new(self.cas).put_root(entries)?);
+        }
         let tree = TreeNode::new(entries);
         let canonical = tree.canonical_bytes()?;
         let hash = B3Hash::digest(&canonical);
@@ -249,9 +258,15 @@ impl<'a> FsStore<'a> {
         Ok(hash)
     }
 
-    /// Load a tree by hash.
+    /// Load a directory by hash. HAMT roots are transparently flattened to a
+    /// `TreeNode`, so callers see one directory representation regardless of
+    /// the on-disk encoding.
     pub fn load_tree(&self, hash: B3Hash) -> Result<TreeNode, FsMerkleError> {
         let data = self.cas.get(hash)?;
+        if crate::hamt::is_hamt_node(&data) {
+            let entries = crate::hamt::HamtStore::new(self.cas).entries(hash)?;
+            return Ok(TreeNode { entries }); // already name-sorted and validated
+        }
         parse_tree(&data)
     }
 
@@ -459,17 +474,35 @@ fn diff_recursive(
         return Ok(());
     }
 
-    let a_tree = if a_hash == B3Hash::ZERO {
-        TreeNode { entries: vec![] }
-    } else {
-        store.load_tree(a_hash)?
-    };
+    let a_data = (a_hash != B3Hash::ZERO)
+        .then(|| store.cas.get(a_hash))
+        .transpose()?;
+    let b_data = (b_hash != B3Hash::ZERO)
+        .then(|| store.cas.get(b_hash))
+        .transpose()?;
 
-    let b_tree = if b_hash == B3Hash::ZERO {
-        TreeNode { entries: vec![] }
-    } else {
-        store.load_tree(b_hash)?
+    // Both sides HAMT: structural diff proportional to the change, not the
+    // directory size. Flattening a large HAMT would read every node just to
+    // report one edit. Mixed encodings (a directory crossing the threshold
+    // between seals) fall through to the flatten-and-compare path below.
+    if let (Some(a), Some(b)) = (&a_data, &b_data)
+        && crate::hamt::is_hamt_node(a)
+        && crate::hamt::is_hamt_node(b)
+    {
+        return diff_hamt_dirs(a_hash, b_hash, prefix, store, changes);
+    }
+
+    let flatten = |hash: B3Hash, data: Option<Vec<u8>>| -> Result<TreeNode, FsMerkleError> {
+        match data {
+            None => Ok(TreeNode { entries: vec![] }),
+            Some(d) if crate::hamt::is_hamt_node(&d) => Ok(TreeNode {
+                entries: crate::hamt::HamtStore::new(store.cas).entries(hash)?,
+            }),
+            Some(d) => parse_tree(&d),
+        }
     };
+    let a_tree = flatten(a_hash, a_data)?;
+    let b_tree = flatten(b_hash, b_data)?;
 
     let a_map: HashMap<&str, &Entry> = a_tree
         .entries
@@ -547,11 +580,75 @@ fn diff_recursive(
     Ok(())
 }
 
+/// Diff two HAMT-encoded directories via the structural HAMT diff, mapping
+/// its per-name changes onto the `Change` shape `diff_recursive` emits and
+/// recursing into changed subdirectories.
+fn diff_hamt_dirs(
+    a_hash: B3Hash,
+    b_hash: B3Hash,
+    prefix: &str,
+    store: &FsStore<'_>,
+    changes: &mut Vec<Change>,
+) -> Result<(), FsMerkleError> {
+    for ch in crate::hamt::HamtStore::new(store.cas).diff(a_hash, b_hash)? {
+        let child_path = if prefix.is_empty() {
+            ch.name
+        } else {
+            format!("{}/{}", prefix, ch.name)
+        };
+        match (ch.old, ch.new) {
+            (None, Some(n)) => changes.push(Change {
+                path: child_path,
+                kind: ChangeKind::Added,
+                old_hash: B3Hash::ZERO,
+                new_hash: n.hash,
+                old_mode: 0,
+                new_mode: n.mode,
+            }),
+            (Some(o), None) => changes.push(Change {
+                path: child_path,
+                kind: ChangeKind::Deleted,
+                old_hash: o.hash,
+                new_hash: B3Hash::ZERO,
+                old_mode: o.mode,
+                new_mode: 0,
+            }),
+            (Some(o), Some(n)) => {
+                if o.kind != n.kind {
+                    changes.push(Change {
+                        path: child_path,
+                        kind: ChangeKind::TypeChange,
+                        old_hash: o.hash,
+                        new_hash: n.hash,
+                        old_mode: o.mode,
+                        new_mode: n.mode,
+                    });
+                } else if o.hash != n.hash {
+                    if o.kind == NodeKind::Tree {
+                        diff_recursive(o.hash, n.hash, &child_path, store, changes)?;
+                    } else {
+                        changes.push(Change {
+                            path: child_path,
+                            kind: ChangeKind::Modified,
+                            old_hash: o.hash,
+                            new_hash: n.hash,
+                            old_mode: o.mode,
+                            new_mode: n.mode,
+                        });
+                    }
+                }
+            }
+            (None, None) => unreachable!("HamtChange always has old or new"),
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Validation helpers
 // ---------------------------------------------------------------------------
 
-fn validate_name(name: &str) -> Result<(), FsMerkleError> {
+pub(crate) fn validate_name(name: &str) -> Result<(), FsMerkleError> {
     if name.is_empty() {
         return Err(FsMerkleError::InvalidName("empty filename".into()));
     }
@@ -570,7 +667,7 @@ fn validate_name(name: &str) -> Result<(), FsMerkleError> {
     Ok(())
 }
 
-fn validate_mode(mode: u32, kind: NodeKind) -> Result<(), FsMerkleError> {
+pub(crate) fn validate_mode(mode: u32, kind: NodeKind) -> Result<(), FsMerkleError> {
     match kind {
         NodeKind::Blob if mode != MODE_FILE && mode != MODE_EXEC && mode != MODE_SYMLINK => {
             Err(FsMerkleError::InvalidMode {
@@ -615,12 +712,94 @@ pub enum FsMerkleError {
 
     #[error("CAS error: {0}")]
     Cas(#[from] CasError),
+
+    #[error("malformed tree: {0}")]
+    Read(#[from] crate::reader::ReadError),
+}
+
+/// Boundary conversion for the HAMT directory encoding. CAS errors keep
+/// their type (`NotFound` drives fetch-on-demand paths); everything else
+/// flattens to `InvalidData` — fsmerkle callers only propagate.
+impl From<crate::hamt::HamtError> for FsMerkleError {
+    fn from(e: crate::hamt::HamtError) -> Self {
+        match e {
+            crate::hamt::HamtError::Cas(c) => FsMerkleError::Cas(c),
+            other => FsMerkleError::InvalidData(format!("hamt: {}", other)),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cas::MemoryCas;
+
+    fn big_entries(n: usize, salt: &str) -> Vec<Entry> {
+        (0..n)
+            .map(|i| Entry {
+                name: format!("f{:04}", i),
+                mode: MODE_FILE,
+                kind: NodeKind::Blob,
+                hash: B3Hash::digest(format!("{salt}{i}").as_bytes()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn put_tree_uses_hamt_over_threshold_when_enabled() {
+        let cas = MemoryCas::with_hamt_dirs();
+        let store = FsStore::new(&cas);
+
+        let small = store
+            .put_tree(big_entries(HAMT_DIR_THRESHOLD, "a"))
+            .unwrap();
+        assert!(!crate::hamt::is_hamt_node(&cas.get(small).unwrap()));
+
+        let big = store
+            .put_tree(big_entries(HAMT_DIR_THRESHOLD + 1, "a"))
+            .unwrap();
+        assert!(crate::hamt::is_hamt_node(&cas.get(big).unwrap()));
+
+        // Transparent flatten: same entries back, name-sorted.
+        let tree = store.load_tree(big).unwrap();
+        assert_eq!(tree.entries.len(), HAMT_DIR_THRESHOLD + 1);
+        assert_eq!(tree.entries, TreeNode::new(tree.entries.clone()).entries);
+    }
+
+    #[test]
+    fn put_tree_stays_fsmerkle_when_disabled() {
+        let cas = MemoryCas::new();
+        let store = FsStore::new(&cas);
+        let big = store.put_tree(big_entries(1000, "a")).unwrap();
+        assert!(!crate::hamt::is_hamt_node(&cas.get(big).unwrap()));
+    }
+
+    #[test]
+    fn diff_hamt_fast_path_and_mixed_encodings() {
+        let cas = MemoryCas::with_hamt_dirs();
+        let store = FsStore::new(&cas);
+        let n = HAMT_DIR_THRESHOLD + 10;
+
+        let mut old_entries = big_entries(n, "a");
+        let old = store.put_tree(old_entries.clone()).unwrap();
+        old_entries[7].hash = B3Hash::digest(b"edited");
+        let new = store.put_tree(old_entries.clone()).unwrap();
+
+        // HAMT vs HAMT: structural fast path.
+        let changes = diff_trees(old, new, &store).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "f0007");
+        assert_eq!(changes[0].kind, ChangeKind::Modified);
+
+        // HAMT vs classic tree (directory shrinks below the threshold):
+        // flatten-and-compare must report exactly the dropped entries.
+        old_entries.truncate(HAMT_DIR_THRESHOLD - 10);
+        let shrunk = store.put_tree(old_entries).unwrap();
+        assert!(!crate::hamt::is_hamt_node(&cas.get(shrunk).unwrap()));
+        let changes = diff_trees(new, shrunk, &store).unwrap();
+        assert_eq!(changes.len(), 20);
+        assert!(changes.iter().all(|c| c.kind == ChangeKind::Deleted));
+    }
 
     #[test]
     fn blob_hash_deterministic() {

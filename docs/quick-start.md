@@ -18,6 +18,7 @@ command to its Ivaldi equivalent.
 - [Authentication](#authentication)
 - [Merge strategies](#merge-strategies)
 - [Peer-to-peer sharing](#peer-to-peer-sharing)
+- [Health and recovery](#health-and-recovery)
 - [Command reference](#command-reference)
 - [Configuration](#configuration)
 - [Scripting and CI](#scripting-and-ci)
@@ -91,7 +92,7 @@ ivaldi reseal "Better message"     # Redo the last seal (message and/or staged c
 ivaldi status                      # Check workspace state
 ivaldi log --oneline               # View history
 ivaldi diff                        # Compare changes
-ivaldi whodidit src/main.rs        # Which seal last touched each line (blame)
+ivaldi whodidit src/main.rs        # Which seal last touched each line (alias: wdi)
 ivaldi whereami                    # Show current position (alias: wai)
 ivaldi exclude "*.tmp"             # Add patterns to .ivaldiignore
 ```
@@ -281,6 +282,37 @@ refuse anything not already in `~/.ivaldi/known_peers`.
 
 Deep dive: [p2p.md](p2p.md).
 
+## Health and recovery
+
+Ivaldi can check its own storage and get your files back even when a repository
+is damaged. None of these commands modify history.
+
+```bash
+# Check integrity. Fast by default; --full re-hashes every stored object.
+ivaldi verify
+ivaldi verify --full
+
+# Machine-readable report + non-zero exit on any problem (good for CI/cron).
+ivaldi verify --full --json
+
+# Diagnose a repository and get told what to do next.
+ivaldi doctor
+
+# Recover files from a damaged repo, bypassing refs and the MMR. Works even
+# when HEAD/refs are gone; writes recovered snapshots into the output dir.
+ivaldi rescue --out ./ivaldi-rescue
+```
+
+- **`verify`** validates the format, the MMR/leaf/checkpoint structure, and
+  (with `--full`) that every stored object still hashes to its own address.
+- **`doctor`** runs those checks and prints per-failure guidance — e.g. it
+  points a repo with a damaged history or corrupt objects at `rescue`.
+- **`rescue`** reads content directly from the object store, verifying every
+  object's hash before writing it out, so recovered files are guaranteed
+  intact. Corrupt or missing pieces are skipped and reported, never faked.
+
+Deep dives: [verify.md](verify.md), [rescue.md](rescue.md).
+
 ## Command reference
 
 | Command | Alias | Description |
@@ -291,7 +323,7 @@ Deep dive: [p2p.md](p2p.md).
 | `status` | | Show workspace state |
 | `whereami` | `wai` | Show current position |
 | `log` | | View commit history |
-| `whodidit <file>` | `blame` | Show which seal last touched each line of a file |
+| `whodidit <file>` | `wdi` | Show which seal last touched each line of a file |
 | `diff` | | Compare changes |
 | `reseal` | | Redo the most recent seal (new message and/or staged changes) |
 | `discard [files]` | | Remove files from the gathered set (none = everything) |
@@ -316,6 +348,9 @@ Deep dive: [p2p.md](p2p.md).
 | `serve` | | Run an `ivaldi://` peer server for trusted users |
 | `peer` | | Manage trusted peers + known servers (`trust` / `list` / `forget` / `whoami` / `known`) |
 | `review` | `rv` | Local code review system (see [review.md](review.md)) |
+| `verify` | | Check repository integrity (`--full` re-hashes objects; see [verify.md](verify.md)) |
+| `rescue` | | Recover files from a damaged repo (see [rescue.md](rescue.md)) |
+| `doctor` | | Diagnose a repository and print recovery guidance |
 | `completions <shell>` | | Print a shell completion script (bash/zsh/fish/powershell/elvish) |
 | `man [--out dir]` | | Generate man pages (used by `make install-extras`) |
 
@@ -353,3 +388,7 @@ More detail: [config.md](config.md), [color.md](color.md).
 `status`, `timeline list`, and `portal list` accept `--json`, and
 `log --format json` emits machine-readable history — handy for scripts
 and CI. `make install-extras` installs man pages and shell completions.
+
+Running Ivaldi as your primary VCS while keeping a Git backup? See
+[dogfooding.md](dogfooding.md) and
+[`scripts/mirror-to-git.sh`](../scripts/mirror-to-git.sh).

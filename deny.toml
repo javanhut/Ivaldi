@@ -1,0 +1,47 @@
+# cargo-deny configuration. Run: cargo deny check
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# Security advisories (RUSTSEC) are denied by default in current cargo-deny;
+# yanked crates are treated the same.
+yanked = "deny"
+
+[licenses]
+# Permissive set actually present in this AGPL-3.0 project's dependency tree,
+# plus the project's own AGPL-3.0-only license.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "AGPL-3.0-only",
+]
+
+# Two transitive deps carry licenses we don't want to allow tree-wide, so we
+# scope them to exactly those crates rather than blanket-allowing the license.
+[[licenses.exceptions]]
+allow = ["CDLA-Permissive-2.0"]
+crate = "webpki-roots" # via ureq (rustls trust anchors)
+
+[[licenses.exceptions]]
+allow = ["WTFPL"]
+crate = "terminfo" # via termwiz (TUI)
+
+[bans]
+# A large dependency tree will legitimately carry duplicate versions; warn
+# rather than fail CI on it. No `*` version requirements are allowed.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Everything must come from crates.io; no unknown registries or git sources.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

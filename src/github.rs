@@ -18,6 +18,8 @@ const ACCEPT: &str = "application/vnd.github.v3+json";
 pub struct GitHubClient {
     token: Option<String>,
     agent: ureq::Agent,
+    api_base: String,
+    raw_base: String,
 }
 
 fn make_agent() -> ureq::Agent {
@@ -88,6 +90,8 @@ impl GitHubClient {
         Self {
             token,
             agent: make_agent(),
+            api_base: GITHUB_API.into(),
+            raw_base: "https://raw.githubusercontent.com".into(),
         }
     }
 
@@ -95,6 +99,19 @@ impl GitHubClient {
         Self {
             token: Some(token.into()),
             agent: make_agent(),
+            api_base: GITHUB_API.into(),
+            raw_base: "https://raw.githubusercontent.com".into(),
+        }
+    }
+
+    /// Construct a client for a GitHub-compatible API endpoint. Primarily
+    /// useful for enterprise installations and deterministic protocol tests.
+    pub fn with_base_urls(api_base: impl Into<String>, raw_base: impl Into<String>) -> Self {
+        Self {
+            token: None,
+            agent: make_agent(),
+            api_base: api_base.into().trim_end_matches('/').to_string(),
+            raw_base: raw_base.into().trim_end_matches('/').to_string(),
         }
     }
 
@@ -120,10 +137,10 @@ impl GitHubClient {
     }
 
     fn url(&self, path: &str) -> String {
-        if path.starts_with("https://") {
+        if path.starts_with("https://") || path.starts_with("http://") {
             path.to_string()
         } else {
-            format!("{}{}", GITHUB_API, path)
+            format!("{}{}", self.api_base, path)
         }
     }
 
@@ -298,10 +315,7 @@ impl GitHubClient {
         path: &str,
         git_ref: &str,
     ) -> Result<Vec<u8>, GitHubError> {
-        let url = format!(
-            "https://raw.githubusercontent.com/{}/{}/{}/{}",
-            owner, repo, git_ref, path
-        );
+        let url = format!("{}/{}/{}/{}/{}", self.raw_base, owner, repo, git_ref, path);
         let resp = self.get(&url)?;
         let mut buf = Vec::new();
         resp.into_body()

@@ -3,3 +3,5 @@
 /target
 FEATURE_REFERENCE.md
 .lazy/
+plan.md
+*/target*

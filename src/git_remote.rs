@@ -19,6 +19,15 @@ use crate::remote::RemoteBranch;
 
 const GITHUB_BASE: &str = "https://github.com";
 
+/// Hard ceiling on a single decoded git object (mirrors
+/// `pack::MAX_DELTA_OUTPUT`). Any host or MITM'd anonymous clone can hand us
+/// a pack; a forged size varint must never drive a giant allocation.
+const MAX_GIT_OBJECT_SIZE: usize = 1 << 30; // 1 GiB
+/// Maximum nesting depth for tree walks / imports. Real repos are a few
+/// dozen levels deep; an attacker-shaped pack can nest trees (or reference a
+/// tree from itself) to blow the stack of a recursive walker.
+const MAX_TREE_DEPTH: usize = 512;
+
 /// Build an HTTP Basic auth header for a GitHub token.
 ///
 /// GitHub's smart-HTTP git endpoints (`github.com/.../info/refs`,
@@ -379,8 +388,15 @@ impl SmartHttpClient {
             })
             .collect();
 
-        // ---- Translate Ivaldi history to git objects.
+        // ---- Refuse a non-fast-forward push unless forced. Some hosts
+        // (git's default without receive.denyNonFastForwards) happily
+        // rewrite the branch, silently destroying remote seals.
         let mapping = HashMapping::new(&repo.ivaldi_dir);
+        if old_sha1 != zero {
+            check_push_fast_forward(repo, &mapping, branch, &old_sha1, head_idx, force)?;
+        }
+
+        // ---- Translate Ivaldi history to git objects.
         let export = crate::git_export::export_chain(repo, head_idx, &mapping, &server_has)
             .map_err(|e| GitRemoteError::Protocol(format!("git export: {}", e)))?;
         if export.objects.is_empty() {
@@ -402,9 +418,6 @@ impl SmartHttpClient {
         command_line.push('\0');
         command_line.push_str("report-status agent=ivaldi/0.1.0");
         command_line.push('\n');
-        // Force vs. non-fast-forward is enforced server-side (GitHub decides
-        // based on branch protection); there is no extra wire flag to set.
-        let _ = force;
 
         let mut body = Vec::new();
         body.extend(pkt_line(&command_line));
@@ -459,6 +472,46 @@ impl SmartHttpClient {
             .map_err(|e| GitRemoteError::Io(e.to_string()))?;
         Ok(bytes)
     }
+}
+
+/// Refuse a non-fast-forward smart-HTTP push unless `force` is set.
+///
+/// `old_sha1` is the remote's advertised tip for the branch (known non-zero
+/// by the caller). The push is a fast-forward only if that tip maps — via
+/// the SHA1↔BLAKE3 map — to a local leaf that is an ancestor of the local
+/// head being pushed. Anything else (unknown tip, unmapped tip,
+/// mapped-but-diverged tip) would overwrite remote seals on hosts that
+/// permit non-fast-forward updates. Runs entirely locally, BEFORE any bytes
+/// are POSTed.
+fn check_push_fast_forward(
+    repo: &crate::repo::Repo,
+    mapping: &crate::remote::HashMapping,
+    branch: &str,
+    old_sha1: &str,
+    head_idx: u64,
+    force: bool,
+) -> Result<(), GitRemoteError> {
+    if force {
+        return Ok(());
+    }
+    // ponytail: O(n) leaf scan; fine until repos get huge (mirrors the
+    // existing find_leaf_idx_by_hash pattern in sync::import).
+    let remote_tip_local_idx = mapping.get_blake3(old_sha1).and_then(|b3| {
+        (0..repo.commit_count())
+            .find(|&idx| matches!(repo.get_leaf(idx), Ok(Some(leaf)) if leaf.hash() == b3))
+    });
+    let is_ff = match remote_tip_local_idx {
+        Some(idx) => repo.is_ancestor(idx, head_idx).unwrap_or(false),
+        None => false,
+    };
+    if !is_ff {
+        return Err(GitRemoteError::Protocol(format!(
+            "remote timeline '{}' has seals you do not have (remote tip {}) — \
+             run 'ivaldi harvest' to sync first, or pass --force to overwrite remote history",
+            branch, old_sha1
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -879,7 +932,13 @@ struct PackedEntry {
 /// One resolved delta entry: `(entry index, object data, sha1, object kind)`.
 type ResolvedDelta = (usize, Vec<u8>, String, GitObjectKind);
 
-pub(crate) fn parse_packfile(data: &[u8]) -> Result<HashMap<String, GitObject>, GitRemoteError> {
+/// Parse a git packfile into a `sha1 → object` map.
+///
+/// Network-facing: every count, size, and varint in the pack is validated
+/// against the actual byte length before it drives an allocation, and each
+/// object's zlib stream is capped at its declared size. Public so the fuzz
+/// target `git_parse_packfile` can exercise it.
+pub fn parse_packfile(data: &[u8]) -> Result<HashMap<String, GitObject>, GitRemoteError> {
     if data.len() < 12 || &data[..4] != b"PACK" {
         return Err(GitRemoteError::Protocol("invalid packfile header".into()));
     }
@@ -899,12 +958,22 @@ pub(crate) fn parse_packfile(data: &[u8]) -> Result<HashMap<String, GitObject>, 
             .try_into()
             .map_err(|_| GitRemoteError::Protocol("truncated packfile header".into()))?,
     ) as usize;
+    // The smallest possible entry is a 1-byte header plus an ~8-byte zlib
+    // stream; a claimed count beyond that is corrupt. Checked BEFORE the
+    // `with_capacity` below so a forged 4-byte count can't allocate gigabytes.
+    if count > data.len() / 9 {
+        return Err(GitRemoteError::Protocol(format!(
+            "corrupt packfile: claims {} entries but is only {} bytes",
+            count,
+            data.len()
+        )));
+    }
 
     let mut idx = 12usize;
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         let offset = idx;
-        let (kind, header_len, _size) = parse_object_header(&data[idx..])?;
+        let (kind, header_len, size) = parse_object_header(&data[idx..])?;
         idx += header_len;
 
         let kind = match kind {
@@ -933,7 +1002,7 @@ pub(crate) fn parse_packfile(data: &[u8]) -> Result<HashMap<String, GitObject>, 
             }
         };
 
-        let (inflated, consumed) = inflate_from(&data[idx..])?;
+        let (inflated, consumed) = inflate_from(&data[idx..], size)?;
         idx += consumed;
         entries.push(PackedEntry {
             offset,
@@ -1054,8 +1123,8 @@ fn parse_object_header(data: &[u8]) -> Result<(u8, usize, usize), GitRemoteError
         .first()
         .ok_or_else(|| GitRemoteError::Protocol("truncated object header".into()))?;
     let kind = (first >> 4) & 0x07;
-    let mut size = (first & 0x0f) as usize;
-    let mut shift = 4usize;
+    let mut size = (first & 0x0f) as u64;
+    let mut shift = 4u32;
     let mut used = 1usize;
     let mut byte = first;
 
@@ -1063,12 +1132,25 @@ fn parse_object_header(data: &[u8]) -> Result<(u8, usize, usize), GitRemoteError
         byte = *data
             .get(used)
             .ok_or_else(|| GitRemoteError::Protocol("truncated object header".into()))?;
-        size |= ((byte & 0x7f) as usize) << shift;
+        // A shift ≥ 64 is a malformed (or hostile) varint; without this cap
+        // the shift overflows and panics under overflow-checks.
+        if shift >= 64 {
+            return Err(GitRemoteError::Protocol(
+                "object header size varint too long".into(),
+            ));
+        }
+        size |= ((byte & 0x7f) as u64) << shift;
         shift += 7;
         used += 1;
     }
 
-    Ok((kind, used, size))
+    if size > MAX_GIT_OBJECT_SIZE as u64 {
+        return Err(GitRemoteError::Protocol(format!(
+            "object declares size {} which exceeds the {} byte limit",
+            size, MAX_GIT_OBJECT_SIZE
+        )));
+    }
+    Ok((kind, used, size as usize))
 }
 
 fn parse_ofs_delta_base(
@@ -1080,32 +1162,57 @@ fn parse_ofs_delta_base(
         .get(used)
         .ok_or_else(|| GitRemoteError::Protocol("truncated ofs-delta base".into()))?;
     used += 1;
-    let mut value = (byte & 0x7f) as usize;
+    let mut value = (byte & 0x7f) as u64;
     while byte & 0x80 != 0 {
+        // 10 continuation bytes already exceed any offset a real pack can
+        // hold; further bytes only overflow the accumulator.
+        if used >= 10 {
+            return Err(GitRemoteError::Protocol(
+                "ofs-delta base varint too long".into(),
+            ));
+        }
         byte = *data
             .get(used)
             .ok_or_else(|| GitRemoteError::Protocol("truncated ofs-delta base".into()))?;
         used += 1;
-        value = ((value + 1) << 7) | ((byte & 0x7f) as usize);
+        value = value
+            .checked_add(1)
+            .and_then(|v| v.checked_shl(7))
+            .map(|v| v | ((byte & 0x7f) as u64))
+            .ok_or_else(|| GitRemoteError::Protocol("ofs-delta base overflow".into()))?;
     }
+    let value = usize::try_from(value)
+        .map_err(|_| GitRemoteError::Protocol("ofs-delta base overflow".into()))?;
     current_offset
         .checked_sub(value)
         .map(|base| (base, used))
         .ok_or_else(|| GitRemoteError::Protocol("invalid ofs-delta base offset".into()))
 }
 
-fn inflate_from(data: &[u8]) -> Result<(Vec<u8>, usize), GitRemoteError> {
+/// Inflate one zlib stream, capped at `expected` bytes (the size the pack
+/// entry header declared). A stream producing more than declared is a zlib
+/// bomb; less is truncation. Both are hard errors.
+fn inflate_from(data: &[u8], expected: usize) -> Result<(Vec<u8>, usize), GitRemoteError> {
     let reader = Cursor::new(data);
-    let mut decoder = ZlibDecoder::new(reader);
+    let decoder = ZlibDecoder::new(reader);
+    // +1 so an over-long stream is detectable rather than silently clipped.
+    let mut limited = decoder.take(expected as u64 + 1);
     let mut out = Vec::new();
-    decoder
+    limited
         .read_to_end(&mut out)
         .map_err(|e| GitRemoteError::Protocol(format!("zlib decode failed: {}", e)))?;
-    let consumed = decoder.into_inner().position() as usize;
+    if out.len() != expected {
+        return Err(GitRemoteError::Protocol(format!(
+            "object inflated to {}+ bytes but its header declared {}",
+            out.len(),
+            expected
+        )));
+    }
+    let consumed = limited.into_inner().into_inner().position() as usize;
     Ok((out, consumed))
 }
 
-pub(crate) fn git_object_id(kind: GitObjectKind, data: &[u8]) -> String {
+pub fn git_object_id(kind: GitObjectKind, data: &[u8]) -> String {
     let kind_name = match kind {
         GitObjectKind::Commit => "commit",
         GitObjectKind::Tree => "tree",
@@ -1117,12 +1224,22 @@ pub(crate) fn git_object_id(kind: GitObjectKind, data: &[u8]) -> String {
     hex::encode(sha1_digest(&canonical))
 }
 
-fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, GitRemoteError> {
+/// Apply a git delta stream to `base`. Public so the fuzz target
+/// `git_apply_delta` can exercise it against arbitrary bytes.
+pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, GitRemoteError> {
     let mut cursor = 0usize;
     let base_size = read_varint(delta, &mut cursor)?;
     let result_size = read_varint(delta, &mut cursor)?;
     if base_size != base.len() {
         return Err(GitRemoteError::Protocol("delta base size mismatch".into()));
+    }
+    // Checked BEFORE `with_capacity`: a forged result-size varint must not
+    // drive the allocation (mirrors pack::MAX_DELTA_OUTPUT).
+    if result_size > MAX_GIT_OBJECT_SIZE {
+        return Err(GitRemoteError::Protocol(format!(
+            "delta declares result size {} which exceeds the {} byte limit",
+            result_size, MAX_GIT_OBJECT_SIZE
+        )));
     }
 
     let mut out = Vec::with_capacity(result_size);
@@ -1155,7 +1272,9 @@ fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, GitRemoteError> {
             if size == 0 {
                 size = 0x10000;
             }
-            let end = offset + size;
+            let end = offset
+                .checked_add(size)
+                .ok_or_else(|| GitRemoteError::Protocol("delta copy range overflow".into()))?;
             if end > base.len() {
                 return Err(GitRemoteError::Protocol(
                     "delta copy exceeds base size".into(),
@@ -1183,16 +1302,25 @@ fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, GitRemoteError> {
 }
 
 fn read_varint(data: &[u8], cursor: &mut usize) -> Result<usize, GitRemoteError> {
-    let mut shift = 0usize;
-    let mut value = 0usize;
+    let mut shift = 0u32;
+    let mut value = 0u64;
     loop {
         let byte = *data
             .get(*cursor)
             .ok_or_else(|| GitRemoteError::Protocol("truncated varint".into()))?;
         *cursor += 1;
-        value |= ((byte & 0x7f) as usize) << shift;
+        // Cap the shift so a run of continuation bytes can't overflow it
+        // (panic under overflow-checks) or wrap the accumulator.
+        if shift >= 64 {
+            return Err(GitRemoteError::Protocol("varint too long".into()));
+        }
+        value |= u64::from(byte & 0x7f)
+            .checked_shl(shift)
+            .filter(|v| v >> shift == u64::from(byte & 0x7f))
+            .ok_or_else(|| GitRemoteError::Protocol("varint overflow".into()))?;
         if byte & 0x80 == 0 {
-            return Ok(value);
+            return usize::try_from(value)
+                .map_err(|_| GitRemoteError::Protocol("varint overflow".into()));
         }
         shift += 7;
     }
@@ -1404,7 +1532,16 @@ pub fn import_fetch_result(
 
     for idx in 0..repo.commit_count() {
         if let Ok(Some(leaf)) = repo.get_leaf(idx) {
-            leaf_idx_by_hash.insert(leaf.hash(), idx);
+            let leaf_hash = leaf.hash();
+            leaf_idx_by_hash.insert(leaf_hash, idx);
+            // A process can die after the append-only leaf transaction commits
+            // but before the separate Git↔Ivaldi mapping file is published.
+            // The source SHA is authenticated leaf metadata, so reconstruct
+            // the mapping from history instead of appending a duplicate leaf.
+            if let Some(git_sha) = leaf.meta.get("git.sha1") {
+                mapping.insert(git_sha, leaf_hash);
+                leaf_idx_by_sha.insert(git_sha.clone(), idx);
+            }
         }
     }
 
@@ -1429,12 +1566,25 @@ pub fn import_fetch_result(
     for (git_sha, hash) in prefetched {
         mapping.insert(&git_sha, hash);
     }
+    // Persist the blob mappings now: a crash during the commit loop must not
+    // lose the record of CAS work already done (retry would re-import
+    // everything and, worse, resolve parents against an empty map). The CAS
+    // is flushed FIRST — the mapping must never durably claim a blob whose
+    // directory entry could still vanish on power loss.
+    crate::failpoint::fail_point("import.after_blob_prefetch");
+    cas.flush().map_err(|e| GitRemoteError::Io(e.to_string()))?;
+    mapping
+        .save()
+        .map_err(|e| GitRemoteError::Io(e.to_string()))?;
 
-    for sha in &commit_order {
-        if let Some(existing_hash) = mapping.get_blake3(sha) {
-            if let Some(idx) = leaf_idx_by_hash.get(&existing_hash).copied() {
-                leaf_idx_by_sha.insert(sha.clone(), idx);
-            }
+    for (commit_no, sha) in commit_order.iter().enumerate() {
+        // Skip only when the mapped leaf actually exists locally. A mapping
+        // entry whose leaf is missing (stale/foreign map) falls through to a
+        // fresh import instead of silently severing its children's ancestry.
+        if let Some(existing_hash) = mapping.get_blake3(sha)
+            && let Some(idx) = leaf_idx_by_hash.get(&existing_hash).copied()
+        {
+            leaf_idx_by_sha.insert(sha.clone(), idx);
             commits_skipped += 1;
             pb_commits.inc(1);
             continue;
@@ -1460,17 +1610,29 @@ pub fn import_fetch_result(
             format!("{} <{}>", commit.author_name, commit.author_email)
         };
 
-        let prev_idx = commit
-            .parents
-            .first()
-            .and_then(|p| leaf_idx_by_sha.get(p).copied())
-            .unwrap_or(NO_PARENT);
+        // Every parent must resolve to a real local leaf. `commit_order` is
+        // topological and the pack is self-contained, so an unresolvable
+        // parent means corrupted state — refusing beats silently importing
+        // this commit as a fake root (severed ancestry).
+        let resolve_parent = |p: &String| -> Result<u64, GitRemoteError> {
+            leaf_idx_by_sha.get(p).copied().ok_or_else(|| {
+                GitRemoteError::Protocol(format!(
+                    "commit {} lists parent {} which resolves to no local seal — \
+                     refusing to sever ancestry; run 'ivaldi verify --full' and retry the harvest",
+                    sha, p
+                ))
+            })
+        };
+        let prev_idx = match commit.parents.first() {
+            Some(p) => resolve_parent(p)?,
+            None => NO_PARENT,
+        };
         let merge_idxs = commit
             .parents
             .iter()
             .skip(1)
-            .filter_map(|p| leaf_idx_by_sha.get(p).copied())
-            .collect();
+            .map(resolve_parent)
+            .collect::<Result<Vec<_>, _>>()?;
 
         let mut leaf = Leaf::new(
             tree_hash,
@@ -1481,6 +1643,10 @@ pub fn import_fetch_result(
         );
         leaf.prev_idx = prev_idx;
         leaf.merge_idxs = merge_idxs;
+        // Recovery anchor for the unavoidable database↔mapping-file crash
+        // window. On retry this makes an already-landed leaf discoverable by
+        // its remote identity without guessing from content or position.
+        leaf.meta.insert("git.sha1".into(), sha.clone());
 
         // Preserve git fidelity that doesn't fit Leaf's typed fields. Stored
         // under reserved `git.*` meta keys; the canonical leaf encoding
@@ -1501,13 +1667,26 @@ pub fn import_fetch_result(
                     .insert("git.committer_tz".into(), commit.committer_tz.clone());
             }
         }
+        // Flush this commit's tree nodes before the leaf transaction makes a
+        // durable record referencing them; a leaf whose tree is lost to a
+        // power failure fails verification forever (leaves are append-only).
+        cas.flush().map_err(|e| GitRemoteError::Io(e.to_string()))?;
         let result = repo
             .commit_raw(leaf, &fetch.branch)
             .map_err(|e| GitRemoteError::Io(e.to_string()))?;
+        crate::failpoint::fail_point("import.mid_commit_loop");
         mapping.insert(sha, result.hash);
         leaf_idx_by_sha.insert(sha.clone(), result.index);
         leaf_idx_by_hash.insert(result.hash, result.index);
         commits_imported += 1;
+        // Checkpoint the mapping periodically so a crash mid-import leaves
+        // most already-landed leaves recorded (retry skips them instead of
+        // duplicating history). atomic_write makes each save all-or-nothing.
+        if commit_no % 200 == 199 {
+            mapping
+                .save()
+                .map_err(|e| GitRemoteError::Io(e.to_string()))?;
+        }
         pb_commits.inc(1);
     }
 
@@ -1550,17 +1729,20 @@ pub fn import_fetch_result(
             .get_blake3(&fetch.head_sha)
             .and_then(|b3| leaf_idx_by_hash.get(&b3).copied())
     });
+    // Flush any remaining CAS writes BEFORE the head and mapping become
+    // durable records referencing them (usually a no-op: the commit loop
+    // flushed per commit).
+    cas.flush().map_err(|e| GitRemoteError::Io(e.to_string()))?;
     if let Some(idx) = head_idx {
         repo.set_timeline_head(&fetch.branch, idx)
             .map_err(|e| GitRemoteError::Io(e.to_string()))?;
     }
 
+    crate::failpoint::fail_point("import.before_mapping_save");
     mapping
         .save()
         .map_err(|e| GitRemoteError::Io(e.to_string()))?;
-    // One fsync at the end of the import covers all blobs written without
-    // per-`put` fsync. See `FileCas::flush`.
-    cas.flush().map_err(|e| GitRemoteError::Io(e.to_string()))?;
+    crate::failpoint::fail_point("import.after_mapping_save");
     Ok(crate::sync::ImportResult {
         commits_imported,
         commits_skipped,
@@ -1569,23 +1751,37 @@ pub fn import_fetch_result(
     })
 }
 
+/// Topologically order all commits reachable from `sha` (parents before
+/// children). Iterative with an explicit stack: history depth equals commit
+/// count, so recursion would blow the stack on any large (or
+/// attacker-shaped) history.
 fn collect_commit_order(
     sha: &str,
     objects: &HashMap<String, GitObject>,
     seen: &mut std::collections::HashSet<String>,
     out: &mut Vec<String>,
 ) -> Result<(), GitRemoteError> {
-    if !seen.insert(sha.to_string()) {
-        return Ok(());
+    // (sha, expanded): expanded=false → visit parents first; true → emit.
+    let mut stack: Vec<(String, bool)> = vec![(sha.to_string(), false)];
+    while let Some((sha, expanded)) = stack.pop() {
+        if expanded {
+            out.push(sha);
+            continue;
+        }
+        if !seen.insert(sha.clone()) {
+            continue;
+        }
+        let object = objects
+            .get(&sha)
+            .ok_or_else(|| GitRemoteError::Protocol(format!("missing commit object {}", sha)))?;
+        let commit = parse_commit(&object.data)?;
+        stack.push((sha, true));
+        for parent in commit.parents.iter().rev() {
+            if !seen.contains(parent) {
+                stack.push((parent.clone(), false));
+            }
+        }
     }
-    let object = objects
-        .get(sha)
-        .ok_or_else(|| GitRemoteError::Protocol(format!("missing commit object {}", sha)))?;
-    let commit = parse_commit(&object.data)?;
-    for parent in &commit.parents {
-        collect_commit_order(parent, objects, seen, out)?;
-    }
-    out.push(sha.to_string());
     Ok(())
 }
 
@@ -1599,6 +1795,16 @@ fn import_tree(
     submodules_skipped: &mut std::collections::BTreeSet<String>,
 ) -> Result<B3Hash, GitRemoteError> {
     use crate::fsmerkle::{Entry, MODE_DIR, MODE_EXEC, MODE_FILE, MODE_SYMLINK, NodeKind};
+
+    // Depth guard: `tree_cache` only dedupes completed subtrees, so a
+    // self-referencing tree in a hostile pack would otherwise recurse
+    // forever. Path depth == number of separators + 1.
+    if path_prefix.split('/').count() >= MAX_TREE_DEPTH {
+        return Err(GitRemoteError::Protocol(format!(
+            "tree nesting exceeds {} levels — refusing (malformed or hostile pack)",
+            MAX_TREE_DEPTH
+        )));
+    }
 
     if let Some(hash) = tree_cache.get(sha).copied() {
         return Ok(hash);
@@ -1724,37 +1930,32 @@ fn collect_reachable_blobs(
     let mut seen_trees = std::collections::HashSet::new();
     let mut seen_blobs = std::collections::HashSet::new();
     let mut order = Vec::new();
-    walk_commit_for_blobs(
-        head_sha,
-        objects,
-        &mut seen_commits,
-        &mut seen_trees,
-        &mut seen_blobs,
-        &mut order,
-    )?;
+    // Iterate commits with a worklist: recursing per commit would blow the
+    // stack on deep histories.
+    let mut queue: Vec<String> = vec![head_sha.to_string()];
+    while let Some(sha) = queue.pop() {
+        if !seen_commits.insert(sha.clone()) {
+            continue;
+        }
+        let object = objects
+            .get(&sha)
+            .ok_or_else(|| GitRemoteError::Protocol(format!("missing commit object {}", sha)))?;
+        let commit = parse_commit(&object.data)?;
+        walk_tree_for_blobs(
+            &commit.tree,
+            objects,
+            &mut seen_trees,
+            &mut seen_blobs,
+            &mut order,
+            0,
+        )?;
+        for parent in &commit.parents {
+            if !seen_commits.contains(parent) {
+                queue.push(parent.clone());
+            }
+        }
+    }
     Ok(order)
-}
-
-fn walk_commit_for_blobs(
-    sha: &str,
-    objects: &HashMap<String, GitObject>,
-    seen_commits: &mut std::collections::HashSet<String>,
-    seen_trees: &mut std::collections::HashSet<String>,
-    seen_blobs: &mut std::collections::HashSet<String>,
-    order: &mut Vec<String>,
-) -> Result<(), GitRemoteError> {
-    if !seen_commits.insert(sha.to_string()) {
-        return Ok(());
-    }
-    let object = objects
-        .get(sha)
-        .ok_or_else(|| GitRemoteError::Protocol(format!("missing commit object {}", sha)))?;
-    let commit = parse_commit(&object.data)?;
-    walk_tree_for_blobs(&commit.tree, objects, seen_trees, seen_blobs, order)?;
-    for parent in &commit.parents {
-        walk_commit_for_blobs(parent, objects, seen_commits, seen_trees, seen_blobs, order)?;
-    }
-    Ok(())
 }
 
 fn walk_tree_for_blobs(
@@ -1763,7 +1964,14 @@ fn walk_tree_for_blobs(
     seen_trees: &mut std::collections::HashSet<String>,
     seen_blobs: &mut std::collections::HashSet<String>,
     order: &mut Vec<String>,
+    depth: usize,
 ) -> Result<(), GitRemoteError> {
+    if depth >= MAX_TREE_DEPTH {
+        return Err(GitRemoteError::Protocol(format!(
+            "tree nesting exceeds {} levels — refusing (malformed or hostile pack)",
+            MAX_TREE_DEPTH
+        )));
+    }
     if !seen_trees.insert(sha.to_string()) {
         return Ok(());
     }
@@ -1773,7 +1981,14 @@ fn walk_tree_for_blobs(
     for entry in parse_tree(&object.data)? {
         match entry.mode.as_str() {
             "40000" | "040000" => {
-                walk_tree_for_blobs(&entry.sha, objects, seen_trees, seen_blobs, order)?;
+                walk_tree_for_blobs(
+                    &entry.sha,
+                    objects,
+                    seen_trees,
+                    seen_blobs,
+                    order,
+                    depth + 1,
+                )?;
             }
             "100644" | "100755" | "120000" => {
                 if seen_blobs.insert(entry.sha.clone()) {
@@ -1825,6 +2040,7 @@ fn prefetch_blobs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote::HashMapping;
 
     #[test]
     fn pkt_line_roundtrip() {
@@ -2016,5 +2232,246 @@ mod tests {
             hex::encode(sha1_digest(b"abc")),
             "a9993e364706816aba3e25717850c26c9cd0d89d"
         );
+    }
+
+    // ---- Hostile-input tests: network bytes must error, never allocate
+    // ---- unbounded, panic, or blow the stack.
+
+    fn pack_header(count: u32) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(b"PACK");
+        p.extend_from_slice(&2u32.to_be_bytes());
+        p.extend_from_slice(&count.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn packfile_with_forged_huge_entry_count_errors_without_allocating() {
+        // Claims u32::MAX entries with an empty body; must error out of the
+        // count sanity check before Vec::with_capacity.
+        let pack = pack_header(u32::MAX);
+        let err = parse_packfile(&pack).unwrap_err();
+        assert!(err.to_string().contains("claims"), "{}", err);
+    }
+
+    #[test]
+    fn object_header_with_giant_declared_size_is_rejected() {
+        let mut pack = pack_header(1);
+        // Object header declaring ~2^60 bytes: type=blob(3), size varint with
+        // many continuation bytes.
+        pack.push(0x80 | (3 << 4) | 0x0f);
+        pack.extend(std::iter::repeat_n(0xffu8, 7));
+        pack.push(0x7f);
+        let err = parse_packfile(&pack).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds") || msg.contains("varint"),
+            "unexpected error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn object_header_varint_with_endless_continuation_errors() {
+        let mut data = vec![0x80 | (3 << 4)];
+        data.extend(std::iter::repeat_n(0xffu8, 64));
+        let err = parse_object_header(&data).unwrap_err();
+        assert!(err.to_string().contains("varint too long"), "{}", err);
+    }
+
+    #[test]
+    fn zlib_stream_longer_than_declared_size_is_rejected() {
+        // Entry declares size 1 but the zlib stream inflates to 5 bytes.
+        let mut pack = pack_header(1);
+        pack.push((3 << 4) | 1); // blob, size=1
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(b"hello").unwrap();
+        pack.extend(enc.finish().unwrap());
+        let err = parse_packfile(&pack).unwrap_err();
+        assert!(err.to_string().contains("declared"), "{}", err);
+    }
+
+    #[test]
+    fn delta_with_forged_result_size_errors_before_allocation() {
+        // base_size = 0 (matches empty base), result_size = 1 << 40.
+        let mut delta = vec![0x00];
+        let mut size = 1u64 << 40;
+        while size > 0 {
+            let mut b = (size & 0x7f) as u8;
+            size >>= 7;
+            if size > 0 {
+                b |= 0x80;
+            }
+            delta.push(b);
+        }
+        let err = apply_delta(&[], &delta).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{}", err);
+    }
+
+    #[test]
+    fn delta_varint_with_64_continuation_bytes_errors() {
+        let delta = vec![0xffu8; 64];
+        assert!(apply_delta(&[], &delta).is_err());
+    }
+
+    #[test]
+    fn ofs_delta_base_varint_overflow_is_rejected() {
+        let data = vec![0xffu8; 16];
+        assert!(parse_ofs_delta_base(&data, 100).is_err());
+    }
+
+    #[test]
+    fn deep_commit_chain_does_not_overflow_the_stack() {
+        // 100k-commit linear chain: the recursive walkers would blow the
+        // stack; the iterative rewrites must handle it.
+        let n = 100_000usize;
+        let tree = Vec::new(); // empty tree object
+        let tree_sha = git_object_id(GitObjectKind::Tree, &tree);
+        let mut objects: HashMap<String, GitObject> = HashMap::new();
+        objects.insert(
+            tree_sha.clone(),
+            GitObject {
+                kind: GitObjectKind::Tree,
+                data: tree,
+            },
+        );
+        let mut parent: Option<String> = None;
+        let mut head = String::new();
+        for i in 0..n {
+            let mut c = format!("tree {}\n", tree_sha);
+            if let Some(p) = &parent {
+                c.push_str(&format!("parent {}\n", p));
+            }
+            c.push_str(&format!(
+                "author A <a@x> {} +0000\ncommitter A <a@x> {} +0000\n\nc{}\n",
+                i, i, i
+            ));
+            let data = c.into_bytes();
+            let sha = git_object_id(GitObjectKind::Commit, &data);
+            objects.insert(
+                sha.clone(),
+                GitObject {
+                    kind: GitObjectKind::Commit,
+                    data,
+                },
+            );
+            parent = Some(sha.clone());
+            head = sha;
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut order = Vec::new();
+        collect_commit_order(&head, &objects, &mut seen, &mut order).unwrap();
+        assert_eq!(order.len(), n);
+        // Topological: every commit appears after its parent.
+        assert_eq!(order.last().unwrap(), &head);
+
+        let blobs = collect_reachable_blobs(&head, &objects).unwrap();
+        assert!(blobs.is_empty());
+    }
+
+    #[test]
+    fn overly_deep_tree_nesting_is_rejected() {
+        // Chain of trees nested beyond MAX_TREE_DEPTH.
+        let mut objects: HashMap<String, GitObject> = HashMap::new();
+        let mut child_sha: Option<String> = None;
+        let mut top = String::new();
+        for _ in 0..(MAX_TREE_DEPTH + 8) {
+            let mut tree = Vec::new();
+            if let Some(c) = &child_sha {
+                tree.extend_from_slice(b"40000 d\0");
+                tree.extend_from_slice(&hex::decode(c).unwrap());
+            }
+            let sha = git_object_id(GitObjectKind::Tree, &tree);
+            objects.insert(
+                sha.clone(),
+                GitObject {
+                    kind: GitObjectKind::Tree,
+                    data: tree,
+                },
+            );
+            child_sha = Some(sha.clone());
+            top = sha;
+        }
+        let commit = format!(
+            "tree {}\nauthor A <a@x> 0 +0000\ncommitter A <a@x> 0 +0000\n\nm\n",
+            top
+        )
+        .into_bytes();
+        let head = git_object_id(GitObjectKind::Commit, &commit);
+        objects.insert(
+            head.clone(),
+            GitObject {
+                kind: GitObjectKind::Commit,
+                data: commit,
+            },
+        );
+
+        let err = collect_reachable_blobs(&head, &objects).unwrap_err();
+        assert!(err.to_string().contains("nesting"), "{}", err);
+    }
+
+    // ---- Non-fast-forward push guard (pure local check, no server).
+
+    fn repo_with_two_seals() -> (tempfile::TempDir, crate::repo::Repo) {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let mut repo = crate::repo::Repo::open(dir.path()).unwrap();
+        let cas = crate::cas::FileCas::new(dir.path().join(".ivaldi/objects")).unwrap();
+        let store = crate::fsmerkle::FsStore::new(&cas);
+        for body in [&b"one"[..], &b"two"[..]] {
+            let (blob, _) = store.put_blob(body).unwrap();
+            use crate::fsmerkle::{Entry, MODE_FILE, NodeKind};
+            let tree = store
+                .put_tree(vec![Entry {
+                    name: "f.txt".into(),
+                    mode: MODE_FILE,
+                    kind: NodeKind::Blob,
+                    hash: blob,
+                }])
+                .unwrap();
+            repo.commit(tree, "t <t@x>", "seal").unwrap();
+        }
+        (dir, repo)
+    }
+
+    #[test]
+    fn push_guard_rejects_unknown_remote_tip_without_force() {
+        let (_dir, repo) = repo_with_two_seals();
+        let mapping = HashMapping::new(&repo.ivaldi_dir);
+        let unknown_tip = "ab".repeat(20);
+        let err =
+            check_push_fast_forward(&repo, &mapping, "main", &unknown_tip, 1, false).unwrap_err();
+        assert!(err.to_string().contains("seals you do not have"), "{}", err);
+    }
+
+    #[test]
+    fn push_guard_allows_force() {
+        let (_dir, repo) = repo_with_two_seals();
+        let mapping = HashMapping::new(&repo.ivaldi_dir);
+        let unknown_tip = "ab".repeat(20);
+        assert!(check_push_fast_forward(&repo, &mapping, "main", &unknown_tip, 1, true).is_ok());
+    }
+
+    #[test]
+    fn push_guard_allows_fast_forward_from_mapped_ancestor() {
+        let (_dir, repo) = repo_with_two_seals();
+        let ancestor = repo.get_leaf(0).unwrap().unwrap();
+        let mut mapping = HashMapping::new(&repo.ivaldi_dir);
+        let remote_tip = "cd".repeat(20);
+        mapping.insert(&remote_tip, ancestor.hash());
+        assert!(check_push_fast_forward(&repo, &mapping, "main", &remote_tip, 1, false).is_ok());
+    }
+
+    #[test]
+    fn push_guard_rejects_diverged_remote_tip() {
+        let (_dir, repo) = repo_with_two_seals();
+        // Remote tip maps to leaf 1, but we're pushing from head at leaf 0 —
+        // the remote has a seal our chain does not include.
+        let other = repo.get_leaf(1).unwrap().unwrap();
+        let mut mapping = HashMapping::new(&repo.ivaldi_dir);
+        let remote_tip = "ef".repeat(20);
+        mapping.insert(&remote_tip, other.hash());
+        assert!(check_push_fast_forward(&repo, &mapping, "main", &remote_tip, 0, false).is_err());
     }
 }

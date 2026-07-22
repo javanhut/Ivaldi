@@ -43,8 +43,9 @@ in Ivaldi the same afternoon.
 | Fix the last commit | `git commit --amend` | `ivaldi reseal` |
 | Undo a commit safely | `git revert <sha>` | `ivaldi undo <seal>` |
 | Copy one commit over | `git cherry-pick <sha>` | `ivaldi pluck <seal>` (alias `cherry-pick`) |
-| Who wrote each line? | `git blame f.txt` | `ivaldi whodidit f.txt` (alias `blame`) |
+| Who wrote each line? | `git blame f.txt` | `ivaldi whodidit f.txt` (alias `wdi`) |
 | Ignore a path | edit `.gitignore` | `ivaldi exclude pattern` (writes `.ivaldiignore`) |
+| Skip a file temporarily | `git update-index --skip-worktree f` | `ivaldi skip f` (`ivaldi unskip f` to undo) |
 
 ## Branches (timelines)
 
