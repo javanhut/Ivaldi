@@ -74,6 +74,10 @@ trying to do:
 - **Merges never leave markers in your files.** When a merge can't resolve
   automatically, you choose a strategy (`theirs`, `ours`, `union`, `base`)
   instead of hand-editing conflict debris.
+- **Skip files without touching the ignore file.** `ivaldi skip <path>`
+  temporarily excludes a file (a regenerated lockfile, test or debug output)
+  from staging — and therefore from seals and pushes — until
+  `ivaldi unskip`. The list is repo-local and never committed.
 - **BLAKE3 everywhere.** All hashing is BLAKE3 — roughly 10× faster than
   SHA-256 and cryptographically secure, where git is still migrating off
   deprecated SHA-1.
@@ -90,6 +94,150 @@ trying to do:
   an encrypted, mutually authenticated channel (Noise XX, ed25519) — no
   hosting service required.
 
+## Install
+
+### Prebuilt releases
+
+Prebuilt, signed binaries are attached to each
+[GitHub release](https://github.com/javanhut/ivaldi/releases) for Linux,
+macOS, and Windows on both `x86_64` and `arm64`. See
+[Verifying releases](#verifying-releases) for how to check them.
+
+### From source
+
+Prerequisites: a Rust toolchain (rust 1.89+, edition 2024) — install via
+[rustup.rs](https://rustup.rs).
+
+```bash
+git clone https://github.com/javanhut/ivaldi.git
+cd ivaldi
+```
+
+The repo ships two equivalent task setups — a `Makefile` and a `lazy.toml`
+for the [imlazy](https://github.com/javanhut/ImLazy) task runner. Use
+whichever you have:
+
+```bash
+# With make
+make build
+sudo make install                  # installs to /usr/local/bin
+make install PREFIX=~/.local       # or a custom prefix, no sudo
+sudo make install-extras           # optional: man pages + bash/zsh/fish completions
+
+# With imlazy (same targets; `build` is the default)
+imlazy                             # = imlazy build
+sudo imlazy install
+imlazy install prefix=~/.local
+sudo imlazy install-extras
+```
+
+Verify with:
+
+```bash
+ivaldi forge        # initialize your first repository
+```
+
+## Verifying releases
+
+Every release archive is signed, and each release ships a single
+`SHA256SUMS` file covering all artifacts.
+
+Signing is keyless via [Sigstore](https://www.sigstore.dev/) — there is no
+long-lived public key to trust. Instead you verify that a signature was
+produced by Ivaldi's own release workflow. Install
+[`cosign`](https://docs.sigstore.dev/cosign/system_config/installation/), then:
+
+```bash
+# 1. Verify the checksums file was signed by Ivaldi's release workflow.
+cosign verify-blob \
+  --bundle SHA256SUMS.cosign.bundle \
+  --certificate-identity-regexp 'https://github.com/javanhut/ivaldi/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+
+# 2. Check your downloaded archive against the trusted checksums.
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+The first command fails if the checksums file was not produced by this
+repository's release workflow; the second fails if your download does not match.
+Both must pass. To verify an individual archive directly, use its own
+`.cosign.bundle` with the same `cosign verify-blob` invocation.
+
+## Command overview
+
+The vocabulary is different on purpose — names match the action, not git
+tradition. Common aliases are shown in parentheses.
+
+**Daily work**
+
+| Command | Alias | Description |
+|---------|-------|-------------|
+| `ivaldi forge` | `init` | Initialize a repository |
+| `ivaldi gather [files] [-p]` | `add` | Stage files for the next seal (`-p` picks hunks interactively) |
+| `ivaldi seal "msg"` | `se` | Create a sealed commit |
+| `ivaldi reseal [msg]` | `rs` | Redo the most recent seal, folding in staged changes |
+| `ivaldi status [--json]` | `st` | Show repository status |
+| `ivaldi whereami` | `wai` | Show current timeline and position |
+| `ivaldi log` | `lg` | View commit history |
+| `ivaldi whodidit <file>` | `blame` | Line-by-line seal attribution |
+| `ivaldi diff` | `df` | Compare changes |
+| `ivaldi discard [files]` | `dc` | Unstage files (none = everything) |
+| `ivaldi skip <paths>` / `ivaldi skip --list` | | Temporarily exclude paths from staging (repo-local) |
+| `ivaldi unskip <paths>` | | Stop excluding paths from staging |
+| `ivaldi exclude <patterns>` | `ex` | Add patterns to `.ivaldiignore` |
+| `ivaldi config` | `cf` | View/modify settings (bare `config` opens an interactive form) |
+| `ivaldi tui` | `ui` | Open the interactive TUI dashboard |
+
+**Time travel**
+
+| Command | Alias | Description |
+|---------|-------|-------------|
+| `ivaldi undo <seal>` | `ud` | New seal that removes an earlier seal's changes |
+| `ivaldi pluck <seal>` | `cherry-pick` | New seal that applies another seal's changes |
+| `ivaldi rewind <seal> [--discard]` | `rw` | Move the timeline head back to an earlier seal |
+| `ivaldi reverse --all` | | Throw away all uncommitted changes (destructive!) |
+| `ivaldi travel [--all]` | `tv` | Interactive history browser |
+| `ivaldi weld --last N` | `w` | Combine a range of seals into one (linear history) |
+
+**Timelines (branches)**
+
+| Command | Alias | Description |
+|---------|-------|-------------|
+| `ivaldi timeline create/switch/list/rename/remove` | `tl` | Manage timelines; dirty work shelves automatically on switch |
+| `ivaldi timeline butterfly create/up/down/rm` | `tl bf` | Experimental sandbox timelines |
+| `ivaldi fuse <src> to <tgt>` | `fu` | Merge timelines (no conflict markers — strategy selection) |
+
+**Sharing**
+
+| Command | Alias | Description |
+|---------|-------|-------------|
+| `ivaldi portal add/list/remove/set-default` | `pt` | Manage remotes (HTTPS / SSH / `ivaldi://`) |
+| `ivaldi auth login/status/logout` | `au` | OAuth for GitHub/GitLab (device flow) |
+| `ivaldi download <url>` | `dl` | Clone (transport auto-detected from URL) |
+| `ivaldi upload [--portal P]` | `up` | Push to the default or named portal |
+| `ivaldi scout` | `sc` | Discover remote timelines |
+| `ivaldi harvest <name>` | `hv` | Fetch specific remote timelines |
+| `ivaldi sync [branch]` | `sy` | Pull remote changes, delta only |
+| `ivaldi serve` | `sv` | Serve the repo to authorized peers over `ivaldi://` |
+| `ivaldi peer trust/list/forget` | `pr` | Manage peer pubkey allowlists |
+
+**Review and repository care**
+
+| Command | Alias | Description |
+|---------|-------|-------------|
+| `ivaldi review create/list/show/diff/comment/approve/merge/close` | `rv` | Local code review system |
+| `ivaldi verify [--full]` | | Check repository integrity |
+| `ivaldi prove <seal>` | | Emit or verify an MMR inclusion receipt (no git equivalent) |
+| `ivaldi rescue [--out dir]` | | Recover files from a damaged repository |
+| `ivaldi recover [--dry-run]` | | Safely repair a repository in place (never discards data) |
+| `ivaldi doctor [--json]` | | Diagnose a repository and print recovery guidance |
+| `ivaldi migrate` | | Upgrade an older repository format (verified rollback snapshot) |
+| `ivaldi completions <shell>` | `cmp` | Print a shell completion script |
+
+The full reference with every flag is in [`docs/cli.md`](docs/cli.md), and
+`ivaldi <command> --help` is always authoritative.
+
 ## Migration guide for Git users
 
 | | Git | Ivaldi |
@@ -100,12 +248,9 @@ trying to do:
 | Undoing a commit | `revert` / `reset` (destructive variants) | `undo` / `rewind` — old seals always recoverable |
 | Stashing | Manual `git stash` | Automatic on timeline switch |
 | Merge conflicts | Markers in files | Clean workspace, strategy selection |
+| Skip a file temporarily | `update-index --skip-worktree` | `skip` / `unskip` |
 | Clone | All branches | Selective (`scout` + `harvest`) |
-| Directories | Canonical Merkle trees | Content-addressed Merkle trees |
 | Peer-to-peer | Not built in | `ivaldi serve` + `ivaldi://` transport |
-
-The vocabulary is different on purpose — names match the action, not git
-tradition:
 
 | Ivaldi | Git equivalent |
 |--------|---------------|
@@ -113,12 +258,15 @@ tradition:
 | Timeline | Branch |
 | Seal | Commit |
 | Gather | Add / Stage |
+| Discard | Unstage |
 | Fuse | Merge |
 | Portal | Remote |
 | Upload / Download | Push / Clone |
 | Scout / Harvest | Fetch (metadata / data) |
 | Shelf | Stash (automatic) |
+| Skip / Unskip | Skip-worktree |
 | Pluck | Cherry-pick |
+| Reseal | Commit --amend |
 | Weld | Squash a range |
 | Whodidit | Blame |
 | Butterfly | Experimental sandbox branch |
@@ -149,7 +297,8 @@ Run the complete suite, including deterministic crash injection, with:
 cargo test --locked --all-targets --all-features
 ```
 
-CI runs the all-features suite on Linux, macOS, and Windows. See the
+CI runs formatting, Clippy with warnings denied, and the all-features suite on
+Linux, macOS, and Windows. See the
 [test-evidence matrix](docs/test-matrix.md) for the guarantees exercised by
 each layer.
 
@@ -165,59 +314,6 @@ upgrade commitments, operating limits, release procedures, and independent
 review required before that contract is frozen. An unchecked certification
 item does not, by itself, mean the corresponding native feature is absent or
 untested; its stated evidence and acceptance criteria define what remains.
-
-## Install
-
-Prerequisites: a Rust toolchain (edition 2024) — install via [rustup.rs](https://rustup.rs).
-
-```bash
-git clone https://github.com/javanhut/ivaldi.git
-cd ivaldi
-
-make build
-sudo make install                  # installs to /usr/local/bin
-
-# Or without sudo, to a custom prefix
-make install PREFIX=~/.local
-
-# Optional: man pages + bash/zsh/fish completions
-sudo make install-extras
-```
-
-Verify with:
-
-```bash
-ivaldi forge        # initialize your first repository
-```
-
-## Verifying releases
-
-Prebuilt, signed binaries are attached to each
-[GitHub release](https://github.com/javanhut/ivaldi/releases) for Linux, macOS,
-and Windows on both `x86_64` and `arm64`. Every archive is signed, and each
-release ships a single `SHA256SUMS` file covering all artifacts.
-
-Signing is keyless via [Sigstore](https://www.sigstore.dev/) — there is no
-long-lived public key to trust. Instead you verify that a signature was
-produced by Ivaldi's own release workflow. Install
-[`cosign`](https://docs.sigstore.dev/cosign/system_config/installation/), then:
-
-```bash
-# 1. Verify the checksums file was signed by Ivaldi's release workflow.
-cosign verify-blob \
-  --bundle SHA256SUMS.cosign.bundle \
-  --certificate-identity-regexp 'https://github.com/javanhut/ivaldi/.*' \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  SHA256SUMS
-
-# 2. Check your downloaded archive against the trusted checksums.
-sha256sum --check --ignore-missing SHA256SUMS
-```
-
-The first command fails if the checksums file was not produced by this
-repository's release workflow; the second fails if your download does not match.
-Both must pass. To verify an individual archive directly, use its own
-`.cosign.bundle` with the same `cosign verify-blob` invocation.
 
 ## Learn Ivaldi
 
