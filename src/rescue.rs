@@ -15,10 +15,13 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::fsmerkle::{self, MODE_EXEC, NodeKind};
+use crate::fsmerkle::{self, NodeKind};
 use crate::hash::B3Hash;
 use crate::leaf;
 use crate::store::Store;
+
+#[cfg(unix)]
+use crate::fsmerkle::MODE_EXEC;
 
 /// Deepest tree nesting rescue will follow. Bounds recursion against a hostile
 /// or cyclic-looking tree (content addressing forbids true cycles, but a
