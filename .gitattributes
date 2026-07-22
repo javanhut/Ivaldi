@@ -1,0 +1,2 @@
+# Historical repository-format fixtures are byte-for-byte contract inputs.
+tests/fixtures/repository-format/** text eol=lf
