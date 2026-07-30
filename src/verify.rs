@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
 use crate::hash::B3Hash;
-use crate::repo::Repo;
+use crate::repo::{Repo, RepoError};
 use crate::store::Store;
 
 /// One named integrity check and its outcome.
@@ -40,6 +40,14 @@ impl Report {
     pub fn guidance(&self) -> Vec<String> {
         if self.ok {
             return vec!["Repository is healthy. No action needed.".into()];
+        }
+        // Every content check fails as a consequence when the store cannot be
+        // opened; diagnosing damaged history from that would be wrong.
+        if let Some(c) = self.checks.iter().find(|c| c.name == "store" && !c.ok) {
+            return vec![format!(
+                "The commit store could not be opened, so history was not inspected:\n    {}",
+                c.detail
+            )];
         }
         let mut out = Vec::new();
         for c in self.checks.iter().filter(|c| !c.ok) {
@@ -154,6 +162,13 @@ fn verify_impl(work_dir: &Path, full: bool, migrating: bool) -> Report {
                 detail: "MMR, leaves, and root checkpoint are consistent".into(),
             }
         }
+        // A store that will not open says nothing about whether history is
+        // damaged — report it as its own failure, not as MMR corruption.
+        Err(RepoError::Store(e)) => Check {
+            name: "store".into(),
+            ok: false,
+            detail: e.to_string(),
+        },
         Err(e) => Check {
             name: "structure".into(),
             ok: false,
@@ -169,10 +184,19 @@ fn verify_impl(work_dir: &Path, full: bool, migrating: bool) -> Report {
         // Deeper structural checks need direct store access. Never create a
         // store if store.db is absent (redb would materialize an empty one).
         let store_path = ivaldi_dir.join("store.db");
-        let store = if store_path.exists() {
-            Store::open(&store_path).ok()
-        } else {
-            None
+        let store = match store_path.exists().then(|| Store::open(&store_path)) {
+            Some(Ok(store)) => Some(store),
+            Some(Err(e)) => {
+                if !checks.iter().any(|c| c.name == "store") {
+                    checks.push(Check {
+                        name: "store".into(),
+                        ok: false,
+                        detail: e.to_string(),
+                    });
+                }
+                None
+            }
+            None => None,
         };
         checks.push(verify_reachable_content(&ivaldi_dir, store.as_ref()));
         checks.push(verify_refs(&ivaldi_dir, store.as_ref()));
@@ -677,6 +701,21 @@ mod tests {
         );
         let guidance = report.guidance();
         assert!(guidance.iter().any(|g| g.contains("ivaldi rescue")));
+    }
+
+    #[test]
+    fn unopenable_store_is_not_diagnosed_as_damaged_history() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        std::fs::write(dir.path().join(".ivaldi/store.db"), b"not a database").unwrap();
+
+        let report = verify(dir.path(), true);
+        assert!(!report.ok);
+        assert!(report.checks.iter().any(|c| c.name == "store" && !c.ok));
+        assert!(!report.checks.iter().any(|c| c.name == "structure" && !c.ok));
+        let guidance = report.guidance();
+        assert_eq!(guidance.len(), 1);
+        assert!(guidance[0].contains("commit store could not be opened"));
     }
 
     #[test]

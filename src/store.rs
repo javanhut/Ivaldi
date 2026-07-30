@@ -65,6 +65,11 @@ impl Store {
                  retry when it finishes"
                     .into(),
             ),
+            redb::DatabaseError::UpgradeRequired(v) => StoreError(format!(
+                "repository store was written by an older ivaldi (store format v{v}); \
+                 export it with that older ivaldi:\n    ivaldi rescue --out ./ivaldi-rescue\n\
+                 then re-forge with this version"
+            )),
             other => StoreError::from(other),
         })?;
         let w = db.begin_write()?;
