@@ -4,11 +4,15 @@
 //! - Auto-resolves non-conflicting changes using BLAKE3 hashes
 //! - Detects identical changes on both sides automatically
 //! - Multiple strategies: auto, ours, theirs, union, base
-//! - NO conflict markers written to workspace files (workspace always clean)
+//! - Cleanly merged files never get markers; only the files that genuinely
+//!   conflict are written back with `<<<<<<< / ======= / >>>>>>>` regions
+//!   (see [`write_conflict_markers`]) so they can be resolved in an editor
+//!   and finished with `ivaldi fuse --continue`
 //! - Only truly conflicting files require user intervention
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::Path;
 
 use crate::fsmerkle::{FsMerkleError, FsStore};
 use crate::hash::B3Hash;
@@ -319,6 +323,240 @@ fn merge_file_union(
             }
         }
     }
+}
+
+// -- Conflict markers -------------------------------------------------------
+
+/// Marker prefix opening the "ours" side of a conflict region.
+pub const MARKER_OURS: &str = "<<<<<<<";
+/// Marker separating the two sides of a conflict region.
+pub const MARKER_SEP: &str = "=======";
+/// Marker closing the "theirs" side of a conflict region.
+pub const MARKER_THEIRS: &str = ">>>>>>>";
+
+/// True if `content` still holds an unresolved conflict region.
+///
+/// Used by `fuse --continue` to refuse committing a file the user hasn't
+/// finished editing. Only line-leading markers count, so a string literal
+/// containing `=======` mid-line doesn't trip it.
+pub fn has_conflict_markers(content: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(content) else {
+        return false;
+    };
+    let mut ours = false;
+    let mut theirs = false;
+    for line in text.lines() {
+        if line.starts_with(MARKER_OURS) {
+            ours = true;
+        } else if line.starts_with(MARKER_THEIRS) {
+            theirs = true;
+        }
+    }
+    ours && theirs
+}
+
+/// Write every conflicted file back to the workspace with its two sides
+/// wrapped in conflict markers, so the user can resolve them in an editor.
+///
+/// Returns `(marked, skipped)`: paths written with markers, and paths left
+/// untouched because at least one side is binary (nothing sensible to
+/// interleave — resolve those by choosing a side).
+pub fn write_conflict_markers(
+    store: &FsStore<'_>,
+    work_dir: &Path,
+    conflicts: &[Conflict],
+    ours_label: &str,
+    theirs_label: &str,
+) -> (Vec<String>, Vec<String>) {
+    let mut marked = Vec::new();
+    let mut skipped = Vec::new();
+
+    for c in conflicts {
+        // A missing side is a delete/modify conflict: treat it as empty so the
+        // marker block shows the deletion as one of the two choices.
+        let load = |h: Option<B3Hash>| -> Option<Vec<u8>> {
+            match h {
+                Some(h) => store.load_blob(h).ok().map(|(_, bytes)| bytes),
+                None => Some(Vec::new()),
+            }
+        };
+        let (Some(base), Some(ours), Some(theirs)) = (load(c.base), load(c.ours), load(c.theirs))
+        else {
+            skipped.push(c.path.clone());
+            continue;
+        };
+        if crate::diff::is_binary(&ours) || crate::diff::is_binary(&theirs) {
+            skipped.push(c.path.clone());
+            continue;
+        }
+        let (base, ours, theirs) = (
+            String::from_utf8_lossy(&base),
+            String::from_utf8_lossy(&ours),
+            String::from_utf8_lossy(&theirs),
+        );
+        let merged = merge3(&base, &ours, &theirs, ours_label, theirs_label);
+
+        let path = work_dir.join(&c.path);
+        let wrote = match path.parent() {
+            Some(parent) => std::fs::create_dir_all(parent)
+                .and_then(|()| crate::atomic_io::atomic_write(&path, merged.as_bytes())),
+            None => crate::atomic_io::atomic_write(&path, merged.as_bytes()),
+        };
+        if wrote.is_ok() {
+            marked.push(c.path.clone());
+        } else {
+            skipped.push(c.path.clone());
+        }
+    }
+
+    (marked, skipped)
+}
+
+/// One side's edit against the merge base: base lines `start..end` are
+/// replaced by `lines`. An empty range is a pure insertion.
+#[derive(Debug)]
+struct Edit {
+    start: usize,
+    end: usize,
+    lines: Vec<String>,
+}
+
+/// Diff3-style line merge of a single file.
+///
+/// Regions only one side touched are taken from that side; regions both sides
+/// touched are wrapped in conflict markers. This is what makes a conflicted
+/// fuse resolvable in an editor instead of an all-or-nothing choice between
+/// two whole file versions.
+fn merge3(base: &str, ours: &str, theirs: &str, ours_label: &str, theirs_label: &str) -> String {
+    let base_lines: Vec<&str> = base.lines().collect();
+
+    // Both sides' edits in one stream, ordered by the base lines they touch.
+    let mut all: Vec<(u8, Edit)> = base_edits(base, ours)
+        .into_iter()
+        .map(|e| (0u8, e))
+        .chain(base_edits(base, theirs).into_iter().map(|e| (1u8, e)))
+        .collect();
+    all.sort_by_key(|(side, e)| (e.start, e.end, *side));
+
+    let mut out: Vec<String> = Vec::new();
+    let mut b = 0usize;
+    let mut k = 0usize;
+    while k < all.len() {
+        let start = all[k].1.start;
+        while b < start {
+            out.push(base_lines[b].to_string());
+            b += 1;
+        }
+
+        // Grow the region over every following edit that overlaps it, or that
+        // starts at the same base line (two insertions at one point).
+        let mut end = all[k].1.end;
+        let mut m = k + 1;
+        while m < all.len() && (all[m].1.start < end || all[m].1.start == start) {
+            end = end.max(all[m].1.end);
+            m += 1;
+        }
+
+        let region = &all[k..m];
+        let ours_side = || region.iter().filter(|(s, _)| *s == 0).map(|(_, e)| e);
+        let theirs_side = || region.iter().filter(|(s, _)| *s == 1).map(|(_, e)| e);
+        let both = ours_side().next().is_some() && theirs_side().next().is_some();
+
+        if both {
+            out.push(format!("{MARKER_OURS} {ours_label}"));
+            out.extend(rebuild(&base_lines, start, end, ours_side()));
+            out.push(MARKER_SEP.to_string());
+            out.extend(rebuild(&base_lines, start, end, theirs_side()));
+            out.push(format!("{MARKER_THEIRS} {theirs_label}"));
+        } else {
+            out.extend(rebuild(
+                &base_lines,
+                start,
+                end,
+                region.iter().map(|(_, e)| e),
+            ));
+        }
+
+        b = end;
+        k = m;
+    }
+    while b < base_lines.len() {
+        out.push(base_lines[b].to_string());
+        b += 1;
+    }
+
+    let mut text = out.join("\n");
+    // `lines()` drops the terminator; restore it if either side had one.
+    if (ours.ends_with('\n') || theirs.ends_with('\n')) && !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
+/// Rewrite base lines `start..end` as one side sees them, applying that side's
+/// edits and passing untouched base lines through.
+fn rebuild<'a>(
+    base_lines: &[&str],
+    start: usize,
+    end: usize,
+    edits: impl Iterator<Item = &'a Edit>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut b = start;
+    for e in edits {
+        while b < e.start {
+            out.push(base_lines[b].to_string());
+            b += 1;
+        }
+        out.extend(e.lines.iter().cloned());
+        b = b.max(e.end);
+    }
+    while b < end {
+        out.push(base_lines[b].to_string());
+        b += 1;
+    }
+    out
+}
+
+/// Convert a line diff of `base` → `side` into replace-this-base-range edits.
+fn base_edits(base: &str, side: &str) -> Vec<Edit> {
+    use crate::diff::LineOp;
+
+    let mut edits = Vec::new();
+    let mut cur: Option<Edit> = None;
+    let mut b = 0usize;
+    for op in crate::diff::compute_ops(base, side) {
+        match op {
+            LineOp::Context(_) => {
+                if let Some(e) = cur.take() {
+                    edits.push(e);
+                }
+                b += 1;
+            }
+            LineOp::Remove(_) => {
+                let e = cur.get_or_insert(Edit {
+                    start: b,
+                    end: b,
+                    lines: Vec::new(),
+                });
+                e.end = b + 1;
+                b += 1;
+            }
+            LineOp::Add(line) => {
+                cur.get_or_insert(Edit {
+                    start: b,
+                    end: b,
+                    lines: Vec::new(),
+                })
+                .lines
+                .push(line);
+            }
+        }
+    }
+    if let Some(e) = cur {
+        edits.push(e);
+    }
+    edits
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -733,6 +971,59 @@ mod tests {
         assert!(result.success);
         assert!(result.merged_files.is_empty());
         assert!(result.conflicts.is_empty());
+    }
+
+    // ---- diff3 conflict markers ----
+
+    #[test]
+    fn merge3_takes_each_side_when_regions_do_not_overlap() {
+        let base = "a\nb\nc\nd\ne\n";
+        let ours = "a\nOURS\nc\nd\ne\n";
+        let theirs = "a\nb\nc\nTHEIRS\ne\n";
+
+        let merged = merge3(base, ours, theirs, "main", "remote");
+        assert_eq!(merged, "a\nOURS\nc\nTHEIRS\ne\n");
+        assert!(!has_conflict_markers(merged.as_bytes()));
+    }
+
+    #[test]
+    fn merge3_marks_the_region_both_sides_changed() {
+        let base = "a\nb\nc\n";
+        let ours = "a\nOURS\nc\n";
+        let theirs = "a\nTHEIRS\nc\n";
+
+        let merged = merge3(base, ours, theirs, "main", "remote");
+        assert_eq!(
+            merged,
+            "a\n<<<<<<< main\nOURS\n=======\nTHEIRS\n>>>>>>> remote\nc\n"
+        );
+        assert!(has_conflict_markers(merged.as_bytes()));
+    }
+
+    #[test]
+    fn merge3_keeps_a_clean_hunk_outside_the_conflict() {
+        // Both sides rewrite line 2; only theirs appends at the end. The
+        // append must survive rather than being swallowed by the conflict.
+        let base = "a\nb\nc\n";
+        let ours = "a\nOURS\nc\n";
+        let theirs = "a\nTHEIRS\nc\nappended\n";
+
+        let merged = merge3(base, ours, theirs, "main", "remote");
+        assert!(merged.ends_with("appended\n"), "{merged}");
+        assert_eq!(merged.matches(MARKER_SEP).count(), 1, "{merged}");
+    }
+
+    #[test]
+    fn merge3_handles_a_side_deleting_the_file() {
+        let base = "a\nb\n";
+        let merged = merge3(base, "", "a\nCHANGED\n", "main", "remote");
+        assert!(has_conflict_markers(merged.as_bytes()), "{merged}");
+    }
+
+    #[test]
+    fn has_conflict_markers_ignores_lone_or_mid_line_markers() {
+        assert!(!has_conflict_markers(b"let sep = \"=======\";\n"));
+        assert!(!has_conflict_markers(b"<<<<<<< main\nonly one side\n"));
     }
 
     #[test]

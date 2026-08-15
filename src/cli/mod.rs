@@ -662,7 +662,7 @@ pub struct FuseArgs {
     pub strategy: String,
 
     /// Continue merge after resolving conflicts
-    #[arg(long, name = "continue")]
+    #[arg(long = "continue", visible_alias = "continue-merge")]
     pub continue_merge: bool,
 
     /// Abort current merge

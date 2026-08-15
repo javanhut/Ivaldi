@@ -855,6 +855,39 @@ pub(super) fn cmd_sync(args: SyncArgs, quiet: bool) -> Result<(), String> {
         return Ok(());
     }
 
+    // A conflicted sync integrated nothing: the remote seals are downloaded,
+    // the merge is recorded as in-progress, and the timeline head has not
+    // moved. Saying "synced" here is how a half-done merge turns into an
+    // upload that keeps getting rejected.
+    if !result.conflicts.is_empty() {
+        let source = repo
+            .load_merge_state()
+            .ok()
+            .flatten()
+            .map(|s| s.source_timeline)
+            .unwrap_or_else(|| format!("__sync_{timeline}"));
+        println!(
+            "{} Merge conflicts — nothing was integrated:\n",
+            color::red("!!")
+        );
+        for f in &result.conflicts {
+            println!("  {} {}", color::red("CONFLICT"), f);
+        }
+        println!(
+            "\nThe remote seals are downloaded and timeline '{}' is unchanged. \
+             Conflicted files now hold both sides between conflict markers.",
+            color::bold(&timeline)
+        );
+        println!("\nTo finish the merge:");
+        println!("  edit the files above, then 'ivaldi fuse --continue'");
+        println!("  or 'ivaldi fuse --strategy=theirs {source}' to take the remote wholesale");
+        println!("  or 'ivaldi fuse --abort' to drop the merge");
+        return Err(format!(
+            "{} conflicted file(s) — merge not completed",
+            result.conflicts.len()
+        ));
+    }
+
     for f in &result.added {
         println!("{} {}", color::green("++"), f);
     }

@@ -13,6 +13,18 @@ pub struct StatusJson {
     pub head: Option<SealRefJson>,
     pub files: Vec<FileJson>,
     pub staged_deletions: Vec<String>,
+    /// Present only while a fuse is unfinished.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge: Option<MergeJson>,
+}
+
+/// JSON view of an unfinished fuse.
+#[derive(serde::Serialize)]
+pub struct MergeJson {
+    pub source_timeline: String,
+    pub target_timeline: String,
+    pub strategy: String,
+    pub conflicts: Vec<String>,
 }
 
 /// JSON reference to a seal (commit).
