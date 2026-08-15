@@ -438,31 +438,59 @@ fn merge3(base: &str, ours: &str, theirs: &str, ours_label: &str, theirs_label: 
         .collect();
     all.sort_by_key(|(side, e)| (e.start, e.end, *side));
 
-    let mut out: Vec<String> = Vec::new();
-    let mut b = 0usize;
+    // Group the edits into regions of base lines: overlapping or directly
+    // adjacent edits belong to the same region. Independent changes a line or
+    // more apart stay separate regions and merge cleanly.
+    let mut regions: Vec<(usize, usize, usize, usize)> = Vec::new(); // start, end, k, m
     let mut k = 0usize;
     while k < all.len() {
         let start = all[k].1.start;
+        let mut end = all[k].1.end;
+        let mut m = k + 1;
+        while m < all.len() && all[m].1.start <= end {
+            end = end.max(all[m].1.end);
+            m += 1;
+        }
+        regions.push((start, end, k, m));
+        k = m;
+    }
+
+    let is_conflict = |&(_, _, k, m): &(usize, usize, usize, usize)| {
+        all[k..m].iter().any(|(s, _)| *s == 0) && all[k..m].iter().any(|(s, _)| *s == 1)
+    };
+
+    // Two sides rewriting the same function produce edits that alternate every
+    // few lines. Applying those independently splices both rewrites together
+    // into code that was never on either side, so a conflict swallows anything
+    // within a marker's distance of it — the result is one honest conflict
+    // instead of a plausible-looking merge nobody wrote.
+    const SETTLE: usize = 7;
+    let mut i = 0;
+    while i + 1 < regions.len() {
+        let gap = regions[i + 1].0.saturating_sub(regions[i].1);
+        if gap < SETTLE && (is_conflict(&regions[i]) || is_conflict(&regions[i + 1])) {
+            regions[i].1 = regions[i + 1].1;
+            regions[i].3 = regions[i + 1].3;
+            regions.remove(i + 1);
+            continue; // re-test the widened region against what follows
+        }
+        i += 1;
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut b = 0usize;
+    for region in &regions {
+        let (start, end, k, m) = *region;
         while b < start {
             out.push(base_lines[b].to_string());
             b += 1;
         }
 
-        // Grow the region over every following edit that overlaps it, or that
-        // starts at the same base line (two insertions at one point).
-        let mut end = all[k].1.end;
-        let mut m = k + 1;
-        while m < all.len() && (all[m].1.start < end || all[m].1.start == start) {
-            end = end.max(all[m].1.end);
-            m += 1;
-        }
+        let edits = &all[k..m];
+        let ours_side = || edits.iter().filter(|(s, _)| *s == 0).map(|(_, e)| e);
+        let theirs_side = || edits.iter().filter(|(s, _)| *s == 1).map(|(_, e)| e);
 
-        let region = &all[k..m];
-        let ours_side = || region.iter().filter(|(s, _)| *s == 0).map(|(_, e)| e);
-        let theirs_side = || region.iter().filter(|(s, _)| *s == 1).map(|(_, e)| e);
-        let both = ours_side().next().is_some() && theirs_side().next().is_some();
-
-        if both {
+        if is_conflict(region) {
             out.push(format!("{MARKER_OURS} {ours_label}"));
             out.extend(rebuild(&base_lines, start, end, ours_side()));
             out.push(MARKER_SEP.to_string());
@@ -473,12 +501,11 @@ fn merge3(base: &str, ours: &str, theirs: &str, ours_label: &str, theirs_label: 
                 &base_lines,
                 start,
                 end,
-                region.iter().map(|(_, e)| e),
+                edits.iter().map(|(_, e)| e),
             ));
         }
 
         b = end;
-        k = m;
     }
     while b < base_lines.len() {
         out.push(base_lines[b].to_string());
@@ -1001,16 +1028,40 @@ mod tests {
     }
 
     #[test]
-    fn merge3_keeps_a_clean_hunk_outside_the_conflict() {
-        // Both sides rewrite line 2; only theirs appends at the end. The
-        // append must survive rather than being swallowed by the conflict.
-        let base = "a\nb\nc\n";
-        let ours = "a\nOURS\nc\n";
-        let theirs = "a\nTHEIRS\nc\nappended\n";
+    fn merge3_keeps_a_distant_clean_hunk_outside_the_conflict() {
+        // Both sides rewrite line 2; theirs also appends, well clear of it.
+        let base = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n";
+        let ours = "a\nOURS\nc\nd\ne\nf\ng\nh\ni\nj\n";
+        let theirs = "a\nTHEIRS\nc\nd\ne\nf\ng\nh\ni\nj\nappended\n";
 
         let merged = merge3(base, ours, theirs, "main", "remote");
         assert!(merged.ends_with("appended\n"), "{merged}");
         assert_eq!(merged.matches(MARKER_SEP).count(), 1, "{merged}");
+    }
+
+    #[test]
+    fn merge3_does_not_splice_two_rewrites_of_the_same_region() {
+        // Both sides restructured the same block in different ways. Applying
+        // the edits independently would interleave them into code neither
+        // side wrote, so the whole run has to come out as one conflict.
+        let base = "fn f() {\n    one();\n    two();\n    three();\n}\n";
+        let ours = "fn f() {\n    one();\n    OURS_A();\n    three();\n    OURS_B();\n}\n";
+        let theirs = "fn f() {\n    THEIRS_A();\n    two();\n    THEIRS_B();\n}\n";
+
+        let merged = merge3(base, ours, theirs, "main", "remote");
+        assert_eq!(merged.matches(MARKER_SEP).count(), 1, "{merged}");
+        // Every marked line belongs to exactly one side of the one conflict.
+        let (ours_part, theirs_part) = merged.split_once(MARKER_SEP).unwrap();
+        assert!(
+            ours_part.contains("OURS_A") && ours_part.contains("OURS_B"),
+            "{merged}"
+        );
+        assert!(!ours_part.contains("THEIRS_"), "{merged}");
+        assert!(
+            theirs_part.contains("THEIRS_A") && theirs_part.contains("THEIRS_B"),
+            "{merged}"
+        );
+        assert!(!theirs_part.contains("OURS_"), "{merged}");
     }
 
     #[test]
