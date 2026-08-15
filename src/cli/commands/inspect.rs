@@ -26,6 +26,11 @@ pub(super) fn cmd_status(args: StatusArgs) -> Result<(), String> {
         .status(last_tree, &ignore_cache)
         .map_err(|e| e.to_string())?;
 
+    // A merge in progress outranks everything else on this screen: until it is
+    // finished the timeline head is still pre-merge, so an unqualified "clean"
+    // would be a lie.
+    let merge = repo.load_merge_state().ok().flatten();
+
     if args.json {
         let head = head_leaf.as_ref().map(|leaf| {
             let hash = leaf.hash();
@@ -57,6 +62,12 @@ pub(super) fn cmd_status(args: StatusArgs) -> Result<(), String> {
             head,
             files,
             staged_deletions,
+            merge: merge.map(|m| json::MergeJson {
+                source_timeline: m.source_timeline,
+                target_timeline: m.target_timeline,
+                strategy: m.strategy,
+                conflicts: m.conflicts,
+            }),
         };
         println!(
             "{}",
@@ -76,6 +87,20 @@ pub(super) fn cmd_status(args: StatusArgs) -> Result<(), String> {
             color::seal_name(&name),
             color::hash(&hash.short8())
         );
+    }
+
+    if let Some(m) = &merge {
+        println!(
+            "\n{} Merge in progress: {} into {} ({} strategy)",
+            color::red("!!"),
+            color::timeline(&m.source_timeline),
+            color::timeline(&m.target_timeline),
+            m.strategy
+        );
+        for path in &m.conflicts {
+            println!("  {} {}", color::red("CONFLICT"), path);
+        }
+        println!("  Finish with 'ivaldi fuse --continue', or drop it with 'ivaldi fuse --abort'");
     }
 
     if !ws.skipped.is_empty() {

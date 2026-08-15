@@ -495,7 +495,16 @@ fn sync_diverged(
     );
 
     if !fuse_result.success {
-        // Conflicts — save merge state, report
+        // Conflicts — write both sides into the workspace, save merge state,
+        // and report. The timeline head does NOT move: the merge is finished
+        // by 'ivaldi fuse --continue', not by sync.
+        let (_marked, _binary) = crate::fuse::write_conflict_markers(
+            &store,
+            &repo.work_dir,
+            &fuse_result.conflicts,
+            timeline,
+            &temp_timeline,
+        );
         let conflicts: Vec<String> = fuse_result
             .conflicts
             .iter()

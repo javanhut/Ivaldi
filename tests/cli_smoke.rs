@@ -265,3 +265,76 @@ fn skip_excludes_paths_from_staging_until_unskip() {
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     assert_eq!(status["files"], serde_json::json!([]));
 }
+
+/// A conflicted fuse must leave a resolvable state, and `--continue` must
+/// finish it without dropping the side that merged cleanly.
+#[test]
+fn conflicted_fuse_is_reported_resolvable_and_completable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    forge_with_identity(path);
+
+    std::fs::write(path.join("shared.txt"), "a\nb\nc\n").unwrap();
+    std::fs::write(path.join("only_theirs.txt"), "base\n").unwrap();
+    seal_all(path, "base");
+
+    // Source side: rewrite line 2 of shared.txt, and change a file main never
+    // touches — that second change must survive the merge.
+    ivaldi_ok(path, &["timeline", "create", "feature"]);
+    std::fs::write(path.join("shared.txt"), "a\nTHEIRS\nc\n").unwrap();
+    std::fs::write(path.join("only_theirs.txt"), "changed by feature\n").unwrap();
+    seal_all(path, "feature edit");
+
+    // Target side: rewrite the same line differently.
+    ivaldi_ok(path, &["timeline", "switch", "main"]);
+    std::fs::write(path.join("shared.txt"), "a\nOURS\nc\n").unwrap();
+    seal_all(path, "main edit");
+
+    // The fuse conflicts, says so, and writes both sides into the file.
+    let fuse = ivaldi(path, &["fuse", "feature"]);
+    assert!(!fuse.status.success(), "a conflicted fuse must not exit 0");
+    let out = String::from_utf8_lossy(&fuse.stdout);
+    assert!(out.contains("CONFLICT: shared.txt"), "{out}");
+    let conflicted = std::fs::read_to_string(path.join("shared.txt")).unwrap();
+    assert!(conflicted.contains("<<<<<<<"), "{conflicted}");
+    assert!(
+        conflicted.contains("OURS") && conflicted.contains("THEIRS"),
+        "{conflicted}"
+    );
+
+    // Status must not call this clean.
+    let status = ivaldi_ok(path, &["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["merge"]["source_timeline"], "feature");
+    assert_eq!(
+        status["merge"]["conflicts"],
+        serde_json::json!(["shared.txt"])
+    );
+
+    // Continuing before resolving is refused.
+    let early = ivaldi(path, &["fuse", "--continue"]);
+    assert!(!early.status.success());
+
+    std::fs::write(path.join("shared.txt"), "a\nRESOLVED\nc\n").unwrap();
+    ivaldi_ok(path, &["fuse", "--continue"]);
+
+    // The resolution and the cleanly-merged file both landed, and the merge
+    // state is gone.
+    assert_eq!(
+        std::fs::read_to_string(path.join("shared.txt")).unwrap(),
+        "a\nRESOLVED\nc\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("only_theirs.txt")).unwrap(),
+        "changed by feature\n"
+    );
+    let status = ivaldi_ok(path, &["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(status["merge"].is_null(), "{status}");
+
+    // The merge seal records both parents, which is what lets a diverged
+    // upload fast-forward again.
+    let log = ivaldi_ok(path, &["log", "--format", "json"]);
+    let log: serde_json::Value = serde_json::from_slice(&log.stdout).unwrap();
+    assert_eq!(log[0]["is_merge"], true, "{log}");
+}

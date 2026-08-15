@@ -100,26 +100,14 @@ pub(super) fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
     }
 
     if args.continue_merge {
-        let state = repo
-            .load_merge_state()
-            .map_err(|e| e.to_string())?
-            .ok_or("no merge in progress")?;
-        if state.conflicts.is_empty() {
-            repo.clear_merge_state().map_err(|e| e.to_string())?;
-            if !quiet {
-                println!("Merge completed.");
-            }
-        } else {
-            println!("Unresolved conflicts:");
-            for c in &state.conflicts {
-                println!("  CONFLICT: {}", c);
-            }
-            println!("\nResolve conflicts, then run 'ivaldi fuse --continue'");
-        }
-        return Ok(());
+        return continue_merge(&mut repo, quiet);
     }
 
-    if repo.has_merge_in_progress() {
+    // A merge in progress only blocks *bare* re-invocations. Naming a source
+    // again is a deliberate re-attempt — usually the `--strategy=theirs`
+    // escape hatch printed with the conflicts — so let it through and let the
+    // new outcome replace the recorded merge state.
+    if repo.has_merge_in_progress() && args.source.is_none() {
         return Err("merge already in progress. Use --continue or --abort.".into());
     }
 
@@ -232,6 +220,10 @@ pub(super) fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
         ws.materialize(merged_tree)
             .map_err(|e| format!("merge committed but failed to materialize: {}", e))?;
 
+        // A re-attempt that succeeds (e.g. --strategy=theirs after a
+        // conflicted auto fuse) resolves the recorded merge.
+        repo.clear_merge_state().map_err(|e| e.to_string())?;
+
         if !quiet {
             println!("[OK] Merge completed successfully!");
             println!(
@@ -252,17 +244,177 @@ pub(super) fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
         repo.save_merge_state(&state).map_err(|e| e.to_string())?;
         crate::failpoint::fail_point("fuse.after_merge_state");
 
+        // Put both sides in front of the user, in the files themselves.
+        let (marked, skipped) = crate::fuse::write_conflict_markers(
+            &store,
+            &ctx.work_dir,
+            &result.conflicts,
+            &target,
+            source,
+        );
+
         println!("[CONFLICTS] Merge conflicts detected:\n");
-        for path in &conflict_paths {
-            println!("  CONFLICT: {}", path);
+        for path in &marked {
+            println!("  CONFLICT: {} (conflict markers written)", path);
         }
-        println!("\n>> {} file(s) with conflicts", conflict_paths.len());
+        for path in &skipped {
+            println!("  CONFLICT: {} (binary — choose a side)", path);
+        }
         println!("\nResolution options:");
-        println!("  ivaldi fuse --continue          - after manual resolution");
-        println!("  ivaldi fuse --strategy=theirs {} to {}", source, target);
-        println!("  ivaldi fuse --abort             - abort merge");
+        println!("  edit the marked files, then 'ivaldi fuse --continue'");
+        println!(
+            "  ivaldi fuse --strategy=theirs {}   - take the source wholesale",
+            source
+        );
+        println!("  ivaldi fuse --abort                - abort merge");
+
+        // No merge seal was created and the timeline head has not moved, so
+        // this is a failure — exiting 0 here is what lets a half-done merge
+        // pass for a finished one in scripts and in the next command.
+        return Err(format!(
+            "{} file(s) with conflicts — merge not completed",
+            conflict_paths.len()
+        ));
     }
 
+    Ok(())
+}
+
+/// Finish a conflicted fuse. Re-runs the three-way merge to recover everything
+/// that auto-resolved, then takes the conflicted paths from the workspace,
+/// where the user resolved them. Both parents are recorded, so the merge is a
+/// real merge seal — which is also what makes a diverged `upload` fast-forward
+/// again.
+fn continue_merge(repo: &mut Repo, quiet: bool) -> Result<(), String> {
+    use crate::fuse::FuseEngine;
+    use std::collections::BTreeMap;
+
+    let state = repo
+        .load_merge_state()
+        .map_err(|e| e.to_string())?
+        .ok_or("no merge in progress")?;
+
+    let target = repo.current_timeline().map_err(|e| e.to_string())?;
+    if target != state.target_timeline {
+        return Err(format!(
+            "the merge in progress targets '{}' but the current timeline is '{}' — \
+             switch back, or run 'ivaldi fuse --abort'",
+            state.target_timeline, target
+        ));
+    }
+
+    let source_head = repo
+        .get_timeline_head(&state.source_timeline)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            format!(
+                "source timeline '{}' no longer exists — run 'ivaldi fuse --abort' and redo the merge",
+                state.source_timeline
+            )
+        })?;
+    let target_head = repo
+        .get_timeline_head(&target)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("timeline '{}' has no seals", target))?;
+    let source_leaf = repo
+        .get_leaf(source_head)
+        .map_err(|e| e.to_string())?
+        .ok_or("corrupt source head")?;
+    let target_leaf = repo
+        .get_leaf(target_head)
+        .map_err(|e| e.to_string())?
+        .ok_or("corrupt target head")?;
+
+    let ctx = find_repo()?;
+    let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
+    let store = crate::fsmerkle::FsStore::new(&cas);
+
+    let mut base_files = BTreeMap::new();
+    let mut ours_files = BTreeMap::new();
+    let mut theirs_files = BTreeMap::new();
+    if let Some(base_idx) = repo
+        .merge_base(target_head, source_head)
+        .map_err(|e| e.to_string())?
+        && let Some(base_leaf) = repo.get_leaf(base_idx).map_err(|e| e.to_string())?
+    {
+        collect_blob_hashes(&store, base_leaf.tree_root, "", &mut base_files)?;
+    }
+    collect_blob_hashes(&store, target_leaf.tree_root, "", &mut ours_files)?;
+    collect_blob_hashes(&store, source_leaf.tree_root, "", &mut theirs_files)?;
+
+    let strategy = state.strategy.parse::<Strategy>().unwrap_or(Strategy::Auto);
+    let result = FuseEngine::fuse(&store, &base_files, &ours_files, &theirs_files, strategy);
+    let mut merged = result.merged_files;
+
+    // Everything the engine could not decide is read back from the workspace.
+    let mut unresolved = Vec::new();
+    for c in &result.conflicts {
+        match std::fs::read(ctx.work_dir.join(&c.path)) {
+            Ok(bytes) => {
+                if crate::fuse::has_conflict_markers(&bytes) {
+                    unresolved.push(c.path.clone());
+                    continue;
+                }
+                let (hash, _) = store.put_blob(&bytes).map_err(|e| e.to_string())?;
+                merged.insert(c.path.clone(), hash);
+            }
+            // Deleting the file is a valid resolution: it stays out of the tree.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("cannot read {}: {}", c.path, e)),
+        }
+    }
+    if !unresolved.is_empty() {
+        println!("Unresolved conflicts:");
+        for path in &unresolved {
+            println!("  CONFLICT: {}", path);
+        }
+        return Err(format!(
+            "{} file(s) still contain conflict markers — resolve them, then rerun \
+             'ivaldi fuse --continue'",
+            unresolved.len()
+        ));
+    }
+
+    let merged_tree = store
+        .build_tree_from_hash_map(&merged)
+        .map_err(|e| e.to_string())?;
+
+    let author = repo.config().author().unwrap_or_else(|| "ivaldi".into());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let message = format!("Fuse {} into {}", state.source_timeline, target);
+    let mut fuse_leaf = crate::leaf::Leaf::new(merged_tree, &target, &author, now, &message);
+    fuse_leaf.prev_idx = target_head;
+    fuse_leaf.merge_idxs = vec![source_head];
+
+    // Durable tree before the commit record that points at it (same ordering
+    // as the clean-fuse path).
+    cas.flush().map_err(|e| e.to_string())?;
+    let commit_result = repo
+        .commit_raw(fuse_leaf, &target)
+        .map_err(|e| e.to_string())?;
+
+    let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
+    ws.materialize(merged_tree)
+        .map_err(|e| format!("merge committed but failed to materialize: {}", e))?;
+
+    repo.clear_merge_state().map_err(|e| e.to_string())?;
+    // The scratch timeline sync created to hold the remote side has no further
+    // use once the merge references it; its seals stay in the history.
+    if state.source_timeline.starts_with("__sync_") {
+        let _ = repo.remove_timeline(&state.source_timeline);
+    }
+
+    if !quiet {
+        println!("[OK] Merge completed successfully!");
+        println!(
+            "  Merge seal: {} ({})",
+            commit_result.seal_name,
+            commit_result.hash.short8()
+        );
+    }
     Ok(())
 }
 
