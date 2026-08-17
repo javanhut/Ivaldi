@@ -184,13 +184,54 @@ impl FileCas {
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Get a file's bytes out of the page cache and onto the storage device,
+/// without flushing the device's own write cache.
+///
+/// `File::sync_all` is `fcntl(F_FULLFSYNC)` on macOS — a whole-device barrier
+/// costing ~4 ms regardless of object size, versus ~0.13 ms for a plain
+/// `fsync`. Paying it per object made importing a large repository 30x slower
+/// than the writes themselves. Plain `fsync` still guarantees no crash can
+/// publish a torn object (the poison case, since `put` dedups on existence);
+/// the device barrier is paid once per [`FileCas::flush`] instead, which is
+/// where durability is actually owed.
+#[cfg(unix)]
+fn sync_bytes_to_device(file: &fs::File) -> std::io::Result<()> {
+    // ponytail: Linux/BSD fsync already flushes the device, so this only
+    // moves the cost there rather than removing it. `sync_file_range` +
+    // barrier-at-flush would fix that too, if a Linux import ever measures slow.
+    rustix::fs::fsync(file).map_err(std::io::Error::from)
+}
+
+#[cfg(not(unix))]
+fn sync_bytes_to_device(file: &fs::File) -> std::io::Result<()> {
+    file.sync_all()
+}
+
+/// One whole-device cache flush, making every previously-`fsync`ed object
+/// survive power loss. Issued on the CAS root directory; on Apple platforms
+/// `F_FULLFSYNC` on a directory fd flushes the same device as on a file fd.
+#[cfg(target_vendor = "apple")]
+fn device_barrier(dir: &fs::File) -> std::io::Result<()> {
+    rustix::fs::fcntl_fullfsync(dir).map_err(std::io::Error::from)
+}
+
+/// Elsewhere `sync_bytes_to_device` already flushed the device per object, so
+/// this only needs to make the directory entries durable.
+#[cfg(not(target_vendor = "apple"))]
+fn device_barrier(dir: &fs::File) -> std::io::Result<()> {
+    dir.sync_all()
+}
+
 impl FileCas {
-    /// Flush directory metadata to disk for shards written since the last
-    /// flush. Object *contents* are already fsynced by `put` before their
-    /// rename; this makes the directory entries themselves durable. Call
-    /// before any durable record (commit, mapping save, timeline head)
-    /// references objects written since the last flush.
+    /// Make everything written since the last flush durable: the shard
+    /// directory entries, then one whole-device cache barrier covering every
+    /// object `put` wrote. Call before any durable record (commit, mapping
+    /// save, timeline head) references those objects.
     /// No-op when nothing was written.
+    ///
+    /// The barrier is the expensive half (~4 ms on macOS), which is why `put`
+    /// no longer pays one per object — see [`sync_bytes_to_device`]. Batch
+    /// your writes and flush once; flushing per object is back to square one.
     pub fn flush(&self) -> Result<(), CasError> {
         let shards: Vec<PathBuf> = {
             let mut dirty = self.dirty_shards.lock().unwrap();
@@ -204,9 +245,11 @@ impl FileCas {
                 let _ = dir.sync_all();
             }
         }
-        if let Ok(root) = fs::File::open(&self.root) {
-            let _ = root.sync_all();
-        }
+        // Unlike the per-shard syncs above (directory metadata, best-effort:
+        // some filesystems reject directory fsync), this one carries the
+        // objects' own durability. A silent failure here would let a commit
+        // record claim bytes the device can still lose, so it propagates.
+        device_barrier(&fs::File::open(&self.root)?)?;
         Ok(())
     }
 
@@ -242,19 +285,17 @@ impl Cas for FileCas {
         // Write to a per-process, per-call unique temp file then rename
         // (atomic on most filesystems). The unique suffix lets concurrent
         // writers race on the same hash without clobbering each other's tmp.
-        // The content is fsynced BEFORE the rename publishes it: `flush()`
-        // only makes directory entries durable, so without this a durable
-        // commit record could reference an object whose bytes vanish on
-        // power loss — and because `put` dedups on `path.exists()`, a
-        // truncated survivor would poison every retry.
-        // ponytail: one fsync per new object; batch pending files in flush()
-        // if import throughput ever demands it.
+        // The content reaches the device BEFORE the rename publishes it,
+        // because `put` dedups on `path.exists()`: a truncated survivor would
+        // poison every retry. The device *cache* flush that turns this into
+        // power-loss durability is batched into `flush()`, which is the point
+        // where a commit record is about to reference these bytes.
         let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = path.with_extension(format!("tmp.{}.{}", process::id(), n));
         {
             let mut file = fs::File::create(&tmp_path)?;
             file.write_all(data)?;
-            file.sync_all()?;
+            sync_bytes_to_device(&file)?;
         }
         if let Err(e) = fs::rename(&tmp_path, &path) {
             // If a concurrent writer already published the same hash, that's

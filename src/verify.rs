@@ -176,6 +176,7 @@ fn verify_impl(work_dir: &Path, full: bool, migrating: bool) -> Report {
         };
         checks.push(verify_reachable_content(&ivaldi_dir, store.as_ref()));
         checks.push(verify_refs(&ivaldi_dir, store.as_ref()));
+        checks.push(verify_tags(&ivaldi_dir, store.as_ref()));
         checks.push(verify_seal_mappings(store.as_ref()));
     }
 
@@ -346,6 +347,105 @@ fn verify_reachable_content(ivaldi_dir: &Path, store: Option<&Store>) -> Check {
             detail,
         }
     }
+}
+
+/// Every stored tag must parse, name a seal the store actually holds, and have
+/// its `refs/tags/<name>` marker — and every marker must have a stored tag.
+/// A tag pointing at nothing is a name that silently resolves wrong, which is
+/// worse than a name that isn't there.
+fn verify_tags(ivaldi_dir: &Path, store: Option<&Store>) -> Check {
+    let tags_dir = ivaldi_dir.join("refs/tags");
+    let mut problems = Vec::new();
+
+    let stored = match store {
+        Some(store) => match store.list_tags() {
+            Ok(tags) => tags,
+            Err(e) => {
+                problems.push(format!("cannot list stored tags: {e}"));
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+    let indices: HashSet<u64> = match store {
+        Some(store) => match store.all_leaf_indices() {
+            Ok(indices) => indices.into_iter().collect(),
+            Err(e) => {
+                problems.push(format!("cannot list stored leaves: {e}"));
+                HashSet::new()
+            }
+        },
+        None => HashSet::new(),
+    };
+
+    let mut stored_names = HashSet::new();
+    for (name, record) in &stored {
+        stored_names.insert(name.clone());
+        match crate::tags::parse_tag(name, record) {
+            Ok(tag) => {
+                if !indices.contains(&tag.target_index) {
+                    problems.push(format!(
+                        "tag '{name}' points at missing seal {}",
+                        tag.target_index
+                    ));
+                }
+            }
+            Err(e) => problems.push(e.to_string()),
+        }
+        match crate::refname::tag_ref_path(ivaldi_dir, name) {
+            Ok(path) if path.exists() => {}
+            Ok(_) => problems.push(format!("stored tag '{name}' has no ref marker")),
+            Err(e) => problems.push(e.to_string()),
+        }
+    }
+
+    for name in tag_marker_names(&tags_dir, &mut problems) {
+        if !stored_names.contains(&name) {
+            problems.push(format!("tag marker '{name}' has no stored tag"));
+        }
+    }
+
+    if problems.is_empty() {
+        Check {
+            name: "tags".into(),
+            ok: true,
+            detail: format!("{} tags resolve", stored.len()),
+        }
+    } else {
+        Check {
+            name: "tags".into(),
+            ok: false,
+            detail: problems.join("; "),
+        }
+    }
+}
+
+/// Relative names of every marker file under `refs/tags`. A missing directory
+/// simply means no tags.
+fn tag_marker_names(tags_dir: &Path, problems: &mut Vec<String>) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut pending = vec![tags_dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                problems.push(format!("cannot read {}: {e}", dir.display()));
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if let Ok(relative) = path.strip_prefix(tags_dir)
+                && let Some(name) = relative.to_str()
+            {
+                names.push(name.replace(std::path::MAIN_SEPARATOR, "/"));
+            }
+        }
+    }
+    names
 }
 
 /// Every `refs/heads/<name>` must resolve: either the store has a timeline head
@@ -840,6 +940,80 @@ mod tests {
             .expect("full verification should include refs");
         assert!(refs.ok, "{}", refs.detail);
         assert!(refs.detail.contains("2 refs resolve"));
+    }
+
+    fn repo_with_one_tag() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let mut repo = crate::repo::Repo::open(dir.path()).unwrap();
+        let landed = repo.commit(B3Hash::digest(b"tree"), "A", "root").unwrap();
+        repo.set_tags(&[crate::tags::Tag::lightweight("v1.0", landed.index)])
+            .unwrap();
+        dir
+    }
+
+    fn tags_check(dir: &Path) -> Check {
+        verify(dir, true)
+            .checks
+            .into_iter()
+            .find(|c| c.name == "tags")
+            .expect("full verification should include tags")
+    }
+
+    #[test]
+    fn a_tag_on_a_real_seal_resolves() {
+        let dir = repo_with_one_tag();
+        let tags = tags_check(dir.path());
+        assert!(tags.ok, "{}", tags.detail);
+        assert!(tags.detail.contains("1 tags resolve"));
+    }
+
+    #[test]
+    fn tag_pointing_at_a_missing_seal_fails_full_check() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        // Write the record straight to the store, bypassing `Repo::set_tags`'
+        // own target check, to reproduce a repository damaged after the fact.
+        let store = Store::open(&dir.path().join(".ivaldi/store.db")).unwrap();
+        let record = crate::tags::Tag::lightweight("ghost", 99).canonical_bytes();
+        store.put_tags(&[("ghost".to_string(), record)]).unwrap();
+        drop(store);
+        std::fs::create_dir_all(dir.path().join(".ivaldi/refs/tags")).unwrap();
+        std::fs::write(dir.path().join(".ivaldi/refs/tags/ghost"), b"").unwrap();
+
+        let tags = tags_check(dir.path());
+        assert!(!tags.ok);
+        assert!(tags.detail.contains("points at missing seal"), "{}", tags.detail);
+    }
+
+    #[test]
+    fn stored_tag_without_its_marker_fails_full_check() {
+        let dir = repo_with_one_tag();
+        std::fs::remove_file(dir.path().join(".ivaldi/refs/tags/v1.0")).unwrap();
+
+        let tags = tags_check(dir.path());
+        assert!(!tags.ok);
+        assert!(tags.detail.contains("has no ref marker"), "{}", tags.detail);
+    }
+
+    #[test]
+    fn tag_marker_without_a_stored_tag_fails_full_check() {
+        let dir = repo_with_one_tag();
+        std::fs::write(dir.path().join(".ivaldi/refs/tags/orphan"), b"").unwrap();
+
+        let tags = tags_check(dir.path());
+        assert!(!tags.ok);
+        assert!(tags.detail.contains("has no stored tag"), "{}", tags.detail);
+    }
+
+    #[test]
+    fn tags_do_not_disturb_the_heads_ref_check() {
+        // `refs/tags` lives beside `refs/heads`; the heads walk must not see it.
+        let dir = repo_with_one_tag();
+        let report = verify(dir.path(), true);
+        let refs = report.checks.iter().find(|c| c.name == "refs").unwrap();
+        assert!(refs.ok, "{}", refs.detail);
+        assert!(refs.detail.contains("1 refs resolve"), "{}", refs.detail);
     }
 
     #[test]

@@ -83,6 +83,7 @@ fn fetch_result(branch: &str, head: &str, objects: HashMap<String, GitObject>) -
         head_sha: head.to_string(),
         refs: Vec::new(),
         objects,
+        shallow: Default::default(),
     }
 }
 
@@ -120,6 +121,177 @@ fn seal_local(dir: &Path, name: &str, body: &[u8]) {
         .unwrap();
     repo.commit(tree, "local <l@x>", &format!("local {}", name))
         .unwrap();
+}
+
+fn add_tag_object(
+    objects: &mut HashMap<String, GitObject>,
+    target: &str,
+    name: &str,
+    message: &str,
+) -> String {
+    let mut body = format!("object {}\ntype commit\ntag {}\n", target, name);
+    body.push_str("tagger Tagger <t@x> 1710000500 +0000\n\n");
+    body.push_str(message);
+    let data = body.into_bytes();
+    let sha = git_object_id(GitObjectKind::Tag, &data);
+    objects.insert(
+        sha.clone(),
+        GitObject {
+            kind: GitObjectKind::Tag,
+            data,
+        },
+    );
+    sha
+}
+
+fn tag_ref(name: &str, id: &str) -> ivaldi::git_remote::AdvertisedRef {
+    ivaldi::git_remote::AdvertisedRef {
+        id: id.to_string(),
+        name: format!("refs/tags/{}", name),
+    }
+}
+
+/// Lightweight and annotated tags both resolve, and a tag pointing off the
+/// cloned branch pulls its own commit in as a seal rather than being dropped.
+#[test]
+fn tags_import_with_annotations_and_off_branch_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    ivaldi::forge::forge(dir.path()).unwrap();
+
+    let (mut objects, c1, c2) = two_commit_chain();
+    // A commit on no branch at all, reachable only through its tag — the case
+    // that silently produced zero tags before tag targets became walk roots.
+    let side_blob = add_blob(&mut objects, b"side body");
+    let side_tree = add_tree(&mut objects, &[("side.txt", &side_blob)]);
+    let side = add_commit(&mut objects, &side_tree, &[c1.as_str()], "side");
+    let annotated = add_tag_object(&mut objects, &side, "v2.0", "Release two\n");
+
+    let mut fetch = fetch_result("main", &c2, objects);
+    fetch.refs = vec![
+        tag_ref("v1.0", &c1),        // lightweight, on-branch
+        tag_ref("v2.0", &annotated), // annotated, off-branch
+    ];
+
+    {
+        let mut repo = Repo::open(dir.path()).unwrap();
+        let result = import_fetch_result(&mut repo, &fetch).unwrap();
+        assert_eq!(result.tags_imported, 2);
+        // The off-branch commit had to be imported for its tag to resolve.
+        assert_eq!(result.commits_imported, 3);
+
+        let v1 = repo.get_tag("v1.0").unwrap().unwrap();
+        assert_eq!(v1.kind, ivaldi::tags::TagKind::Lightweight);
+        assert!(v1.message.is_none());
+        assert_eq!(repo.get_leaf(v1.target_index).unwrap().unwrap().message, "root\n");
+
+        let v2 = repo.get_tag("v2.0").unwrap().unwrap();
+        assert_eq!(v2.kind, ivaldi::tags::TagKind::Annotated);
+        assert_eq!(v2.message.as_deref(), Some("Release two\n"));
+        assert_eq!(v2.tagger.as_deref(), Some("Tagger <t@x>"));
+        assert_eq!(v2.timestamp, Some(1710000500));
+        assert_eq!(repo.get_leaf(v2.target_index).unwrap().unwrap().message, "side\n");
+
+        // The tagged side commit must not have hijacked the branch head.
+        let head = repo.get_timeline_head("main").unwrap().unwrap();
+        assert_eq!(repo.get_leaf(head).unwrap().unwrap().message, "tip\n");
+
+        // Every tag has its ref marker.
+        for name in ["v1.0", "v2.0"] {
+            assert!(dir.path().join(".ivaldi/refs/tags").join(name).exists());
+        }
+    }
+    verify_full_ok(dir.path());
+}
+
+/// Re-importing the same advertisement must not duplicate or disturb tags.
+#[test]
+fn tag_import_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    ivaldi::forge::forge(dir.path()).unwrap();
+
+    let (objects, c1, c2) = two_commit_chain();
+    let mut fetch = fetch_result("main", &c2, objects);
+    fetch.refs = vec![tag_ref("v1.0", &c1)];
+
+    let mut repo = Repo::open(dir.path()).unwrap();
+    assert_eq!(import_fetch_result(&mut repo, &fetch).unwrap().tags_imported, 1);
+    // Second pass: already recorded at the same seal, so nothing to write.
+    assert_eq!(import_fetch_result(&mut repo, &fetch).unwrap().tags_imported, 0);
+    assert_eq!(repo.list_tags().unwrap().len(), 1);
+    drop(repo);
+    verify_full_ok(dir.path());
+}
+
+/// A tag whose target was never fetched is skipped, not an error — that is
+/// the normal shape of a clone without `--include-tags`.
+#[test]
+fn tag_pointing_at_an_unfetched_object_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    ivaldi::forge::forge(dir.path()).unwrap();
+
+    let (objects, _c1, c2) = two_commit_chain();
+    let mut fetch = fetch_result("main", &c2, objects);
+    fetch.refs = vec![tag_ref("v9.9", "0123456789012345678901234567890123456789")];
+
+    let mut repo = Repo::open(dir.path()).unwrap();
+    let result = import_fetch_result(&mut repo, &fetch).unwrap();
+    assert_eq!(result.tags_imported, 0);
+    assert!(repo.list_tags().unwrap().is_empty());
+    drop(repo);
+    verify_full_ok(dir.path());
+}
+
+/// A `--depth`-limited fetch: the server sends only the tip and declares it a
+/// shallow boundary, so the tip lands as a root with its truncation recorded.
+#[test]
+fn shallow_import_lands_the_boundary_as_a_marked_root() {
+    let dir = tempfile::tempdir().unwrap();
+    ivaldi::forge::forge(dir.path()).unwrap();
+
+    let (mut objects, c1, c2) = two_commit_chain();
+    // The root's commit object is absent from a depth-1 pack (its blob and
+    // tree survive because the tip's tree still references them).
+    objects.remove(&c1);
+    let mut fetch = fetch_result("main", &c2, objects);
+    fetch.shallow.insert(c2.clone());
+
+    {
+        let mut repo = Repo::open(dir.path()).unwrap();
+        let result = import_fetch_result(&mut repo, &fetch).unwrap();
+        assert_eq!(result.commits_imported, 1);
+
+        let head = repo.get_timeline_head("main").unwrap().unwrap();
+        assert_eq!(head, 0);
+        let tip = repo.get_leaf(0).unwrap().unwrap();
+        assert_eq!(tip.message, "tip\n");
+        assert_eq!(tip.prev_idx, NO_PARENT, "boundary must land as a root");
+        assert_eq!(
+            tip.meta.get("git.shallow").map(String::as_str),
+            Some("1"),
+            "a truncated root must be distinguishable from a real one"
+        );
+    }
+    verify_full_ok(dir.path());
+}
+
+/// The same missing parent WITHOUT a shallow declaration is a broken pack,
+/// and must still be refused rather than silently severing ancestry.
+#[test]
+fn missing_parent_without_shallow_declaration_is_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    ivaldi::forge::forge(dir.path()).unwrap();
+
+    let (mut objects, c1, c2) = two_commit_chain();
+    objects.remove(&c1);
+    let fetch = fetch_result("main", &c2, objects);
+
+    let mut repo = Repo::open(dir.path()).unwrap();
+    let err = import_fetch_result(&mut repo, &fetch).unwrap_err();
+    assert!(
+        err.to_string().contains("missing commit object"),
+        "unexpected error: {}",
+        err
+    );
 }
 
 #[test]

@@ -3,7 +3,7 @@
 //! This module implements the minimal subset needed by `ivaldi download`:
 //! ref advertisement, upload-pack fetch, packfile parsing, and object import.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{Cursor, Read, Write};
 
 use base64::Engine;
@@ -18,6 +18,28 @@ use crate::progress;
 use crate::remote::RemoteBranch;
 
 const GITHUB_BASE: &str = "https://github.com";
+
+/// Capabilities advertised on the first `want` line. `shallow` is what earns
+/// the right to send `deepen` and to receive the server's `shallow` boundary
+/// lines back; the rest are the framing/encoding we already handle.
+pub(crate) const UPLOAD_PACK_CAPS: &str =
+    "multi_ack_detailed side-band-64k ofs-delta shallow no-progress include-tag agent=ivaldi/0.1.0";
+
+/// Object ids to `want` on top of the branch tip so a fetch also carries the
+/// repository's tags.
+///
+/// Advertised `refs/tags/*` only; the peeled `^{}` companions resolve to
+/// objects the tag itself already reaches. Duplicates and the branch tip are
+/// dropped so the request never asks for the same object twice.
+pub(crate) fn tag_wants(refs: &[AdvertisedRef], head_sha: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    seen.insert(head_sha.to_string());
+    refs.iter()
+        .filter(|r| r.name.starts_with("refs/tags/") && !r.name.ends_with("^{}"))
+        .filter(|r| seen.insert(r.id.clone()))
+        .map(|r| r.id.clone())
+        .collect()
+}
 
 /// Hard ceiling on a single decoded git object (mirrors
 /// `pack::MAX_DELTA_OUTPUT`). Any host or MITM'd anonymous clone can hand us
@@ -52,6 +74,11 @@ pub struct FetchResult {
     pub head_sha: String,
     pub refs: Vec<AdvertisedRef>,
     pub objects: HashMap<String, GitObject>,
+    /// Commits the server declared as shallow boundaries: their parents were
+    /// deliberately left out of the pack, so importing them as roots is
+    /// correct rather than corruption. Empty for a full fetch, where a
+    /// missing parent still means a broken pack and import must refuse.
+    pub shallow: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +120,8 @@ pub struct TreeEntry {
 pub struct SmartHttpClient {
     token: Option<String>,
     agent: ureq::Agent,
+    depth: usize,
+    include_tags: bool,
 }
 
 impl SmartHttpClient {
@@ -106,7 +135,26 @@ impl SmartHttpClient {
         Self {
             token: token.map(str::to_string),
             agent,
+            depth: 0,
+            include_tags: false,
         }
+    }
+
+    /// Truncate the fetch to `depth` commits of history per branch tip
+    /// (0 = full history, the default). Sent to the server as `deepen`, so
+    /// the pack itself is smaller — this is a bandwidth fix, not just a
+    /// display filter.
+    pub fn with_depth(mut self, depth: usize) -> Self {
+        self.depth = depth;
+        self
+    }
+
+    /// Also fetch the objects behind `refs/tags/*`. Off by default: tags
+    /// commonly point outside the branch being cloned, so including them can
+    /// pull in a great deal of extra history.
+    pub fn with_tags(mut self, include_tags: bool) -> Self {
+        self.include_tags = include_tags;
+        self
     }
 
     pub fn fetch_repo(
@@ -130,14 +178,20 @@ impl SmartHttpClient {
         let base = base.trim_end_matches('/');
         let discovery = self.discover_refs(base, "git-upload-pack")?;
         let (branch_name, head_sha) = select_branch_from_discovery(&discovery, branch)?;
-        let pack = self.fetch_pack(base, &head_sha)?;
-        let objects = parse_packfile(&pack)?;
+        let extra_wants = if self.include_tags {
+            tag_wants(&discovery.refs, &head_sha)
+        } else {
+            Vec::new()
+        };
+        let response = self.fetch_pack(base, &head_sha, &extra_wants)?;
+        let objects = parse_packfile(&response.pack)?;
 
         Ok(FetchResult {
             branch: branch_name,
             head_sha,
             refs: discovery.refs,
             objects,
+            shallow: response.shallow,
         })
     }
 
@@ -237,12 +291,27 @@ impl SmartHttpClient {
         parse_discovery(&bytes)
     }
 
-    fn fetch_pack(&self, base: &str, want_sha: &str) -> Result<Vec<u8>, GitRemoteError> {
+    fn fetch_pack(
+        &self,
+        base: &str,
+        want_sha: &str,
+        extra_wants: &[String],
+    ) -> Result<UploadPackResponse, GitRemoteError> {
         let url = format!("{}/git-upload-pack", base);
-        let caps =
-            "multi_ack_detailed side-band-64k ofs-delta no-progress include-tag agent=ivaldi/0.1.0";
         let mut body = Vec::new();
-        body.extend(pkt_line(&format!("want {} {}\n", want_sha, caps)));
+        // Only the first want carries the capability list; the rest are bare.
+        body.extend(pkt_line(&format!(
+            "want {} {}\n",
+            want_sha, UPLOAD_PACK_CAPS
+        )));
+        for want in extra_wants {
+            body.extend(pkt_line(&format!("want {}\n", want)));
+        }
+        // Per the pack protocol the depth request goes after the wants and
+        // before the flush that ends the request.
+        if self.depth > 0 {
+            body.extend(pkt_line(&format!("deepen {}\n", self.depth)));
+        }
         body.extend_from_slice(b"0000");
         body.extend(pkt_line("done\n"));
 
@@ -330,12 +399,14 @@ impl SmartHttpClient {
         repo_name: &str,
         branch: &str,
         force: bool,
+        include_tags: bool,
     ) -> Result<PushReport, GitRemoteError> {
         self.push_repo_url(
             repo,
             &format!("{}/{}/{}.git", GITHUB_BASE, owner, repo_name),
             branch,
             force,
+            include_tags,
         )
     }
 
@@ -347,9 +418,9 @@ impl SmartHttpClient {
         base: &str,
         branch: &str,
         force: bool,
+        include_tags: bool,
     ) -> Result<PushReport, GitRemoteError> {
         use crate::remote::HashMapping;
-        use std::collections::BTreeSet;
 
         let base = base.trim_end_matches('/');
 
@@ -364,80 +435,61 @@ impl SmartHttpClient {
         // ---- Discover the remote's receive-pack advertisement.
         let discovery = self.discover_refs(base, "git-receive-pack")?;
         let target_ref = format!("refs/heads/{}", branch);
-        let zero = "0".repeat(40);
         let old_sha1 = discovery
             .refs
             .iter()
             .find(|r| r.name == target_ref)
             .map(|r| r.id.clone())
-            .unwrap_or_else(|| zero.clone());
-
-        // SHA-1s the server already advertised, so the exporter only skips
-        // ancestors actually present on this remote.
-        let server_has: BTreeSet<[u8; 20]> = discovery
-            .refs
-            .iter()
-            .filter(|r| r.id != zero)
-            .filter_map(|r| {
-                let raw = hex::decode(&r.id).ok()?;
-                (raw.len() == 20).then(|| {
-                    let mut b = [0u8; 20];
-                    b.copy_from_slice(&raw);
-                    b
-                })
-            })
-            .collect();
+            .unwrap_or_else(|| ZERO_SHA1.to_string());
 
         // ---- Refuse a non-fast-forward push unless forced. Some hosts
         // (git's default without receive.denyNonFastForwards) happily
         // rewrite the branch, silently destroying remote seals.
         let mapping = HashMapping::new(&repo.ivaldi_dir);
-        if old_sha1 != zero {
+        if old_sha1 != ZERO_SHA1 {
             check_push_fast_forward(repo, &mapping, branch, &old_sha1, head_idx, force)?;
         }
 
-        // ---- Translate Ivaldi history to git objects.
-        let export = crate::git_export::export_chain(repo, head_idx, &mapping, &server_has)
-            .map_err(|e| GitRemoteError::Protocol(format!("git export: {}", e)))?;
-        if export.objects.is_empty() {
-            return Err(GitRemoteError::Protocol(
-                "nothing to push: every commit on this branch is already on the remote".into(),
-            ));
-        }
-        let new_sha1_hex = hex::encode(export.tip_sha1);
-        if new_sha1_hex == old_sha1 {
-            return Err(GitRemoteError::Protocol(
-                "nothing to push: remote tip already matches local tip".into(),
-            ));
+        // ---- Translate Ivaldi history (and any tags) to git objects.
+        let plan = plan_push(
+            repo,
+            branch,
+            head_idx,
+            &discovery.refs,
+            &mapping,
+            include_tags,
+            force,
+        )?;
+        if plan.updates.is_empty() {
+            return Err(nothing_to_push(&plan.skipped_tags));
         }
 
-        // ---- Build the request body: command pkt-line + flush + packfile.
-        // `report-status` makes the server tell us the outcome. We do not
-        // request side-band-64k, so the response is plain pkt-lines.
-        let mut command_line = format!("{} {} {}", old_sha1, new_sha1_hex, target_ref);
-        command_line.push('\0');
-        command_line.push_str("report-status agent=ivaldi/0.1.0");
-        command_line.push('\n');
-
-        let mut body = Vec::new();
-        body.extend(pkt_line(&command_line));
-        body.extend_from_slice(b"0000");
-        let mut object_refs: Vec<&crate::git_export::GitObject> = export.objects.values().collect();
+        // ---- Build the request body: command pkt-lines + flush + packfile.
+        let mut body = receive_pack_commands(&plan.updates);
+        let mut object_refs: Vec<&crate::git_export::GitObject> = plan.objects.values().collect();
         object_refs.sort_by_key(|o| o.sha1);
         let pack = crate::git_pack_writer::write_pack(&object_refs)
             .map_err(|e| GitRemoteError::Protocol(e.to_string()))?;
         body.extend_from_slice(&pack);
+        // None when only tags moved — there is then no new branch tip to map.
+        let branch_new_sha1 = plan
+            .updates
+            .iter()
+            .find(|(name, _, _)| *name == target_ref)
+            .map(|(_, _, new)| new.clone());
 
         // ---- Send it in one request and parse the report-status reply.
         let pb = progress::spinner("Uploading pack");
         let response = self.post_receive_pack(base, &body)?;
-        pb.finish_with_message(format!("Pack uploaded ({} objects)", export.objects.len()));
-        let report = parse_report_status(&response)?;
+        pb.finish_with_message(format!("Pack uploaded ({} objects)", plan.objects.len()));
+        let mut report = parse_report_status(&response)?;
+        report.skipped_tags = plan.skipped_tags;
 
         // Record the new mapping locally on full success so the next push can
         // short-circuit. Non-fatal if the save fails.
         if report.unpack_ok
             && report.refs.iter().all(|r| r.error.is_none())
+            && let Some(new_sha1_hex) = branch_new_sha1
             && let Ok(Some(leaf)) = repo.get_leaf(head_idx)
         {
             let mut mapping = HashMapping::new(&repo.ivaldi_dir);
@@ -472,6 +524,151 @@ impl SmartHttpClient {
             .map_err(|e| GitRemoteError::Io(e.to_string()))?;
         Ok(bytes)
     }
+}
+
+/// Everything a push has to send, resolved against the server's advertisement.
+pub(crate) struct PushPlan {
+    pub objects: std::collections::BTreeMap<[u8; 20], crate::git_export::GitObject>,
+    /// `(ref name, old sha1 hex, new sha1 hex)`, branch first. No-ops are
+    /// already filtered out, so an empty list means there is nothing to do.
+    pub updates: Vec<(String, String, String)>,
+    /// Tags deliberately left out, with the reason, for the caller to report.
+    pub skipped_tags: Vec<String>,
+}
+
+/// The 40 zeros git uses for "this ref does not exist yet".
+pub(crate) const ZERO_SHA1: &str = "0000000000000000000000000000000000000000";
+
+/// Work out which refs a push should update and which objects that needs.
+///
+/// Shared by the HTTPS and SSH push paths so the two can't drift on which
+/// commits are considered already-present, when a tag is safe to move, or how
+/// "nothing to push" is decided.
+///
+/// Tags are only included when asked for. A tag the remote already holds at a
+/// different object is a tag *move* — skipped unless forced, because
+/// overwriting a published release tag is exactly the kind of loss `--force`
+/// should have to be explicit about.
+pub(crate) fn plan_push(
+    repo: &crate::repo::Repo,
+    branch: &str,
+    head_idx: u64,
+    advertised: &[AdvertisedRef],
+    mapping: &crate::remote::HashMapping,
+    include_tags: bool,
+    force: bool,
+) -> Result<PushPlan, GitRemoteError> {
+    use std::collections::BTreeSet;
+
+    let advertised_sha = |name: &str| -> String {
+        advertised
+            .iter()
+            .find(|r| r.name == name)
+            .map(|r| r.id.clone())
+            .unwrap_or_else(|| ZERO_SHA1.to_string())
+    };
+
+    // SHA-1s the server already advertised, so the exporter only skips
+    // ancestors actually present on this remote.
+    let server_has: BTreeSet<[u8; 20]> = advertised
+        .iter()
+        .filter(|r| r.id != ZERO_SHA1)
+        .filter_map(|r| {
+            let raw = hex::decode(&r.id).ok()?;
+            (raw.len() == 20).then(|| {
+                let mut b = [0u8; 20];
+                b.copy_from_slice(&raw);
+                b
+            })
+        })
+        .collect();
+
+    let tags = if include_tags {
+        repo.list_tags()
+            .map_err(|e| GitRemoteError::Io(e.to_string()))?
+    } else {
+        Vec::new()
+    };
+
+    // Tag targets join the branch head as export roots: a tag on a seal that
+    // is not an ancestor of the branch still needs its commits on the server.
+    let mut roots = vec![head_idx];
+    for tag in &tags {
+        if !roots.contains(&tag.target_index) {
+            roots.push(tag.target_index);
+        }
+    }
+
+    let export = crate::git_export::export_roots(repo, &roots, mapping, &server_has)
+        .map_err(|e| GitRemoteError::Protocol(format!("git export: {}", e)))?;
+    let mut objects = export.objects;
+
+    let mut updates = Vec::new();
+    let branch_ref = format!("refs/heads/{}", branch);
+    let branch_old = advertised_sha(&branch_ref);
+    let branch_new = hex::encode(export.tip_sha1);
+    if branch_new != branch_old {
+        updates.push((branch_ref, branch_old, branch_new));
+    }
+
+    let mut skipped_tags = Vec::new();
+    let tag_updates = crate::git_export::export_tags(&tags, &export.leaf_to_git, &mut objects)
+        .map_err(|e| GitRemoteError::Protocol(format!("git export: {}", e)))?;
+    for update in tag_updates {
+        let old = advertised_sha(&update.name);
+        let new = hex::encode(update.new_sha1);
+        if old == new {
+            continue; // remote already has this tag at this object
+        }
+        if old != ZERO_SHA1 && !force {
+            skipped_tags.push(format!(
+                "{} (remote has a different object; --force to move it)",
+                update.name
+            ));
+            continue;
+        }
+        updates.push((update.name, old, new));
+    }
+
+    Ok(PushPlan {
+        objects,
+        updates,
+        skipped_tags,
+    })
+}
+
+/// The "nothing to send" error, which must not read as "all done" when tags
+/// were in fact refused — that is the difference between an idle push and a
+/// tag the user asked for that never left.
+pub(crate) fn nothing_to_push(skipped_tags: &[String]) -> GitRemoteError {
+    if skipped_tags.is_empty() {
+        return GitRemoteError::Protocol(
+            "nothing to push: the remote already has this timeline and its tags".into(),
+        );
+    }
+    GitRemoteError::Protocol(format!(
+        "nothing pushed: the timeline is already up to date and these tags were left alone: {}",
+        skipped_tags.join(", ")
+    ))
+}
+
+/// Encode a receive-pack request preamble: one command pkt-line per update
+/// (capabilities ride on the first, per the protocol) then a flush.
+pub(crate) fn receive_pack_commands(updates: &[(String, String, String)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, (name, old, new)) in updates.iter().enumerate() {
+        let mut line = format!("{} {} {}", old, new, name);
+        if i == 0 {
+            // `report-status` makes the server tell us the outcome; we do not
+            // request side-band-64k, so the response stays plain pkt-lines.
+            line.push('\0');
+            line.push_str("report-status agent=ivaldi/0.1.0");
+        }
+        line.push('\n');
+        out.extend(pkt_line(&line));
+    }
+    out.extend_from_slice(b"0000");
+    out
 }
 
 /// Refuse a non-fast-forward smart-HTTP push unless `force` is set.
@@ -750,6 +947,11 @@ pub struct PushReport {
     pub unpack_ok: bool,
     pub unpack_error: Option<String>,
     pub refs: Vec<PushedRef>,
+    /// Tags the push deliberately left alone, with the reason. Carried on the
+    /// report rather than logged, so the caller always surfaces them: a tag
+    /// the user asked to push and that silently didn't go is the one outcome
+    /// they must not have to run with `-v` to discover.
+    pub skipped_tags: Vec<String>,
 }
 
 /// Parse a `report-status` block from `git-receive-pack` (shared by the SSH
@@ -810,6 +1012,7 @@ pub(crate) fn parse_report_status(data: &[u8]) -> Result<PushReport, GitRemoteEr
         // for it but be lenient.
     }
     Ok(PushReport {
+        skipped_tags: Vec::new(),
         unpack_ok,
         unpack_error,
         refs,
@@ -884,11 +1087,29 @@ fn parse_pkt_text_lines(data: &[u8]) -> Result<Vec<String>, GitRemoteError> {
     Ok(out)
 }
 
-pub(crate) fn extract_pack_from_upload_pack(data: &[u8]) -> Result<Vec<u8>, GitRemoteError> {
+/// A demultiplexed `git-upload-pack` response.
+pub(crate) struct UploadPackResponse {
+    pub pack: Vec<u8>,
+    /// Shallow boundaries declared by the server (empty unless we deepened).
+    pub shallow: BTreeSet<String>,
+}
+
+pub(crate) fn extract_pack_from_upload_pack(
+    data: &[u8],
+) -> Result<UploadPackResponse, GitRemoteError> {
     let mut pack = Vec::new();
+    let mut shallow = BTreeSet::new();
     for line in parse_pkt_lines(data)? {
         let Some(line) = line else { continue };
         if line == b"NAK\n" || line.starts_with(b"ACK ") {
+            continue;
+        }
+        // Shallow-update block, sent ahead of the pack when we asked to
+        // `deepen`. `unshallow` only appears when deepening an existing
+        // shallow repo, which `download` never does (it clones into an
+        // empty directory), so the boundary set is purely additive here.
+        if let Some(sha) = line.strip_prefix(b"shallow ".as_slice()) {
+            shallow.insert(String::from_utf8_lossy(sha).trim().to_string());
             continue;
         }
         if line.starts_with(b"PACK") {
@@ -914,7 +1135,7 @@ pub(crate) fn extract_pack_from_upload_pack(data: &[u8]) -> Result<Vec<u8>, GitR
             "upload-pack response did not contain a packfile".into(),
         ));
     }
-    Ok(pack)
+    Ok(UploadPackResponse { pack, shallow })
 }
 
 enum PackedKind {
@@ -1333,6 +1554,71 @@ fn sha1_digest(data: &[u8]) -> [u8; 20] {
     hasher.finalize().into()
 }
 
+/// An annotated git tag object.
+#[derive(Debug, Clone)]
+pub struct ParsedTag {
+    /// SHA-1 of the object this tag names (usually a commit, occasionally
+    /// another tag).
+    pub object: String,
+    pub tagger: String,
+    pub timestamp: i64,
+    /// The tagger's UTC offset, e.g. `-0500`. Part of the object's SHA-1, so
+    /// it has to survive a fetch/push round trip.
+    pub tz: String,
+    pub message: String,
+}
+
+/// Parse an annotated tag object (`object`/`type`/`tag`/`tagger` headers,
+/// blank line, message). Lightweight tags have no such object — their ref
+/// points straight at a commit.
+pub fn parse_tag_object(data: &[u8]) -> Result<ParsedTag, GitRemoteError> {
+    let text = std::str::from_utf8(data)
+        .map_err(|_| GitRemoteError::Protocol("tag object is not valid UTF-8".into()))?;
+    let (headers, message) = text.split_once("\n\n").unwrap_or((text, ""));
+
+    let mut object = None;
+    let mut tagger = String::new();
+    let mut timestamp = 0i64;
+    let mut tz = String::from("+0000");
+    for line in headers.lines() {
+        if let Some(value) = line.strip_prefix("object ") {
+            object = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("tagger ") {
+            // `Name <email> <unix> <tz>` — same shape as a commit's author.
+            let (identity, time, offset) = split_identity_and_time(value);
+            tagger = identity;
+            timestamp = time;
+            tz = offset;
+        }
+    }
+
+    Ok(ParsedTag {
+        object: object
+            .ok_or_else(|| GitRemoteError::Protocol("tag object has no target".into()))?,
+        tagger,
+        timestamp,
+        tz,
+        message: message.to_string(),
+    })
+}
+
+/// Split a git identity line into `"Name <email>"`, its unix timestamp, and
+/// its UTC offset. A malformed or absent timestamp reads as 0 and a missing
+/// offset as `+0000`, rather than failing the parse — the identity is the
+/// part callers display.
+fn split_identity_and_time(value: &str) -> (String, i64, String) {
+    match value.rfind('>') {
+        Some(end) => {
+            let identity = value[..=end].trim().to_string();
+            let mut rest = value[end + 1..].split_whitespace();
+            let timestamp = rest.next().and_then(|t| t.parse::<i64>().ok()).unwrap_or(0);
+            let tz = rest.next().unwrap_or("+0000").to_string();
+            (identity, timestamp, tz)
+        }
+        None => (value.trim().to_string(), 0, "+0000".to_string()),
+    }
+}
+
 pub fn parse_commit(data: &[u8]) -> Result<ParsedCommit, GitRemoteError> {
     let text = std::str::from_utf8(data)
         .map_err(|_| GitRemoteError::Protocol("commit object is not valid UTF-8".into()))?;
@@ -1516,9 +1802,25 @@ pub fn import_fetch_result(
     collect_commit_order(
         &fetch.head_sha,
         &fetch.objects,
+        &fetch.shallow,
         &mut seen,
         &mut commit_order,
     )?;
+    // Tagged commits usually sit outside the branch being cloned, so they need
+    // their own walk roots — without this their objects arrive in the pack but
+    // never become seals, and every tag then resolves to nothing.
+    // `seen` is shared, so the combined order stays topological and each commit
+    // is emitted once.
+    let tags = advertised_tags(fetch)?;
+    for tag in &tags {
+        collect_commit_order(
+            &tag.target_commit,
+            &fetch.objects,
+            &fetch.shallow,
+            &mut seen,
+            &mut commit_order,
+        )?;
+    }
 
     let mut tree_cache: HashMap<String, B3Hash> = HashMap::new();
     let mut leaf_idx_by_sha: HashMap<String, u64> = HashMap::new();
@@ -1548,7 +1850,13 @@ pub fn import_fetch_result(
     // Walk every reachable blob once, then write the new ones to CAS in
     // parallel up front. After this, the per-commit tree import is pure
     // mapping lookups + tree assembly — no blob I/O on the hot path.
-    let all_blobs = collect_reachable_blobs(&fetch.head_sha, &fetch.objects)?;
+    let tag_roots: Vec<&str> = tags.iter().map(|t| t.target_commit.as_str()).collect();
+    let all_blobs = collect_reachable_blobs(
+        &fetch.head_sha,
+        &tag_roots,
+        &fetch.objects,
+        &fetch.shallow,
+    )?;
     let pending_count = all_blobs
         .iter()
         .filter(|sha| mapping.get_blake3(sha).is_none())
@@ -1577,7 +1885,11 @@ pub fn import_fetch_result(
         .save()
         .map_err(|e| GitRemoteError::Io(e.to_string()))?;
 
-    for (commit_no, sha) in commit_order.iter().enumerate() {
+    // Leaves built but not yet landed. Drained by `land_commit_batch` every
+    // COMMIT_BATCH commits and once more after the loop.
+    let mut batch: Vec<(String, Leaf)> = Vec::with_capacity(COMMIT_BATCH);
+
+    for sha in commit_order.iter() {
         // Skip only when the mapped leaf actually exists locally. A mapping
         // entry whose leaf is missing (stale/foreign map) falls through to a
         // fresh import instead of silently severing its children's ancestry.
@@ -1623,16 +1935,25 @@ pub fn import_fetch_result(
                 ))
             })
         };
-        let prev_idx = match commit.parents.first() {
-            Some(p) => resolve_parent(p)?,
-            None => NO_PARENT,
+        // A shallow boundary lands as a root: the server was asked to omit
+        // its ancestry, so there is nothing to sever. Everywhere else an
+        // unresolvable parent still means a broken pack.
+        let is_boundary = fetch.shallow.contains(sha);
+        let (prev_idx, merge_idxs) = if is_boundary {
+            (NO_PARENT, Vec::new())
+        } else {
+            let prev_idx = match commit.parents.first() {
+                Some(p) => resolve_parent(p)?,
+                None => NO_PARENT,
+            };
+            let merge_idxs = commit
+                .parents
+                .iter()
+                .skip(1)
+                .map(resolve_parent)
+                .collect::<Result<Vec<_>, _>>()?;
+            (prev_idx, merge_idxs)
         };
-        let merge_idxs = commit
-            .parents
-            .iter()
-            .skip(1)
-            .map(resolve_parent)
-            .collect::<Result<Vec<_>, _>>()?;
 
         let mut leaf = Leaf::new(
             tree_hash,
@@ -1647,6 +1968,12 @@ pub fn import_fetch_result(
         // window. On retry this makes an already-landed leaf discoverable by
         // its remote identity without guessing from content or position.
         leaf.meta.insert("git.sha1".into(), sha.clone());
+        // Mark truncated ancestry in authenticated leaf metadata so a root
+        // that only looks like a root is never mistaken for the real start
+        // of history — by a reader, by `whereami`, or by a later deepen.
+        if is_boundary {
+            leaf.meta.insert("git.shallow".into(), "1".into());
+        }
 
         // Preserve git fidelity that doesn't fit Leaf's typed fields. Stored
         // under reserved `git.*` meta keys; the canonical leaf encoding
@@ -1667,28 +1994,33 @@ pub fn import_fetch_result(
                     .insert("git.committer_tz".into(), commit.committer_tz.clone());
             }
         }
-        // Flush this commit's tree nodes before the leaf transaction makes a
-        // durable record referencing them; a leaf whose tree is lost to a
-        // power failure fails verification forever (leaves are append-only).
-        cas.flush().map_err(|e| GitRemoteError::Io(e.to_string()))?;
-        let result = repo
-            .commit_raw(leaf, &fetch.branch)
-            .map_err(|e| GitRemoteError::Io(e.to_string()))?;
-        crate::failpoint::fail_point("import.mid_commit_loop");
-        mapping.insert(sha, result.hash);
-        leaf_idx_by_sha.insert(sha.clone(), result.index);
-        leaf_idx_by_hash.insert(result.hash, result.index);
+        // Queue rather than commit. `commit_batch_raw` assigns consecutive
+        // indices from the current MMR size, so this leaf's index is known
+        // before it lands and children later in the topological order can
+        // resolve it as a parent immediately.
+        leaf_idx_by_sha.insert(sha.clone(), repo.commit_count() + batch.len() as u64);
+        batch.push((sha.clone(), leaf));
         commits_imported += 1;
-        // Checkpoint the mapping periodically so a crash mid-import leaves
-        // most already-landed leaves recorded (retry skips them instead of
-        // duplicating history). atomic_write makes each save all-or-nothing.
-        if commit_no % 200 == 199 {
-            mapping
-                .save()
-                .map_err(|e| GitRemoteError::Io(e.to_string()))?;
+        if batch.len() >= COMMIT_BATCH {
+            land_commit_batch(
+                repo,
+                &cas,
+                &mut mapping,
+                &mut leaf_idx_by_hash,
+                &fetch.branch,
+                &mut batch,
+            )?;
         }
         pb_commits.inc(1);
     }
+    land_commit_batch(
+        repo,
+        &cas,
+        &mut mapping,
+        &mut leaf_idx_by_hash,
+        &fetch.branch,
+        &mut batch,
+    )?;
 
     pb_blobs.finish_with_message(format!("{} blobs imported", blobs_downloaded));
     let commit_msg = if commits_skipped > 0 {
@@ -1743,12 +2075,177 @@ pub fn import_fetch_result(
         .save()
         .map_err(|e| GitRemoteError::Io(e.to_string()))?;
     crate::failpoint::fail_point("import.after_mapping_save");
+
+    // Tags land last: every one names a seal, so they can only be resolved
+    // once the leaves exist. Nothing is gated on `--include-tags` here — a tag
+    // is recorded exactly when its target was actually fetched, which also
+    // picks up tags that happen to sit on the history a plain clone pulled.
+    let tags = tags_for_landed_commits(tags, repo, &mapping, &leaf_idx_by_sha, &leaf_idx_by_hash)?;
+    let tags_imported = tags.len();
+    repo.set_tags(&tags)
+        .map_err(|e| GitRemoteError::Io(e.to_string()))?;
+
     Ok(crate::sync::ImportResult {
         commits_imported,
         commits_skipped,
         blobs_downloaded,
         timeline: fetch.branch.clone(),
+        tags_imported,
     })
+}
+
+/// One advertised `refs/tags/<name>` resolved against the fetched objects.
+struct AdvertisedTag {
+    name: String,
+    /// The commit the tag ultimately names, after peeling any tag objects.
+    target_commit: String,
+    /// Present for annotated tags — the outermost tag object's own message.
+    annotation: Option<ParsedTag>,
+}
+
+/// Resolve every advertised tag whose objects this fetch actually carries.
+///
+/// Lightweight tags point straight at a commit; annotated ones point at a tag
+/// object carrying the message and tagger, and may even chain tag→tag. Tags
+/// that were not fetched, or that name something other than a commit, are
+/// skipped — that is the normal outcome of cloning one branch without
+/// `--include-tags`, not a broken pack.
+fn advertised_tags(fetch: &FetchResult) -> Result<Vec<AdvertisedTag>, GitRemoteError> {
+    // Chained annotated tags are legal but vanishingly rare; a cap keeps a
+    // hostile pack from looping us forever.
+    const MAX_TAG_CHAIN: usize = 16;
+
+    let mut out = Vec::new();
+    for advertised in &fetch.refs {
+        let Some(name) = advertised.name.strip_prefix("refs/tags/") else {
+            continue;
+        };
+        if name.ends_with("^{}") {
+            continue; // peeled companion of the ref above
+        }
+        // A name Ivaldi can't safely represent as a ref path is skipped, not
+        // an error: one odd remote tag must not fail an otherwise good clone.
+        if crate::refname::validate_timeline_name(name).is_err() {
+            crate::logging::warn(&format!("skipping remote tag {name:?}: unusable name"));
+            continue;
+        }
+
+        let mut sha = advertised.id.clone();
+        let mut annotation: Option<ParsedTag> = None;
+        for _ in 0..MAX_TAG_CHAIN {
+            match fetch.objects.get(&sha) {
+                Some(object) if object.kind == GitObjectKind::Tag => {
+                    let parsed = parse_tag_object(&object.data)?;
+                    sha = parsed.object.clone();
+                    // The outermost annotation is the tag's own message.
+                    annotation.get_or_insert(parsed);
+                }
+                _ => break,
+            }
+        }
+
+        // Only commits become seals. A tag on a tree or blob has nothing to
+        // point at in Ivaldi's model.
+        let is_local_commit = fetch
+            .objects
+            .get(&sha)
+            .is_some_and(|o| o.kind == GitObjectKind::Commit);
+        if !is_local_commit {
+            continue;
+        }
+        out.push(AdvertisedTag {
+            name: name.to_string(),
+            target_commit: sha,
+            annotation,
+        });
+    }
+    Ok(out)
+}
+
+/// Bind resolved tags to the seals their target commits landed at.
+fn tags_for_landed_commits(
+    tags: Vec<AdvertisedTag>,
+    repo: &crate::repo::Repo,
+    mapping: &crate::remote::HashMapping,
+    leaf_idx_by_sha: &HashMap<String, u64>,
+    leaf_idx_by_hash: &HashMap<B3Hash, u64>,
+) -> Result<Vec<crate::tags::Tag>, GitRemoteError> {
+    let mut out = Vec::new();
+    for tag in tags {
+        let Some(index) = leaf_idx_by_sha
+            .get(&tag.target_commit)
+            .copied()
+            .or_else(|| {
+                mapping
+                    .get_blake3(&tag.target_commit)
+                    .and_then(|b3| leaf_idx_by_hash.get(&b3).copied())
+            })
+        else {
+            continue; // target commit was not imported
+        };
+        // Re-tagging the same seal is a no-op; a tag that moved gets rewritten.
+        if repo
+            .get_tag(&tag.name)
+            .map_err(|e| GitRemoteError::Io(e.to_string()))?
+            .is_some_and(|existing| existing.target_index == index)
+        {
+            continue;
+        }
+        out.push(match tag.annotation {
+            Some(a) => crate::tags::Tag::annotated(
+                &tag.name,
+                index,
+                &a.message,
+                &a.tagger,
+                a.timestamp,
+                &a.tz,
+            ),
+            None => crate::tags::Tag::lightweight(&tag.name, index),
+        });
+    }
+    Ok(out)
+}
+
+/// How many imported commits land per store transaction. Each batch costs one
+/// CAS device barrier plus one transaction, so this is the whole difference
+/// between importing history at disk speed and at fsync speed. Small enough
+/// that an interrupted import re-does at most this many commits on retry.
+const COMMIT_BATCH: usize = 512;
+
+/// Land a batch of freshly built leaves in ONE store transaction.
+///
+/// Ordering is the same contract `commit_raw` had, just amortized: the
+/// batch's tree nodes are made durable before the transaction that references
+/// them, so a leaf can never outlive its tree. A crash between the
+/// transaction and the mapping save is the pre-existing recoverable window —
+/// each leaf carries its `git.sha1`, so a retry rediscovers it from history
+/// instead of appending a duplicate.
+fn land_commit_batch(
+    repo: &mut crate::repo::Repo,
+    cas: &crate::cas::FileCas,
+    mapping: &mut crate::remote::HashMapping,
+    leaf_idx_by_hash: &mut HashMap<B3Hash, u64>,
+    branch: &str,
+    batch: &mut Vec<(String, crate::leaf::Leaf)>,
+) -> Result<(), GitRemoteError> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    cas.flush().map_err(|e| GitRemoteError::Io(e.to_string()))?;
+    let (shas, leaves): (Vec<String>, Vec<crate::leaf::Leaf>) =
+        std::mem::take(batch).into_iter().unzip();
+    let results = repo
+        .commit_batch_raw(leaves, branch)
+        .map_err(|e| GitRemoteError::Io(e.to_string()))?;
+    crate::failpoint::fail_point("import.mid_commit_loop");
+    for (sha, result) in shas.iter().zip(results.iter()) {
+        mapping.insert(sha, result.hash);
+        leaf_idx_by_hash.insert(result.hash, result.index);
+    }
+    mapping
+        .save()
+        .map_err(|e| GitRemoteError::Io(e.to_string()))?;
+    Ok(())
 }
 
 /// Topologically order all commits reachable from `sha` (parents before
@@ -1758,6 +2255,7 @@ pub fn import_fetch_result(
 fn collect_commit_order(
     sha: &str,
     objects: &HashMap<String, GitObject>,
+    shallow: &BTreeSet<String>,
     seen: &mut std::collections::HashSet<String>,
     out: &mut Vec<String>,
 ) -> Result<(), GitRemoteError> {
@@ -1775,7 +2273,13 @@ fn collect_commit_order(
             .get(&sha)
             .ok_or_else(|| GitRemoteError::Protocol(format!("missing commit object {}", sha)))?;
         let commit = parse_commit(&object.data)?;
+        let boundary = shallow.contains(&sha);
         stack.push((sha, true));
+        // A shallow boundary's parents are outside the pack by design; walking
+        // into them would fail the same way a truncated pack does.
+        if boundary {
+            continue;
+        }
         for parent in commit.parents.iter().rev() {
             if !seen.contains(parent) {
                 stack.push((parent.clone(), false));
@@ -1924,7 +2428,9 @@ fn import_tree(
 
 fn collect_reachable_blobs(
     head_sha: &str,
+    extra_roots: &[&str],
     objects: &HashMap<String, GitObject>,
+    shallow: &BTreeSet<String>,
 ) -> Result<Vec<String>, GitRemoteError> {
     let mut seen_commits = std::collections::HashSet::new();
     let mut seen_trees = std::collections::HashSet::new();
@@ -1933,6 +2439,7 @@ fn collect_reachable_blobs(
     // Iterate commits with a worklist: recursing per commit would blow the
     // stack on deep histories.
     let mut queue: Vec<String> = vec![head_sha.to_string()];
+    queue.extend(extra_roots.iter().map(|s| s.to_string()));
     while let Some(sha) = queue.pop() {
         if !seen_commits.insert(sha.clone()) {
             continue;
@@ -1949,6 +2456,11 @@ fn collect_reachable_blobs(
             &mut order,
             0,
         )?;
+        // Same boundary rule as `collect_commit_order`: a shallow commit's
+        // parents (and their trees) were never sent.
+        if shallow.contains(&sha) {
+            continue;
+        }
         for parent in &commit.parents {
             if !seen_commits.contains(parent) {
                 queue.push(parent.clone());
@@ -2077,6 +2589,90 @@ mod tests {
         assert!(!r.unpack_ok);
         assert_eq!(r.unpack_error.as_deref(), Some("invalid pack"));
         assert!(r.refs.is_empty());
+    }
+
+    #[test]
+    fn tag_wants_skips_peeled_refs_branches_and_the_tip() {
+        let refs = vec![
+            AdvertisedRef {
+                id: "aa".into(),
+                name: "refs/heads/main".into(),
+            },
+            AdvertisedRef {
+                id: "bb".into(),
+                name: "refs/tags/v1.0".into(),
+            },
+            AdvertisedRef {
+                id: "cc".into(),
+                name: "refs/tags/v1.0^{}".into(),
+            },
+            // A tag on the tip we already want, and a duplicate id: both are
+            // already covered, so re-asking wastes a want line.
+            AdvertisedRef {
+                id: "aa".into(),
+                name: "refs/tags/tip".into(),
+            },
+            AdvertisedRef {
+                id: "bb".into(),
+                name: "refs/tags/alias".into(),
+            },
+        ];
+        assert_eq!(tag_wants(&refs, "aa"), vec!["bb".to_string()]);
+    }
+
+    #[test]
+    fn annotated_tag_object_yields_target_tagger_and_message() {
+        let data = b"object 1111111111111111111111111111111111111111\n\
+            type commit\n\
+            tag v1.0\n\
+            tagger Jane Doe <jane@example.com> 1710000000 -0500\n\
+            \nRelease notes\n\nwith a blank line\n";
+        let parsed = parse_tag_object(data).unwrap();
+        assert_eq!(parsed.object, "1111111111111111111111111111111111111111");
+        assert_eq!(parsed.tagger, "Jane Doe <jane@example.com>");
+        assert_eq!(parsed.timestamp, 1710000000);
+        assert_eq!(parsed.tz, "-0500");
+        assert_eq!(parsed.message, "Release notes\n\nwith a blank line\n");
+    }
+
+    #[test]
+    fn tag_object_without_a_target_is_refused() {
+        let err = parse_tag_object(b"type commit\ntag v1.0\n\nhi").unwrap_err();
+        assert!(err.to_string().contains("no target"), "{}", err);
+    }
+
+    #[test]
+    fn upload_pack_response_collects_shallow_boundaries_before_the_pack() {
+        // What a server sends for `deepen 1`: the shallow-update block, a
+        // flush, NAK, then the pack muxed over side-band channel 1.
+        let mut bytes = Vec::new();
+        bytes.extend(pkt("shallow 1111111111111111111111111111111111111111\n"));
+        bytes.extend(pkt("shallow 2222222222222222222222222222222222222222\n"));
+        bytes.extend(b"0000");
+        bytes.extend(pkt("NAK\n"));
+        let pack = encode_pack_for_tests(&[(GitObjectKind::Blob, b"hi".to_vec())]);
+        let mut payload = vec![1u8];
+        payload.extend_from_slice(&pack);
+        bytes.extend(format!("{:04x}", payload.len() + 4).into_bytes());
+        bytes.extend(payload);
+
+        let r = extract_pack_from_upload_pack(&bytes).unwrap();
+        assert_eq!(&r.pack[..4], b"PACK");
+        assert_eq!(r.shallow.len(), 2);
+        assert!(r.shallow.contains("1111111111111111111111111111111111111111"));
+    }
+
+    #[test]
+    fn full_fetch_reports_no_shallow_boundaries() {
+        let pack = encode_pack_for_tests(&[(GitObjectKind::Blob, b"hi".to_vec())]);
+        let mut bytes = pkt("NAK\n");
+        let mut payload = vec![1u8];
+        payload.extend_from_slice(&pack);
+        bytes.extend(format!("{:04x}", payload.len() + 4).into_bytes());
+        bytes.extend(payload);
+
+        let r = extract_pack_from_upload_pack(&bytes).unwrap();
+        assert!(r.shallow.is_empty());
     }
 
     #[test]
@@ -2361,12 +2957,12 @@ mod tests {
 
         let mut seen = std::collections::HashSet::new();
         let mut order = Vec::new();
-        collect_commit_order(&head, &objects, &mut seen, &mut order).unwrap();
+        collect_commit_order(&head, &objects, &BTreeSet::new(), &mut seen, &mut order).unwrap();
         assert_eq!(order.len(), n);
         // Topological: every commit appears after its parent.
         assert_eq!(order.last().unwrap(), &head);
 
-        let blobs = collect_reachable_blobs(&head, &objects).unwrap();
+        let blobs = collect_reachable_blobs(&head, &[], &objects, &BTreeSet::new()).unwrap();
         assert!(blobs.is_empty());
     }
 
@@ -2407,7 +3003,7 @@ mod tests {
             },
         );
 
-        let err = collect_reachable_blobs(&head, &objects).unwrap_err();
+        let err = collect_reachable_blobs(&head, &[], &objects, &BTreeSet::new()).unwrap_err();
         assert!(err.to_string().contains("nesting"), "{}", err);
     }
 
@@ -2433,6 +3029,119 @@ mod tests {
             repo.commit(tree, "t <t@x>", "seal").unwrap();
         }
         (dir, repo)
+    }
+
+    /// A two-seal repo with `v1.0` on the oldest seal, ready to plan pushes.
+    ///
+    /// Seal timestamps come from the clock, so anything comparing object ids
+    /// across two plans has to reuse ONE repo — two `repo_with_two_seals()`
+    /// calls land in different seconds under load and mint different commits.
+    fn repo_with_a_tag() -> (tempfile::TempDir, crate::repo::Repo) {
+        let (dir, repo) = repo_with_two_seals();
+        repo.set_tags(&[crate::tags::Tag::lightweight("v1.0", 0)])
+            .unwrap();
+        (dir, repo)
+    }
+
+    fn plan_for(
+        repo: &crate::repo::Repo,
+        advertised: Vec<AdvertisedRef>,
+        include_tags: bool,
+        force: bool,
+    ) -> PushPlan {
+        let mapping = HashMapping::new(&repo.ivaldi_dir);
+        plan_push(repo, "main", 1, &advertised, &mapping, include_tags, force).unwrap()
+    }
+
+    fn update_named<'a>(plan: &'a PushPlan, name: &str) -> Option<&'a (String, String, String)> {
+        plan.updates.iter().find(|(n, _, _)| n == name)
+    }
+
+    #[test]
+    fn push_plan_omits_tags_unless_asked() {
+        let (_dir, repo) = repo_with_a_tag();
+        let plan = plan_for(&repo, Vec::new(), false, false);
+        assert!(update_named(&plan, "refs/heads/main").is_some());
+        assert!(
+            plan.updates.iter().all(|(n, _, _)| !n.starts_with("refs/tags/")),
+            "tags must not ride along on a plain push: {:?}",
+            plan.updates
+        );
+    }
+
+    #[test]
+    fn push_plan_creates_a_tag_ref_on_an_empty_remote() {
+        let (_dir, repo) = repo_with_a_tag();
+        let plan = plan_for(&repo, Vec::new(), true, false);
+        let (_, old, new) = update_named(&plan, "refs/tags/v1.0").expect("tag update");
+        assert_eq!(old, ZERO_SHA1, "a new remote tag starts from zeros");
+        assert_ne!(new, ZERO_SHA1);
+        assert!(plan.skipped_tags.is_empty());
+    }
+
+    #[test]
+    fn push_plan_refuses_to_move_an_existing_remote_tag_without_force() {
+        // The remote already publishes v1.0 at some other object.
+        let advertised = vec![AdvertisedRef {
+            id: "1".repeat(40),
+            name: "refs/tags/v1.0".into(),
+        }];
+        let (_dir, repo) = repo_with_a_tag();
+        let plan = plan_for(&repo, advertised.clone(), true, false);
+        assert!(
+            update_named(&plan, "refs/tags/v1.0").is_none(),
+            "moving a published tag needs --force"
+        );
+        assert_eq!(plan.skipped_tags.len(), 1);
+        assert!(plan.skipped_tags[0].contains("v1.0"));
+
+        // ...and --force is exactly what lets it through.
+        let forced = plan_for(&repo, advertised, true, true);
+        assert!(update_named(&forced, "refs/tags/v1.0").is_some());
+        assert!(forced.skipped_tags.is_empty());
+    }
+
+    #[test]
+    fn push_plan_skips_a_tag_the_remote_already_has_at_the_same_object() {
+        // Plan once against an empty remote to learn the tag's object id,
+        // then replay that id as the remote's advertisement — same repo, so
+        // the second plan mints the identical object.
+        let (_dir, repo) = repo_with_a_tag();
+        let first = plan_for(&repo, Vec::new(), true, false);
+        let (_, _, new) = update_named(&first, "refs/tags/v1.0").unwrap().clone();
+
+        let second = plan_for(
+            &repo,
+            vec![AdvertisedRef {
+                id: new,
+                name: "refs/tags/v1.0".into(),
+            }],
+            true,
+            false,
+        );
+        assert!(update_named(&second, "refs/tags/v1.0").is_none());
+        assert!(
+            second.skipped_tags.is_empty(),
+            "already-present is not a refusal worth reporting"
+        );
+    }
+
+    #[test]
+    fn receive_pack_commands_put_capabilities_on_the_first_line_only() {
+        let updates = vec![
+            ("refs/heads/main".to_string(), "a".repeat(40), "b".repeat(40)),
+            ("refs/tags/v1".to_string(), ZERO_SHA1.to_string(), "c".repeat(40)),
+        ];
+        let body = receive_pack_commands(&updates);
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(
+            text.matches("report-status").count(),
+            1,
+            "capabilities ride on the first command only"
+        );
+        assert!(text.contains("refs/heads/main"));
+        assert!(text.contains("refs/tags/v1"));
+        assert!(text.ends_with("0000"), "commands end with a flush-pkt");
     }
 
     #[test]

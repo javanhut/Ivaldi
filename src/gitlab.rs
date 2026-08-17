@@ -27,6 +27,17 @@ pub fn resolve_host(explicit: Option<&str>) -> String {
         .unwrap_or_else(|| auth::GITLAB_HOST.to_string())
 }
 
+/// True when `host` (a bare hostname, e.g. `gitlab.com`) is the GitLab
+/// instance this install authenticates against.
+///
+/// One rule, used everywhere a GitLab host has to be recognised: which
+/// credential a download may use, and which platform a portal records. Points
+/// at gitlab.com unless `IVALDI_GITLAB_HOST` names a self-hosted instance,
+/// matching `ivaldi auth login --gitlab`.
+pub fn is_gitlab_host(host: &str) -> bool {
+    crate::portal::http_host(&resolve_host(None)).is_some_and(|h| h.eq_ignore_ascii_case(host))
+}
+
 fn client_id() -> String {
     std::env::var("IVALDI_GITLAB_CLIENT_ID")
         .ok()
@@ -101,6 +112,18 @@ pub fn poll_for_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_gitlab_host_matches_the_configured_instance_only() {
+        // Whatever `resolve_host` points at must be recognised, and unrelated
+        // hosts must not be — that check gates which server the stored GitLab
+        // credential may be sent to.
+        let configured = crate::portal::http_host(&resolve_host(None)).unwrap();
+        assert!(is_gitlab_host(&configured));
+        assert!(is_gitlab_host(&configured.to_uppercase()));
+        assert!(!is_gitlab_host("github.com"));
+        assert!(!is_gitlab_host("evil.example.com"));
+    }
 
     #[test]
     fn resolve_host_prefers_explicit_then_env_then_default() {

@@ -355,6 +355,16 @@ pub(super) fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<(), String
     use crate::ssh_transport::SshTarget;
     use crate::sync;
 
+    // `--skip-history` is "just the tip", i.e. depth 1. An explicit `--depth`
+    // wins if both are given rather than silently picking one.
+    let options = crate::sync::FetchOptions {
+        depth: match (args.skip_history, args.depth) {
+            (true, 0) => 1,
+            (_, d) => d,
+        },
+        include_tags: args.include_tags,
+    };
+
     // `ivaldi://host[:port][/timeline]` — peer-to-peer transport, no
     // GitHub / GitLab in the loop.
     if let Some(url) = crate::p2p::PeerUrl::parse(&args.repo) {
@@ -404,7 +414,8 @@ pub(super) fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<(), String
             .to_string();
         let target_dir =
             std::path::PathBuf::from(args.directory.as_deref().unwrap_or(&default_dir));
-        let result = sync::download_ssh(&target, &target_dir, None).map_err(|e| e.to_string())?;
+        let result =
+            sync::download_ssh(&target, &target_dir, None, options).map_err(|e| e.to_string())?;
         if !quiet {
             println!(
                 "Cloned {}@{}:{} → {}",
@@ -422,7 +433,7 @@ pub(super) fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<(), String
     // GitHub/GitLab return None and keep their existing REST-aware path below.
     if let Some((base, owner, repo)) = parse_generic_git_url(&args.repo) {
         let target_dir = std::path::PathBuf::from(args.directory.as_deref().unwrap_or(&repo));
-        let result = sync::download_url(&base, &owner, &repo, &target_dir, None, None)
+        let result = sync::download_url(&base, &owner, &repo, &target_dir, None, None, options)
             .map_err(|e| e.to_string())?;
         if !quiet {
             println!("Cloned {} → {}", base, target_dir.display());
@@ -432,24 +443,91 @@ pub(super) fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<(), String
     }
 
     let spec = parse_repo_arg(&args.repo)?;
-    let client = GitHubClient::new();
-
     let target_dir = std::path::PathBuf::from(args.directory.as_deref().unwrap_or(&spec.repo));
     let branch = spec.branch_hint.as_deref();
 
-    let result = sync::download(&client, &spec.owner, &spec.repo, &target_dir, branch)
-        .map_err(|e| e.to_string())?;
+    let is_gitlab = args.gitlab || spec.platform == Platform::GitLab;
+    let host = resolve_download_host(args.url.as_deref(), is_gitlab);
+
+    let result = match &host {
+        // GitHub keeps its own path: the REST-aware client also carries the
+        // stored GitHub credential.
+        None => {
+            let client = GitHubClient::new();
+            sync::download(&client, &spec.owner, &spec.repo, &target_dir, branch, options)
+        }
+        Some(host) => {
+            let base = format!("{}/{}/{}.git", host, spec.owner, spec.repo);
+            let token = download_token(host, is_gitlab);
+            sync::download_url(
+                &base,
+                &spec.owner,
+                &spec.repo,
+                &target_dir,
+                token.as_deref(),
+                branch,
+                options,
+            )
+        }
+    }
+    .map_err(|e| e.to_string())?;
 
     if !quiet {
-        println!(
-            "Cloned {}/{} → {}",
-            spec.owner,
-            spec.repo,
-            target_dir.display()
-        );
+        match &host {
+            Some(host) => println!(
+                "Cloned {}/{}/{} → {}",
+                host,
+                spec.owner,
+                spec.repo,
+                target_dir.display()
+            ),
+            None => println!(
+                "Cloned {}/{} → {}",
+                spec.owner,
+                spec.repo,
+                target_dir.display()
+            ),
+        }
         println!("  {} files downloaded", result.files_downloaded);
     }
     Ok(())
+}
+
+/// Which host serves a `download`, or `None` for GitHub (whose REST-aware
+/// client path also carries the stored GitHub credential).
+///
+/// `--url` wins, then GitLab — either `--gitlab` or a gitlab.com argument —
+/// resolved through `IVALDI_GITLAB_HOST` exactly like `auth login --gitlab`.
+/// Before this, a `https://gitlab.com/owner/repo` argument parsed as GitLab
+/// and was then downloaded from github.com: a silently wrong repository, not
+/// just an ignored flag.
+fn resolve_download_host(url: Option<&str>, is_gitlab: bool) -> Option<String> {
+    match (url, is_gitlab) {
+        (Some(url), _) => Some(url.trim_end_matches('/').to_string()),
+        (None, true) => Some(crate::gitlab::resolve_host(None)),
+        (None, false) => None,
+    }
+}
+
+/// Credential for a non-GitHub download host.
+///
+/// `generic_git_token` already offers the stored GitLab credential to the
+/// configured GitLab host. `--gitlab --url https://gitlab.example.com` is the
+/// one case it can't see: the user named a self-hosted instance on the command
+/// line rather than through `IVALDI_GITLAB_HOST`, and said outright that it is
+/// GitLab, so honour that.
+fn download_token(host: &str, is_gitlab: bool) -> Option<String> {
+    let http_host = crate::portal::http_host(host).unwrap_or_default();
+    crate::auth::generic_git_token(&http_host).or_else(|| {
+        if !is_gitlab {
+            return None;
+        }
+        crate::auth::TokenStore::new()
+            .and_then(|store| store.load_token(Platform::GitLab))
+            .ok()
+            .flatten()
+            .map(|token| token.access_token)
+    })
 }
 
 /// Parse a generic Git smart-HTTP URL into `(base_url, owner, repo)`.
@@ -482,6 +560,15 @@ pub(super) fn parse_generic_git_url(raw: &str) -> Option<(String, String, String
     Some((raw.trim_end_matches('/').to_string(), owner, repo))
 }
 
+/// Tell the user about tags a push deliberately left alone. Always printed,
+/// never gated on `-v`: a tag they asked to push that didn't go is the
+/// outcome most likely to be mistaken for success.
+fn report_skipped_tags(report: &crate::git_remote::PushReport) {
+    for skipped in &report.skipped_tags {
+        eprintln!("  {} not pushed: {}", color::bold_yellow("~~"), skipped);
+    }
+}
+
 pub(super) fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
     use crate::github::GitHubClient;
     use crate::portal::Transport;
@@ -512,7 +599,7 @@ pub(super) fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
             }
         }
         let report = crate::ssh_transport::SshClient::new(target)
-            .push_repo(&mut repo, &timeline, args.force)
+            .push_repo(&mut repo, &timeline, args.force, args.tags)
             .map_err(|e| e.to_string())?;
 
         if !report.unpack_ok {
@@ -522,6 +609,7 @@ pub(super) fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
             ));
         }
         let mut had_failure = false;
+        report_skipped_tags(&report);
         for r in &report.refs {
             match &r.error {
                 Some(reason) => {
@@ -598,7 +686,7 @@ pub(super) fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
             .unwrap_or_else(|| repo.current_timeline().unwrap_or_else(|_| "main".into()));
 
         let report = crate::git_remote::SmartHttpClient::new(token.as_deref())
-            .push_repo_url(&mut repo, &base_url, &timeline, args.force)
+            .push_repo_url(&mut repo, &base_url, &timeline, args.force, args.tags)
             .map_err(|e| e.to_string())?;
 
         if !report.unpack_ok {
@@ -608,6 +696,7 @@ pub(super) fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
             ));
         }
         let mut had_failure = false;
+        report_skipped_tags(&report);
         for r in &report.refs {
             match &r.error {
                 Some(reason) => {
@@ -663,6 +752,7 @@ pub(super) fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
             &portal.repo,
             &timeline,
             args.force,
+            args.tags,
         )
         .map_err(|e| e.to_string())?;
 
@@ -673,6 +763,7 @@ pub(super) fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
         ));
     }
     let mut had_failure = false;
+    report_skipped_tags(&report);
     for r in &report.refs {
         match &r.error {
             Some(reason) => {
@@ -1029,5 +1120,40 @@ pub(super) fn cmd_peer(args: PeerArgs, _quiet: bool) -> Result<(), String> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_host_is_none_for_github_and_set_for_gitlab() {
+        assert_eq!(resolve_download_host(None, false), None);
+        // `--gitlab`, or a gitlab.com argument, must leave the GitHub path.
+        assert!(resolve_download_host(None, true).is_some());
+    }
+
+    #[test]
+    fn explicit_url_wins_and_loses_its_trailing_slash() {
+        assert_eq!(
+            resolve_download_host(Some("https://git.example.com/"), false).as_deref(),
+            Some("https://git.example.com")
+        );
+        // Even alongside --gitlab: the user named the instance.
+        assert_eq!(
+            resolve_download_host(Some("https://gitlab.example.com"), true).as_deref(),
+            Some("https://gitlab.example.com")
+        );
+    }
+
+    #[test]
+    fn stored_gitlab_token_is_not_offered_to_an_arbitrary_url_host() {
+        // A bare `--url` host is not GitLab, so only the generic resolver
+        // applies — a stored GitLab credential must never reach it.
+        assert_eq!(
+            download_token("https://evil.example.com", false),
+            crate::auth::generic_git_token("evil.example.com")
+        );
     }
 }

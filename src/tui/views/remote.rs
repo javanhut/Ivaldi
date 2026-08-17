@@ -291,7 +291,7 @@ impl RemoteView {
                     let mut repo = crate::repo::Repo::open(&work_dir).map_err(|e| e.to_string())?;
                     let timeline = repo.current_timeline().map_err(|e| e.to_string())?;
                     let report = crate::git_remote::SmartHttpClient::new(client.token())
-                        .push_repo(&mut repo, &owner, &repo_name, &timeline, false)
+                        .push_repo(&mut repo, &owner, &repo_name, &timeline, false, false)
                         .map_err(|e| e.to_string())?;
                     if !report.unpack_ok {
                         return Err(format!(

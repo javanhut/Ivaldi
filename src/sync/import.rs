@@ -26,6 +26,9 @@ pub struct ImportResult {
     pub commits_skipped: usize,
     pub blobs_downloaded: usize,
     pub timeline: String,
+    /// Remote `refs/tags/*` that resolved to an imported seal. Tags whose
+    /// target was not fetched are skipped, not counted.
+    pub tags_imported: usize,
 }
 
 /// Parse ISO 8601 date string to unix timestamp (no chrono dependency).
@@ -285,6 +288,9 @@ pub(super) fn import_full_history_into(
         commits_skipped,
         blobs_downloaded,
         timeline: local_timeline.to_string(),
+        // This path lands a single remote tip during `sync`; tags come from
+        // the download/harvest importer, which sees the full ref advertisement.
+        tags_imported: 0,
     })
 }
 

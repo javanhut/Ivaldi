@@ -113,11 +113,32 @@ impl SshTarget {
 /// per fetch / list).
 pub struct SshClient {
     target: SshTarget,
+    depth: usize,
+    include_tags: bool,
 }
 
 impl SshClient {
     pub fn new(target: SshTarget) -> Self {
-        Self { target }
+        Self {
+            target,
+            depth: 0,
+            include_tags: false,
+        }
+    }
+
+    /// Truncate the fetch to `depth` commits of history per branch tip
+    /// (0 = full history, the default). See
+    /// [`crate::git_remote::SmartHttpClient::with_depth`].
+    pub fn with_depth(mut self, depth: usize) -> Self {
+        self.depth = depth;
+        self
+    }
+
+    /// Also fetch the objects behind `refs/tags/*`. See
+    /// [`crate::git_remote::SmartHttpClient::with_tags`].
+    pub fn with_tags(mut self, include_tags: bool) -> Self {
+        self.include_tags = include_tags;
+        self
     }
 
     /// List branch refs for a repo via `ls-remote`-style ref advertisement.
@@ -150,14 +171,25 @@ impl SshClient {
         let (discovery, mut stdin, mut child) = read_advertisement(session)?;
         let (branch_name, head_sha) = select_branch_from_discovery(&discovery, branch)?;
 
-        // Send the upload-pack request body: one `want` + flush + `done`.
-        let caps =
-            "multi_ack_detailed side-band-64k ofs-delta no-progress include-tag agent=ivaldi/0.1.0";
+        // Send the upload-pack request body: one `want`, an optional depth
+        // request, then flush + `done`.
         let mut body = Vec::new();
         body.extend(crate::git_remote::pkt_line(&format!(
             "want {} {}\n",
-            head_sha, caps
+            head_sha,
+            crate::git_remote::UPLOAD_PACK_CAPS
         )));
+        if self.include_tags {
+            for want in crate::git_remote::tag_wants(&discovery.refs, &head_sha) {
+                body.extend(crate::git_remote::pkt_line(&format!("want {}\n", want)));
+            }
+        }
+        if self.depth > 0 {
+            body.extend(crate::git_remote::pkt_line(&format!(
+                "deepen {}\n",
+                self.depth
+            )));
+        }
         body.extend_from_slice(b"0000");
         body.extend(crate::git_remote::pkt_line("done\n"));
         stdin
@@ -190,13 +222,14 @@ impl SshClient {
         pb.finish_with_message(format!("ssh pack downloaded ({} bytes)", response.len()));
         finish_child(child)?;
 
-        let pack = extract_pack_from_upload_pack(&response)?;
-        let objects = parse_packfile(&pack)?;
+        let response = extract_pack_from_upload_pack(&response)?;
+        let objects = parse_packfile(&response.pack)?;
         Ok(FetchResult {
             branch: branch_name,
             head_sha,
             refs: discovery.refs,
             objects,
+            shallow: response.shallow,
         })
     }
 
@@ -214,10 +247,12 @@ impl SshClient {
         repo: &mut crate::repo::Repo,
         branch: &str,
         force: bool,
+        include_tags: bool,
     ) -> Result<PushReport, GitRemoteError> {
-        use crate::git_export;
         use crate::git_pack_writer;
-        use crate::git_remote::{parse_discovery, pkt_line};
+        use crate::git_remote::{
+            ZERO_SHA1, nothing_to_push, parse_discovery, plan_push, receive_pack_commands,
+        };
         use crate::remote::HashMapping;
 
         // ---- Resolve local head.
@@ -262,87 +297,44 @@ impl SshClient {
         let discovery = crate::git_remote::parse_discovery(&adv_bytes)
             .map_err(|e| GitRemoteError::Protocol(format!("receive-pack advertisement: {}", e)))?;
 
-        let target_ref = format!("refs/heads/{}", branch);
-        let old_sha1 = discovery
-            .refs
-            .iter()
-            .find(|r| r.name == target_ref)
-            .map(|r| r.id.clone())
-            .unwrap_or_else(|| "0".repeat(40));
         let _ = parse_discovery; // silence unused-import in some build configs
 
-        // ---- Translate Ivaldi history to git objects.
-        // Build the set of SHA-1s the server already has from its
-        // advertisement, so the exporter only skips ancestors actually
-        // present on this remote (not ones merely seen on some prior
-        // remote via a different portal).
-        let server_has: std::collections::BTreeSet<[u8; 20]> = discovery
-            .refs
-            .iter()
-            .filter_map(|r| {
-                if r.id == "0".repeat(40) {
-                    None
-                } else {
-                    let mut bytes = [0u8; 20];
-                    let raw = hex::decode(&r.id).ok()?;
-                    if raw.len() == 20 {
-                        bytes.copy_from_slice(&raw);
-                        Some(bytes)
-                    } else {
-                        None
-                    }
-                }
-            })
-            .collect();
+        // ---- Translate Ivaldi history (and any tags) to git objects.
+        // Shares `plan_push` with the HTTPS path so both agree on what the
+        // server already has, when a tag may move, and what "nothing to
+        // push" means.
         let mapping = HashMapping::new(&repo.ivaldi_dir);
-        let export = git_export::export_chain(repo, head_idx, &mapping, &server_has)
-            .map_err(|e| GitRemoteError::Protocol(format!("git export: {}", e)))?;
-
-        // No new commits and the ref is already at the target sha →
-        // nothing to push. Refuse early so we don't send an empty pack.
-        if export.objects.is_empty() {
-            // Force-update is allowed only when the remote ref points
-            // somewhere different; we don't surface that as "no work" so
-            // the caller can decide whether it was intentional.
-            return Err(GitRemoteError::Protocol(
-                "nothing to push: every commit on this branch is already on the remote".into(),
-            ));
+        let plan = plan_push(
+            repo,
+            branch,
+            head_idx,
+            &discovery.refs,
+            &mapping,
+            include_tags,
+            force,
+        )?;
+        if plan.updates.is_empty() {
+            return Err(nothing_to_push(&plan.skipped_tags));
         }
+        let target_ref = format!("refs/heads/{}", branch);
+        let branch_new_sha1 = plan
+            .updates
+            .iter()
+            .find(|(name, _, _)| *name == target_ref)
+            .map(|(_, _, new)| new.clone());
+        let _ = ZERO_SHA1;
 
-        let new_sha1_hex = hex::encode(export.tip_sha1);
-        if new_sha1_hex == old_sha1 {
-            return Err(GitRemoteError::Protocol(
-                "nothing to push: remote tip already matches local tip".into(),
-            ));
-        }
+        // For non-force pushes receive-pack itself is the source of truth on
+        // fast-forward: a non-FF branch update comes back as `ng`. `force`
+        // reaches `plan_push`, which is where it decides whether a tag that
+        // already exists remotely may be moved.
 
-        // ---- Build update command line. Capabilities go after the FIRST
-        // command line (per receive-pack protocol).
-        let mut command_line = format!("{} {} {}", old_sha1, new_sha1_hex, target_ref);
-        // `report-status` is needed so the server tells us whether the
-        // push succeeded; `agent` is informational. We do NOT request
-        // side-band-64k for v1 — keeps the response parser trivial.
-        let caps = "report-status agent=ivaldi/0.1.0";
-        command_line.push('\0');
-        command_line.push_str(caps);
-        command_line.push('\n');
-
-        // For non-force pushes: refuse if the remote isn't at our parent
-        // chain. Receive-pack itself will reject with "non-fast-forward",
-        // but we can also short-circuit. We don't bother — let the server
-        // be the source of truth. `force` is plumbed through so the
-        // caller's intent is documented; non-FF still surfaces as `ng`.
-        let _ = force;
-
-        // ---- Send command + flush + packfile.
+        // ---- Send commands + flush + packfile.
         stdin
-            .write_all(&pkt_line(&command_line))
-            .map_err(|e| GitRemoteError::Io(e.to_string()))?;
-        stdin
-            .write_all(b"0000")
+            .write_all(&receive_pack_commands(&plan.updates))
             .map_err(|e| GitRemoteError::Io(e.to_string()))?;
 
-        let mut object_refs: Vec<&crate::git_export::GitObject> = export.objects.values().collect();
+        let mut object_refs: Vec<&crate::git_export::GitObject> = plan.objects.values().collect();
         // Stable order — receivers don't care, but determinism helps debugging.
         object_refs.sort_by_key(|o| o.sha1);
         let pack = git_pack_writer::write_pack(&object_refs)
@@ -375,17 +367,19 @@ impl SshClient {
         }
         finish_child(child)?;
 
-        let report = parse_report_status(&response)?;
+        let mut report = parse_report_status(&response)?;
+        report.skipped_tags = plan.skipped_tags;
         // After a successful push, record the new mapping locally so the
         // next push can short-circuit. Non-fatal if save fails.
-        if report.unpack_ok && report.refs.iter().all(|r| r.error.is_none()) {
+        if report.unpack_ok
+            && report.refs.iter().all(|r| r.error.is_none())
+            // None when only tags moved — there is then no new tip to map.
+            && let Some(new_sha1_hex) = branch_new_sha1
+            && let Ok(Some(leaf)) = repo.get_leaf(head_idx)
+        {
             let mut mapping = HashMapping::new(&repo.ivaldi_dir);
-            // Newly minted commit → leaf hash. We need to look up the leaf
-            // index for `head_idx` (we already have it).
-            if let Ok(Some(leaf)) = repo.get_leaf(head_idx) {
-                mapping.insert(&new_sha1_hex, leaf.hash());
-                let _ = mapping.save();
-            }
+            mapping.insert(&new_sha1_hex, leaf.hash());
+            let _ = mapping.save();
         }
 
         Ok(report)

@@ -287,14 +287,33 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }
 
-/// Resolve a Basic-auth token for a generic (non-GitHub/GitLab) Git host:
-/// the `IVALDI_GIT_TOKEN` env override first, then the host's `.netrc`
-/// password. Returns `None` for public hosts that need no auth.
+/// Resolve a Basic-auth token for a non-GitHub Git host: the
+/// `IVALDI_GIT_TOKEN` env override first, then the host's `.netrc` password,
+/// then — for the GitLab instance this install authenticates against — the
+/// token stored by `ivaldi auth login --gitlab`. Returns `None` for public
+/// hosts that need no auth.
+///
+/// GitLab talks plain smart-HTTP here like any other host, so without that
+/// last source a `--gitlab` login would authenticate `auth` and nothing else.
 pub fn generic_git_token(host: &str) -> Option<String> {
     std::env::var("IVALDI_GIT_TOKEN")
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| read_netrc_token(host))
+        .or_else(|| stored_gitlab_token(host))
+}
+
+/// The stored GitLab credential, offered only to the configured GitLab host so
+/// it is never sent to an arbitrary server a URL happened to name.
+fn stored_gitlab_token(host: &str) -> Option<String> {
+    if !crate::gitlab::is_gitlab_host(host) {
+        return None;
+    }
+    TokenStore::new()
+        .and_then(|store| store.load_token(Platform::GitLab))
+        .ok()
+        .flatten()
+        .map(|token| token.access_token)
 }
 
 fn read_netrc_token(machine: &str) -> Option<String> {

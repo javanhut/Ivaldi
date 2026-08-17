@@ -86,6 +86,18 @@ pub fn timeline_ref_path(ivaldi_dir: &Path, name: &str) -> Result<PathBuf, RefNa
     Ok(ivaldi_dir.join("refs/heads").join(name))
 }
 
+/// Return the filesystem marker path for a validated tag name.
+///
+/// Tag names cross the same boundaries as timeline names — database key,
+/// filesystem path, Git ref, network input — and Git applies the same
+/// `check-ref-format` rules to both, so they share one validator. A remote
+/// tag whose name Ivaldi cannot safely represent is rejected here rather
+/// than written as a path outside `refs/tags`.
+pub fn tag_ref_path(ivaldi_dir: &Path, name: &str) -> Result<PathBuf, RefNameError> {
+    validate_timeline_name(name)?;
+    Ok(ivaldi_dir.join("refs/tags").join(name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -121,7 +121,15 @@ pub(super) fn cmd_tui() -> Result<(), String> {
             let spec = parse_repo_arg(&repo_arg)?;
             let client = crate::github::GitHubClient::new();
             let branch = spec.branch_hint.as_deref();
-            crate::sync::download(&client, &spec.owner, &spec.repo, &target_dir, branch)
+            // Full history, no tags: the launcher has no options prompt.
+            crate::sync::download(
+                &client,
+                &spec.owner,
+                &spec.repo,
+                &target_dir,
+                branch,
+                Default::default(),
+            )
                 .map_err(|e| e.to_string())?;
             crate::tui::app::run(&target_dir, &target_dir.join(".ivaldi"))
         }

@@ -140,6 +140,7 @@ fn import_fixture() -> FetchResult {
         head_sha: tip,
         refs: Vec::new(),
         objects,
+        shallow: Default::default(),
     }
 }
 
@@ -559,21 +560,20 @@ fn import_crashes_before_or_after_mapping_publication_converge_exactly_once() {
 }
 
 #[test]
-fn repeated_crashes_in_commit_mapping_window_do_not_accumulate_orphans() {
+fn crashes_in_commit_mapping_window_do_not_accumulate_orphans() {
     let dir = tempfile::tempdir().unwrap();
     ivaldi::forge::forge(dir.path()).unwrap();
 
-    // First death lands root before its mapping; second retry must discover
-    // that root from authenticated leaf metadata and lands only the tip.
-    for expected_count in [1, 2] {
-        let output = child(dir.path(), "import", "import.mid_commit_loop");
-        assert_aborted(&output, "import.mid_commit_loop");
-        verify_full_ok(dir.path());
-        assert_eq!(
-            Repo::open(dir.path()).unwrap().commit_count(),
-            expected_count
-        );
-    }
+    // Death after a leaf batch lands but before its mapping is published.
+    // Import batches commits per store transaction, so the whole fixture is
+    // one batch — the window is the same, it just covers the batch.
+    let output = child(dir.path(), "import", "import.mid_commit_loop");
+    assert_aborted(&output, "import.mid_commit_loop");
+    verify_full_ok(dir.path());
+    assert_eq!(Repo::open(dir.path()).unwrap().commit_count(), 2);
+
+    // Retries must rediscover those leaves from their authenticated
+    // `git.sha1` metadata rather than appending duplicate history.
     run_import(dir.path());
     run_import(dir.path());
     verify_full_ok(dir.path());
