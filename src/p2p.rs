@@ -794,6 +794,40 @@ fn handle_connection(
     Ok(())
 }
 
+/// Verify every object reachable from `roots` is actually in `cas`.
+///
+/// Blob bytes are checked against their own hash as they arrive, and the tip
+/// leaf is checked against what landed — but a leaf's `tree_root` is taken on
+/// faith. Without this, a peer can land a leaf referencing objects it never
+/// sent, producing a timeline that fetches fine and then fails to
+/// materialize. It is also the check that has to exist before any form of
+/// shared object storage could be safe: unverified references are exactly how
+/// one repository ends up serving another's content.
+fn verify_trees_present(
+    cas: &crate::cas::FileCas,
+    roots: &[B3Hash],
+) -> Result<(), crate::cas::CasError> {
+    use crate::cas::Cas;
+    use crate::fsmerkle::FsStore;
+
+    let store = FsStore::new(cas);
+    let mut seen_trees: BTreeSet<B3Hash> = BTreeSet::new();
+    let mut objects: BTreeSet<B3Hash> = BTreeSet::new();
+    for root in roots {
+        // Walking the tree fetches every interior node, so a missing tree
+        // node fails here...
+        collect_objects_from_tree(&store, *root, &mut seen_trees, &mut objects)
+            .map_err(|e| crate::cas::CasError::Io(std::io::Error::other(e.to_string())))?;
+    }
+    // ...while leaf blobs are only named by the walk, never read. Check them.
+    for hash in &objects {
+        if !cas.has(*hash)? {
+            return Err(crate::cas::CasError::NotFound(*hash));
+        }
+    }
+    Ok(())
+}
+
 /// Pick the repo a client named.
 ///
 /// An exact name always wins. An empty name means "you only serve one thing,
@@ -859,100 +893,140 @@ fn serve_push(
         FileCas::new(repo.ivaldi_dir.join("objects")).map_err(|e| P2pError::Io(e.to_string()))?;
 
     let mut lander = LeafLander::default();
-    let mut asm = BlobAssembler::default();
-    let claimed_head = loop {
-        match chan.recv()? {
-            Message::BlobChunk {
-                hash_hex,
-                total_len,
-                offset,
-                data,
-            } => match asm.feed(&hash_hex, total_len, offset, &data) {
-                Ok(None) => {}
-                Ok(Some(wb)) => apply_blob(&cas, &wb)?,
-                Err(e) => {
-                    chan.send(&Message::PushRejected {
-                        reason: e.to_string(),
-                    })?;
-                    return Ok(());
-                }
-            },
-            Message::PushBundle { leaves, blobs } => {
-                // Write objects first (they're prerequisites for any
-                // leaf's tree walk later). Bytes are content-addressed,
-                // so duplicates are no-ops.
-                for wb in blobs {
-                    apply_blob(&cas, &wb)?;
-                }
-                // This bundle's objects must be durable (directory entries
-                // included) before any leaf transaction references them.
-                cas.flush().map_err(|e| P2pError::Io(e.to_string()))?;
-                for wl in leaves {
-                    if let Err(e) = lander.land(repo, &landed_as, &wl) {
-                        // A bad parent reference or malformed leaf must not
-                        // poison the recipient's history: reject explicitly.
-                        // Everything landed so far is a valid prefix under
-                        // peers/<sender>/ and a retry re-lands idempotently.
+    // Objects this transfer introduced, as opposed to ones the store
+    // already held. Only these may be discarded if the push does not land.
+    let mut introduced: BTreeSet<B3Hash> = BTreeSet::new();
+
+    // The body runs in a closure so that *every* way out — an explicit
+    // rejection, a protocol error, or the peer simply vanishing mid-transfer
+    // — lands on the cleanup below. A dropped connection is the common case
+    // and the one an attacker controls.
+    let outcome = {
+        let cas = &cas;
+        let lander = &mut lander;
+        let introduced = &mut introduced;
+        (|| -> Result<bool, P2pError> {
+            let mut asm = BlobAssembler::default();
+            let claimed_head = loop {
+                match chan.recv()? {
+                    Message::BlobChunk {
+                        hash_hex,
+                        total_len,
+                        offset,
+                        data,
+                    } => match asm.feed(&hash_hex, total_len, offset, &data) {
+                        Ok(None) => {}
+                        Ok(Some(wb)) => {
+                                if let Some(h) = apply_blob(cas, &wb)? {
+                                    introduced.insert(h);
+                                }
+                            }
+                        Err(e) => {
+                            chan.send(&Message::PushRejected {
+                                reason: e.to_string(),
+                            })?;
+                            return Ok(false);
+                        }
+                    },
+                    Message::PushBundle { leaves, blobs } => {
+                        // Write objects first (they're prerequisites for any
+                        // leaf's tree walk later). Bytes are content-addressed,
+                        // so duplicates are no-ops.
+                        for wb in blobs {
+                            if let Some(h) = apply_blob(cas, &wb)? {
+                                introduced.insert(h);
+                            }
+                        }
+                        // This bundle's objects must be durable (directory entries
+                        // included) before any leaf transaction references them.
+                        cas.flush().map_err(|e| P2pError::Io(e.to_string()))?;
+                        for wl in leaves {
+                            if let Err(e) = lander.land(repo, &landed_as, &wl) {
+                                // A bad parent reference or malformed leaf must not
+                                // poison the recipient's history: reject explicitly.
+                                // Everything landed so far is a valid prefix under
+                                // peers/<sender>/ and a retry re-lands idempotently.
+                                chan.send(&Message::PushRejected {
+                                    reason: e.to_string(),
+                                })?;
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    Message::PushDone { head_b3_hex } => {
+                        if let Err(e) = asm.finish() {
+                            chan.send(&Message::PushRejected {
+                                reason: e.to_string(),
+                            })?;
+                            return Ok(false);
+                        }
+                        break head_b3_hex;
+                    }
+                    Message::Error { message } => return Err(P2pError::Protocol(message)),
+                    other => {
                         chan.send(&Message::PushRejected {
-                            reason: e.to_string(),
+                            reason: format!("unexpected message during push: {:?}", other),
                         })?;
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
-            }
-            Message::PushDone { head_b3_hex } => {
-                if let Err(e) = asm.finish() {
+            };
+
+            // The sender's claimed tip must be a leaf that actually arrived —
+            // otherwise a truncated push would be indistinguishable from a
+            // complete one.
+            let tip_idx = match lander.local_idx_for_wire_hash(&claimed_head) {
+                Some(idx) => idx,
+                None => {
                     chan.send(&Message::PushRejected {
-                        reason: e.to_string(),
+                        reason: format!(
+                            "push tip {} never arrived — transfer truncated or peer misbehaving",
+                            claimed_head
+                        ),
                     })?;
-                    return Ok(());
+                    return Ok(false);
                 }
-                break head_b3_hex;
-            }
-            Message::Error { message } => return Err(P2pError::Protocol(message)),
-            other => {
+            };
+            // Every newly landed leaf must have its whole tree on disk. Rejecting
+            // here leaves the leaves in the MMR but never advances the timeline —
+            // the same "valid prefix, retry re-lands idempotently" model the bad
+            // parent path above already uses.
+            if let Err(e) = verify_trees_present(cas, lander.landed_tree_roots()) {
                 chan.send(&Message::PushRejected {
-                    reason: format!("unexpected message during push: {:?}", other),
+                    reason: format!(
+                        "push references objects that never arrived ({}) —                  transfer truncated or peer misbehaving",
+                        e
+                    ),
                 })?;
-                return Ok(());
+                return Ok(false);
             }
-        }
-    };
 
-    // The sender's claimed tip must be a leaf that actually arrived —
-    // otherwise a truncated push would be indistinguishable from a
-    // complete one.
-    let tip_idx = match lander.local_idx_for_wire_hash(&claimed_head) {
-        Some(idx) => idx,
-        None => {
-            chan.send(&Message::PushRejected {
-                reason: format!(
-                    "push tip {} never arrived — transfer truncated or peer misbehaving",
-                    claimed_head
-                ),
+            // Re-pushing an already-known chain lands zero new leaves, so point the
+            // peers/ timeline at the (deduplicated) tip explicitly.
+            if repo
+                .get_timeline_head(&landed_as)
+                .map_err(|e| P2pError::Protocol(e.to_string()))?
+                != Some(tip_idx)
+            {
+                repo.set_timeline_head(&landed_as, tip_idx)
+                    .map_err(|e| P2pError::Io(e.to_string()))?;
+            }
+
+            chan.send(&Message::PushAccepted {
+                landed_as: landed_as.clone(),
             })?;
-            return Ok(());
-        }
+            eprintln!(
+                "received push: {} new leaf(s) landed at {}",
+                lander.leaves_landed, landed_as
+            );
+            Ok(true)
+        })()
     };
-    // Re-pushing an already-known chain lands zero new leaves, so point the
-    // peers/ timeline at the (deduplicated) tip explicitly.
-    if repo
-        .get_timeline_head(&landed_as)
-        .map_err(|e| P2pError::Protocol(e.to_string()))?
-        != Some(tip_idx)
-    {
-        repo.set_timeline_head(&landed_as, tip_idx)
-            .map_err(|e| P2pError::Io(e.to_string()))?;
-    }
 
-    chan.send(&Message::PushAccepted {
-        landed_as: landed_as.clone(),
-    })?;
-    eprintln!(
-        "received push: {} new leaf(s) landed at {}",
-        lander.leaves_landed, landed_as
-    );
-    Ok(())
+    if !matches!(outcome, Ok(true)) {
+        discard_unreachable(&cas, &introduced, lander.landed_tree_roots());
+    }
+    outcome.map(|_| ())
 }
 
 /// Translates wire leaves (whose `prev_idx`/`merge_idxs` are *sender-local*
@@ -971,6 +1045,9 @@ struct LeafLander {
     /// arrived (the *landed* leaf hash differs once indices are rewritten).
     local_by_wire_hash: std::collections::BTreeMap<String, u64>,
     leaves_landed: usize,
+    /// `tree_root` of every leaf newly committed by this push. Checked for
+    /// object completeness before the push is accepted.
+    landed_tree_roots: Vec<B3Hash>,
 }
 
 impl LeafLander {
@@ -1019,9 +1096,11 @@ impl LeafLander {
                 .map(|(idx, _)| idx)
                 .ok_or_else(|| P2pError::Protocol("seal name exists but leaf not found".into()))?
         } else {
+            let tree_root = leaf.tree_root;
             let result = repo
                 .commit_raw(leaf, timeline)
                 .map_err(|e| P2pError::Io(e.to_string()))?;
+            self.landed_tree_roots.push(tree_root);
             self.leaves_landed += 1;
             result.index
         };
@@ -1045,6 +1124,10 @@ impl LeafLander {
 
     fn local_idx_for_wire_hash(&self, wire_hash_hex: &str) -> Option<u64> {
         self.local_by_wire_hash.get(wire_hash_hex).copied()
+    }
+
+    fn landed_tree_roots(&self) -> &[B3Hash] {
+        &self.landed_tree_roots
     }
 }
 
@@ -1303,7 +1386,7 @@ fn fetch_into_created_target(
                 data,
             } => {
                 if let Some(wb) = asm.feed(&hash_hex, total_len, offset, &data)? {
-                    apply_blob(&cas, &wb)?;
+                    let _ = apply_blob(&cas, &wb)?;
                     blobs_imported += 1;
                 }
             }
@@ -1312,7 +1395,7 @@ fn fetch_into_created_target(
                     lander.land(&mut repo, &timeline, &wl)?;
                 }
                 for wb in blobs {
-                    apply_blob(&cas, &wb)?;
+                    let _ = apply_blob(&cas, &wb)?;
                     blobs_imported += 1;
                 }
             }
@@ -1450,15 +1533,69 @@ fn enforce_tofu(
     }
 }
 
-fn apply_blob(cas: &crate::cas::FileCas, wb: &WireBlob) -> Result<(), P2pError> {
+/// Store one wire object, returning its hash only if the store did not
+/// already hold it. Callers landing an inbound push use that to tell content
+/// this transfer introduced from content that was already here — the former
+/// can be discarded if the push is refused, the latter never can.
+fn apply_blob(cas: &crate::cas::FileCas, wb: &WireBlob) -> Result<Option<B3Hash>, P2pError> {
     use crate::cas::Cas;
     let raw = hex::decode(&wb.hash_hex)
         .map_err(|e| P2pError::Protocol(format!("blob hash hex: {}", e)))?;
     let hash = B3Hash::from_slice(&raw)
         .ok_or_else(|| P2pError::Protocol("blob hash wrong length".into()))?;
+    let existed = cas
+        .has(hash)
+        .map_err(|e| P2pError::Io(format!("cas has: {}", e)))?;
     cas.put(hash, &wb.data)
         .map_err(|e| P2pError::Io(format!("cas put: {}", e)))?;
-    Ok(())
+    Ok((!existed).then_some(hash))
+}
+
+/// Remove objects an unaccepted push introduced and nothing will reference.
+///
+/// Two rules keep this from destroying live content:
+///
+/// 1. Only objects that did **not** exist before this push are candidates, so
+///    content shared with existing history is never touched.
+/// 2. Anything reachable from a leaf that did land is kept. Rejected pushes
+///    leave their landed leaves in the append-only MMR as a valid prefix;
+///    stripping their objects would manufacture exactly the unmaterializable
+///    history `verify_trees_present` exists to refuse.
+///
+/// The walk is best-effort. A tree node that never arrived cannot be read, so
+/// its subtree is unknown — blobs reachable only that way are discarded. That
+/// is safe: no intact tree reaches them, and the leaf that named them is
+/// already unmaterializable.
+fn discard_unreachable(
+    cas: &crate::cas::FileCas,
+    introduced: &BTreeSet<B3Hash>,
+    landed_roots: &[B3Hash],
+) {
+    if introduced.is_empty() {
+        return;
+    }
+    let store = crate::fsmerkle::FsStore::new(cas);
+    let mut seen_trees: BTreeSet<B3Hash> = BTreeSet::new();
+    let mut reachable: BTreeSet<B3Hash> = BTreeSet::new();
+    for root in landed_roots {
+        let _ = collect_objects_from_tree(&store, *root, &mut seen_trees, &mut reachable);
+    }
+
+    let mut discarded = 0usize;
+    for hash in introduced {
+        if reachable.contains(hash) {
+            continue;
+        }
+        if cas.remove(*hash).unwrap_or(false) {
+            discarded += 1;
+        }
+    }
+    if discarded > 0 {
+        crate::logging::warn(&format!(
+            "discarded {} object(s) introduced by a push that was not accepted",
+            discarded
+        ));
+    }
 }
 
 /// Ship every object in `hashes`: small objects batched into size-bounded
@@ -2907,5 +3044,129 @@ mod tests {
         );
 
         handle.join().unwrap();
+    }
+
+    /// A leaf may name any `tree_root` it likes; the push must not be
+    /// accepted unless the objects behind it actually arrived.
+    #[test]
+    fn push_verification_rejects_references_to_absent_objects() {
+        use crate::cas::FileCas;
+        use crate::fsmerkle::{Entry, FsStore, MODE_FILE, NodeKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cas = FileCas::new(dir.path().join("objects")).unwrap();
+        let store = FsStore::new(&cas);
+
+        // A complete tree passes.
+        let (blob, _) = store.put_blob(b"present").unwrap();
+        let good = store
+            .put_tree(vec![Entry {
+                name: "there.txt".into(),
+                mode: MODE_FILE,
+                kind: NodeKind::Blob,
+                hash: blob,
+            }])
+            .unwrap();
+        cas.flush().unwrap();
+        verify_trees_present(&cas, &[good]).expect("a fully-shipped tree is accepted");
+
+        // A tree whose blob was never stored is refused. The tree node itself
+        // exists, so only the blob check can catch this one.
+        let phantom = B3Hash::digest(b"an object nobody sent");
+        let dangling = store
+            .put_tree(vec![Entry {
+                name: "missing.txt".into(),
+                mode: MODE_FILE,
+                kind: NodeKind::Blob,
+                hash: phantom,
+            }])
+            .unwrap();
+        cas.flush().unwrap();
+        let err = verify_trees_present(&cas, &[dangling])
+            .expect_err("a tree naming an absent blob must be refused");
+        assert!(err.to_string().contains(&phantom.to_string()), "{err}");
+
+        // A tree_root that was never sent at all is refused too.
+        assert!(
+            verify_trees_present(&cas, &[B3Hash::digest(b"no such tree")]).is_err(),
+            "an absent tree root must be refused"
+        );
+    }
+
+    /// Cleanup after a refused push must remove only what that push brought
+    /// in and nothing else can reach.
+    #[test]
+    fn refused_push_discards_only_its_own_unreferenced_objects() {
+        use crate::cas::{Cas, FileCas};
+        use crate::fsmerkle::{Entry, FsStore, MODE_FILE, NodeKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cas = FileCas::new(dir.path().join("objects")).unwrap();
+        let store = FsStore::new(&cas);
+
+        let entry = |name: &str, hash| Entry {
+            name: name.into(),
+            mode: MODE_FILE,
+            kind: NodeKind::Blob,
+            hash,
+        };
+
+        // Content the store already held before the push.
+        let (preexisting, _) = store.put_blob(b"already here").unwrap();
+        // Content the push brought in, referenced by a leaf that did land.
+        let (landed_blob, _) = store.put_blob(b"landed by this push").unwrap();
+        let landed_root = store
+            .put_tree(vec![
+                entry("old.txt", preexisting),
+                entry("new.txt", landed_blob),
+            ])
+            .unwrap();
+        // Content the push brought in that nothing references.
+        let (orphan, _) = store.put_blob(b"orphan from a refused push").unwrap();
+        cas.flush().unwrap();
+
+        // The tree node itself also arrived over the wire.
+        let introduced: BTreeSet<B3Hash> =
+            [landed_blob, orphan, landed_root].into_iter().collect();
+
+        discard_unreachable(&cas, &introduced, &[landed_root]);
+
+        assert!(
+            cas.has(preexisting).unwrap(),
+            "content that predates the push is never a candidate"
+        );
+        assert!(
+            cas.has(landed_blob).unwrap(),
+            "content reachable from a landed leaf must survive"
+        );
+        assert!(
+            cas.has(landed_root).unwrap(),
+            "the landed tree node itself must survive"
+        );
+        assert!(!cas.has(orphan).unwrap(), "unreferenced arrival is discarded");
+    }
+
+    /// A push that landed nothing leaves nothing behind — but still must not
+    /// touch what was already there.
+    #[test]
+    fn push_that_landed_nothing_discards_all_it_introduced() {
+        use crate::cas::{Cas, FileCas};
+        use crate::fsmerkle::FsStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cas = FileCas::new(dir.path().join("objects")).unwrap();
+        let store = FsStore::new(&cas);
+
+        let (preexisting, _) = store.put_blob(b"already here").unwrap();
+        let (a, _) = store.put_blob(b"truncated push part a").unwrap();
+        let (b, _) = store.put_blob(b"truncated push part b").unwrap();
+        cas.flush().unwrap();
+
+        let introduced: BTreeSet<B3Hash> = [a, b].into_iter().collect();
+        discard_unreachable(&cas, &introduced, &[]);
+
+        assert!(cas.has(preexisting).unwrap(), "pre-existing content survives");
+        assert!(!cas.has(a).unwrap());
+        assert!(!cas.has(b).unwrap());
     }
 }

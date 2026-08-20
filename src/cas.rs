@@ -174,6 +174,18 @@ impl FileCas {
         })
     }
 
+    /// Delete one object. Returns whether a file was actually removed.
+    ///
+    /// Only for objects proven unreferenced — the store has no refcounts, so
+    /// nothing here protects a caller that deletes live content.
+    pub fn remove(&self, hash: B3Hash) -> Result<bool, CasError> {
+        match fs::remove_file(self.object_path(hash)) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(CasError::Io(e)),
+        }
+    }
+
     /// Get the file path for a given hash.
     fn object_path(&self, hash: B3Hash) -> PathBuf {
         let hex = hash.to_hex();
