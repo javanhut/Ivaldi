@@ -85,26 +85,52 @@ const MAX_WIRE_BLOB: u64 = 1024 * 1024 * 1024;
 /// - `ivaldi://host`                  → port=default, timeline=None
 /// - `ivaldi://host:9999`             → custom port
 /// - `ivaldi://host:9999/main`        → request a specific timeline
+/// - `ivaldi://hub:9418/atmo/main`    → repo `atmo` on a hub, timeline `main`
+/// - `ivaldi://hub:9418/atmo/`        → repo `atmo`, server picks the timeline
+///
+/// One path segment stays the timeline, so every `ivaldi serve` URL written
+/// before hubs existed keeps meaning exactly what it meant. A second segment
+/// is what promotes the first to a repo name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerUrl {
     pub host: String,
     pub port: u16,
+    /// Hosted repo to open. `None` for a single-repo peer.
+    pub repo: Option<String>,
     pub timeline: Option<String>,
 }
 
 impl PeerUrl {
     pub fn parse(url: &str) -> Option<Self> {
         let rest = url.strip_prefix("ivaldi://")?;
-        let (hostport, timeline) = match rest.split_once('/') {
-            Some((hp, t)) => {
-                let t = t.trim_start_matches('/');
-                if t.is_empty() {
-                    (hp, None)
-                } else {
-                    (hp, Some(t.to_string()))
+        let (hostport, repo, timeline) = match rest.split_once('/') {
+            Some((hp, path)) => {
+                let path = path.trim_start_matches('/');
+                match path.split_once('/') {
+                    // Two segments: `<repo>/<timeline>`. A trailing slash
+                    // leaves the timeline empty, meaning "server decides".
+                    Some((r, t)) if !r.is_empty() => (
+                        hp,
+                        Some(r.to_string()),
+                        if t.is_empty() {
+                            None
+                        } else {
+                            Some(t.to_string())
+                        },
+                    ),
+                    // One segment (or a leading slash): the timeline.
+                    _ => (
+                        hp,
+                        None,
+                        if path.is_empty() {
+                            None
+                        } else {
+                            Some(path.to_string())
+                        },
+                    ),
                 }
             }
-            None => (rest, None),
+            None => (rest, None, None),
         };
         if hostport.is_empty() {
             return None;
@@ -122,6 +148,7 @@ impl PeerUrl {
         Some(Self {
             host,
             port,
+            repo,
             timeline,
         })
     }
@@ -167,7 +194,11 @@ pub struct WireBlob {
 pub enum Message {
     /// Both directions, immediately after the Noise handshake: wire
     /// protocol version check. A mismatch is refused explicitly.
-    Hello { version: u32 },
+    ///
+    /// `repo` names which hosted repository the initiator wants. Empty from
+    /// a responder, and empty from any client addressing a single-repo
+    /// `ivaldi serve` — only a hub with several repos on one port needs it.
+    Hello { version: u32, repo: String },
 
     /// Client → server: list local timelines.
     ListTimelines,
@@ -257,11 +288,26 @@ pub struct Channel {
     /// Static public key of the peer on the other end, for authorization
     /// checks and display.
     pub remote_static: [u8; crate::identity::KEY_LEN],
+    /// Repo the peer named in its `Hello`. Empty unless the peer is a client
+    /// addressing a specific repo on a multi-repo host.
+    pub remote_repo: String,
 }
 
 impl Channel {
     /// Initiator side. Performs Noise XX with the supplied static keypair.
+    /// Addresses the peer's only repo; see [`Channel::connect_to_repo`].
     pub fn connect(addr: impl ToSocketAddrs, identity: &Identity) -> Result<Self, P2pError> {
+        Self::connect_to_repo(addr, identity, "")
+    }
+
+    /// Initiator side, naming which hosted repo to open. `repo` is empty for
+    /// a single-repo peer and a repo name for a host serving several on one
+    /// port.
+    pub fn connect_to_repo(
+        addr: impl ToSocketAddrs,
+        identity: &Identity,
+        repo: &str,
+    ) -> Result<Self, P2pError> {
         let stream = TcpStream::connect(addr)?;
         stream.set_read_timeout(Some(Duration::from_secs(60)))?;
         stream.set_write_timeout(Some(Duration::from_secs(60)))?;
@@ -271,12 +317,14 @@ impl Channel {
             stream,
             noise,
             remote_static,
+            remote_repo: String::new(),
         };
-        chan.exchange_hello()?;
+        chan.exchange_hello(repo)?;
         Ok(chan)
     }
 
-    /// Responder side. Caller has already accepted a TCP connection.
+    /// Responder side. Caller has already accepted a TCP connection. After
+    /// this returns, `remote_repo` holds the repo the client asked for.
     pub fn accept(stream: TcpStream, identity: &Identity) -> Result<Self, P2pError> {
         stream.set_read_timeout(Some(Duration::from_secs(60)))?;
         stream.set_write_timeout(Some(Duration::from_secs(60)))?;
@@ -286,8 +334,9 @@ impl Channel {
             stream,
             noise,
             remote_static,
+            remote_repo: String::new(),
         };
-        chan.exchange_hello()?;
+        chan.exchange_hello("")?;
         Ok(chan)
     }
 
@@ -295,12 +344,18 @@ impl Channel {
     /// after the handshake. The Noise prologue already guarantees both peers
     /// speak the protobuf framing; this catches in-era version drift with an
     /// actionable error instead of a mid-stream decode failure.
-    fn exchange_hello(&mut self) -> Result<(), P2pError> {
+    fn exchange_hello(&mut self, repo: &str) -> Result<(), P2pError> {
         let version = crate::p2p_proto::PROTOCOL_VERSION;
-        self.send(&Message::Hello { version })?;
+        self.send(&Message::Hello {
+            version,
+            repo: repo.to_string(),
+        })?;
         match self.recv()? {
-            Message::Hello { version: v } if v == version => Ok(()),
-            Message::Hello { version: v } => Err(P2pError::Protocol(format!(
+            Message::Hello { version: v, repo: r } if v == version => {
+                self.remote_repo = r;
+                Ok(())
+            }
+            Message::Hello { version: v, .. } => Err(P2pError::Protocol(format!(
                 "peer speaks ivaldi protocol v{}, this build speaks v{} — \
                  upgrade the older peer",
                 v, version
@@ -557,8 +612,44 @@ pub fn serve_with_repo(
     identity: &Identity,
     peer_store_path: std::path::PathBuf,
 ) -> Result<(), P2pError> {
+    let mut repos = std::collections::BTreeMap::new();
+    repos.insert(
+        String::new(),
+        HostedRepo {
+            repo,
+            peer_store_path,
+        },
+    );
+    serve_multi(bind, repos, identity)
+}
+
+/// One repository offered by a host, with the peer allowlist that governs it.
+pub struct HostedRepo {
+    pub repo: std::sync::Arc<std::sync::Mutex<crate::repo::Repo>>,
+    /// Path to this repo's `authorized_peers`. Per-repo, so a host can offer
+    /// several repositories to different sets of peers.
+    pub peer_store_path: std::path::PathBuf,
+}
+
+/// Serve several repositories on one port. Clients pick one by name in
+/// `Hello.repo` (`ivaldi://host:port/<repo>/<timeline>`); a single-entry map
+/// keyed by the empty string is the plain `ivaldi serve` case.
+///
+/// Each repo carries its own peer allowlist and its own mutex, so authorizing
+/// a peer for one repository grants nothing on the others and traffic to one
+/// repo does not serialize behind traffic to another.
+pub fn serve_multi(
+    bind: &str,
+    repos: std::collections::BTreeMap<String, HostedRepo>,
+    identity: &Identity,
+) -> Result<(), P2pError> {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    if repos.is_empty() {
+        return Err(P2pError::Protocol("no repositories to serve".into()));
+    }
+    let repos = Arc::new(repos);
 
     let listener = TcpListener::bind(bind)?;
     eprintln!(
@@ -589,9 +680,8 @@ pub fn serve_with_repo(
         inflight.fetch_add(1, Ordering::AcqRel);
 
         let identity = identity.clone();
-        let peer_store_path = peer_store_path.clone();
         let counter = inflight.clone();
-        let repo = repo.clone();
+        let repos = repos.clone();
         std::thread::spawn(move || {
             struct Guard<'a>(&'a Arc<AtomicUsize>);
             impl<'a> Drop for Guard<'a> {
@@ -601,15 +691,7 @@ pub fn serve_with_repo(
             }
             let _g = Guard(&counter);
 
-            let peer_store = PeerStore::new(peer_store_path);
-            let mut guard = match repo.lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    crate::logging::warn("worker: repo mutex poisoned, skipping");
-                    return;
-                }
-            };
-            if let Err(e) = handle_connection(&mut guard, stream, &identity, &peer_store) {
+            if let Err(e) = handle_connection(&repos, stream, &identity) {
                 crate::logging::warn(&format!("connection error: {}", e));
             }
         });
@@ -618,13 +700,32 @@ pub fn serve_with_repo(
 }
 
 fn handle_connection(
-    repo: &mut crate::repo::Repo,
+    repos: &std::collections::BTreeMap<String, HostedRepo>,
     stream: TcpStream,
     identity: &Identity,
-    peer_store: &PeerStore,
 ) -> Result<(), P2pError> {
     let peer_addr = stream.peer_addr().ok();
     let mut chan = Channel::accept(stream, identity)?;
+
+    // Which repo? Resolved before the allowlist check, because the allowlist
+    // is per-repo: an unknown name must not be answered from another repo's
+    // permissions.
+    let requested = chan.remote_repo.clone();
+    let hosted = match resolve_hosted(repos, &requested) {
+        Some(h) => h,
+        None => {
+            let _ = chan.send(&Message::Error {
+                message: format!("no repository named '{}' on this host", requested),
+            });
+            chan.shutdown();
+            return Err(P2pError::Protocol(format!(
+                "peer {:?} asked for unknown repo '{}'",
+                peer_addr, requested
+            )));
+        }
+    };
+    let peer_store = PeerStore::new(hosted.peer_store_path.clone());
+
     if !peer_store
         .is_trusted(&chan.remote_static)
         .map_err(|e| P2pError::Protocol(e.to_string()))?
@@ -641,10 +742,25 @@ fn handle_connection(
         return Err(P2pError::PeerNotAuthorized);
     }
     eprintln!(
-        "peer {} ({:?}) connected",
+        "peer {} ({:?}) connected{}",
         hex::encode(chan.remote_static),
-        peer_addr
+        peer_addr,
+        if requested.is_empty() {
+            String::new()
+        } else {
+            format!(" for repo '{}'", requested)
+        }
     );
+
+    // Held for the connection, as before — but now per repo, so concurrent
+    // traffic to different repositories no longer serializes.
+    // ponytail: still one writer per repo. Split into a read/write lock when
+    // a single busy repo actually queues.
+    let mut guard = hosted
+        .repo
+        .lock()
+        .map_err(|_| P2pError::Protocol("repo mutex poisoned".into()))?;
+    let repo = &mut *guard;
 
     loop {
         let req = match chan.recv() {
@@ -666,7 +782,7 @@ fn handle_connection(
                 serve_want(repo, &mut chan, &timeline, &have)?;
             }
             Message::PushStart { timeline } => {
-                serve_push(repo, &mut chan, &timeline, peer_store)?;
+                serve_push(repo, &mut chan, &timeline, &peer_store)?;
             }
             other => {
                 chan.send(&Message::Error {
@@ -676,6 +792,25 @@ fn handle_connection(
         }
     }
     Ok(())
+}
+
+/// Pick the repo a client named.
+///
+/// An exact name always wins. An empty name means "you only serve one thing,
+/// give me that" and resolves only when the host really does serve one repo.
+/// A name that matches nothing is refused rather than falling back to a
+/// default — silently serving the wrong repository is worse than an error.
+fn resolve_hosted<'a, V>(
+    repos: &'a std::collections::BTreeMap<String, V>,
+    requested: &str,
+) -> Option<&'a V> {
+    if let Some(h) = repos.get(requested) {
+        return Some(h);
+    }
+    if requested.is_empty() && repos.len() == 1 {
+        return repos.values().next();
+    }
+    None
 }
 
 /// Receive-only push. Lands inbound seals at `peers/<sender>/<timeline>`
@@ -1115,7 +1250,11 @@ fn fetch_into_created_target(
     identity: &Identity,
     tofu: crate::known_peers::TofuPolicy,
 ) -> Result<FetchSummary, P2pError> {
-    let mut chan = Channel::connect(url.socket_addr(), identity)?;
+    let mut chan = Channel::connect_to_repo(
+        url.socket_addr(),
+        identity,
+        url.repo.as_deref().unwrap_or(""),
+    )?;
     enforce_tofu(url, &chan.remote_static, tofu)?;
     eprintln!("connected to {}", hex::encode(chan.remote_static));
 
@@ -1538,7 +1677,11 @@ pub fn push_to(
         .map_err(|e| P2pError::Io(e.to_string()))?
         .ok_or_else(|| P2pError::Protocol(format!("local timeline '{}' has no head", timeline)))?;
 
-    let mut chan = Channel::connect(url.socket_addr(), identity)?;
+    let mut chan = Channel::connect_to_repo(
+        url.socket_addr(),
+        identity,
+        url.repo.as_deref().unwrap_or(""),
+    )?;
     enforce_tofu(url, &chan.remote_static, tofu)?;
 
     chan.send(&Message::PushStart {
@@ -1642,6 +1785,23 @@ pub fn push_to(
 
 #[cfg(test)]
 mod tests {
+
+    /// One repository under the empty key — the shape a plain `ivaldi serve`
+    /// hands to `serve_multi`.
+    fn single_hosted(
+        root: &std::path::Path,
+    ) -> std::collections::BTreeMap<String, super::HostedRepo> {
+        let repo = crate::repo::Repo::open(root).unwrap();
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            String::new(),
+            super::HostedRepo {
+                repo: std::sync::Arc::new(std::sync::Mutex::new(repo)),
+                peer_store_path: root.join(".ivaldi/authorized_peers"),
+            },
+        );
+        m
+    }
     use super::*;
 
     #[test]
@@ -1874,9 +2034,8 @@ mod tests {
         let server_root = server_dir.path().to_path_buf();
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let mut srv_repo = crate::repo::Repo::open(&server_root).unwrap();
-            let store = PeerStore::new(server_root.join(".ivaldi/authorized_peers"));
-            handle_connection(&mut srv_repo, stream, &server_id_clone, &store).unwrap();
+            let repos = single_hosted(&server_root);
+            handle_connection(&repos, stream, &server_id_clone).unwrap();
         });
 
         // Client.
@@ -1920,10 +2079,9 @@ mod tests {
         let server_root = server_dir.path().to_path_buf();
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let mut srv_repo = crate::repo::Repo::open(&server_root).unwrap();
-            let store = PeerStore::new(server_root.join(".ivaldi/authorized_peers"));
+            let repos = single_hosted(&server_root);
             // Expect this to err with PeerNotAuthorized.
-            let _ = handle_connection(&mut srv_repo, stream, &server_id_clone, &store);
+            let _ = handle_connection(&repos, stream, &server_id_clone);
         });
 
         let _ = peer_store; // keep alive to prove we never trusted
@@ -2113,9 +2271,8 @@ mod tests {
         let server_root = server_dir.path().to_path_buf();
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let mut srv_repo = crate::repo::Repo::open(&server_root).unwrap();
-            let store = PeerStore::new(server_root.join(".ivaldi/authorized_peers"));
-            handle_connection(&mut srv_repo, stream, &server_id_clone, &store).unwrap();
+            let repos = single_hosted(&server_root);
+            handle_connection(&repos, stream, &server_id_clone).unwrap();
         });
 
         let client_dir = tempfile::tempdir().unwrap();
@@ -2614,5 +2771,141 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn peer_url_carries_repo_when_two_segments_given() {
+        // One segment is still the timeline — every pre-hub URL is untouched.
+        let u = PeerUrl::parse("ivaldi://h:9500/main").unwrap();
+        assert_eq!(u.repo, None);
+        assert_eq!(u.timeline.as_deref(), Some("main"));
+
+        // Two segments: repo, then timeline.
+        let u = PeerUrl::parse("ivaldi://hub:9418/atmosphere/main").unwrap();
+        assert_eq!(u.repo.as_deref(), Some("atmosphere"));
+        assert_eq!(u.timeline.as_deref(), Some("main"));
+
+        // Trailing slash: name the repo, let the server pick the timeline.
+        let u = PeerUrl::parse("ivaldi://hub/atmosphere/").unwrap();
+        assert_eq!(u.repo.as_deref(), Some("atmosphere"));
+        assert_eq!(u.timeline, None);
+
+        // Bare host is unchanged.
+        let u = PeerUrl::parse("ivaldi://hub").unwrap();
+        assert_eq!((u.repo, u.timeline), (None, None));
+    }
+
+    #[test]
+    fn unknown_repo_never_falls_back_to_a_default() {
+        let mut one = std::collections::BTreeMap::new();
+        one.insert(String::new(), 1u8);
+        // Empty request on a single-repo host resolves to the sole repo.
+        assert_eq!(resolve_hosted(&one, ""), Some(&1));
+        // ...but a name that host does not have is refused, not defaulted.
+        assert_eq!(resolve_hosted(&one, "atmosphere"), None);
+
+        let mut many = std::collections::BTreeMap::new();
+        many.insert("alpha".to_string(), 1u8);
+        many.insert("beta".to_string(), 2u8);
+        assert_eq!(resolve_hosted(&many, "beta"), Some(&2));
+        assert_eq!(resolve_hosted(&many, "gamma"), None);
+        // Ambiguous: several repos and no name given.
+        assert_eq!(resolve_hosted(&many, ""), None);
+    }
+
+    /// Two repositories, one port, routed by the name in `Hello`.
+    #[test]
+    fn multi_repo_host_routes_each_fetch_to_the_right_repo() {
+        use crate::fsmerkle::{Entry, MODE_FILE, NodeKind};
+
+        let root = tempfile::tempdir().unwrap();
+        let client_id = Identity::generate().unwrap();
+        let server_id = Identity::generate().unwrap();
+
+        let mut repos = std::collections::BTreeMap::new();
+        for (name, text) in [("alpha", "i am alpha"), ("beta", "i am beta")] {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            crate::forge::forge(&dir).unwrap();
+            // Scoped so the redb handle is dropped before we reopen below.
+            {
+                let mut repo = crate::repo::Repo::open(&dir).unwrap();
+                let cas = crate::cas::FileCas::new(dir.join(".ivaldi/objects")).unwrap();
+                let store = crate::fsmerkle::FsStore::new(&cas);
+                let (blob, _) = store.put_blob(text.as_bytes()).unwrap();
+                let tree = store
+                    .put_tree(vec![Entry {
+                        name: "who.txt".into(),
+                        mode: MODE_FILE,
+                        kind: NodeKind::Blob,
+                        hash: blob,
+                    }])
+                    .unwrap();
+                repo.commit(tree, "tester <t@x>", "seed").unwrap();
+            }
+            let peer_store_path = dir.join(".ivaldi/authorized_peers");
+            PeerStore::new(peer_store_path.clone())
+                .trust(client_id.public, Some("client"))
+                .unwrap();
+            repos.insert(
+                name.to_string(),
+                HostedRepo {
+                    repo: std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::repo::Repo::open(&dir).unwrap(),
+                    )),
+                    peer_store_path,
+                },
+            );
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            // Three connections: alpha, beta, then one naming a repo that
+            // does not exist.
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().unwrap();
+                let _ = handle_connection(&repos, stream, &server_id);
+            }
+        });
+
+        let client_dir = tempfile::tempdir().unwrap();
+        let fetch = |repo: &str, into: &str| {
+            let url =
+                PeerUrl::parse(&format!("ivaldi://127.0.0.1:{}/{}/main", port, repo)).unwrap();
+            fetch_into_with_policy(
+                &url,
+                &client_dir.path().join(into),
+                &client_id,
+                crate::known_peers::TofuPolicy::AcceptAll,
+            )
+        };
+
+        let (a, b, missing) = with_isolated_known_peers(|| {
+            (
+                fetch("alpha", "a"),
+                fetch("beta", "b"),
+                fetch("nosuchrepo", "c"),
+            )
+        });
+
+        a.expect("alpha should fetch");
+        b.expect("beta should fetch");
+        assert!(
+            missing.is_err(),
+            "a repo the host does not serve must be refused"
+        );
+
+        // Each clone got its own repo's content, not the other's.
+        assert_eq!(
+            std::fs::read_to_string(client_dir.path().join("a/who.txt")).unwrap(),
+            "i am alpha"
+        );
+        assert_eq!(
+            std::fs::read_to_string(client_dir.path().join("b/who.txt")).unwrap(),
+            "i am beta"
+        );
+
+        handle.join().unwrap();
     }
 }
