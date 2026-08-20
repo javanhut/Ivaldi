@@ -107,11 +107,20 @@ pub(super) fn cmd_portal(args: PortalArgs, quiet: bool) -> Result<(), String> {
             } else {
                 println!("Configured portals:");
                 for (i, p) in portals.iter().enumerate() {
-                    let plat = match p.platform {
-                        Platform::GitHub => "github",
-                        Platform::GitLab => "gitlab",
+                    // Report the transport, not `platform`. A peer portal
+                    // carries a placeholder platform it never uses, so
+                    // reading that field would label every `ivaldi://` remote
+                    // "github".
+                    let kind = match p.transport() {
+                        crate::portal::Transport::Peer(_) => "ivaldi".to_string(),
+                        crate::portal::Transport::Ssh(_) => "ssh".to_string(),
+                        crate::portal::Transport::GenericHttps(_) => "git/https".to_string(),
+                        crate::portal::Transport::Https => match p.platform {
+                            Platform::GitHub => "github".to_string(),
+                            Platform::GitLab => "gitlab".to_string(),
+                        },
                     };
-                    print!("  {} ({})", p.to_string_repr(), plat);
+                    print!("  {} ({})", p.to_string_repr(), kind);
                     if let Some(url) = &p.base_url {
                         print!(" [{}]", url);
                     }

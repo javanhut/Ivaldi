@@ -1128,10 +1128,37 @@ fn serve_want(
     timeline: &str,
     have: &[String],
 ) -> Result<(), P2pError> {
-    let head = repo
+    let head = match repo
         .get_timeline_head(timeline)
         .map_err(|e| P2pError::Protocol(e.to_string()))?
-        .ok_or_else(|| P2pError::Protocol(format!("unknown timeline '{}'", timeline)))?;
+    {
+        Some(h) => h,
+        None => {
+            // Say so on the wire rather than dropping the connection. Bailing
+            // here leaves the client reading a closed socket and reporting
+            // "failed to fill whole buffer", which describes our behaviour
+            // instead of their problem — and a freshly forged repository is
+            // the most likely way to arrive here.
+            let known = repo
+                .list_timelines()
+                .map_err(|e| P2pError::Protocol(e.to_string()))?;
+            let message = if known.is_empty() {
+                "this repository is empty — nothing has been sealed on it yet".to_string()
+            } else {
+                format!(
+                    "no timeline '{}' here; this repository has: {}",
+                    timeline,
+                    known
+                        .iter()
+                        .map(|(n, _)| n.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            chan.send(&Message::Error { message })?;
+            return Ok(());
+        }
+    };
 
     // Walk the linear chain (prev_idx + merge parents) from head back, stopping
     // at any leaf whose blake3 the client already has.
@@ -3044,32 +3071,96 @@ mod tests {
         assert!(!cas.has(b).unwrap());
     }
 
+    /// Messages in a queue. No socket, no handshake, no encryption — used to
+    /// drive the protocol without standing up a transport.
+    struct MemChannel {
+        inbox: std::collections::VecDeque<Message>,
+        outbox: Vec<Message>,
+    }
+    impl MessageChannel for MemChannel {
+        fn send(&mut self, msg: &Message) -> Result<(), P2pError> {
+            self.outbox.push(msg.clone());
+            Ok(())
+        }
+        fn recv(&mut self) -> Result<Message, P2pError> {
+            // An empty inbox is the peer hanging up, which is how
+            // `serve_connection` learns a conversation is over.
+            self.inbox
+                .pop_front()
+                .ok_or_else(|| P2pError::Io("peer hung up".into()))
+        }
+    }
+
+    /// Seed a repository with one commit, or none at all.
+    fn seeded_repo(dir: &std::path::Path, with_commit: bool) -> crate::repo::Repo {
+        crate::forge::forge(dir).unwrap();
+        if with_commit {
+            use crate::fsmerkle::{Entry, FsStore, MODE_FILE, NodeKind};
+            let cas = crate::cas::FileCas::new(dir.join(".ivaldi/objects")).unwrap();
+            let store = FsStore::new(&cas);
+            let (blob, _) = store.put_blob(b"seed").unwrap();
+            let tree = store
+                .put_tree(vec![Entry {
+                    name: "f.txt".into(),
+                    mode: MODE_FILE,
+                    kind: NodeKind::Blob,
+                    hash: blob,
+                }])
+                .unwrap();
+            let mut repo = crate::repo::Repo::open(dir).unwrap();
+            repo.commit(tree, "tester <t@x>", "seed").unwrap();
+        }
+        crate::repo::Repo::open(dir).unwrap()
+    }
+
+    /// Wanting a timeline that isn't there must come back as a message the
+    /// client can print, not a closed socket.
+    #[test]
+    fn a_missing_timeline_is_answered_not_hung_up_on() {
+        let empty_dir = tempfile::tempdir().unwrap();
+        let mut empty = seeded_repo(empty_dir.path(), false);
+        let mut chan = MemChannel {
+            inbox: std::collections::VecDeque::from([Message::WantTimeline {
+                timeline: "main".into(),
+                have: vec![],
+            }]),
+            outbox: Vec::new(),
+        };
+        serve_connection(&mut empty, &mut chan, "tester").unwrap();
+        match chan.outbox.as_slice() {
+            [Message::Error { message }] => assert!(
+                message.contains("empty"),
+                "a freshly forged repo should say so, got {message:?}"
+            ),
+            other => panic!("expected one Error, got {other:?}"),
+        }
+
+        // With timelines present, the error names what is actually there.
+        let seeded_dir = tempfile::tempdir().unwrap();
+        let mut seeded = seeded_repo(seeded_dir.path(), true);
+        let mut chan = MemChannel {
+            inbox: std::collections::VecDeque::from([Message::WantTimeline {
+                timeline: "nosuch".into(),
+                have: vec![],
+            }]),
+            outbox: Vec::new(),
+        };
+        serve_connection(&mut seeded, &mut chan, "tester").unwrap();
+        match chan.outbox.as_slice() {
+            [Message::Error { message }] => {
+                assert!(message.contains("nosuch"), "{message}");
+                assert!(message.contains("main"), "should list what exists: {message}");
+            }
+            other => panic!("expected one Error, got {other:?}"),
+        }
+    }
+
     /// The protocol must run over a carrier that is neither TCP nor Noise.
     /// If this compiles and passes, SSH and HTTPS are new `MessageChannel`
     /// impls rather than a second copy of the request loop.
     #[test]
     fn serve_connection_runs_over_a_non_noise_carrier() {
         use crate::fsmerkle::{Entry, FsStore, MODE_FILE, NodeKind};
-        use std::collections::VecDeque;
-
-        /// Messages in a queue. No socket, no handshake, no encryption.
-        struct MemChannel {
-            inbox: VecDeque<Message>,
-            outbox: Vec<Message>,
-        }
-        impl MessageChannel for MemChannel {
-            fn send(&mut self, msg: &Message) -> Result<(), P2pError> {
-                self.outbox.push(msg.clone());
-                Ok(())
-            }
-            fn recv(&mut self) -> Result<Message, P2pError> {
-                // An empty inbox is the peer hanging up, which is how
-                // `serve_connection` learns a conversation is over.
-                self.inbox
-                    .pop_front()
-                    .ok_or_else(|| P2pError::Io("peer hung up".into()))
-            }
-        }
 
         let dir = tempfile::tempdir().unwrap();
         crate::forge::forge(dir.path()).unwrap();
@@ -3091,7 +3182,7 @@ mod tests {
 
         let mut repo = crate::repo::Repo::open(dir.path()).unwrap();
         let mut chan = MemChannel {
-            inbox: VecDeque::from([Message::ListTimelines]),
+            inbox: std::collections::VecDeque::from([Message::ListTimelines]),
             outbox: Vec::new(),
         };
         serve_connection(&mut repo, &mut chan, "tester").unwrap();
