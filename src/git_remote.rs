@@ -451,6 +451,7 @@ impl SmartHttpClient {
         }
 
         // ---- Translate Ivaldi history (and any tags) to git objects.
+        let prepare_pb = progress::spinner("Preparing incremental upload");
         let plan = plan_push(
             repo,
             branch,
@@ -460,17 +461,26 @@ impl SmartHttpClient {
             include_tags,
             force,
         )?;
+        prepare_pb.finish_with_message(format!(
+            "Upload prepared ({} changed objects)",
+            plan.objects.len()
+        ));
         if plan.updates.is_empty() {
             return Err(nothing_to_push(&plan.skipped_tags));
         }
 
         // ---- Build the request body: command pkt-lines + flush + packfile.
-        let mut body = receive_pack_commands(&plan.updates);
+        let preamble = receive_pack_commands(&plan.updates);
+        let preamble_len = preamble.len();
         let mut object_refs: Vec<&crate::git_export::GitObject> = plan.objects.values().collect();
         object_refs.sort_by_key(|o| o.sha1);
-        let pack = crate::git_pack_writer::write_pack(&object_refs)
+        let pack_pb = progress::spinner("Compressing upload pack");
+        let body = crate::git_pack_writer::write_pack_after(preamble, &object_refs)
             .map_err(|e| GitRemoteError::Protocol(e.to_string()))?;
-        body.extend_from_slice(&pack);
+        pack_pb.finish_with_message(format!(
+            "Pack ready ({} bytes)",
+            body.len() - preamble_len
+        ));
         // None when only tags moved — there is then no new branch tip to map.
         let branch_new_sha1 = plan
             .updates
@@ -539,6 +549,80 @@ pub(crate) struct PushPlan {
 /// The 40 zeros git uses for "this ref does not exist yet".
 pub(crate) const ZERO_SHA1: &str = "0000000000000000000000000000000000000000";
 
+/// Expand the server's advertised commit tips through the locally known DAG.
+///
+/// Git advertises ref tips, not every reachable commit/object. Once an
+/// advertised SHA maps to a local leaf, all of that leaf's ancestors and its
+/// current filesystem snapshot are known to exist on the receiver. Returning
+/// both facts lets export stop at an internal fork point and omit unchanged
+/// tree/blob bodies without confusing identity with remote presence.
+fn advertised_remote_state(
+    repo: &crate::repo::Repo,
+    advertised: &[AdvertisedRef],
+    mapping: &crate::remote::HashMapping,
+) -> Result<(BTreeSet<[u8; 20]>, Vec<B3Hash>), GitRemoteError> {
+    let mut server_has = BTreeSet::new();
+    for r in advertised.iter().filter(|r| r.id != ZERO_SHA1) {
+        if let Some(sha) = sha1_hex_to_array(&r.id) {
+            server_has.insert(sha);
+        }
+    }
+
+    // One store scan avoids an O(refs × leaves) resolve for repositories with
+    // many branches/tags.
+    let mut leaf_by_hash = std::collections::BTreeMap::new();
+    for idx in 0..repo.commit_count() {
+        if let Some(leaf) = repo
+            .get_leaf(idx)
+            .map_err(|e| GitRemoteError::Io(e.to_string()))?
+        {
+            leaf_by_hash.insert(leaf.hash(), (idx, leaf.tree_root));
+        }
+    }
+
+    let mut remote_tree_roots = BTreeSet::new();
+    let mut stack = Vec::new();
+    for r in advertised.iter().filter(|r| r.id != ZERO_SHA1) {
+        let Some(b3) = mapping.get_blake3(&r.id) else {
+            continue;
+        };
+        let Some(&(idx, tree_root)) = leaf_by_hash.get(&b3) else {
+            continue;
+        };
+        remote_tree_roots.insert(tree_root);
+        stack.push(idx);
+    }
+
+    let mut visited = BTreeSet::new();
+    while let Some(idx) = stack.pop() {
+        if !visited.insert(idx) {
+            continue;
+        }
+        let Some(leaf) = repo
+            .get_leaf(idx)
+            .map_err(|e| GitRemoteError::Io(e.to_string()))?
+        else {
+            continue;
+        };
+        if let Some(sha) = mapping.get_sha1(leaf.hash()).and_then(sha1_hex_to_array) {
+            server_has.insert(sha);
+        }
+        stack.extend(leaf.all_parents());
+    }
+
+    Ok((server_has, remote_tree_roots.into_iter().collect()))
+}
+
+fn sha1_hex_to_array(value: &str) -> Option<[u8; 20]> {
+    let raw = hex::decode(value).ok()?;
+    if raw.len() != 20 {
+        return None;
+    }
+    let mut sha = [0u8; 20];
+    sha.copy_from_slice(&raw);
+    Some(sha)
+}
+
 /// Work out which refs a push should update and which objects that needs.
 ///
 /// Shared by the HTTPS and SSH push paths so the two can't drift on which
@@ -558,8 +642,6 @@ pub(crate) fn plan_push(
     include_tags: bool,
     force: bool,
 ) -> Result<PushPlan, GitRemoteError> {
-    use std::collections::BTreeSet;
-
     let advertised_sha = |name: &str| -> String {
         advertised
             .iter()
@@ -568,20 +650,7 @@ pub(crate) fn plan_push(
             .unwrap_or_else(|| ZERO_SHA1.to_string())
     };
 
-    // SHA-1s the server already advertised, so the exporter only skips
-    // ancestors actually present on this remote.
-    let server_has: BTreeSet<[u8; 20]> = advertised
-        .iter()
-        .filter(|r| r.id != ZERO_SHA1)
-        .filter_map(|r| {
-            let raw = hex::decode(&r.id).ok()?;
-            (raw.len() == 20).then(|| {
-                let mut b = [0u8; 20];
-                b.copy_from_slice(&raw);
-                b
-            })
-        })
-        .collect();
+    let (server_has, remote_tree_roots) = advertised_remote_state(repo, advertised, mapping)?;
 
     let tags = if include_tags {
         repo.list_tags()
@@ -599,8 +668,14 @@ pub(crate) fn plan_push(
         }
     }
 
-    let export = crate::git_export::export_roots(repo, &roots, mapping, &server_has)
-        .map_err(|e| GitRemoteError::Protocol(format!("git export: {}", e)))?;
+    let export = crate::git_export::export_roots_incremental(
+        repo,
+        &roots,
+        mapping,
+        &server_has,
+        &remote_tree_roots,
+    )
+    .map_err(|e| GitRemoteError::Protocol(format!("git export: {}", e)))?;
     let mut objects = export.objects;
 
     let mut updates = Vec::new();
@@ -2422,6 +2497,10 @@ fn import_tree(
     let hash = store
         .put_tree(ivaldi_entries)
         .map_err(|e| GitRemoteError::Io(e.to_string()))?;
+    // Tree identity is deterministic just like blob identity. Persisting it
+    // lets a later upload reference a remote-known subtree without loading
+    // and re-hashing every blob below it.
+    mapping.insert(sha, hash);
     tree_cache.insert(sha.to_string(), hash);
     Ok(hash)
 }
@@ -3053,6 +3132,13 @@ mod tests {
         plan_push(repo, "main", 1, &advertised, &mapping, include_tags, force).unwrap()
     }
 
+    fn advertised_ref(name: &str, sha: [u8; 20]) -> AdvertisedRef {
+        AdvertisedRef {
+            id: hex::encode(sha),
+            name: name.into(),
+        }
+    }
+
     fn update_named<'a>(plan: &'a PushPlan, name: &str) -> Option<&'a (String, String, String)> {
         plan.updates.iter().find(|(n, _, _)| n == name)
     }
@@ -3067,6 +3153,120 @@ mod tests {
             "tags must not ride along on a plain push: {:?}",
             plan.updates
         );
+    }
+
+    #[test]
+    fn incremental_push_omits_unchanged_blob_from_remote_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let mut repo = crate::repo::Repo::open(dir.path()).unwrap();
+        let cas = crate::cas::FileCas::new(dir.path().join(".ivaldi/objects")).unwrap();
+        let store = crate::fsmerkle::FsStore::new(&cas);
+        use crate::fsmerkle::{Entry, MODE_FILE, NodeKind};
+
+        let (stable, _) = store.put_blob(b"large unchanged payload").unwrap();
+        let (old, _) = store.put_blob(b"old").unwrap();
+        let first_tree = store
+            .put_tree(vec![
+                Entry {
+                    name: "stable.bin".into(),
+                    mode: MODE_FILE,
+                    kind: NodeKind::Blob,
+                    hash: stable,
+                },
+                Entry {
+                    name: "value.txt".into(),
+                    mode: MODE_FILE,
+                    kind: NodeKind::Blob,
+                    hash: old,
+                },
+            ])
+            .unwrap();
+        repo.commit(first_tree, "t <t@x>", "first").unwrap();
+
+        // Export once to establish the exact Git identities the advertised
+        // remote tip would have. This also exercises persistent tree/blob
+        // identity caching.
+        let mapping = HashMapping::new(&repo.ivaldi_dir);
+        let first = crate::git_export::export_chain(&repo, 0, &mapping, &BTreeSet::new()).unwrap();
+
+        let (new, _) = store.put_blob(b"new").unwrap();
+        let second_tree = store
+            .put_tree(vec![
+                Entry {
+                    name: "stable.bin".into(),
+                    mode: MODE_FILE,
+                    kind: NodeKind::Blob,
+                    hash: stable,
+                },
+                Entry {
+                    name: "value.txt".into(),
+                    mode: MODE_FILE,
+                    kind: NodeKind::Blob,
+                    hash: new,
+                },
+            ])
+            .unwrap();
+        repo.commit(second_tree, "t <t@x>", "second").unwrap();
+
+        let mapping = HashMapping::new(&repo.ivaldi_dir);
+        let plan = plan_push(
+            &repo,
+            "main",
+            1,
+            &[advertised_ref("refs/heads/main", first.tip_sha1)],
+            &mapping,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(plan.objects.len(), 3, "new blob + tree + commit only");
+        assert!(plan.objects.values().any(|o| o.body == b"new"));
+        assert!(
+            plan.objects
+                .values()
+                .all(|o| o.body != b"large unchanged payload"),
+            "a blob reachable from the advertised snapshot must not be resent"
+        );
+    }
+
+    #[test]
+    fn advertised_tip_expands_to_internal_ancestor_for_new_branch() {
+        let (dir, mut repo) = repo_with_two_seals();
+        let cas = crate::cas::FileCas::new(dir.path().join(".ivaldi/objects")).unwrap();
+        let store = crate::fsmerkle::FsStore::new(&cas);
+        let (blob, _) = store.put_blob(b"three").unwrap();
+        let tree = store
+            .put_tree(vec![crate::fsmerkle::Entry {
+                name: "f.txt".into(),
+                mode: crate::fsmerkle::MODE_FILE,
+                kind: crate::fsmerkle::NodeKind::Blob,
+                hash: blob,
+            }])
+            .unwrap();
+        repo.commit(tree, "t <t@x>", "third").unwrap();
+
+        let mapping = HashMapping::new(&repo.ivaldi_dir);
+        let remote_main =
+            crate::git_export::export_chain(&repo, 2, &mapping, &BTreeSet::new()).unwrap();
+        let mapping = HashMapping::new(&repo.ivaldi_dir);
+        let plan = plan_push(
+            &repo,
+            "fork",
+            1,
+            &[advertised_ref("refs/heads/main", remote_main.tip_sha1)],
+            &mapping,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            plan.objects.is_empty(),
+            "the remote main tip already reaches the fork commit"
+        );
+        assert!(update_named(&plan, "refs/heads/fork").is_some());
     }
 
     #[test]

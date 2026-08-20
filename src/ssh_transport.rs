@@ -304,6 +304,7 @@ impl SshClient {
         // server already has, when a tag may move, and what "nothing to
         // push" means.
         let mapping = HashMapping::new(&repo.ivaldi_dir);
+        let prepare_pb = crate::progress::spinner("Preparing incremental upload");
         let plan = plan_push(
             repo,
             branch,
@@ -313,6 +314,10 @@ impl SshClient {
             include_tags,
             force,
         )?;
+        prepare_pb.finish_with_message(format!(
+            "Upload prepared ({} changed objects)",
+            plan.objects.len()
+        ));
         if plan.updates.is_empty() {
             return Err(nothing_to_push(&plan.skipped_tags));
         }
@@ -337,8 +342,10 @@ impl SshClient {
         let mut object_refs: Vec<&crate::git_export::GitObject> = plan.objects.values().collect();
         // Stable order — receivers don't care, but determinism helps debugging.
         object_refs.sort_by_key(|o| o.sha1);
+        let pack_pb = crate::progress::spinner("Compressing upload pack");
         let pack = git_pack_writer::write_pack(&object_refs)
             .map_err(|e| GitRemoteError::Protocol(e.to_string()))?;
+        pack_pb.finish_with_message(format!("Pack ready ({} bytes)", pack.len()));
         stdin
             .write_all(&pack)
             .map_err(|e| GitRemoteError::Io(e.to_string()))?;

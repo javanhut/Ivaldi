@@ -78,6 +78,23 @@ wrong: it meant "I cloned this from GitHub, so when I push it to a
 *different* remote, send nothing." The current behavior treats each
 remote's advertisement as the source of truth.
 
+Advertised ref tips are also expanded through the locally verified commit DAG.
+That means creating a remote branch at an internal ancestor requires only a ref
+update; Ivaldi does not rebuild history merely because the ancestor is no
+longer itself advertised as a tip.
+
+## Incremental filesystem objects
+
+For every advertised commit that maps to a local leaf, export walks its current
+Merkle snapshot and records the reachable Ivaldi tree/blob hashes without
+loading blob bodies. When a new snapshot reuses one of those hashes, its body
+is omitted from the outgoing pack. Persistent BLAKE3↔SHA-1 identities in
+`.ivaldi/hash-map` supply the Git object name needed by the new tree.
+
+Remote presence remains portal-specific: a cached identity alone never causes
+an object to be omitted. The object must also be reachable from a tip
+advertised by the portal handling this upload.
+
 ## Topological order
 
 Leaves are emitted oldest-first (by MMR index, which is monotonic in
