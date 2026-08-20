@@ -280,6 +280,33 @@ impl From<std::io::Error> for P2pError {
     }
 }
 
+/// A duplex of protocol messages.
+///
+/// The request/response logic does not care what carries the frames or what
+/// secures them. `ivaldi://` uses [`Channel`] — Noise over TCP — because a
+/// bare TCP socket offers nothing on its own. A carrier that already
+/// authenticates and encrypts, such as SSH or TLS, can implement this over
+/// its own stream instead of nesting Noise inside a tunnel that has already
+/// done the work.
+///
+/// Deliberately just the message pair. Anything transport-shaped —
+/// half-close, peer keys, the repo a client asked for — stays on the
+/// concrete type that actually has it.
+pub trait MessageChannel {
+    fn send(&mut self, msg: &Message) -> Result<(), P2pError>;
+    fn recv(&mut self) -> Result<Message, P2pError>;
+}
+
+impl MessageChannel for Channel {
+    fn send(&mut self, msg: &Message) -> Result<(), P2pError> {
+        // Inherent method wins at the call site, so this is not recursive.
+        Channel::send(self, msg)
+    }
+    fn recv(&mut self) -> Result<Message, P2pError> {
+        Channel::recv(self)
+    }
+}
+
 /// Encrypted, framed channel over a TCP stream after a successful Noise
 /// handshake.
 pub struct Channel {
@@ -733,7 +760,7 @@ fn accept_one(
 /// a push outside that namespace no matter what it passes.
 pub fn serve_connection(
     repo: &mut crate::repo::Repo,
-    chan: &mut Channel,
+    chan: &mut dyn MessageChannel,
     sender_label: &str,
 ) -> Result<(), P2pError> {
     loop {
@@ -831,7 +858,7 @@ fn verify_trees_present(
 /// users sharing one repo).
 fn serve_push(
     repo: &mut crate::repo::Repo,
-    chan: &mut Channel,
+    chan: &mut dyn MessageChannel,
     timeline: &str,
     sender: &str,
 ) -> Result<(), P2pError> {
@@ -1097,7 +1124,7 @@ impl LeafLander {
 
 fn serve_want(
     repo: &mut crate::repo::Repo,
-    chan: &mut Channel,
+    chan: &mut dyn MessageChannel,
     timeline: &str,
     have: &[String],
 ) -> Result<(), P2pError> {
@@ -1568,14 +1595,18 @@ fn discard_unreachable(
 /// transfer can never land a durable leaf whose tree bytes never arrived.
 /// Returns the number of objects sent.
 fn send_objects(
-    chan: &mut Channel,
+    chan: &mut dyn MessageChannel,
     cas: &crate::cas::FileCas,
     hashes: &BTreeSet<B3Hash>,
     push: bool,
 ) -> Result<usize, P2pError> {
     use crate::cas::Cas;
 
-    fn flush(chan: &mut Channel, batch: &mut Vec<WireBlob>, push: bool) -> Result<(), P2pError> {
+    fn flush(
+        chan: &mut dyn MessageChannel,
+        batch: &mut Vec<WireBlob>,
+        push: bool,
+    ) -> Result<(), P2pError> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -1622,7 +1653,11 @@ fn send_objects(
 /// Send one CAS object: small objects are batched inline into bundles by the
 /// caller; large ones are streamed here as bounded [`Message::BlobChunk`]
 /// slices so no single frame approaches `MAX_FRAME`.
-fn send_blob_chunks(chan: &mut Channel, hash_hex: &str, data: &[u8]) -> Result<(), P2pError> {
+fn send_blob_chunks(
+    chan: &mut dyn MessageChannel,
+    hash_hex: &str,
+    data: &[u8],
+) -> Result<(), P2pError> {
     let total_len = data.len() as u64;
     let mut offset = 0usize;
     while offset < data.len() {
@@ -3007,5 +3042,65 @@ mod tests {
         assert!(cas.has(preexisting).unwrap(), "pre-existing content survives");
         assert!(!cas.has(a).unwrap());
         assert!(!cas.has(b).unwrap());
+    }
+
+    /// The protocol must run over a carrier that is neither TCP nor Noise.
+    /// If this compiles and passes, SSH and HTTPS are new `MessageChannel`
+    /// impls rather than a second copy of the request loop.
+    #[test]
+    fn serve_connection_runs_over_a_non_noise_carrier() {
+        use crate::fsmerkle::{Entry, FsStore, MODE_FILE, NodeKind};
+        use std::collections::VecDeque;
+
+        /// Messages in a queue. No socket, no handshake, no encryption.
+        struct MemChannel {
+            inbox: VecDeque<Message>,
+            outbox: Vec<Message>,
+        }
+        impl MessageChannel for MemChannel {
+            fn send(&mut self, msg: &Message) -> Result<(), P2pError> {
+                self.outbox.push(msg.clone());
+                Ok(())
+            }
+            fn recv(&mut self) -> Result<Message, P2pError> {
+                // An empty inbox is the peer hanging up, which is how
+                // `serve_connection` learns a conversation is over.
+                self.inbox
+                    .pop_front()
+                    .ok_or_else(|| P2pError::Io("peer hung up".into()))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        {
+            let cas = crate::cas::FileCas::new(dir.path().join(".ivaldi/objects")).unwrap();
+            let store = FsStore::new(&cas);
+            let (blob, _) = store.put_blob(b"over some other carrier").unwrap();
+            let tree = store
+                .put_tree(vec![Entry {
+                    name: "f.txt".into(),
+                    mode: MODE_FILE,
+                    kind: NodeKind::Blob,
+                    hash: blob,
+                }])
+                .unwrap();
+            let mut repo = crate::repo::Repo::open(dir.path()).unwrap();
+            repo.commit(tree, "tester <t@x>", "seed").unwrap();
+        }
+
+        let mut repo = crate::repo::Repo::open(dir.path()).unwrap();
+        let mut chan = MemChannel {
+            inbox: VecDeque::from([Message::ListTimelines]),
+            outbox: Vec::new(),
+        };
+        serve_connection(&mut repo, &mut chan, "tester").unwrap();
+
+        match chan.outbox.as_slice() {
+            [Message::Timelines { names }] => {
+                assert!(names.iter().any(|n| n == "main"), "got {:?}", names)
+            }
+            other => panic!("expected one Timelines reply, got {:?}", other),
+        }
     }
 }
