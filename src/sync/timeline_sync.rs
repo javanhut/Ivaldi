@@ -8,12 +8,13 @@ use crate::atomic_io::atomic_write;
 use crate::cas::FileCas;
 use crate::fsmerkle::FsStore;
 use crate::github::{CommitInfo, GitHubClient};
+use crate::hash::B3Hash;
 use crate::leaf::Leaf;
 use crate::refname::timeline_ref_path;
 use crate::remote::HashMapping;
 use crate::repo::Repo;
 
-use super::import::{import_full_history, import_full_history_into};
+use super::import::import_commit_history_into;
 use super::{
     SyncError, checkout_tree_to_workspace, compute_file_changes, compute_workspace_delta,
     get_tree_files,
@@ -69,33 +70,60 @@ pub fn sync_timeline(
     force: bool,
 ) -> Result<SyncResult, SyncError> {
     recover_interrupted_sync(repo)?;
-    let branches = client.list_branches(owner, repo_name)?;
-    let branch = branches
-        .iter()
-        .find(|b| b.name == timeline)
-        .ok_or_else(|| SyncError::Other(format!("remote branch '{}' not found", timeline)))?;
-
     let mut hash_mapping = HashMapping::new(&repo.ivaldi_dir);
 
-    // Fetch remote commits
-    let remote_commits = client.list_commits(owner, repo_name, timeline, 0)?;
+    // Probe only the tip first. The common up-to-date case should be one
+    // small request, not a walk of every remote commit and its full tree.
+    let Some(remote_tip) = client
+        .list_commits(owner, repo_name, timeline, 1)?
+        .into_iter()
+        .next()
+    else {
+        return Ok(up_to_date_result());
+    };
 
+    // Get local head BEFORE import so we can constrain ancestor search.
+    let local_head_idx = repo.get_timeline_head(timeline)?;
+    let local_reachable = collect_local_reachable(repo, local_head_idx);
+    let reachable_by_hash = index_reachable_hashes(repo, &local_reachable);
+
+    // Most syncs have nothing to do. Imported leaves authenticate the remote
+    // SHA in their metadata; native uploaded leaves are validated once and
+    // cached in HashMapping. A stale legacy mapping is removed before the
+    // full ancestor search.
+    if let Some(tip_idx) = hash_mapping
+        .get_blake3(&remote_tip.sha)
+        .and_then(|hash| reachable_by_hash.get(&hash).copied())
+    {
+        if !remote_tip_mapping_is_stale(
+            client,
+            repo,
+            owner,
+            repo_name,
+            &remote_tip,
+            tip_idx,
+            &mut hash_mapping,
+        )? {
+            return Ok(up_to_date_result());
+        }
+        hash_mapping.remove_sha1(&remote_tip.sha);
+        hash_mapping.save()?;
+    }
+
+    // The tip differs, so fetch history once for ancestor classification and
+    // pass the same listing into import if integration proceeds.
+    let remote_commits = client.list_commits(owner, repo_name, timeline, 0)?;
     if remote_commits.is_empty() {
         return Ok(up_to_date_result());
     }
-
-    // Get local head BEFORE import so we can constrain ancestor search
-    let local_head_idx = repo.get_timeline_head(timeline)?;
-    let local_reachable = collect_local_reachable(repo, local_head_idx);
 
     // Track commits with stale mappings so we skip them on re-search
     let mut stale_shas: BTreeSet<String> = BTreeSet::new();
 
     let (mut common_ancestor_sha, mut common_ancestor_idx) = find_common_ancestor(
-        repo,
         &remote_commits,
         &hash_mapping,
-        &local_reachable,
+        &reachable_by_hash,
         &stale_shas,
     );
 
@@ -105,7 +133,15 @@ pub fn sync_timeline(
     // sync created a wrong fuse commit and mapped the remote tip to it.
     if common_ancestor_sha.as_ref() == Some(&remote_commits[0].sha)
         && let Some(ca_idx) = common_ancestor_idx
-        && remote_tip_mapping_is_stale(client, repo, owner, repo_name, &remote_commits[0], ca_idx)?
+        && remote_tip_mapping_is_stale(
+            client,
+            repo,
+            owner,
+            repo_name,
+            &remote_commits[0],
+            ca_idx,
+            &mut hash_mapping,
+        )?
     {
         // Stale mapping: remove it and re-search for the real ancestor
         let stale_sha = remote_commits[0].sha.clone();
@@ -114,10 +150,9 @@ pub fn sync_timeline(
         stale_shas.insert(stale_sha);
 
         (common_ancestor_sha, common_ancestor_idx) = find_common_ancestor(
-            repo,
             &remote_commits,
             &hash_mapping,
-            &local_reachable,
+            &reachable_by_hash,
             &stale_shas,
         );
     }
@@ -130,6 +165,7 @@ pub fn sync_timeline(
     if new_remote_count == 0 {
         return Ok(up_to_date_result());
     }
+    let remote_tip_sha = remote_commits[0].sha.clone();
 
     // Sync rewrites the workspace to match the incoming tree (overwriting and
     // deleting files), so any uncommitted change would be silently lost.
@@ -160,6 +196,8 @@ pub fn sync_timeline(
             repo_name,
             timeline,
             common_ancestor_idx,
+            remote_commits,
+            force,
         );
     }
 
@@ -170,7 +208,8 @@ pub fn sync_timeline(
         repo_name,
         timeline,
         common_ancestor_idx,
-        &branch.commit.sha,
+        &remote_tip_sha,
+        remote_commits,
     )
 }
 
@@ -272,15 +311,28 @@ fn collect_local_reachable(repo: &Repo, local_head_idx: Option<u64>) -> BTreeSet
     reachable
 }
 
+/// Build the hash lookup once for ancestor searches. A repeated linear scan
+/// of every leaf for every mapped commit made sync quadratic on long histories.
+fn index_reachable_hashes(repo: &Repo, reachable: &BTreeSet<u64>) -> BTreeMap<B3Hash, u64> {
+    reachable
+        .iter()
+        .filter_map(|&idx| {
+            repo.get_leaf(idx)
+                .ok()
+                .flatten()
+                .map(|leaf| (leaf.hash(), idx))
+        })
+        .collect()
+}
+
 /// Sync step 2: find the common ancestor — walk remote commits
 /// newest→oldest, check the hash mapping, and only accept leaves that are
 /// reachable from the local timeline head. Commits in `stale_shas` are
 /// skipped (their mappings were found to be wrong).
 fn find_common_ancestor(
-    repo: &Repo,
     remote_commits: &[CommitInfo],
     hash_mapping: &HashMapping,
-    local_reachable: &BTreeSet<u64>,
+    reachable_by_hash: &BTreeMap<B3Hash, u64>,
     stale_shas: &BTreeSet<String>,
 ) -> (Option<String>, Option<u64>) {
     for commit in remote_commits {
@@ -288,14 +340,8 @@ fn find_common_ancestor(
             continue;
         }
         if let Some(b3) = hash_mapping.get_blake3(&commit.sha) {
-            // Find leaf index with this hash
-            for idx in 0..repo.commit_count() {
-                if let Ok(Some(leaf)) = repo.get_leaf(idx)
-                    && leaf.hash() == b3
-                    && local_reachable.contains(&idx)
-                {
-                    return (Some(commit.sha.clone()), Some(idx));
-                }
+            if let Some(&idx) = reachable_by_hash.get(&b3) {
+                return (Some(commit.sha.clone()), Some(idx));
             }
         }
     }
@@ -312,16 +358,21 @@ fn remote_tip_mapping_is_stale(
     repo_name: &str,
     remote_tip: &CommitInfo,
     ca_idx: u64,
+    hash_mapping: &mut HashMapping,
 ) -> Result<bool, SyncError> {
-    if repo
-        .get_leaf(ca_idx)?
-        .and_then(|leaf| leaf.meta.get("sync.remote_tip").cloned())
-        .as_deref()
-        == Some(remote_tip.sha.as_str())
+    let Some(leaf) = repo.get_leaf(ca_idx)? else {
+        return Ok(true);
+    };
+    let authenticated = leaf
+        .meta
+        .get("sync.remote_tip")
+        .or_else(|| leaf.meta.get("git.sha1"));
+    if authenticated.map(String::as_str) == Some(remote_tip.sha.as_str())
+        || hash_mapping.is_verified(&remote_tip.sha)
     {
-        // A fuse intentionally contains local paths that are absent remotely.
-        // Its authenticated marker distinguishes that from an accidental
-        // mapping of an ordinary imported commit to the wrong tree.
+        // A fused seal authenticates the remote tip, while an imported seal
+        // authenticates its Git identity. Native uploaded seals use the
+        // persisted verification cache after their first remote comparison.
         return Ok(false);
     }
     let remote_tree = client.get_tree(owner, repo_name, &remote_tip.commit.tree.sha)?;
@@ -337,7 +388,17 @@ fn remote_tip_mapping_is_stale(
     let local_files = get_tree_files(repo, &verify_store, ca_idx)?;
     let local_paths: BTreeSet<&str> = local_files.keys().map(|s| s.as_str()).collect();
 
-    Ok(remote_paths != local_paths)
+    let stale = remote_paths != local_paths;
+    if !stale && hash_mapping.mark_verified(&remote_tip.sha) {
+        if let Err(e) = hash_mapping.save() {
+            // This is an advisory performance cache. The authenticated map
+            // and remote comparison already established correctness, so a
+            // cache-write failure must not turn an up-to-date sync into an
+            // operational failure.
+            crate::logging::warn(&format!("could not cache remote-tip validation: {e}"));
+        }
+    }
+    Ok(stale)
 }
 
 /// Sync step 4: count new remote commits (those before the common ancestor
@@ -397,8 +458,11 @@ fn sync_fast_forward(
     repo_name: &str,
     timeline: &str,
     common_ancestor_idx: Option<u64>,
+    remote_commits: Vec<CommitInfo>,
+    force: bool,
 ) -> Result<SyncResult, SyncError> {
-    let _import = import_full_history(client, repo, owner, repo_name, timeline, 0)?;
+    let _import =
+        import_commit_history_into(client, repo, owner, repo_name, timeline, remote_commits)?;
 
     // Compute file changes for the result
     let cas = FileCas::new(repo.ivaldi_dir.join("objects"))?;
@@ -408,7 +472,13 @@ fn sync_fast_forward(
         compute_workspace_delta(repo, &store, timeline, common_ancestor_idx)?;
 
     // Update workspace files
-    checkout_tree_to_workspace(repo, &store, timeline)?;
+    if force {
+        checkout_tree_to_workspace(repo, &store, timeline)?;
+    } else {
+        super::checkout_tree_delta_to_workspace(
+            repo, &store, timeline, &added, &modified, &deleted,
+        )?;
+    }
 
     Ok(SyncResult {
         added,
@@ -431,6 +501,7 @@ fn sync_diverged(
     timeline: &str,
     common_ancestor_idx: Option<u64>,
     remote_tip_sha: &str,
+    remote_commits: Vec<CommitInfo>,
 ) -> Result<SyncResult, SyncError> {
     // Same value as captured before the ancestor search: nothing between
     // there and here mutates this timeline's head.
@@ -459,8 +530,14 @@ fn sync_diverged(
     crate::failpoint::fail_point("sync.after_temp_timeline");
 
     // Import remote history into temp timeline (fetch from real remote branch)
-    let _import =
-        import_full_history_into(client, repo, owner, repo_name, timeline, &temp_timeline, 0)?;
+    let _import = import_commit_history_into(
+        client,
+        repo,
+        owner,
+        repo_name,
+        &temp_timeline,
+        remote_commits,
+    )?;
 
     // Get file sets for three-way merge
     let cas = FileCas::new(repo.ivaldi_dir.join("objects"))?;
@@ -729,6 +806,8 @@ fn save_sync_conflicts(
 mod tests {
     use super::*;
     use crate::github::{AuthorInfo, CommitDetail, ParentRef, TreeRef};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     fn commit_info(sha: &str, parents: &[&str]) -> CommitInfo {
         CommitInfo {
@@ -828,16 +907,82 @@ mod tests {
         // Reachable set limited to leaves 0-1: the tip's mapping (leaf 2) is
         // outside it, so the mid commit must win.
         let reachable: BTreeSet<u64> = [0u64, 1].into();
+        let reachable_by_hash = index_reachable_hashes(&repo, &reachable);
         let (sha, idx) =
-            find_common_ancestor(&repo, &commits, &mapping, &reachable, &BTreeSet::new());
+            find_common_ancestor(&commits, &mapping, &reachable_by_hash, &BTreeSet::new());
         assert_eq!(sha.as_deref(), Some("remote-mid"));
         assert_eq!(idx, Some(1));
 
         // Marking the mid stale skips it entirely.
         let stale: BTreeSet<String> = ["remote-mid".to_string(), "remote-tip".to_string()].into();
-        let (sha, idx) = find_common_ancestor(&repo, &commits, &mapping, &reachable, &stale);
+        let (sha, idx) = find_common_ancestor(&commits, &mapping, &reachable_by_hash, &stale);
         assert_eq!(sha, None);
         assert_eq!(idx, None);
+    }
+
+    #[test]
+    fn up_to_date_sync_uses_one_tip_request() {
+        const TIP: &str = "1111111111111111111111111111111111111111";
+        const TREE: &str = "2222222222222222222222222222222222222222";
+
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let mut repo = Repo::open(dir.path()).unwrap();
+        let cas = FileCas::new(dir.path().join(".ivaldi/objects")).unwrap();
+        let store = FsStore::new(&cas);
+        let tree = store.build_tree_from_map(&BTreeMap::new()).unwrap();
+        cas.flush().unwrap();
+        let mut leaf = Leaf::new(tree, "main", "Remote", 1, "tip");
+        leaf.meta.insert("git.sha1".into(), TIP.into());
+        let committed = repo.commit_raw(leaf, "main").unwrap();
+        let mut mapping = HashMapping::new(&repo.ivaldi_dir);
+        mapping.insert(TIP, committed.hash);
+        mapping.save().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let first = String::from_utf8_lossy(&request[..read]);
+            let path = first
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap()
+                .to_string();
+            let body = format!(
+                r#"[{{"sha":"{TIP}","commit":{{"message":"tip","author":{{"name":"Remote","email":"r@example.com"}},"tree":{{"sha":"{TREE}"}}}},"parents":[]}}]"#
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            path
+        });
+
+        let base = format!("http://{address}");
+        let client = GitHubClient::with_base_urls(&base, &base);
+        let result = sync_timeline(
+            &client,
+            &mut repo,
+            "owner",
+            "repo",
+            "main",
+            &mut |_, _| panic!("up-to-date sync must not request consent"),
+            false,
+        )
+        .unwrap();
+        let path = server.join().unwrap();
+
+        assert!(result.no_changes);
+        assert!(
+            path.contains("/commits?sha=main&per_page=1&page=1"),
+            "{path}"
+        );
     }
 
     /// Sync must refuse when the workspace has uncommitted changes, since the

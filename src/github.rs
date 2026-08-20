@@ -15,6 +15,10 @@ use crate::portal::Platform;
 const GITHUB_API: &str = "https://api.github.com";
 const ACCEPT: &str = "application/vnd.github.v3+json";
 
+fn commit_page_size(depth: usize) -> usize {
+    if depth > 0 { depth.min(100) } else { 100 }
+}
+
 pub struct GitHubClient {
     token: Option<String>,
     agent: ureq::Agent,
@@ -288,10 +292,13 @@ impl GitHubClient {
     ) -> Result<Vec<CommitInfo>, GitHubError> {
         let mut all = Vec::new();
         let mut page = 1u32;
+        // A tip probe should not download and deserialize GitHub's default
+        // 100-commit page. Full-history callers retain the largest page size.
+        let per_page = commit_page_size(depth);
         loop {
             let resp = self.get(&format!(
-                "/repos/{}/{}/commits?sha={}&per_page=100&page={}",
-                owner, repo, branch, page
+                "/repos/{}/{}/commits?sha={}&per_page={}&page={}",
+                owner, repo, branch, per_page, page
             ))?;
             let batch: Vec<CommitInfo> = resp.into_body().read_json().map_err(gh_err)?;
             let n = batch.len();
@@ -641,6 +648,14 @@ mod tests {
         let j = r#"{"sha":"abc","commit":{"message":"msg","author":{"name":"A","email":"a@b"},"tree":{"sha":"def"}},"parents":[{"sha":"p1"}]}"#;
         let r: CommitInfo = serde_json::from_str(j).unwrap();
         assert_eq!(r.parents.len(), 1);
+    }
+
+    #[test]
+    fn bounded_commit_listing_uses_the_requested_page_size() {
+        assert_eq!(commit_page_size(0), 100);
+        assert_eq!(commit_page_size(1), 1);
+        assert_eq!(commit_page_size(25), 25);
+        assert_eq!(commit_page_size(500), 100);
     }
 
     #[test]

@@ -576,6 +576,72 @@ fn compute_file_changes(
     (added, modified, deleted)
 }
 
+/// Apply an already-computed clean-workspace delta without rereading and
+/// comparing every unchanged file. Forced sync and crash recovery still use
+/// the full checkout below because they must remove arbitrary untracked state.
+fn checkout_tree_delta_to_workspace(
+    repo: &Repo,
+    store: &FsStore<'_>,
+    timeline: &str,
+    added: &[String],
+    modified: &[String],
+    deleted: &[String],
+) -> Result<(), SyncError> {
+    let head_idx = repo
+        .get_timeline_head(timeline)?
+        .ok_or_else(|| SyncError::Other("no head to checkout".into()))?;
+    let head_leaf = repo
+        .get_leaf(head_idx)?
+        .ok_or_else(|| SyncError::Other("corrupt head leaf".into()))?;
+    let mut files = BTreeMap::new();
+    collect_tree_files(store, head_leaf.tree_root, "", &mut files)?;
+
+    let changed: Vec<&String> = added.iter().chain(modified).collect();
+    changed
+        .par_iter()
+        .map(|path| -> Result<(), SyncError> {
+            let blob_hash = files.get(path.as_str()).ok_or_else(|| {
+                SyncError::Other(format!(
+                    "updated path '{}' is absent from the new tree",
+                    path
+                ))
+            })?;
+            let (_, content) = store.load_blob(*blob_hash)?;
+            let file_path = repo.work_dir.join(path);
+            if let Some(parent) = file_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(file_path, content)?;
+            Ok(())
+        })
+        .collect::<Result<(), SyncError>>()?;
+
+    for path in deleted {
+        let full_path = repo.work_dir.join(path);
+        match fs::remove_file(&full_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let mut dir = full_path.parent();
+        while let Some(d) = dir {
+            if d == repo.work_dir {
+                break;
+            }
+            if fs::read_dir(d)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false)
+            {
+                fs::remove_dir(d)?;
+                dir = d.parent();
+            } else {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Checkout the tip tree of a timeline to the workspace directory.
 ///
 /// Writes all files from the target tree, deletes workspace files that are
@@ -955,6 +1021,44 @@ mod tests {
             fs::read_to_string(dir.path().join("doc.txt")).unwrap(),
             "version 2"
         );
+    }
+
+    #[test]
+    fn delta_checkout_applies_only_the_computed_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut original = BTreeMap::new();
+        original.insert("same.txt".into(), b"same".to_vec());
+        original.insert("changed.txt".into(), b"old".to_vec());
+        original.insert("old/deleted.txt".into(), b"gone".to_vec());
+        let (mut repo, cas) = setup_checkout_repo(dir.path(), &original);
+        let store = FsStore::new(&cas);
+        checkout_tree_to_workspace(&repo, &store, "main").unwrap();
+
+        let mut updated = BTreeMap::new();
+        updated.insert("same.txt".into(), b"same".to_vec());
+        updated.insert("changed.txt".into(), b"new".to_vec());
+        updated.insert("new/added.txt".into(), b"added".to_vec());
+        let tree = store.build_tree_from_map(&updated).unwrap();
+        repo.commit(tree, "test-author", "delta").unwrap();
+
+        checkout_tree_delta_to_workspace(
+            &repo,
+            &store,
+            "main",
+            &["new/added.txt".into()],
+            &["changed.txt".into()],
+            &["old/deleted.txt".into()],
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(dir.path().join("same.txt")).unwrap(), b"same");
+        assert_eq!(fs::read(dir.path().join("changed.txt")).unwrap(), b"new");
+        assert_eq!(
+            fs::read(dir.path().join("new/added.txt")).unwrap(),
+            b"added"
+        );
+        assert!(!dir.path().join("old/deleted.txt").exists());
+        assert!(!dir.path().join("old").exists());
     }
 
     #[test]

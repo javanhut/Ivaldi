@@ -24,7 +24,12 @@ let blake3 = mapping.get_blake3("da39a3ee5e6b...");
 let sha1 = mapping.get_sha1(blake3_hash);
 ```
 
-Storage: `.ivaldi/hash-map` — one mapping per line: `<sha1> <blake3_hex>`
+Storage: `.ivaldi/hash-map` — one mapping per line: `<sha1> <blake3_hex>`.
+An optional `.ivaldi/hash-map-verified` cache records mappings whose remote
+tree was checked, using the same two-column format. This lets an up-to-date
+sync probe only the remote tip without changing the established hash-map
+format. Imported seals carry the equivalent identity in authenticated leaf
+metadata.
 
 ## API Types
 

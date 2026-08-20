@@ -386,6 +386,7 @@ impl SshClient {
         {
             let mut mapping = HashMapping::new(&repo.ivaldi_dir);
             mapping.insert(&new_sha1_hex, leaf.hash());
+            mapping.mark_verified(&new_sha1_hex);
             let _ = mapping.save();
         }
 

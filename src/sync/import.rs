@@ -142,10 +142,24 @@ pub(super) fn import_full_history_into(
     local_timeline: &str,
     depth: usize,
 ) -> Result<ImportResult, SyncError> {
-    // Fetch commits (newest-first from GitHub), then reverse to oldest-first
-    // for correct parent ordering.
-    let mut commits = client.list_commits(owner, repo_name, remote_branch, depth)?;
+    let commits = client.list_commits(owner, repo_name, remote_branch, depth)?;
+    import_commit_history_into(client, repo, owner, repo_name, local_timeline, commits)
+}
+
+/// Import a commit listing already fetched by sync. The list is newest-first,
+/// matching [`GitHubClient::list_commits`]. Keeping this entry point separate
+/// prevents changed syncs from downloading the complete history twice.
+pub(super) fn import_commit_history_into(
+    client: &GitHubClient,
+    repo: &mut Repo,
+    owner: &str,
+    repo_name: &str,
+    local_timeline: &str,
+    mut commits: Vec<CommitInfo>,
+) -> Result<ImportResult, SyncError> {
     let remote_tip_sha = commits.first().map(|commit| commit.sha.clone());
+    // Import oldest-first so every parent index is available when its child
+    // leaf is built.
     commits.reverse();
 
     let cas = FileCas::new(repo.ivaldi_dir.join("objects"))?;
@@ -182,14 +196,19 @@ pub(super) fn import_full_history_into(
         // --- Phase 4: Commit loop using build_tree_from_hash_map ---
         // Track SHA1 → leaf index for parent resolution
         let mut sha_to_idx: HashMap<String, u64> = HashMap::new();
+        // Resolve mapped commits in O(1). The previous per-commit linear scan
+        // made an otherwise cached sync quadratic in repository history.
+        let mut hash_to_idx: HashMap<B3Hash, u64> = HashMap::new();
         // Recover the database→mapping-file crash window from authenticated
         // leaf metadata. A landed commit is reused, never appended twice.
         for idx in 0..repo.commit_count() {
-            if let Some(leaf) = repo.get_leaf(idx)?
-                && let Some(git_sha) = leaf.meta.get("git.sha1")
-            {
-                hash_mapping.insert(git_sha, leaf.hash());
-                sha_to_idx.insert(git_sha.clone(), idx);
+            if let Some(leaf) = repo.get_leaf(idx)? {
+                let leaf_hash = leaf.hash();
+                hash_to_idx.insert(leaf_hash, idx);
+                if let Some(git_sha) = leaf.meta.get("git.sha1") {
+                    hash_mapping.insert(git_sha, leaf_hash);
+                    sha_to_idx.insert(git_sha.clone(), idx);
+                }
             }
         }
         // Cache tree SHA → Ivaldi tree hash to avoid re-downloading identical trees
@@ -212,7 +231,7 @@ pub(super) fn import_full_history_into(
             // exists locally — a mapping entry without its leaf is stale and
             // the commit must be re-imported, not silently trusted.
             if let Some(b3) = hash_mapping.get_blake3(&commit.sha)
-                && let Some(idx) = find_leaf_idx_by_hash(repo, b3)
+                && let Some(&idx) = hash_to_idx.get(&b3)
             {
                 sha_to_idx.insert(commit.sha.clone(), idx);
                 commits_skipped += 1;
@@ -253,6 +272,7 @@ pub(super) fn import_full_history_into(
             // Record mappings
             hash_mapping.insert(&commit.sha, result.hash);
             sha_to_idx.insert(commit.sha.clone(), result.index);
+            hash_to_idx.insert(result.hash, result.index);
             commits_imported += 1;
         }
         pb.finish_with_message(format!(
