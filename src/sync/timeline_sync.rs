@@ -339,10 +339,10 @@ fn find_common_ancestor(
         if stale_shas.contains(&commit.sha) {
             continue;
         }
-        if let Some(b3) = hash_mapping.get_blake3(&commit.sha) {
-            if let Some(&idx) = reachable_by_hash.get(&b3) {
-                return (Some(commit.sha.clone()), Some(idx));
-            }
+        if let Some(b3) = hash_mapping.get_blake3(&commit.sha)
+            && let Some(&idx) = reachable_by_hash.get(&b3)
+        {
+            return (Some(commit.sha.clone()), Some(idx));
         }
     }
     (None, None)
@@ -389,14 +389,15 @@ fn remote_tip_mapping_is_stale(
     let local_paths: BTreeSet<&str> = local_files.keys().map(|s| s.as_str()).collect();
 
     let stale = remote_paths != local_paths;
-    if !stale && hash_mapping.mark_verified(&remote_tip.sha) {
-        if let Err(e) = hash_mapping.save() {
-            // This is an advisory performance cache. The authenticated map
-            // and remote comparison already established correctness, so a
-            // cache-write failure must not turn an up-to-date sync into an
-            // operational failure.
-            crate::logging::warn(&format!("could not cache remote-tip validation: {e}"));
-        }
+    if !stale
+        && hash_mapping.mark_verified(&remote_tip.sha)
+        && let Err(e) = hash_mapping.save()
+    {
+        // This is an advisory performance cache. The authenticated map
+        // and remote comparison already established correctness, so a
+        // cache-write failure must not turn an up-to-date sync into an
+        // operational failure.
+        crate::logging::warn(&format!("could not cache remote-tip validation: {e}"));
     }
     Ok(stale)
 }
@@ -451,6 +452,7 @@ fn count_new_local_commits(
 }
 
 /// Sync fast-forward path: import remote commits and advance the workspace.
+#[allow(clippy::too_many_arguments)]
 fn sync_fast_forward(
     client: &GitHubClient,
     repo: &mut Repo,
@@ -493,6 +495,7 @@ fn sync_fast_forward(
 
 /// Sync diverged path: import remote commits into a temp timeline, three-way
 /// fuse against the common ancestor, then clean up the temp timeline.
+#[allow(clippy::too_many_arguments)]
 fn sync_diverged(
     client: &GitHubClient,
     repo: &mut Repo,
