@@ -182,14 +182,20 @@ fn tags_import_with_annotations_and_off_branch_targets() {
         let v1 = repo.get_tag("v1.0").unwrap().unwrap();
         assert_eq!(v1.kind, ivaldi::tags::TagKind::Lightweight);
         assert!(v1.message.is_none());
-        assert_eq!(repo.get_leaf(v1.target_index).unwrap().unwrap().message, "root\n");
+        assert_eq!(
+            repo.get_leaf(v1.target_index).unwrap().unwrap().message,
+            "root\n"
+        );
 
         let v2 = repo.get_tag("v2.0").unwrap().unwrap();
         assert_eq!(v2.kind, ivaldi::tags::TagKind::Annotated);
         assert_eq!(v2.message.as_deref(), Some("Release two\n"));
         assert_eq!(v2.tagger.as_deref(), Some("Tagger <t@x>"));
         assert_eq!(v2.timestamp, Some(1710000500));
-        assert_eq!(repo.get_leaf(v2.target_index).unwrap().unwrap().message, "side\n");
+        assert_eq!(
+            repo.get_leaf(v2.target_index).unwrap().unwrap().message,
+            "side\n"
+        );
 
         // The tagged side commit must not have hijacked the branch head.
         let head = repo.get_timeline_head("main").unwrap().unwrap();
@@ -214,9 +220,19 @@ fn tag_import_is_idempotent() {
     fetch.refs = vec![tag_ref("v1.0", &c1)];
 
     let mut repo = Repo::open(dir.path()).unwrap();
-    assert_eq!(import_fetch_result(&mut repo, &fetch).unwrap().tags_imported, 1);
+    assert_eq!(
+        import_fetch_result(&mut repo, &fetch)
+            .unwrap()
+            .tags_imported,
+        1
+    );
     // Second pass: already recorded at the same seal, so nothing to write.
-    assert_eq!(import_fetch_result(&mut repo, &fetch).unwrap().tags_imported, 0);
+    assert_eq!(
+        import_fetch_result(&mut repo, &fetch)
+            .unwrap()
+            .tags_imported,
+        0
+    );
     assert_eq!(repo.list_tags().unwrap().len(), 1);
     drop(repo);
     verify_full_ok(dir.path());

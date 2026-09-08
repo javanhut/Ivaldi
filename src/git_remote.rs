@@ -477,10 +477,7 @@ impl SmartHttpClient {
         let pack_pb = progress::spinner("Compressing upload pack");
         let body = crate::git_pack_writer::write_pack_after(preamble, &object_refs)
             .map_err(|e| GitRemoteError::Protocol(e.to_string()))?;
-        pack_pb.finish_with_message(format!(
-            "Pack ready ({} bytes)",
-            body.len() - preamble_len
-        ));
+        pack_pb.finish_with_message(format!("Pack ready ({} bytes)", body.len() - preamble_len));
         // None when only tags moved — there is then no new branch tip to map.
         let branch_new_sha1 = plan
             .updates
@@ -1927,12 +1924,8 @@ pub fn import_fetch_result(
     // parallel up front. After this, the per-commit tree import is pure
     // mapping lookups + tree assembly — no blob I/O on the hot path.
     let tag_roots: Vec<&str> = tags.iter().map(|t| t.target_commit.as_str()).collect();
-    let all_blobs = collect_reachable_blobs(
-        &fetch.head_sha,
-        &tag_roots,
-        &fetch.objects,
-        &fetch.shallow,
-    )?;
+    let all_blobs =
+        collect_reachable_blobs(&fetch.head_sha, &tag_roots, &fetch.objects, &fetch.shallow)?;
     let pending_count = all_blobs
         .iter()
         .filter(|sha| mapping.get_blake3(sha).is_none())
@@ -2739,7 +2732,10 @@ mod tests {
         let r = extract_pack_from_upload_pack(&bytes).unwrap();
         assert_eq!(&r.pack[..4], b"PACK");
         assert_eq!(r.shallow.len(), 2);
-        assert!(r.shallow.contains("1111111111111111111111111111111111111111"));
+        assert!(
+            r.shallow
+                .contains("1111111111111111111111111111111111111111")
+        );
     }
 
     #[test]
@@ -3150,7 +3146,9 @@ mod tests {
         let plan = plan_for(&repo, Vec::new(), false, false);
         assert!(update_named(&plan, "refs/heads/main").is_some());
         assert!(
-            plan.updates.iter().all(|(n, _, _)| !n.starts_with("refs/tags/")),
+            plan.updates
+                .iter()
+                .all(|(n, _, _)| !n.starts_with("refs/tags/")),
             "tags must not ride along on a plain push: {:?}",
             plan.updates
         );
@@ -3330,8 +3328,16 @@ mod tests {
     #[test]
     fn receive_pack_commands_put_capabilities_on_the_first_line_only() {
         let updates = vec![
-            ("refs/heads/main".to_string(), "a".repeat(40), "b".repeat(40)),
-            ("refs/tags/v1".to_string(), ZERO_SHA1.to_string(), "c".repeat(40)),
+            (
+                "refs/heads/main".to_string(),
+                "a".repeat(40),
+                "b".repeat(40),
+            ),
+            (
+                "refs/tags/v1".to_string(),
+                ZERO_SHA1.to_string(),
+                "c".repeat(40),
+            ),
         ];
         let body = receive_pack_commands(&updates);
         let text = String::from_utf8_lossy(&body);

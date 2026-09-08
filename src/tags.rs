@@ -141,7 +141,10 @@ pub fn parse_tag(name: &str, data: &[u8]) -> Result<Tag, TagError> {
 
 /// Resolve a tag's target seal hash through the repository.
 pub fn target_hash(repo: &crate::repo::Repo, tag: &Tag) -> Option<B3Hash> {
-    repo.get_leaf(tag.target_index).ok().flatten().map(|l| l.hash())
+    repo.get_leaf(tag.target_index)
+        .ok()
+        .flatten()
+        .map(|l| l.hash())
 }
 
 #[derive(Debug, thiserror::Error)]

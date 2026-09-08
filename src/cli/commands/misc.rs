@@ -130,7 +130,7 @@ pub(super) fn cmd_tui() -> Result<(), String> {
                 branch,
                 Default::default(),
             )
-                .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?;
             crate::tui::app::run(&target_dir, &target_dir.join(".ivaldi"))
         }
         LauncherChoice::Forge { target_dir } => {

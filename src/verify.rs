@@ -983,7 +983,11 @@ mod tests {
 
         let tags = tags_check(dir.path());
         assert!(!tags.ok);
-        assert!(tags.detail.contains("points at missing seal"), "{}", tags.detail);
+        assert!(
+            tags.detail.contains("points at missing seal"),
+            "{}",
+            tags.detail
+        );
     }
 
     #[test]

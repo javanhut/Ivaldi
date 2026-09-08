@@ -463,7 +463,14 @@ pub(super) fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<(), String
         // stored GitHub credential.
         None => {
             let client = GitHubClient::new();
-            sync::download(&client, &spec.owner, &spec.repo, &target_dir, branch, options)
+            sync::download(
+                &client,
+                &spec.owner,
+                &spec.repo,
+                &target_dir,
+                branch,
+                options,
+            )
         }
         Some(host) => {
             let base = format!("{}/{}/{}.git", host, spec.owner, spec.repo);

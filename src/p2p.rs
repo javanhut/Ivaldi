@@ -378,7 +378,10 @@ impl Channel {
             repo: repo.to_string(),
         })?;
         match self.recv()? {
-            Message::Hello { version: v, repo: r } if v == version => {
+            Message::Hello {
+                version: v,
+                repo: r,
+            } if v == version => {
                 self.remote_repo = r;
                 Ok(())
             }
@@ -746,7 +749,6 @@ fn accept_one(
     serve_connection(&mut guard, &mut chan, &label)
 }
 
-
 /// Serve one already-accepted, already-authorized connection.
 ///
 /// This is the whole of Ivaldi's server side: read requests, answer them
@@ -845,7 +847,6 @@ fn verify_trees_present(
     Ok(())
 }
 
-
 /// Receive-only push. Lands inbound seals at `peers/<sender>/<timeline>`
 /// rather than advancing any of the recipient's working timelines. The
 /// recipient runs `ivaldi fuse peers/<sender>/<timeline>` to integrate
@@ -908,10 +909,10 @@ fn serve_push(
                     } => match asm.feed(&hash_hex, total_len, offset, &data) {
                         Ok(None) => {}
                         Ok(Some(wb)) => {
-                                if let Some(h) = apply_blob(cas, &wb)? {
-                                    introduced.insert(h);
-                                }
+                            if let Some(h) = apply_blob(cas, &wb)? {
+                                introduced.insert(h);
                             }
+                        }
                         Err(e) => {
                             chan.send(&Message::PushRejected {
                                 reason: e.to_string(),
@@ -2945,8 +2946,6 @@ mod tests {
         assert_eq!((u.repo, u.timeline), (None, None));
     }
 
-
-
     /// A leaf may name any `tree_root` it likes; the push must not be
     /// accepted unless the objects behind it actually arrived.
     #[test]
@@ -3027,8 +3026,7 @@ mod tests {
         cas.flush().unwrap();
 
         // The tree node itself also arrived over the wire.
-        let introduced: BTreeSet<B3Hash> =
-            [landed_blob, orphan, landed_root].into_iter().collect();
+        let introduced: BTreeSet<B3Hash> = [landed_blob, orphan, landed_root].into_iter().collect();
 
         discard_unreachable(&cas, &introduced, &[landed_root]);
 
@@ -3044,7 +3042,10 @@ mod tests {
             cas.has(landed_root).unwrap(),
             "the landed tree node itself must survive"
         );
-        assert!(!cas.has(orphan).unwrap(), "unreferenced arrival is discarded");
+        assert!(
+            !cas.has(orphan).unwrap(),
+            "unreferenced arrival is discarded"
+        );
     }
 
     /// A push that landed nothing leaves nothing behind — but still must not
@@ -3066,7 +3067,10 @@ mod tests {
         let introduced: BTreeSet<B3Hash> = [a, b].into_iter().collect();
         discard_unreachable(&cas, &introduced, &[]);
 
-        assert!(cas.has(preexisting).unwrap(), "pre-existing content survives");
+        assert!(
+            cas.has(preexisting).unwrap(),
+            "pre-existing content survives"
+        );
         assert!(!cas.has(a).unwrap());
         assert!(!cas.has(b).unwrap());
     }
@@ -3149,7 +3153,10 @@ mod tests {
         match chan.outbox.as_slice() {
             [Message::Error { message }] => {
                 assert!(message.contains("nosuch"), "{message}");
-                assert!(message.contains("main"), "should list what exists: {message}");
+                assert!(
+                    message.contains("main"),
+                    "should list what exists: {message}"
+                );
             }
             other => panic!("expected one Error, got {other:?}"),
         }
