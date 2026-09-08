@@ -145,6 +145,10 @@ pub enum Commands {
     #[command(alias = "sy")]
     Sync(SyncArgs),
 
+    /// List, create, or delete tags
+    #[command(alias = "tg")]
+    Tag(TagArgs),
+
     /// Local code review system
     #[command(alias = "rv")]
     Review(ReviewArgs),
@@ -479,9 +483,60 @@ pub struct LogArgs {
     #[arg(long)]
     pub limit: Option<usize>,
 
+    /// Show only the most recent seal (same as `--limit 1`)
+    #[arg(long, conflicts_with = "limit")]
+    pub last: bool,
+
     /// Show commits from all timelines
     #[arg(long)]
     pub all: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct TagArgs {
+    /// Create or delete a tag. Omit to list.
+    #[command(subcommand)]
+    pub command: Option<TagCommands>,
+
+    /// Emit the listing as JSON
+    #[arg(long)]
+    pub json: bool,
+    // Annotations (message + tagger) are shown under the global `-v`; a local
+    // `--verbose` here would collide with it and panic clap at runtime.
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TagCommands {
+    /// Name a seal
+    Create(TagCreateArgs),
+    /// Remove a local tag (never touches the remote)
+    #[command(alias = "rm")]
+    Delete(TagDeleteArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct TagCreateArgs {
+    /// Tag name, e.g. v1.0.0
+    pub name: String,
+
+    /// Seal to tag (seal name or hash prefix). Defaults to the current
+    /// timeline's head.
+    pub seal: Option<String>,
+
+    /// Annotation message. Supplying one makes this an annotated tag,
+    /// recording you and the current time alongside it.
+    #[arg(long, short = 'm')]
+    pub message: Option<String>,
+
+    /// Move an existing tag of this name instead of refusing
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct TagDeleteArgs {
+    /// Tag name to remove
+    pub name: String,
 }
 
 #[derive(clap::Args, Debug)]
@@ -914,6 +969,11 @@ pub struct DownloadArgs {
 pub struct UploadArgs {
     /// Branch name (defaults to current timeline)
     pub branch: Option<String>,
+
+    /// Also push tags. A tag the remote already holds at a different object
+    /// is left alone unless --force is given.
+    #[arg(long)]
+    pub tags: bool,
 
     /// Force push (overwrites remote history)
     #[arg(long)]
@@ -1911,6 +1971,35 @@ mod tests {
                 .unwrap(),
             Commands::Log(_)
         ));
+    }
+
+    #[test]
+    fn command_tree_is_internally_consistent() {
+        // clap's own audit: duplicate arg ids, conflicting shorts, a
+        // subcommand flag shadowing a global one. Every one of those is a
+        // runtime panic on the affected command rather than a parse error, so
+        // it only shows up when a user runs exactly that subcommand — this
+        // catches it at test time instead. (A local `--verbose` on any
+        // subcommand collides with the global `-v` and panics; this test is
+        // what noticed.)
+        <Cli as clap::CommandFactory>::command().debug_assert();
+    }
+
+    #[test]
+    fn tag_is_reachable_and_takes_json() {
+        assert!(matches!(
+            Cli::try_parse_from(["ivaldi", "tag"])
+                .unwrap()
+                .command
+                .unwrap(),
+            Commands::Tag(_)
+        ));
+        let cli = Cli::try_parse_from(["ivaldi", "tag", "--json", "-v"]).unwrap();
+        assert!(cli.verbose > 0);
+        match cli.command.unwrap() {
+            Commands::Tag(args) => assert!(args.json),
+            _ => panic!("expected Tag"),
+        }
     }
 
     #[test]

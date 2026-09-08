@@ -61,24 +61,42 @@ pub struct HashMapping {
     sha1_to_blake3: BTreeMap<String, B3Hash>,
     /// BLAKE3 → SHA1
     blake3_to_sha1: BTreeMap<B3Hash, String>,
+    /// Commit mappings whose local tree has been checked against the remote.
+    ///
+    /// Imported leaves carry authenticated `git.sha1` metadata and do not
+    /// need this cache. Native leaves created locally do, because their Git
+    /// identity lives only in this compatibility mapping. Persisting the bit
+    /// makes an up-to-date sync a one-request tip check after the first
+    /// validation.
+    verified_sha1: BTreeMap<String, B3Hash>,
     /// Persistence path
     map_path: PathBuf,
+    /// Advisory validation-cache path. Kept separate so the established
+    /// two-column hash-map format remains readable by older Ivaldi binaries.
+    verified_path: PathBuf,
 }
 
 impl HashMapping {
     pub fn new(ivaldi_dir: &Path) -> Self {
         let map_path = ivaldi_dir.join("hash-map");
+        let verified_path = ivaldi_dir.join("hash-map-verified");
         let mut mapping = Self {
             sha1_to_blake3: BTreeMap::new(),
             blake3_to_sha1: BTreeMap::new(),
+            verified_sha1: BTreeMap::new(),
             map_path,
+            verified_path,
         };
         mapping.load();
+        mapping.load_verified();
         mapping
     }
 
     /// Map a SHA1 hash to a BLAKE3 hash.
     pub fn insert(&mut self, sha1: &str, blake3: B3Hash) {
+        if self.sha1_to_blake3.get(sha1).copied() != Some(blake3) {
+            self.verified_sha1.remove(sha1);
+        }
         self.sha1_to_blake3.insert(sha1.to_string(), blake3);
         self.blake3_to_sha1.insert(blake3, sha1.to_string());
     }
@@ -98,6 +116,25 @@ impl HashMapping {
         if let Some(blake3) = self.sha1_to_blake3.remove(sha1) {
             self.blake3_to_sha1.remove(&blake3);
         }
+        self.verified_sha1.remove(sha1);
+    }
+
+    /// Record that a commit mapping's local tree has been checked against the
+    /// remote tree. Returns `false` when `sha1` is not mapped.
+    pub fn mark_verified(&mut self, sha1: &str) -> bool {
+        if !self.sha1_to_blake3.contains_key(sha1) {
+            return false;
+        }
+        let blake3 = self.sha1_to_blake3[sha1];
+        self.verified_sha1.insert(sha1.to_string(), blake3);
+        true
+    }
+
+    /// Whether the current mapping for `sha1` has already been validated.
+    pub fn is_verified(&self, sha1: &str) -> bool {
+        self.sha1_to_blake3
+            .get(sha1)
+            .is_some_and(|blake3| self.verified_sha1.get(sha1) == Some(blake3))
     }
 
     /// Number of mappings.
@@ -120,6 +157,15 @@ impl HashMapping {
             lines.push(format!("{} {}", sha1, blake3.to_hex()));
         }
         crate::atomic_io::atomic_write(&self.map_path, (lines.join("\n") + "\n").as_bytes())
+            .map_err(RemoteError::Io)?;
+
+        let verified: Vec<String> = self
+            .verified_sha1
+            .iter()
+            .filter(|(sha1, blake3)| self.sha1_to_blake3.get(*sha1) == Some(*blake3))
+            .map(|(sha1, blake3)| format!("{} {}", sha1, blake3.to_hex()))
+            .collect();
+        crate::atomic_io::atomic_write(&self.verified_path, (verified.join("\n") + "\n").as_bytes())
             .map_err(RemoteError::Io)
     }
 
@@ -138,14 +184,15 @@ impl HashMapping {
             if line.is_empty() {
                 continue;
             }
-            if let Some((sha1, blake3_hex)) = line.split_once(' ')
-                && let Some(blake3) = B3Hash::from_hex(blake3_hex)
-            {
-                self.sha1_to_blake3.insert(sha1.to_string(), blake3);
-                self.blake3_to_sha1.insert(blake3, sha1.to_string());
-            } else {
+            let parsed = line.split_once(' ').and_then(|(sha1, blake3_hex)| {
+                B3Hash::from_hex(blake3_hex).map(|blake3| (sha1, blake3))
+            });
+            let Some((sha1, blake3)) = parsed else {
                 malformed += 1;
-            }
+                continue;
+            };
+            self.sha1_to_blake3.insert(sha1.to_string(), blake3);
+            self.blake3_to_sha1.insert(blake3, sha1.to_string());
         }
         if malformed > 0 {
             crate::logging::warn(&format!(
@@ -153,6 +200,40 @@ impl HashMapping {
                  the next sync may re-import already-synced seals",
                 malformed,
                 self.map_path.display()
+            ));
+        }
+    }
+
+    /// Load the optional validation cache. Each entry includes both hashes,
+    /// so a crash between the two atomic files can only cause a harmless
+    /// revalidation, never trust a replacement mapping.
+    fn load_verified(&mut self) {
+        let content = match fs::read_to_string(&self.verified_path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let mut malformed = 0usize;
+        for line in content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            let parsed = line.split_once(' ').and_then(|(sha1, blake3_hex)| {
+                B3Hash::from_hex(blake3_hex).map(|blake3| (sha1, blake3))
+            });
+            let Some((sha1, blake3)) = parsed else {
+                malformed += 1;
+                continue;
+            };
+            if self.sha1_to_blake3.get(sha1) == Some(&blake3) {
+                self.verified_sha1.insert(sha1.to_string(), blake3);
+            }
+        }
+        if malformed > 0 {
+            crate::logging::warn(&format!(
+                "{} malformed line(s) in {} — remote tips will be revalidated",
+                malformed,
+                self.verified_path.display()
             ));
         }
     }
@@ -226,6 +307,53 @@ mod tests {
         let mapping2 = HashMapping::new(&ivaldi_dir);
         assert_eq!(mapping2.get_blake3(sha1), Some(blake3));
         assert_eq!(mapping2.get_sha1(blake3), Some(sha1));
+    }
+
+    #[test]
+    fn hash_mapping_persists_verified_commit_mappings() {
+        let dir = tempfile::tempdir().unwrap();
+        let ivaldi_dir = dir.path().join(".ivaldi");
+        fs::create_dir_all(&ivaldi_dir).unwrap();
+        let sha1 = "abc123def456789012345678901234567890abcd";
+        let blake3 = B3Hash::digest(b"verified");
+
+        let mut mapping = HashMapping::new(&ivaldi_dir);
+        mapping.insert(sha1, blake3);
+        assert!(mapping.mark_verified(sha1));
+        mapping.save().unwrap();
+
+        let reloaded = HashMapping::new(&ivaldi_dir);
+        assert_eq!(reloaded.get_blake3(sha1), Some(blake3));
+        assert!(reloaded.is_verified(sha1));
+        assert!(
+            fs::read_to_string(ivaldi_dir.join("hash-map-verified"))
+                .unwrap()
+                .contains(sha1)
+        );
+        assert!(
+            !fs::read_to_string(ivaldi_dir.join("hash-map"))
+                .unwrap()
+                .contains("verified")
+        );
+    }
+
+    #[test]
+    fn replacing_or_removing_a_mapping_clears_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let ivaldi_dir = dir.path().join(".ivaldi");
+        fs::create_dir_all(&ivaldi_dir).unwrap();
+        let sha1 = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+
+        let mut mapping = HashMapping::new(&ivaldi_dir);
+        mapping.insert(sha1, B3Hash::digest(b"first"));
+        assert!(mapping.mark_verified(sha1));
+        mapping.insert(sha1, B3Hash::digest(b"second"));
+        assert!(!mapping.is_verified(sha1));
+
+        assert!(mapping.mark_verified(sha1));
+        mapping.remove_sha1(sha1);
+        assert!(!mapping.is_verified(sha1));
+        assert!(!mapping.mark_verified(sha1));
     }
 
     #[test]

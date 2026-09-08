@@ -202,24 +202,184 @@ pub(super) fn cmd_whereami() -> Result<(), String> {
     Ok(())
 }
 
+/// `ivaldi tag` — list the tags in this repository.
+///
+/// Read-only: tags arrive with `ivaldi download --include-tags`. Creating and
+/// pushing tags locally is not implemented.
+pub(super) fn cmd_tag(args: TagArgs, verbose: bool, quiet: bool) -> Result<(), String> {
+    let repo = open_repo()?;
+
+    match args.command {
+        Some(TagCommands::Create(create)) => return tag_create(&repo, create, quiet),
+        Some(TagCommands::Delete(del)) => {
+            if !repo.remove_tag(&del.name).map_err(|e| e.to_string())? {
+                return Err(format!("tag not found: {}", del.name));
+            }
+            if !quiet {
+                println!("Deleted tag {} (locally only)", color::cyan(&del.name));
+            }
+            return Ok(());
+        }
+        None => {}
+    }
+
+    let tags = repo.list_tags().map_err(|e| e.to_string())?;
+
+    if args.json {
+        let out: Vec<json::TagJson> = tags
+            .iter()
+            .map(|tag| {
+                let leaf = repo.get_leaf(tag.target_index).ok().flatten();
+                json::TagJson {
+                    name: tag.name.clone(),
+                    kind: match tag.kind {
+                        crate::tags::TagKind::Lightweight => "lightweight",
+                        crate::tags::TagKind::Annotated => "annotated",
+                    }
+                    .to_string(),
+                    target_index: tag.target_index,
+                    target_hash: leaf.as_ref().map(|l| l.hash().to_hex()),
+                    seal_name: leaf
+                        .as_ref()
+                        .map(|l| crate::seal::generate_seal_name(l.hash())),
+                    tagger: tag.tagger.clone(),
+                    timestamp: tag.timestamp,
+                    message: tag.message.clone(),
+                }
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+
+    if tags.is_empty() {
+        println!("No tags. Download with '--include-tags' to fetch a remote's tags.");
+        return Ok(());
+    }
+
+    for tag in &tags {
+        let target = repo
+            .get_leaf(tag.target_index)
+            .ok()
+            .flatten()
+            .map(|l| l.hash().short8())
+            .unwrap_or_else(|| "?".into());
+        println!("{} {}", color::cyan(&tag.name), color::hash(&target));
+        if verbose && tag.kind == crate::tags::TagKind::Annotated {
+            if let Some(tagger) = &tag.tagger {
+                println!("  Tagger: {}", color::author(tagger));
+            }
+            if let Some(timestamp) = tag.timestamp {
+                println!("  Date: {}", format_unix_utc(timestamp));
+            }
+            if let Some(message) = &tag.message {
+                for line in message.trim_end().lines() {
+                    println!("  {}", line);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `ivaldi tag create <name> [seal]`.
+fn tag_create(repo: &Repo, args: TagCreateArgs, quiet: bool) -> Result<(), String> {
+    let (index, leaf) = match &args.seal {
+        Some(query) => repo
+            .resolve_seal(query)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no seal matches '{}'", query))?,
+        None => {
+            let timeline = repo.current_timeline().map_err(|e| e.to_string())?;
+            let head = repo
+                .get_timeline_head(&timeline)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("timeline '{}' has no seals to tag", timeline))?;
+            let leaf = repo
+                .get_leaf(head)
+                .map_err(|e| e.to_string())?
+                .ok_or("timeline head refers to a missing seal")?;
+            (head, leaf)
+        }
+    };
+
+    // Moving a tag is what --force is for: a name that silently starts
+    // meaning a different seal is worse than a command that refuses.
+    if let Some(existing) = repo.get_tag(&args.name).map_err(|e| e.to_string())? {
+        if !args.force {
+            return Err(format!(
+                "tag '{}' already names seal {} — pass --force to move it",
+                args.name, existing.target_index
+            ));
+        }
+        if existing.target_index == index {
+            if !quiet {
+                println!("Tag {} already names this seal", color::cyan(&args.name));
+            }
+            return Ok(());
+        }
+    }
+
+    let tag = match &args.message {
+        Some(message) => {
+            let tagger = repo.config().author().ok_or(
+                "user.name and user.email not configured. Run:\n  ivaldi config --set user.name \"Your Name\"\n  ivaldi config --set user.email \"you@example.com\"",
+            )?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_secs() as i64;
+            // ponytail: annotated tags are stamped UTC. Ivaldi has no local
+            // timezone plumbing yet; add one here and in `seal` together.
+            crate::tags::Tag::annotated(&args.name, index, message, &tagger, now, "+0000")
+        }
+        None => crate::tags::Tag::lightweight(&args.name, index),
+    };
+    repo.set_tags(std::slice::from_ref(&tag))
+        .map_err(|e| e.to_string())?;
+
+    if !quiet {
+        println!(
+            "Tagged {} as {}",
+            color::hash(&leaf.hash().short8()),
+            color::cyan(&args.name)
+        );
+        println!("  push it with 'ivaldi upload --tags'");
+    }
+    Ok(())
+}
+
 pub(super) fn cmd_log(args: LogArgs) -> Result<(), String> {
     let repo = open_repo()?;
     let timeline = repo.current_timeline().unwrap_or_else(|_| "main".into());
+    // One store read for the whole listing rather than a lookup per entry.
+    let tags_by_seal = repo.tags_by_seal().unwrap_or_default();
+
+    // `--last` is `--limit 1`; both bound the walk itself, so asking for one
+    // seal costs one leaf read instead of a full history traversal.
+    let limit = args.limit.or_else(|| args.last.then_some(1));
 
     let entries = if args.all {
         // Collect from all timelines, dedup
         let mut all = Vec::new();
         for (tl_name, _) in repo.list_timelines().map_err(|e| e.to_string())? {
-            all.extend(repo.walk_history(&tl_name).map_err(|e| e.to_string())?);
+            all.extend(
+                repo.walk_history_limited(&tl_name, limit)
+                    .map_err(|e| e.to_string())?,
+            );
         }
         all.sort_by_key(|e| std::cmp::Reverse(e.time_unix));
         all.dedup_by_key(|e| e.index);
         all
     } else {
-        repo.walk_history(&timeline).map_err(|e| e.to_string())?
+        repo.walk_history_limited(&timeline, limit)
+            .map_err(|e| e.to_string())?
     };
 
-    let entries = if let Some(limit) = args.limit {
+    let entries = if let Some(limit) = limit {
         &entries[..limit.min(entries.len())]
     } else {
         &entries
@@ -232,7 +392,14 @@ pub(super) fn cmd_log(args: LogArgs) -> Result<(), String> {
     });
 
     if format == LogFormat::Json {
-        let out: Vec<json::LogEntryJson> = entries.iter().map(json::LogEntryJson::from).collect();
+        let out: Vec<json::LogEntryJson> = entries
+            .iter()
+            .map(|entry| {
+                let mut view = json::LogEntryJson::from(entry);
+                view.tags = tags_by_seal.get(&entry.index).cloned().unwrap_or_default();
+                view
+            })
+            .collect();
         println!(
             "{}",
             serde_json::to_string_pretty(&out).map_err(|e| e.to_string())?
@@ -246,20 +413,27 @@ pub(super) fn cmd_log(args: LogArgs) -> Result<(), String> {
     }
 
     for entry in entries {
+        // `(v1.0, v1.0.1)` after the identity, the way git decorates refs.
+        let tags = match tags_by_seal.get(&entry.index) {
+            Some(names) if !names.is_empty() => format!(" ({})", names.join(", ")),
+            _ => String::new(),
+        };
         match format {
             LogFormat::Short => {
                 println!(
-                    "{} {} {}",
+                    "{}{} {} {}",
                     color::hash(&entry.short_hash),
+                    color::cyan(&tags),
                     color::seal_name(&entry.seal_name),
                     entry.message
                 );
             }
             LogFormat::Medium => {
                 println!(
-                    "Seal: {} ({})",
+                    "Seal: {} ({}){}",
                     color::seal_name(&entry.seal_name),
-                    color::hash(&entry.short_hash)
+                    color::hash(&entry.short_hash),
+                    color::cyan(&tags)
                 );
                 println!("Timeline: {}", color::timeline(&entry.timeline));
                 println!("Author: {}", color::author(&entry.author));
@@ -270,9 +444,10 @@ pub(super) fn cmd_log(args: LogArgs) -> Result<(), String> {
             }
             LogFormat::Full => {
                 println!(
-                    "Seal: {} ({})",
+                    "Seal: {} ({}){}",
                     color::seal_name(&entry.seal_name),
-                    color::hash(&entry.short_hash)
+                    color::hash(&entry.short_hash),
+                    color::cyan(&tags)
                 );
                 println!("Hash: {}", entry.hash.to_hex());
                 println!("Timeline: {}", color::timeline(&entry.timeline));

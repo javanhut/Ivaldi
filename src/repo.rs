@@ -4,6 +4,7 @@
 //! This is the main entry point for CLI commands that need to read/write
 //! commit history that survives across sessions.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::atomic_io::atomic_write;
@@ -13,7 +14,7 @@ use crate::forge::{self, HeadRef};
 use crate::hash::B3Hash;
 use crate::leaf::{self, Leaf, NO_PARENT};
 use crate::mmr::Mmr;
-use crate::refname::{timeline_ref_path, validate_timeline_name};
+use crate::refname::{tag_ref_path, timeline_ref_path, validate_timeline_name};
 use crate::seal;
 use crate::store::{MMR_ROOT_KEY, MMR_SIZE_KEY, Store, StoreError};
 
@@ -434,6 +435,84 @@ impl Repo {
         self.store.get_timeline_head(name).map_err(RepoError::Store)
     }
 
+    /// Store a batch of tags and materialize their `refs/tags/<name>` markers.
+    ///
+    /// Every target must be a leaf the store already holds — a tag naming a
+    /// missing seal is a dangling ref that `verify` would flag forever, so it
+    /// is refused before anything is written. Markers are created BEFORE the
+    /// transaction, matching `commit_raw`: a stray marker with no stored tag
+    /// is harmless and self-heals on retry, while a stored tag with no marker
+    /// is an inconsistency.
+    pub fn set_tags(&self, tags: &[crate::tags::Tag]) -> Result<(), RepoError> {
+        if tags.is_empty() {
+            return Ok(());
+        }
+        let mut records = Vec::with_capacity(tags.len());
+        for tag in tags {
+            if self
+                .store
+                .get_leaf(tag.target_index)
+                .map_err(RepoError::Store)?
+                .is_none()
+            {
+                return Err(RepoError::Integrity(format!(
+                    "cannot tag {:?}: no seal at index {}",
+                    tag.name, tag.target_index
+                )));
+            }
+            let path = tag_ref_path(&self.ivaldi_dir, &tag.name)
+                .map_err(|e| RepoError::Other(e.to_string()))?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(RepoError::Io)?;
+            }
+            atomic_write(&path, b"").map_err(RepoError::Io)?;
+            records.push((tag.name.clone(), tag.canonical_bytes()));
+        }
+        self.store.put_tags(&records).map_err(RepoError::Store)
+    }
+
+    /// Look up one tag by name.
+    pub fn get_tag(&self, name: &str) -> Result<Option<crate::tags::Tag>, RepoError> {
+        match self.store.get_tag(name).map_err(RepoError::Store)? {
+            Some(record) => Ok(Some(
+                crate::tags::parse_tag(name, &record)
+                    .map_err(|e| RepoError::Other(e.to_string()))?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// All tags, name-sorted. A corrupt record fails the whole listing rather
+    /// than silently hiding a tag that does exist.
+    pub fn list_tags(&self) -> Result<Vec<crate::tags::Tag>, RepoError> {
+        self.store
+            .list_tags()
+            .map_err(RepoError::Store)?
+            .into_iter()
+            .map(|(name, record)| {
+                crate::tags::parse_tag(&name, &record).map_err(|e| RepoError::Other(e.to_string()))
+            })
+            .collect()
+    }
+
+    /// Remove a tag and its ref marker. Returns false if it did not exist.
+    pub fn remove_tag(&self, name: &str) -> Result<bool, RepoError> {
+        let removed = self.store.remove_tag(name).map_err(RepoError::Store)?;
+        if let Ok(path) = tag_ref_path(&self.ivaldi_dir, name) {
+            let _ = std::fs::remove_file(path);
+        }
+        Ok(removed)
+    }
+
+    /// Tag names pointing at each seal index, for annotating history output.
+    pub fn tags_by_seal(&self) -> Result<BTreeMap<u64, Vec<String>>, RepoError> {
+        let mut out: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+        for tag in self.list_tags()? {
+            out.entry(tag.target_index).or_default().push(tag.name);
+        }
+        Ok(out)
+    }
+
     /// Point a timeline at an existing leaf and ensure its `refs/heads/<name>`
     /// file exists. Used by import paths (e.g. `harvest`) when no new commits
     /// were created but the timeline still needs to materialize locally.
@@ -713,8 +792,28 @@ impl Repo {
     /// Full-DAG walk reachable from a timeline's head, sorted newest-first
     /// by MMR index (which is monotonic in commit creation order).
     pub fn walk_history_dag(&self, timeline: &str) -> Result<Vec<HistoryEntry>, RepoError> {
-        use std::collections::{BTreeSet, VecDeque};
+        self.walk_history_limited(timeline, None)
+    }
 
+    /// Newest `limit` seals reachable from a timeline's head (all of them
+    /// when `None`), newest-first by MMR index.
+    ///
+    /// Walks the DAG highest-index-first rather than breadth-first. A leaf's
+    /// parents always have lower indices than the leaf itself (`commit_raw`
+    /// enforces it), so every undiscovered seal ranks below the frontier's
+    /// maximum — popping the maximum therefore emits in exact newest-first
+    /// order and lets a bounded request stop after `limit` leaves instead of
+    /// reading the whole history to throw most of it away.
+    pub fn walk_history_limited(
+        &self,
+        timeline: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<HistoryEntry>, RepoError> {
+        use std::collections::{BTreeSet, BinaryHeap};
+
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
         let head_idx = match self.get_timeline_head(timeline)? {
             Some(idx) => idx,
             None => return Ok(Vec::new()),
@@ -722,9 +821,9 @@ impl Repo {
 
         let mut visited: BTreeSet<u64> = BTreeSet::new();
         let mut entries: Vec<HistoryEntry> = Vec::new();
-        let mut q: VecDeque<u64> = VecDeque::new();
-        q.push_back(head_idx);
-        while let Some(idx) = q.pop_front() {
+        let mut frontier: BinaryHeap<u64> = BinaryHeap::new();
+        frontier.push(head_idx);
+        while let Some(idx) = frontier.pop() {
             if !visited.insert(idx) {
                 continue;
             }
@@ -744,14 +843,15 @@ impl Repo {
                 timeline: leaf.timeline_id.clone(),
                 is_merge: leaf.is_merge(),
             });
+            if limit.is_some_and(|n| entries.len() >= n) {
+                break;
+            }
             for parent in leaf.all_parents() {
                 if !visited.contains(&parent) {
-                    q.push_back(parent);
+                    frontier.push(parent);
                 }
             }
         }
-        // Newest-first: higher MMR index = newer commit.
-        entries.sort_by_key(|e| std::cmp::Reverse(e.index));
         Ok(entries)
     }
 
@@ -1681,6 +1781,39 @@ mod tests {
         let (_dir, repo) = setup_repo();
         let history = repo.walk_history("main").unwrap();
         assert!(history.is_empty());
+    }
+
+    #[test]
+    fn bounded_walk_returns_the_newest_seals_across_a_merge() {
+        let (_dir, mut repo) = setup_repo();
+
+        // A diamond, so the bounded walk has to order a real DAG rather than
+        // a straight chain: First → (Side, Second) → Merge.
+        let first = repo.commit(B3Hash::digest(b"t1"), "A", "First").unwrap();
+        let second = repo.commit(B3Hash::digest(b"t2"), "A", "Second").unwrap();
+        let mut side = Leaf::new(B3Hash::digest(b"t3"), "main", "A", 1000, "Side");
+        side.prev_idx = first.index;
+        let side = repo.commit_raw(side, "main").unwrap();
+        let mut merge = Leaf::new(B3Hash::digest(b"t4"), "main", "A", 2000, "Merge");
+        merge.prev_idx = second.index;
+        merge.merge_idxs = vec![side.index];
+        repo.commit_raw(merge, "main").unwrap();
+
+        let full = repo.walk_history("main").unwrap();
+        assert_eq!(full.len(), 4);
+
+        // A bound is a prefix of the unbounded walk, never a reordering.
+        for n in 0..=5usize {
+            let bounded = repo.walk_history_limited("main", Some(n)).unwrap();
+            assert_eq!(bounded.len(), n.min(4), "limit {n}");
+            let expected: Vec<u64> = full.iter().take(n).map(|e| e.index).collect();
+            let got: Vec<u64> = bounded.iter().map(|e| e.index).collect();
+            assert_eq!(got, expected, "limit {n}");
+        }
+        assert_eq!(
+            repo.walk_history_limited("main", Some(1)).unwrap()[0].message,
+            "Merge"
+        );
     }
 
     #[test]

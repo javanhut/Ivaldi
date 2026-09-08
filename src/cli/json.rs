@@ -55,6 +55,25 @@ pub struct LogEntryJson {
     pub time_unix: i64,
     pub timeline: String,
     pub is_merge: bool,
+    /// Tag names pointing at this seal. Omitted when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub tags: Vec<String>,
+}
+
+/// JSON view of `ivaldi tag`.
+#[derive(serde::Serialize)]
+pub struct TagJson {
+    pub name: String,
+    pub kind: String,
+    pub target_index: u64,
+    pub target_hash: Option<String>,
+    pub seal_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tagger: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 impl From<&HistoryEntry> for LogEntryJson {
@@ -69,6 +88,7 @@ impl From<&HistoryEntry> for LogEntryJson {
             time_unix: entry.time_unix,
             timeline: entry.timeline.clone(),
             is_merge: entry.is_merge,
+            tags: Vec::new(),
         }
     }
 }

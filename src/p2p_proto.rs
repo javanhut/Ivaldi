@@ -9,7 +9,8 @@
 //! Version negotiation: the Noise prologue is `b"ivaldi/2"`, so a peer
 //! speaking protocol v1 (JSON frames) cannot even complete the handshake —
 //! there is no way to confuse the two encodings. Within the protobuf era,
-//! both sides exchange `Hello { version }` immediately after the handshake
+//! both sides exchange `Hello { version, repo }` immediately after the
+//! handshake
 //! and refuse a mismatch explicitly; unknown protobuf fields are ignored by
 //! prost, so additive v2.x changes stay compatible.
 
@@ -69,6 +70,12 @@ pub mod envelope {
 pub struct Hello {
     #[prost(uint32, tag = "1")]
     pub version: u32,
+    /// Which hosted repository this connection is for. Empty means "the
+    /// server's only repo" — a peer-to-peer `ivaldi serve` sends nothing
+    /// here, and a pre-repo client omits the field entirely, which prost
+    /// decodes to the same empty string. Additive: no version bump.
+    #[prost(string, tag = "2")]
+    pub repo: String,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -198,7 +205,10 @@ fn pb_bundle(leaves: &[WireLeaf], blobs: &[WireBlob]) -> Bundle {
 pub fn encode(msg: &Message) -> Vec<u8> {
     use envelope::Msg as M;
     let m = match msg {
-        Message::Hello { version } => M::Hello(Hello { version: *version }),
+        Message::Hello { version, repo } => M::Hello(Hello {
+            version: *version,
+            repo: repo.clone(),
+        }),
         Message::ListTimelines => M::ListTimelines(ListTimelines {}),
         Message::Timelines { names } => M::Timelines(Timelines {
             names: names.clone(),
@@ -251,7 +261,10 @@ pub fn decode(bytes: &[u8]) -> Result<Message, String> {
         .msg
         .ok_or("empty envelope — peer sent a message kind this ivaldi does not know")?;
     Ok(match m {
-        M::Hello(v) => Message::Hello { version: v.version },
+        M::Hello(v) => Message::Hello {
+            version: v.version,
+            repo: v.repo,
+        },
         M::ListTimelines(_) => Message::ListTimelines,
         M::Timelines(v) => Message::Timelines { names: v.names },
         M::WantTimeline(v) => Message::WantTimeline {
@@ -304,7 +317,14 @@ mod tests {
             data: vec![9; 100],
         };
         let messages = vec![
-            Message::Hello { version: 2 },
+            Message::Hello {
+                version: 2,
+                repo: String::new(),
+            },
+            Message::Hello {
+                version: 2,
+                repo: "atmosphere".into(),
+            },
             Message::ListTimelines,
             Message::Timelines {
                 names: vec!["main".into(), "feature/x".into()],

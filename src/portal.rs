@@ -128,8 +128,13 @@ pub fn http_host(url: &str) -> Option<String> {
 /// True for an `http(s)` URL whose host is neither github.com nor gitlab.com —
 /// i.e. a generic Git smart-HTTP host handled by the URL-based transport.
 fn is_generic_https(url: &str) -> bool {
+    // Only github.com is excluded. GitLab has no REST-aware path in Ivaldi —
+    // it speaks plain Git smart-HTTP like any other host — so excluding it
+    // here sent every scout/harvest/sync for a gitlab.com portal to
+    // github.com instead, against an owner/repo that usually doesn't exist
+    // there.
     match http_host(url) {
-        Some(h) => !h.eq_ignore_ascii_case("github.com") && !h.eq_ignore_ascii_case("gitlab.com"),
+        Some(h) => !h.eq_ignore_ascii_case("github.com"),
         None => false,
     }
 }
@@ -508,11 +513,28 @@ mod tests {
 
     #[test]
     fn portal_transport_https_not_generic_for_github_base_url() {
-        // A github/gitlab base URL must keep the platform-specific Https path.
+        // Only github.com keeps the platform-specific Https path — it's the
+        // one host with a REST-aware client behind it.
         let p = Portal::parse("owner/repo")
             .unwrap()
             .with_base_url("https://github.com/owner/repo.git");
         assert!(matches!(p.transport(), Transport::Https));
+    }
+
+    #[test]
+    fn portal_transport_generic_https_for_gitlab_base_url() {
+        // Regression: gitlab.com used to fall through to `Https`, which means
+        // "talk to GitHub" — so scout/harvest/sync on a GitLab clone queried
+        // github.com/owner/repo instead.
+        let p = Portal::parse("owner/repo")
+            .unwrap()
+            .with_base_url("https://gitlab.com/owner/repo.git");
+        match p.transport() {
+            Transport::GenericHttps(url) => {
+                assert_eq!(url, "https://gitlab.com/owner/repo.git")
+            }
+            other => panic!("expected GenericHttps, got {:?}", other),
+        }
     }
 
     #[test]

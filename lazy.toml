@@ -39,6 +39,16 @@ run = [
 ]
 dep = ["build"]
 
+[commands.install-only]
+desc = "# Install a pre-built ivaldi to $(PREFIX)/bin (no rebuild; safe under sudo)"
+run = [
+  "echo \"Installing {{binary}} to {{bindir}}...\"",
+  "install -d {{bindir}}",
+  "install -m 755 {{target}} {{bindir}}/{{binary}}",
+  "echo \"Installed {{binary}} to {{bindir}}/{{binary}}\"",
+  "echo \"Run 'ivaldi --version' to verify.\"",
+]
+
 [commands.install-extras]
 desc = "# Install man pages and shell completions (bash/zsh/fish)"
 run = [
