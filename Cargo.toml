@@ -7,7 +7,7 @@ license = "AGPL-3.0-only"
 readme = "README.md"
 repository = "https://github.com/javanhut/ivaldi"
 homepage = "https://github.com/javanhut/ivaldi"
-rust-version = "1.89"
+rust-version = "1.98"
 keywords = ["version-control", "vcs", "git", "distributed"]
 categories = ["command-line-utilities", "development-tools"]
 

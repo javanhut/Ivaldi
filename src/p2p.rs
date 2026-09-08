@@ -85,26 +85,52 @@ const MAX_WIRE_BLOB: u64 = 1024 * 1024 * 1024;
 /// - `ivaldi://host`                  → port=default, timeline=None
 /// - `ivaldi://host:9999`             → custom port
 /// - `ivaldi://host:9999/main`        → request a specific timeline
+/// - `ivaldi://hub:9418/atmo/main`    → repo `atmo` on a hub, timeline `main`
+/// - `ivaldi://hub:9418/atmo/`        → repo `atmo`, server picks the timeline
+///
+/// One path segment stays the timeline, so every `ivaldi serve` URL written
+/// before hubs existed keeps meaning exactly what it meant. A second segment
+/// is what promotes the first to a repo name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerUrl {
     pub host: String,
     pub port: u16,
+    /// Hosted repo to open. `None` for a single-repo peer.
+    pub repo: Option<String>,
     pub timeline: Option<String>,
 }
 
 impl PeerUrl {
     pub fn parse(url: &str) -> Option<Self> {
         let rest = url.strip_prefix("ivaldi://")?;
-        let (hostport, timeline) = match rest.split_once('/') {
-            Some((hp, t)) => {
-                let t = t.trim_start_matches('/');
-                if t.is_empty() {
-                    (hp, None)
-                } else {
-                    (hp, Some(t.to_string()))
+        let (hostport, repo, timeline) = match rest.split_once('/') {
+            Some((hp, path)) => {
+                let path = path.trim_start_matches('/');
+                match path.split_once('/') {
+                    // Two segments: `<repo>/<timeline>`. A trailing slash
+                    // leaves the timeline empty, meaning "server decides".
+                    Some((r, t)) if !r.is_empty() => (
+                        hp,
+                        Some(r.to_string()),
+                        if t.is_empty() {
+                            None
+                        } else {
+                            Some(t.to_string())
+                        },
+                    ),
+                    // One segment (or a leading slash): the timeline.
+                    _ => (
+                        hp,
+                        None,
+                        if path.is_empty() {
+                            None
+                        } else {
+                            Some(path.to_string())
+                        },
+                    ),
                 }
             }
-            None => (rest, None),
+            None => (rest, None, None),
         };
         if hostport.is_empty() {
             return None;
@@ -122,6 +148,7 @@ impl PeerUrl {
         Some(Self {
             host,
             port,
+            repo,
             timeline,
         })
     }
@@ -167,7 +194,11 @@ pub struct WireBlob {
 pub enum Message {
     /// Both directions, immediately after the Noise handshake: wire
     /// protocol version check. A mismatch is refused explicitly.
-    Hello { version: u32 },
+    ///
+    /// `repo` names which hosted repository the initiator wants. Empty from
+    /// a responder, and empty from any client addressing a single-repo
+    /// `ivaldi serve` — only a hub with several repos on one port needs it.
+    Hello { version: u32, repo: String },
 
     /// Client → server: list local timelines.
     ListTimelines,
@@ -249,6 +280,33 @@ impl From<std::io::Error> for P2pError {
     }
 }
 
+/// A duplex of protocol messages.
+///
+/// The request/response logic does not care what carries the frames or what
+/// secures them. `ivaldi://` uses [`Channel`] — Noise over TCP — because a
+/// bare TCP socket offers nothing on its own. A carrier that already
+/// authenticates and encrypts, such as SSH or TLS, can implement this over
+/// its own stream instead of nesting Noise inside a tunnel that has already
+/// done the work.
+///
+/// Deliberately just the message pair. Anything transport-shaped —
+/// half-close, peer keys, the repo a client asked for — stays on the
+/// concrete type that actually has it.
+pub trait MessageChannel {
+    fn send(&mut self, msg: &Message) -> Result<(), P2pError>;
+    fn recv(&mut self) -> Result<Message, P2pError>;
+}
+
+impl MessageChannel for Channel {
+    fn send(&mut self, msg: &Message) -> Result<(), P2pError> {
+        // Inherent method wins at the call site, so this is not recursive.
+        Channel::send(self, msg)
+    }
+    fn recv(&mut self) -> Result<Message, P2pError> {
+        Channel::recv(self)
+    }
+}
+
 /// Encrypted, framed channel over a TCP stream after a successful Noise
 /// handshake.
 pub struct Channel {
@@ -257,11 +315,26 @@ pub struct Channel {
     /// Static public key of the peer on the other end, for authorization
     /// checks and display.
     pub remote_static: [u8; crate::identity::KEY_LEN],
+    /// Repo the peer named in its `Hello`. Empty unless the peer is a client
+    /// addressing a specific repo on a multi-repo host.
+    pub remote_repo: String,
 }
 
 impl Channel {
     /// Initiator side. Performs Noise XX with the supplied static keypair.
+    /// Addresses the peer's only repo; see [`Channel::connect_to_repo`].
     pub fn connect(addr: impl ToSocketAddrs, identity: &Identity) -> Result<Self, P2pError> {
+        Self::connect_to_repo(addr, identity, "")
+    }
+
+    /// Initiator side, naming which hosted repo to open. `repo` is empty for
+    /// a single-repo peer and a repo name for a host serving several on one
+    /// port.
+    pub fn connect_to_repo(
+        addr: impl ToSocketAddrs,
+        identity: &Identity,
+        repo: &str,
+    ) -> Result<Self, P2pError> {
         let stream = TcpStream::connect(addr)?;
         stream.set_read_timeout(Some(Duration::from_secs(60)))?;
         stream.set_write_timeout(Some(Duration::from_secs(60)))?;
@@ -271,12 +344,14 @@ impl Channel {
             stream,
             noise,
             remote_static,
+            remote_repo: String::new(),
         };
-        chan.exchange_hello()?;
+        chan.exchange_hello(repo)?;
         Ok(chan)
     }
 
-    /// Responder side. Caller has already accepted a TCP connection.
+    /// Responder side. Caller has already accepted a TCP connection. After
+    /// this returns, `remote_repo` holds the repo the client asked for.
     pub fn accept(stream: TcpStream, identity: &Identity) -> Result<Self, P2pError> {
         stream.set_read_timeout(Some(Duration::from_secs(60)))?;
         stream.set_write_timeout(Some(Duration::from_secs(60)))?;
@@ -286,8 +361,9 @@ impl Channel {
             stream,
             noise,
             remote_static,
+            remote_repo: String::new(),
         };
-        chan.exchange_hello()?;
+        chan.exchange_hello("")?;
         Ok(chan)
     }
 
@@ -295,12 +371,21 @@ impl Channel {
     /// after the handshake. The Noise prologue already guarantees both peers
     /// speak the protobuf framing; this catches in-era version drift with an
     /// actionable error instead of a mid-stream decode failure.
-    fn exchange_hello(&mut self) -> Result<(), P2pError> {
+    fn exchange_hello(&mut self, repo: &str) -> Result<(), P2pError> {
         let version = crate::p2p_proto::PROTOCOL_VERSION;
-        self.send(&Message::Hello { version })?;
+        self.send(&Message::Hello {
+            version,
+            repo: repo.to_string(),
+        })?;
         match self.recv()? {
-            Message::Hello { version: v } if v == version => Ok(()),
-            Message::Hello { version: v } => Err(P2pError::Protocol(format!(
+            Message::Hello {
+                version: v,
+                repo: r,
+            } if v == version => {
+                self.remote_repo = r;
+                Ok(())
+            }
+            Message::Hello { version: v, .. } => Err(P2pError::Protocol(format!(
                 "peer speaks ivaldi protocol v{}, this build speaks v{} — \
                  upgrade the older peer",
                 v, version
@@ -602,14 +687,7 @@ pub fn serve_with_repo(
             let _g = Guard(&counter);
 
             let peer_store = PeerStore::new(peer_store_path);
-            let mut guard = match repo.lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    crate::logging::warn("worker: repo mutex poisoned, skipping");
-                    return;
-                }
-            };
-            if let Err(e) = handle_connection(&mut guard, stream, &identity, &peer_store) {
+            if let Err(e) = accept_one(&repo, stream, &identity, &peer_store) {
                 crate::logging::warn(&format!("connection error: {}", e));
             }
         });
@@ -617,14 +695,32 @@ pub fn serve_with_repo(
     Ok(())
 }
 
-fn handle_connection(
-    repo: &mut crate::repo::Repo,
+/// Accept, authorize against this repo's allowlist, and serve. The
+/// single-repo path `ivaldi serve` uses; hosts offering many repositories
+/// write their own equivalent and call [`serve_connection`].
+fn accept_one(
+    repo: &std::sync::Mutex<crate::repo::Repo>,
     stream: TcpStream,
     identity: &Identity,
     peer_store: &PeerStore,
 ) -> Result<(), P2pError> {
     let peer_addr = stream.peer_addr().ok();
     let mut chan = Channel::accept(stream, identity)?;
+
+    if !chan.remote_repo.is_empty() {
+        let _ = chan.send(&Message::Error {
+            message: format!(
+                "this peer serves a single repository and has no '{}'",
+                chan.remote_repo
+            ),
+        });
+        chan.shutdown();
+        return Err(P2pError::Protocol(format!(
+            "peer asked for repo '{}' from a single-repo server",
+            chan.remote_repo
+        )));
+    }
+
     if !peer_store
         .is_trusted(&chan.remote_static)
         .map_err(|e| P2pError::Protocol(e.to_string()))?
@@ -646,6 +742,29 @@ fn handle_connection(
         peer_addr
     );
 
+    let label = peer_label(peer_store, &chan.remote_static);
+    let mut guard = repo
+        .lock()
+        .map_err(|_| P2pError::Protocol("repo mutex poisoned".into()))?;
+    serve_connection(&mut guard, &mut chan, &label)
+}
+
+/// Serve one already-accepted, already-authorized connection.
+///
+/// This is the whole of Ivaldi's server side: read requests, answer them
+/// against `repo`. It does not decide who may connect, which repository they
+/// reach, how many connections to allow, or what any of it is called — a
+/// caller that hosts repositories owns those, because they are hosting
+/// policy rather than version control.
+///
+/// `sender_label` names the peer for inbound pushes, which land at
+/// `peers/<label>/<timeline>`. It is sanitized here; the caller cannot direct
+/// a push outside that namespace no matter what it passes.
+pub fn serve_connection(
+    repo: &mut crate::repo::Repo,
+    chan: &mut dyn MessageChannel,
+    sender_label: &str,
+) -> Result<(), P2pError> {
     loop {
         let req = match chan.recv() {
             Ok(m) => m,
@@ -663,16 +782,66 @@ fn handle_connection(
                 chan.send(&Message::Timelines { names })?;
             }
             Message::WantTimeline { timeline, have } => {
-                serve_want(repo, &mut chan, &timeline, &have)?;
+                serve_want(repo, chan, &timeline, &have)?;
             }
             Message::PushStart { timeline } => {
-                serve_push(repo, &mut chan, &timeline, peer_store)?;
+                serve_push(repo, chan, &timeline, sender_label)?;
             }
             other => {
                 chan.send(&Message::Error {
                     message: format!("unsupported request: {:?}", other),
                 })?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Friendly name for a peer: its allowlist entry if it has one, else a short
+/// pubkey prefix. Offered so hosts label pushes the same way `ivaldi serve`
+/// does, without reimplementing it.
+pub fn peer_label(peer_store: &PeerStore, pubkey: &[u8; crate::identity::KEY_LEN]) -> String {
+    peer_store
+        .list()
+        .ok()
+        .and_then(|entries| {
+            entries
+                .iter()
+                .find(|e| &e.pubkey == pubkey)
+                .and_then(|e| e.name.clone())
+        })
+        .unwrap_or_else(|| hex::encode(&pubkey[..4]))
+}
+
+/// Verify every object reachable from `roots` is actually in `cas`.
+///
+/// Blob bytes are checked against their own hash as they arrive, and the tip
+/// leaf is checked against what landed — but a leaf's `tree_root` is taken on
+/// faith. Without this, a peer can land a leaf referencing objects it never
+/// sent, producing a timeline that fetches fine and then fails to
+/// materialize. It is also the check that has to exist before any form of
+/// shared object storage could be safe: unverified references are exactly how
+/// one repository ends up serving another's content.
+fn verify_trees_present(
+    cas: &crate::cas::FileCas,
+    roots: &[B3Hash],
+) -> Result<(), crate::cas::CasError> {
+    use crate::cas::Cas;
+    use crate::fsmerkle::FsStore;
+
+    let store = FsStore::new(cas);
+    let mut seen_trees: BTreeSet<B3Hash> = BTreeSet::new();
+    let mut objects: BTreeSet<B3Hash> = BTreeSet::new();
+    for root in roots {
+        // Walking the tree fetches every interior node, so a missing tree
+        // node fails here...
+        collect_objects_from_tree(&store, *root, &mut seen_trees, &mut objects)
+            .map_err(|e| crate::cas::CasError::Io(std::io::Error::other(e.to_string())))?;
+    }
+    // ...while leaf blobs are only named by the walk, never read. Check them.
+    for hash in &objects {
+        if !cas.has(*hash)? {
+            return Err(crate::cas::CasError::NotFound(*hash));
         }
     }
     Ok(())
@@ -690,23 +859,15 @@ fn handle_connection(
 /// users sharing one repo).
 fn serve_push(
     repo: &mut crate::repo::Repo,
-    chan: &mut Channel,
+    chan: &mut dyn MessageChannel,
     timeline: &str,
-    peer_store: &PeerStore,
+    sender: &str,
 ) -> Result<(), P2pError> {
     use crate::cas::FileCas;
 
-    // Resolve sender label.
-    let entries = peer_store
-        .list()
-        .map_err(|e| P2pError::Protocol(e.to_string()))?;
-    let sender = entries
-        .iter()
-        .find(|e| e.pubkey == chan.remote_static)
-        .and_then(|e| e.name.clone())
-        .unwrap_or_else(|| hex::encode(&chan.remote_static[..4]));
-
-    // Sanitize the sender label so it can't escape the `peers/` prefix.
+    // Sanitize the caller-supplied label so it can't escape the `peers/`
+    // prefix. Callers choose how a peer is named — an allowlist entry, an
+    // account, anything — but never where the push lands.
     let sender_clean: String = sender
         .chars()
         .map(|c| {
@@ -724,100 +885,140 @@ fn serve_push(
         FileCas::new(repo.ivaldi_dir.join("objects")).map_err(|e| P2pError::Io(e.to_string()))?;
 
     let mut lander = LeafLander::default();
-    let mut asm = BlobAssembler::default();
-    let claimed_head = loop {
-        match chan.recv()? {
-            Message::BlobChunk {
-                hash_hex,
-                total_len,
-                offset,
-                data,
-            } => match asm.feed(&hash_hex, total_len, offset, &data) {
-                Ok(None) => {}
-                Ok(Some(wb)) => apply_blob(&cas, &wb)?,
-                Err(e) => {
-                    chan.send(&Message::PushRejected {
-                        reason: e.to_string(),
-                    })?;
-                    return Ok(());
-                }
-            },
-            Message::PushBundle { leaves, blobs } => {
-                // Write objects first (they're prerequisites for any
-                // leaf's tree walk later). Bytes are content-addressed,
-                // so duplicates are no-ops.
-                for wb in blobs {
-                    apply_blob(&cas, &wb)?;
-                }
-                // This bundle's objects must be durable (directory entries
-                // included) before any leaf transaction references them.
-                cas.flush().map_err(|e| P2pError::Io(e.to_string()))?;
-                for wl in leaves {
-                    if let Err(e) = lander.land(repo, &landed_as, &wl) {
-                        // A bad parent reference or malformed leaf must not
-                        // poison the recipient's history: reject explicitly.
-                        // Everything landed so far is a valid prefix under
-                        // peers/<sender>/ and a retry re-lands idempotently.
+    // Objects this transfer introduced, as opposed to ones the store
+    // already held. Only these may be discarded if the push does not land.
+    let mut introduced: BTreeSet<B3Hash> = BTreeSet::new();
+
+    // The body runs in a closure so that *every* way out — an explicit
+    // rejection, a protocol error, or the peer simply vanishing mid-transfer
+    // — lands on the cleanup below. A dropped connection is the common case
+    // and the one an attacker controls.
+    let outcome = {
+        let cas = &cas;
+        let lander = &mut lander;
+        let introduced = &mut introduced;
+        (|| -> Result<bool, P2pError> {
+            let mut asm = BlobAssembler::default();
+            let claimed_head = loop {
+                match chan.recv()? {
+                    Message::BlobChunk {
+                        hash_hex,
+                        total_len,
+                        offset,
+                        data,
+                    } => match asm.feed(&hash_hex, total_len, offset, &data) {
+                        Ok(None) => {}
+                        Ok(Some(wb)) => {
+                            if let Some(h) = apply_blob(cas, &wb)? {
+                                introduced.insert(h);
+                            }
+                        }
+                        Err(e) => {
+                            chan.send(&Message::PushRejected {
+                                reason: e.to_string(),
+                            })?;
+                            return Ok(false);
+                        }
+                    },
+                    Message::PushBundle { leaves, blobs } => {
+                        // Write objects first (they're prerequisites for any
+                        // leaf's tree walk later). Bytes are content-addressed,
+                        // so duplicates are no-ops.
+                        for wb in blobs {
+                            if let Some(h) = apply_blob(cas, &wb)? {
+                                introduced.insert(h);
+                            }
+                        }
+                        // This bundle's objects must be durable (directory entries
+                        // included) before any leaf transaction references them.
+                        cas.flush().map_err(|e| P2pError::Io(e.to_string()))?;
+                        for wl in leaves {
+                            if let Err(e) = lander.land(repo, &landed_as, &wl) {
+                                // A bad parent reference or malformed leaf must not
+                                // poison the recipient's history: reject explicitly.
+                                // Everything landed so far is a valid prefix under
+                                // peers/<sender>/ and a retry re-lands idempotently.
+                                chan.send(&Message::PushRejected {
+                                    reason: e.to_string(),
+                                })?;
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    Message::PushDone { head_b3_hex } => {
+                        if let Err(e) = asm.finish() {
+                            chan.send(&Message::PushRejected {
+                                reason: e.to_string(),
+                            })?;
+                            return Ok(false);
+                        }
+                        break head_b3_hex;
+                    }
+                    Message::Error { message } => return Err(P2pError::Protocol(message)),
+                    other => {
                         chan.send(&Message::PushRejected {
-                            reason: e.to_string(),
+                            reason: format!("unexpected message during push: {:?}", other),
                         })?;
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
-            }
-            Message::PushDone { head_b3_hex } => {
-                if let Err(e) = asm.finish() {
+            };
+
+            // The sender's claimed tip must be a leaf that actually arrived —
+            // otherwise a truncated push would be indistinguishable from a
+            // complete one.
+            let tip_idx = match lander.local_idx_for_wire_hash(&claimed_head) {
+                Some(idx) => idx,
+                None => {
                     chan.send(&Message::PushRejected {
-                        reason: e.to_string(),
+                        reason: format!(
+                            "push tip {} never arrived — transfer truncated or peer misbehaving",
+                            claimed_head
+                        ),
                     })?;
-                    return Ok(());
+                    return Ok(false);
                 }
-                break head_b3_hex;
-            }
-            Message::Error { message } => return Err(P2pError::Protocol(message)),
-            other => {
+            };
+            // Every newly landed leaf must have its whole tree on disk. Rejecting
+            // here leaves the leaves in the MMR but never advances the timeline —
+            // the same "valid prefix, retry re-lands idempotently" model the bad
+            // parent path above already uses.
+            if let Err(e) = verify_trees_present(cas, lander.landed_tree_roots()) {
                 chan.send(&Message::PushRejected {
-                    reason: format!("unexpected message during push: {:?}", other),
+                    reason: format!(
+                        "push references objects that never arrived ({}) —                  transfer truncated or peer misbehaving",
+                        e
+                    ),
                 })?;
-                return Ok(());
+                return Ok(false);
             }
-        }
-    };
 
-    // The sender's claimed tip must be a leaf that actually arrived —
-    // otherwise a truncated push would be indistinguishable from a
-    // complete one.
-    let tip_idx = match lander.local_idx_for_wire_hash(&claimed_head) {
-        Some(idx) => idx,
-        None => {
-            chan.send(&Message::PushRejected {
-                reason: format!(
-                    "push tip {} never arrived — transfer truncated or peer misbehaving",
-                    claimed_head
-                ),
+            // Re-pushing an already-known chain lands zero new leaves, so point the
+            // peers/ timeline at the (deduplicated) tip explicitly.
+            if repo
+                .get_timeline_head(&landed_as)
+                .map_err(|e| P2pError::Protocol(e.to_string()))?
+                != Some(tip_idx)
+            {
+                repo.set_timeline_head(&landed_as, tip_idx)
+                    .map_err(|e| P2pError::Io(e.to_string()))?;
+            }
+
+            chan.send(&Message::PushAccepted {
+                landed_as: landed_as.clone(),
             })?;
-            return Ok(());
-        }
+            eprintln!(
+                "received push: {} new leaf(s) landed at {}",
+                lander.leaves_landed, landed_as
+            );
+            Ok(true)
+        })()
     };
-    // Re-pushing an already-known chain lands zero new leaves, so point the
-    // peers/ timeline at the (deduplicated) tip explicitly.
-    if repo
-        .get_timeline_head(&landed_as)
-        .map_err(|e| P2pError::Protocol(e.to_string()))?
-        != Some(tip_idx)
-    {
-        repo.set_timeline_head(&landed_as, tip_idx)
-            .map_err(|e| P2pError::Io(e.to_string()))?;
-    }
 
-    chan.send(&Message::PushAccepted {
-        landed_as: landed_as.clone(),
-    })?;
-    eprintln!(
-        "received push: {} new leaf(s) landed at {}",
-        lander.leaves_landed, landed_as
-    );
-    Ok(())
+    if !matches!(outcome, Ok(true)) {
+        discard_unreachable(&cas, &introduced, lander.landed_tree_roots());
+    }
+    outcome.map(|_| ())
 }
 
 /// Translates wire leaves (whose `prev_idx`/`merge_idxs` are *sender-local*
@@ -836,6 +1037,9 @@ struct LeafLander {
     /// arrived (the *landed* leaf hash differs once indices are rewritten).
     local_by_wire_hash: std::collections::BTreeMap<String, u64>,
     leaves_landed: usize,
+    /// `tree_root` of every leaf newly committed by this push. Checked for
+    /// object completeness before the push is accepted.
+    landed_tree_roots: Vec<B3Hash>,
 }
 
 impl LeafLander {
@@ -884,9 +1088,11 @@ impl LeafLander {
                 .map(|(idx, _)| idx)
                 .ok_or_else(|| P2pError::Protocol("seal name exists but leaf not found".into()))?
         } else {
+            let tree_root = leaf.tree_root;
             let result = repo
                 .commit_raw(leaf, timeline)
                 .map_err(|e| P2pError::Io(e.to_string()))?;
+            self.landed_tree_roots.push(tree_root);
             self.leaves_landed += 1;
             result.index
         };
@@ -911,18 +1117,49 @@ impl LeafLander {
     fn local_idx_for_wire_hash(&self, wire_hash_hex: &str) -> Option<u64> {
         self.local_by_wire_hash.get(wire_hash_hex).copied()
     }
+
+    fn landed_tree_roots(&self) -> &[B3Hash] {
+        &self.landed_tree_roots
+    }
 }
 
 fn serve_want(
     repo: &mut crate::repo::Repo,
-    chan: &mut Channel,
+    chan: &mut dyn MessageChannel,
     timeline: &str,
     have: &[String],
 ) -> Result<(), P2pError> {
-    let head = repo
+    let head = match repo
         .get_timeline_head(timeline)
         .map_err(|e| P2pError::Protocol(e.to_string()))?
-        .ok_or_else(|| P2pError::Protocol(format!("unknown timeline '{}'", timeline)))?;
+    {
+        Some(h) => h,
+        None => {
+            // Say so on the wire rather than dropping the connection. Bailing
+            // here leaves the client reading a closed socket and reporting
+            // "failed to fill whole buffer", which describes our behaviour
+            // instead of their problem — and a freshly forged repository is
+            // the most likely way to arrive here.
+            let known = repo
+                .list_timelines()
+                .map_err(|e| P2pError::Protocol(e.to_string()))?;
+            let message = if known.is_empty() {
+                "this repository is empty — nothing has been sealed on it yet".to_string()
+            } else {
+                format!(
+                    "no timeline '{}' here; this repository has: {}",
+                    timeline,
+                    known
+                        .iter()
+                        .map(|(n, _)| n.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            chan.send(&Message::Error { message })?;
+            return Ok(());
+        }
+    };
 
     // Walk the linear chain (prev_idx + merge parents) from head back, stopping
     // at any leaf whose blake3 the client already has.
@@ -1115,7 +1352,11 @@ fn fetch_into_created_target(
     identity: &Identity,
     tofu: crate::known_peers::TofuPolicy,
 ) -> Result<FetchSummary, P2pError> {
-    let mut chan = Channel::connect(url.socket_addr(), identity)?;
+    let mut chan = Channel::connect_to_repo(
+        url.socket_addr(),
+        identity,
+        url.repo.as_deref().unwrap_or(""),
+    )?;
     enforce_tofu(url, &chan.remote_static, tofu)?;
     eprintln!("connected to {}", hex::encode(chan.remote_static));
 
@@ -1164,7 +1405,7 @@ fn fetch_into_created_target(
                 data,
             } => {
                 if let Some(wb) = asm.feed(&hash_hex, total_len, offset, &data)? {
-                    apply_blob(&cas, &wb)?;
+                    let _ = apply_blob(&cas, &wb)?;
                     blobs_imported += 1;
                 }
             }
@@ -1173,7 +1414,7 @@ fn fetch_into_created_target(
                     lander.land(&mut repo, &timeline, &wl)?;
                 }
                 for wb in blobs {
-                    apply_blob(&cas, &wb)?;
+                    let _ = apply_blob(&cas, &wb)?;
                     blobs_imported += 1;
                 }
             }
@@ -1311,15 +1552,69 @@ fn enforce_tofu(
     }
 }
 
-fn apply_blob(cas: &crate::cas::FileCas, wb: &WireBlob) -> Result<(), P2pError> {
+/// Store one wire object, returning its hash only if the store did not
+/// already hold it. Callers landing an inbound push use that to tell content
+/// this transfer introduced from content that was already here — the former
+/// can be discarded if the push is refused, the latter never can.
+fn apply_blob(cas: &crate::cas::FileCas, wb: &WireBlob) -> Result<Option<B3Hash>, P2pError> {
     use crate::cas::Cas;
     let raw = hex::decode(&wb.hash_hex)
         .map_err(|e| P2pError::Protocol(format!("blob hash hex: {}", e)))?;
     let hash = B3Hash::from_slice(&raw)
         .ok_or_else(|| P2pError::Protocol("blob hash wrong length".into()))?;
+    let existed = cas
+        .has(hash)
+        .map_err(|e| P2pError::Io(format!("cas has: {}", e)))?;
     cas.put(hash, &wb.data)
         .map_err(|e| P2pError::Io(format!("cas put: {}", e)))?;
-    Ok(())
+    Ok((!existed).then_some(hash))
+}
+
+/// Remove objects an unaccepted push introduced and nothing will reference.
+///
+/// Two rules keep this from destroying live content:
+///
+/// 1. Only objects that did **not** exist before this push are candidates, so
+///    content shared with existing history is never touched.
+/// 2. Anything reachable from a leaf that did land is kept. Rejected pushes
+///    leave their landed leaves in the append-only MMR as a valid prefix;
+///    stripping their objects would manufacture exactly the unmaterializable
+///    history `verify_trees_present` exists to refuse.
+///
+/// The walk is best-effort. A tree node that never arrived cannot be read, so
+/// its subtree is unknown — blobs reachable only that way are discarded. That
+/// is safe: no intact tree reaches them, and the leaf that named them is
+/// already unmaterializable.
+fn discard_unreachable(
+    cas: &crate::cas::FileCas,
+    introduced: &BTreeSet<B3Hash>,
+    landed_roots: &[B3Hash],
+) {
+    if introduced.is_empty() {
+        return;
+    }
+    let store = crate::fsmerkle::FsStore::new(cas);
+    let mut seen_trees: BTreeSet<B3Hash> = BTreeSet::new();
+    let mut reachable: BTreeSet<B3Hash> = BTreeSet::new();
+    for root in landed_roots {
+        let _ = collect_objects_from_tree(&store, *root, &mut seen_trees, &mut reachable);
+    }
+
+    let mut discarded = 0usize;
+    for hash in introduced {
+        if reachable.contains(hash) {
+            continue;
+        }
+        if cas.remove(*hash).unwrap_or(false) {
+            discarded += 1;
+        }
+    }
+    if discarded > 0 {
+        crate::logging::warn(&format!(
+            "discarded {} object(s) introduced by a push that was not accepted",
+            discarded
+        ));
+    }
 }
 
 /// Ship every object in `hashes`: small objects batched into size-bounded
@@ -1328,14 +1623,18 @@ fn apply_blob(cas: &crate::cas::FileCas, wb: &WireBlob) -> Result<(), P2pError> 
 /// transfer can never land a durable leaf whose tree bytes never arrived.
 /// Returns the number of objects sent.
 fn send_objects(
-    chan: &mut Channel,
+    chan: &mut dyn MessageChannel,
     cas: &crate::cas::FileCas,
     hashes: &BTreeSet<B3Hash>,
     push: bool,
 ) -> Result<usize, P2pError> {
     use crate::cas::Cas;
 
-    fn flush(chan: &mut Channel, batch: &mut Vec<WireBlob>, push: bool) -> Result<(), P2pError> {
+    fn flush(
+        chan: &mut dyn MessageChannel,
+        batch: &mut Vec<WireBlob>,
+        push: bool,
+    ) -> Result<(), P2pError> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -1382,7 +1681,11 @@ fn send_objects(
 /// Send one CAS object: small objects are batched inline into bundles by the
 /// caller; large ones are streamed here as bounded [`Message::BlobChunk`]
 /// slices so no single frame approaches `MAX_FRAME`.
-fn send_blob_chunks(chan: &mut Channel, hash_hex: &str, data: &[u8]) -> Result<(), P2pError> {
+fn send_blob_chunks(
+    chan: &mut dyn MessageChannel,
+    hash_hex: &str,
+    data: &[u8],
+) -> Result<(), P2pError> {
     let total_len = data.len() as u64;
     let mut offset = 0usize;
     while offset < data.len() {
@@ -1538,7 +1841,11 @@ pub fn push_to(
         .map_err(|e| P2pError::Io(e.to_string()))?
         .ok_or_else(|| P2pError::Protocol(format!("local timeline '{}' has no head", timeline)))?;
 
-    let mut chan = Channel::connect(url.socket_addr(), identity)?;
+    let mut chan = Channel::connect_to_repo(
+        url.socket_addr(),
+        identity,
+        url.repo.as_deref().unwrap_or(""),
+    )?;
     enforce_tofu(url, &chan.remote_static, tofu)?;
 
     chan.send(&Message::PushStart {
@@ -1642,6 +1949,7 @@ pub fn push_to(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -1874,9 +2182,9 @@ mod tests {
         let server_root = server_dir.path().to_path_buf();
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let mut srv_repo = crate::repo::Repo::open(&server_root).unwrap();
+            let repo = std::sync::Mutex::new(crate::repo::Repo::open(&server_root).unwrap());
             let store = PeerStore::new(server_root.join(".ivaldi/authorized_peers"));
-            handle_connection(&mut srv_repo, stream, &server_id_clone, &store).unwrap();
+            accept_one(&repo, stream, &server_id_clone, &store).unwrap();
         });
 
         // Client.
@@ -1920,10 +2228,10 @@ mod tests {
         let server_root = server_dir.path().to_path_buf();
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let mut srv_repo = crate::repo::Repo::open(&server_root).unwrap();
+            let repo = std::sync::Mutex::new(crate::repo::Repo::open(&server_root).unwrap());
             let store = PeerStore::new(server_root.join(".ivaldi/authorized_peers"));
             // Expect this to err with PeerNotAuthorized.
-            let _ = handle_connection(&mut srv_repo, stream, &server_id_clone, &store);
+            let _ = accept_one(&repo, stream, &server_id_clone, &store);
         });
 
         let _ = peer_store; // keep alive to prove we never trusted
@@ -2113,9 +2421,9 @@ mod tests {
         let server_root = server_dir.path().to_path_buf();
         let handle = std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let mut srv_repo = crate::repo::Repo::open(&server_root).unwrap();
+            let repo = std::sync::Mutex::new(crate::repo::Repo::open(&server_root).unwrap());
             let store = PeerStore::new(server_root.join(".ivaldi/authorized_peers"));
-            handle_connection(&mut srv_repo, stream, &server_id_clone, &store).unwrap();
+            accept_one(&repo, stream, &server_id_clone, &store).unwrap();
         });
 
         let client_dir = tempfile::tempdir().unwrap();
@@ -2613,6 +2921,284 @@ mod tests {
                 panic!("6 MiB blob never landed in the server CAS");
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn peer_url_carries_repo_when_two_segments_given() {
+        // One segment is still the timeline — every pre-hub URL is untouched.
+        let u = PeerUrl::parse("ivaldi://h:9500/main").unwrap();
+        assert_eq!(u.repo, None);
+        assert_eq!(u.timeline.as_deref(), Some("main"));
+
+        // Two segments: repo, then timeline.
+        let u = PeerUrl::parse("ivaldi://hub:9418/atmosphere/main").unwrap();
+        assert_eq!(u.repo.as_deref(), Some("atmosphere"));
+        assert_eq!(u.timeline.as_deref(), Some("main"));
+
+        // Trailing slash: name the repo, let the server pick the timeline.
+        let u = PeerUrl::parse("ivaldi://hub/atmosphere/").unwrap();
+        assert_eq!(u.repo.as_deref(), Some("atmosphere"));
+        assert_eq!(u.timeline, None);
+
+        // Bare host is unchanged.
+        let u = PeerUrl::parse("ivaldi://hub").unwrap();
+        assert_eq!((u.repo, u.timeline), (None, None));
+    }
+
+    /// A leaf may name any `tree_root` it likes; the push must not be
+    /// accepted unless the objects behind it actually arrived.
+    #[test]
+    fn push_verification_rejects_references_to_absent_objects() {
+        use crate::cas::FileCas;
+        use crate::fsmerkle::{Entry, FsStore, MODE_FILE, NodeKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cas = FileCas::new(dir.path().join("objects")).unwrap();
+        let store = FsStore::new(&cas);
+
+        // A complete tree passes.
+        let (blob, _) = store.put_blob(b"present").unwrap();
+        let good = store
+            .put_tree(vec![Entry {
+                name: "there.txt".into(),
+                mode: MODE_FILE,
+                kind: NodeKind::Blob,
+                hash: blob,
+            }])
+            .unwrap();
+        cas.flush().unwrap();
+        verify_trees_present(&cas, &[good]).expect("a fully-shipped tree is accepted");
+
+        // A tree whose blob was never stored is refused. The tree node itself
+        // exists, so only the blob check can catch this one.
+        let phantom = B3Hash::digest(b"an object nobody sent");
+        let dangling = store
+            .put_tree(vec![Entry {
+                name: "missing.txt".into(),
+                mode: MODE_FILE,
+                kind: NodeKind::Blob,
+                hash: phantom,
+            }])
+            .unwrap();
+        cas.flush().unwrap();
+        let err = verify_trees_present(&cas, &[dangling])
+            .expect_err("a tree naming an absent blob must be refused");
+        assert!(err.to_string().contains(&phantom.to_string()), "{err}");
+
+        // A tree_root that was never sent at all is refused too.
+        assert!(
+            verify_trees_present(&cas, &[B3Hash::digest(b"no such tree")]).is_err(),
+            "an absent tree root must be refused"
+        );
+    }
+
+    /// Cleanup after a refused push must remove only what that push brought
+    /// in and nothing else can reach.
+    #[test]
+    fn refused_push_discards_only_its_own_unreferenced_objects() {
+        use crate::cas::{Cas, FileCas};
+        use crate::fsmerkle::{Entry, FsStore, MODE_FILE, NodeKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cas = FileCas::new(dir.path().join("objects")).unwrap();
+        let store = FsStore::new(&cas);
+
+        let entry = |name: &str, hash| Entry {
+            name: name.into(),
+            mode: MODE_FILE,
+            kind: NodeKind::Blob,
+            hash,
+        };
+
+        // Content the store already held before the push.
+        let (preexisting, _) = store.put_blob(b"already here").unwrap();
+        // Content the push brought in, referenced by a leaf that did land.
+        let (landed_blob, _) = store.put_blob(b"landed by this push").unwrap();
+        let landed_root = store
+            .put_tree(vec![
+                entry("old.txt", preexisting),
+                entry("new.txt", landed_blob),
+            ])
+            .unwrap();
+        // Content the push brought in that nothing references.
+        let (orphan, _) = store.put_blob(b"orphan from a refused push").unwrap();
+        cas.flush().unwrap();
+
+        // The tree node itself also arrived over the wire.
+        let introduced: BTreeSet<B3Hash> = [landed_blob, orphan, landed_root].into_iter().collect();
+
+        discard_unreachable(&cas, &introduced, &[landed_root]);
+
+        assert!(
+            cas.has(preexisting).unwrap(),
+            "content that predates the push is never a candidate"
+        );
+        assert!(
+            cas.has(landed_blob).unwrap(),
+            "content reachable from a landed leaf must survive"
+        );
+        assert!(
+            cas.has(landed_root).unwrap(),
+            "the landed tree node itself must survive"
+        );
+        assert!(
+            !cas.has(orphan).unwrap(),
+            "unreferenced arrival is discarded"
+        );
+    }
+
+    /// A push that landed nothing leaves nothing behind — but still must not
+    /// touch what was already there.
+    #[test]
+    fn push_that_landed_nothing_discards_all_it_introduced() {
+        use crate::cas::{Cas, FileCas};
+        use crate::fsmerkle::FsStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cas = FileCas::new(dir.path().join("objects")).unwrap();
+        let store = FsStore::new(&cas);
+
+        let (preexisting, _) = store.put_blob(b"already here").unwrap();
+        let (a, _) = store.put_blob(b"truncated push part a").unwrap();
+        let (b, _) = store.put_blob(b"truncated push part b").unwrap();
+        cas.flush().unwrap();
+
+        let introduced: BTreeSet<B3Hash> = [a, b].into_iter().collect();
+        discard_unreachable(&cas, &introduced, &[]);
+
+        assert!(
+            cas.has(preexisting).unwrap(),
+            "pre-existing content survives"
+        );
+        assert!(!cas.has(a).unwrap());
+        assert!(!cas.has(b).unwrap());
+    }
+
+    /// Messages in a queue. No socket, no handshake, no encryption — used to
+    /// drive the protocol without standing up a transport.
+    struct MemChannel {
+        inbox: std::collections::VecDeque<Message>,
+        outbox: Vec<Message>,
+    }
+    impl MessageChannel for MemChannel {
+        fn send(&mut self, msg: &Message) -> Result<(), P2pError> {
+            self.outbox.push(msg.clone());
+            Ok(())
+        }
+        fn recv(&mut self) -> Result<Message, P2pError> {
+            // An empty inbox is the peer hanging up, which is how
+            // `serve_connection` learns a conversation is over.
+            self.inbox
+                .pop_front()
+                .ok_or_else(|| P2pError::Io("peer hung up".into()))
+        }
+    }
+
+    /// Seed a repository with one commit, or none at all.
+    fn seeded_repo(dir: &std::path::Path, with_commit: bool) -> crate::repo::Repo {
+        crate::forge::forge(dir).unwrap();
+        if with_commit {
+            use crate::fsmerkle::{Entry, FsStore, MODE_FILE, NodeKind};
+            let cas = crate::cas::FileCas::new(dir.join(".ivaldi/objects")).unwrap();
+            let store = FsStore::new(&cas);
+            let (blob, _) = store.put_blob(b"seed").unwrap();
+            let tree = store
+                .put_tree(vec![Entry {
+                    name: "f.txt".into(),
+                    mode: MODE_FILE,
+                    kind: NodeKind::Blob,
+                    hash: blob,
+                }])
+                .unwrap();
+            let mut repo = crate::repo::Repo::open(dir).unwrap();
+            repo.commit(tree, "tester <t@x>", "seed").unwrap();
+        }
+        crate::repo::Repo::open(dir).unwrap()
+    }
+
+    /// Wanting a timeline that isn't there must come back as a message the
+    /// client can print, not a closed socket.
+    #[test]
+    fn a_missing_timeline_is_answered_not_hung_up_on() {
+        let empty_dir = tempfile::tempdir().unwrap();
+        let mut empty = seeded_repo(empty_dir.path(), false);
+        let mut chan = MemChannel {
+            inbox: std::collections::VecDeque::from([Message::WantTimeline {
+                timeline: "main".into(),
+                have: vec![],
+            }]),
+            outbox: Vec::new(),
+        };
+        serve_connection(&mut empty, &mut chan, "tester").unwrap();
+        match chan.outbox.as_slice() {
+            [Message::Error { message }] => assert!(
+                message.contains("empty"),
+                "a freshly forged repo should say so, got {message:?}"
+            ),
+            other => panic!("expected one Error, got {other:?}"),
+        }
+
+        // With timelines present, the error names what is actually there.
+        let seeded_dir = tempfile::tempdir().unwrap();
+        let mut seeded = seeded_repo(seeded_dir.path(), true);
+        let mut chan = MemChannel {
+            inbox: std::collections::VecDeque::from([Message::WantTimeline {
+                timeline: "nosuch".into(),
+                have: vec![],
+            }]),
+            outbox: Vec::new(),
+        };
+        serve_connection(&mut seeded, &mut chan, "tester").unwrap();
+        match chan.outbox.as_slice() {
+            [Message::Error { message }] => {
+                assert!(message.contains("nosuch"), "{message}");
+                assert!(
+                    message.contains("main"),
+                    "should list what exists: {message}"
+                );
+            }
+            other => panic!("expected one Error, got {other:?}"),
+        }
+    }
+
+    /// The protocol must run over a carrier that is neither TCP nor Noise.
+    /// If this compiles and passes, SSH and HTTPS are new `MessageChannel`
+    /// impls rather than a second copy of the request loop.
+    #[test]
+    fn serve_connection_runs_over_a_non_noise_carrier() {
+        use crate::fsmerkle::{Entry, FsStore, MODE_FILE, NodeKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        {
+            let cas = crate::cas::FileCas::new(dir.path().join(".ivaldi/objects")).unwrap();
+            let store = FsStore::new(&cas);
+            let (blob, _) = store.put_blob(b"over some other carrier").unwrap();
+            let tree = store
+                .put_tree(vec![Entry {
+                    name: "f.txt".into(),
+                    mode: MODE_FILE,
+                    kind: NodeKind::Blob,
+                    hash: blob,
+                }])
+                .unwrap();
+            let mut repo = crate::repo::Repo::open(dir.path()).unwrap();
+            repo.commit(tree, "tester <t@x>", "seed").unwrap();
+        }
+
+        let mut repo = crate::repo::Repo::open(dir.path()).unwrap();
+        let mut chan = MemChannel {
+            inbox: std::collections::VecDeque::from([Message::ListTimelines]),
+            outbox: Vec::new(),
+        };
+        serve_connection(&mut repo, &mut chan, "tester").unwrap();
+
+        match chan.outbox.as_slice() {
+            [Message::Timelines { names }] => {
+                assert!(names.iter().any(|n| n == "main"), "got {:?}", names)
+            }
+            other => panic!("expected one Timelines reply, got {:?}", other),
         }
     }
 }

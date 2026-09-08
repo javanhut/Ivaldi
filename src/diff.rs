@@ -76,7 +76,12 @@ pub fn print_blob_as_deleted(store: &FsStore<'_>, hash: B3Hash) {
 
 /// LCS-based diff op: each entry is one source-side or new-side line.
 #[derive(Debug, Clone)]
-pub(crate) enum LineOp {
+/// One line of an edit script.
+///
+/// Public because the algorithm is shared but the rendering is not: the CLI
+/// prints ANSI, IvaldiHub emits HTML. Computing the diff twice, in two
+/// places, is how the two drift apart.
+pub enum LineOp {
     Context(String),
     Add(String),
     Remove(String),
@@ -86,14 +91,14 @@ pub(crate) enum LineOp {
 /// context, expressed as a range of indices into the global ops vec.
 /// Hunks produced by [`compute_hunks`] never overlap.
 #[derive(Debug, Clone)]
-pub(crate) struct Hunk {
+pub struct Hunk {
     pub ops_range: std::ops::Range<usize>,
 }
 
 /// Group changed ops into hunks: each run of changes whose gaps are within
 /// `2 * context` is merged, then padded with up to `context` lines of
 /// surrounding context.
-pub(crate) fn compute_hunks(ops: &[LineOp], context: usize) -> Vec<Hunk> {
+pub fn compute_hunks(ops: &[LineOp], context: usize) -> Vec<Hunk> {
     let changed: Vec<usize> = ops
         .iter()
         .enumerate()
@@ -181,7 +186,7 @@ pub(crate) fn apply_selected_hunks(
     out
 }
 
-pub(crate) fn compute_ops(old: &str, new: &str) -> Vec<LineOp> {
+pub fn compute_ops(old: &str, new: &str) -> Vec<LineOp> {
     let old_lines: Vec<&str> = old.lines().collect();
     let new_lines: Vec<&str> = new.lines().collect();
     let m = old_lines.len();

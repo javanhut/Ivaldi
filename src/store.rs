@@ -17,6 +17,7 @@ const LEAVES: TableDefinition<u64, &[u8]> = TableDefinition::new("leaves");
 const TIMELINE_HEADS: TableDefinition<&str, u64> = TableDefinition::new("timeline_heads");
 const SEAL_NAME_TO_HASH: TableDefinition<&str, &[u8]> = TableDefinition::new("seal_to_hash");
 const HASH_TO_SEAL_NAME: TableDefinition<&[u8], &str> = TableDefinition::new("hash_to_seal");
+const TAGS: TableDefinition<&str, &[u8]> = TableDefinition::new("tags");
 const BUTTERFLY_DATA: TableDefinition<&str, &[u8]> = TableDefinition::new("butterflies");
 const BUTTERFLY_CHILDREN: TableDefinition<&str, &str> = TableDefinition::new("bf_children");
 const META: TableDefinition<&str, &str> = TableDefinition::new("meta");
@@ -79,6 +80,9 @@ impl Store {
         }
         {
             let _ = w.open_table(HASH_TO_SEAL_NAME)?;
+        }
+        {
+            let _ = w.open_table(TAGS)?;
         }
         {
             let _ = w.open_table(BUTTERFLY_DATA)?;
@@ -191,6 +195,55 @@ impl Store {
         for e in t.iter()? {
             let (k, v) = e?;
             result.push((k.value().to_string(), v.value()));
+        }
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(result)
+    }
+
+    // -- Tags --
+
+    /// Write a batch of tag records in ONE transaction. Import lands every
+    /// tag a fetch resolved at once, so a crash leaves either all of them or
+    /// none rather than a half-tagged repository.
+    pub fn put_tags(&self, tags: &[(String, Vec<u8>)]) -> Result<(), StoreError> {
+        if tags.is_empty() {
+            return Ok(());
+        }
+        let w = self.db.begin_write()?;
+        {
+            let mut table = w.open_table(TAGS)?;
+            for (name, record) in tags {
+                table.insert(name.as_str(), record.as_slice())?;
+            }
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    pub fn get_tag(&self, name: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(TAGS)?;
+        Ok(t.get(name)?.map(|v| v.value().to_vec()))
+    }
+
+    pub fn remove_tag(&self, name: &str) -> Result<bool, StoreError> {
+        let w = self.db.begin_write()?;
+        let removed;
+        {
+            removed = w.open_table(TAGS)?.remove(name)?.is_some();
+        }
+        w.commit()?;
+        Ok(removed)
+    }
+
+    /// All tags, name-sorted.
+    pub fn list_tags(&self) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(TAGS)?;
+        let mut result = Vec::new();
+        for e in t.iter()? {
+            let (k, v) = e?;
+            result.push((k.value().to_string(), v.value().to_vec()));
         }
         result.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(result)

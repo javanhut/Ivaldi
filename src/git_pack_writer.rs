@@ -21,33 +21,55 @@ use std::io::Write;
 
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
+use rayon::prelude::*;
 use sha1::{Digest, Sha1};
 
 use crate::git_export::GitObject;
 use crate::git_remote::GitObjectKind;
 
+type EncodedObject = (Vec<u8>, Vec<u8>);
+
 /// Encode an object set into a git packfile. Caller streams the resulting
 /// bytes into `git-receive-pack`'s stdin after the command pkt-lines + flush.
 pub fn write_pack(objects: &[&GitObject]) -> Result<Vec<u8>, PackWriteError> {
+    write_pack_after(Vec::new(), objects)
+}
+
+/// Append a pack directly after an already-built protocol preamble.
+///
+/// The pack trailer hashes only bytes appended by this function. Smart HTTP
+/// uses this to avoid holding a standalone pack and a second copied request
+/// body at the same time.
+pub(crate) fn write_pack_after(
+    mut buf: Vec<u8>,
+    objects: &[&GitObject],
+) -> Result<Vec<u8>, PackWriteError> {
     let mut hasher = Sha1::new();
-    let mut buf: Vec<u8> = Vec::new();
 
     // Header.
     write_all(&mut buf, &mut hasher, b"PACK");
     write_all(&mut buf, &mut hasher, &2u32.to_be_bytes());
     write_all(&mut buf, &mut hasher, &(objects.len() as u32).to_be_bytes());
 
-    for obj in objects {
-        let header = encode_object_header(obj.kind, obj.body.len());
-        write_all(&mut buf, &mut hasher, &header);
+    // Object streams are independent in pack v2. Compress them in parallel,
+    // then assemble in the caller-provided deterministic order so large
+    // uploads use available cores without changing the resulting pack.
+    let encoded: Result<Vec<EncodedObject>, PackWriteError> = objects
+        .par_iter()
+        .map(|obj| {
+            let header = encode_object_header(obj.kind, obj.body.len());
+            let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(&obj.body)
+                .map_err(|e| PackWriteError::Other(e.to_string()))?;
+            let compressed = enc
+                .finish()
+                .map_err(|e| PackWriteError::Other(e.to_string()))?;
+            Ok((header, compressed))
+        })
+        .collect();
 
-        // Each body is zlib-compressed independently.
-        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(&obj.body)
-            .map_err(|e| PackWriteError::Other(e.to_string()))?;
-        let compressed = enc
-            .finish()
-            .map_err(|e| PackWriteError::Other(e.to_string()))?;
+    for (header, compressed) in encoded? {
+        write_all(&mut buf, &mut hasher, &header);
         write_all(&mut buf, &mut hasher, &compressed);
     }
 
@@ -157,5 +179,32 @@ mod tests {
         let pack = write_pack(&[]).unwrap();
         assert_eq!(pack.len(), 12 + 20);
         assert_eq!(&pack[..4], b"PACK");
+    }
+
+    #[test]
+    fn parallel_compression_is_deterministic() {
+        let objects: Vec<GitObject> = (0..128)
+            .map(|i| {
+                let body = format!("object-{i}-{}", "payload".repeat(64)).into_bytes();
+                let sha1 = sha1_hex_to_array(&crate::git_remote::git_object_id(
+                    GitObjectKind::Blob,
+                    &body,
+                ));
+                GitObject {
+                    sha1,
+                    kind: GitObjectKind::Blob,
+                    body,
+                }
+            })
+            .collect();
+        let refs: Vec<&GitObject> = objects.iter().collect();
+        assert_eq!(write_pack(&refs).unwrap(), write_pack(&refs).unwrap());
+    }
+
+    fn sha1_hex_to_array(value: &str) -> [u8; 20] {
+        let bytes = hex::decode(value).unwrap();
+        let mut out = [0u8; 20];
+        out.copy_from_slice(&bytes);
+        out
     }
 }

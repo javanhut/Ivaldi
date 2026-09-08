@@ -115,6 +115,7 @@ pub fn run_command(cli: Cli) {
         Commands::Scout(args) => cmd_scout(args),
         Commands::Harvest(args) => cmd_harvest(args, cli.quiet),
         Commands::Sync(args) => cmd_sync(args, cli.quiet),
+        Commands::Tag(args) => cmd_tag(args, cli.verbose > 0, cli.quiet),
         Commands::Review(args) => cmd_review(args, cli.quiet),
         Commands::Tui => cmd_tui(),
         Commands::Serve(args) => cmd_serve(args, cli.quiet),

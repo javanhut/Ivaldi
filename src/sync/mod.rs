@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
+use rayon::prelude::*;
+
 use crate::atomic_io::atomic_write;
 use crate::cas::FileCas;
 use crate::fsmerkle::FsStore;
@@ -127,6 +129,19 @@ impl RemoteFetcher {
     }
 }
 
+/// What a download asks the server for beyond "the branch tip".
+///
+/// Bundled rather than threaded as loose parameters: every download entry
+/// point needs the same pair, and both are requested from the server rather
+/// than filtered afterwards.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FetchOptions {
+    /// Commits of history to keep behind each tip; 0 means all of it.
+    pub depth: usize,
+    /// Also fetch the objects behind `refs/tags/*`.
+    pub include_tags: bool,
+}
+
 /// Result of a download (clone) operation.
 #[derive(Debug)]
 pub struct DownloadResult {
@@ -151,12 +166,17 @@ pub struct RemoteTimelineInfo {
 }
 
 /// Download a repository from GitHub into a local Ivaldi repo.
+///
+/// `depth` truncates history to that many commits behind the branch tip
+/// (0 = full history); the truncation is requested from the server, so a
+/// shallow download transfers a smaller pack rather than discarding one.
 pub fn download(
     client: &GitHubClient,
     owner: &str,
     repo_name: &str,
     target_dir: &Path,
     branch: Option<&str>,
+    options: FetchOptions,
 ) -> Result<DownloadResult, SyncError> {
     download_with_fetch(
         target_dir,
@@ -165,6 +185,8 @@ pub fn download(
         None,
         |branch| {
             SmartHttpClient::new(client.token())
+                .with_depth(options.depth)
+                .with_tags(options.include_tags)
                 .fetch_repo(owner, repo_name, branch)
                 .map_err(SyncError::from)
         },
@@ -183,6 +205,7 @@ pub fn download_url(
     target_dir: &Path,
     token: Option<&str>,
     branch: Option<&str>,
+    options: FetchOptions,
 ) -> Result<DownloadResult, SyncError> {
     let base = base_url.to_string();
     let tok = token.map(str::to_string);
@@ -193,6 +216,8 @@ pub fn download_url(
         Some(base_url),
         move |branch| {
             SmartHttpClient::new(tok.as_deref())
+                .with_depth(options.depth)
+                .with_tags(options.include_tags)
                 .fetch_repo_url(&base, branch)
                 .map_err(SyncError::from)
         },
@@ -207,6 +232,7 @@ pub fn download_ssh(
     target: &crate::ssh_transport::SshTarget,
     target_dir: &Path,
     branch: Option<&str>,
+    options: FetchOptions,
 ) -> Result<DownloadResult, SyncError> {
     let (owner, repo_name) = derive_owner_repo_from_path(&target.repo_path);
     let target_clone = target.clone();
@@ -217,6 +243,8 @@ pub fn download_ssh(
         None,
         move |branch| {
             crate::ssh_transport::SshClient::new(target_clone.clone())
+                .with_depth(options.depth)
+                .with_tags(options.include_tags)
                 .fetch_repo(branch)
                 .map_err(SyncError::from)
         },
@@ -282,8 +310,14 @@ where
             .ok_or_else(|| SyncError::Other(format!("invalid portal '{}/{}'", owner, repo_name)))?;
         // Generic (non-GitHub) clones record their smart-HTTP URL so the portal
         // round-trips the real remote instead of a bogus GitHub owner/repo.
+        // `Portal::parse` on a bare owner/repo always says GitHub, so correct
+        // the platform from the URL too — otherwise `ivaldi portal list` shows
+        // a GitLab clone labelled "github".
         if let Some(url) = remote_url {
             portal = portal.with_base_url(url);
+            if crate::portal::http_host(url).is_some_and(|h| crate::gitlab::is_gitlab_host(&h)) {
+                portal = portal.with_platform(crate::portal::Platform::GitLab);
+            }
         }
         let _ = portal_mgr.add(&portal);
 
@@ -323,6 +357,17 @@ where
             "Downloaded {} files, imported {} commits from {}/{}",
             file_count, import.commits_imported, owner, repo_name
         );
+        if import.tags_imported > 0 {
+            eprintln!("Imported {} tag(s)", import.tags_imported);
+        }
+        // Never let a truncated clone look like a complete one — the oldest
+        // seals here are not the start of the project's history.
+        if !remote.shallow.is_empty() {
+            eprintln!(
+                "Shallow: history truncated at {} seal(s); earlier work was not downloaded",
+                remote.shallow.len()
+            );
+        }
 
         Ok(DownloadResult {
             files_downloaded: file_count,
@@ -531,6 +576,72 @@ fn compute_file_changes(
     (added, modified, deleted)
 }
 
+/// Apply an already-computed clean-workspace delta without rereading and
+/// comparing every unchanged file. Forced sync and crash recovery still use
+/// the full checkout below because they must remove arbitrary untracked state.
+fn checkout_tree_delta_to_workspace(
+    repo: &Repo,
+    store: &FsStore<'_>,
+    timeline: &str,
+    added: &[String],
+    modified: &[String],
+    deleted: &[String],
+) -> Result<(), SyncError> {
+    let head_idx = repo
+        .get_timeline_head(timeline)?
+        .ok_or_else(|| SyncError::Other("no head to checkout".into()))?;
+    let head_leaf = repo
+        .get_leaf(head_idx)?
+        .ok_or_else(|| SyncError::Other("corrupt head leaf".into()))?;
+    let mut files = BTreeMap::new();
+    collect_tree_files(store, head_leaf.tree_root, "", &mut files)?;
+
+    let changed: Vec<&String> = added.iter().chain(modified).collect();
+    changed
+        .par_iter()
+        .map(|path| -> Result<(), SyncError> {
+            let blob_hash = files.get(path.as_str()).ok_or_else(|| {
+                SyncError::Other(format!(
+                    "updated path '{}' is absent from the new tree",
+                    path
+                ))
+            })?;
+            let (_, content) = store.load_blob(*blob_hash)?;
+            let file_path = repo.work_dir.join(path);
+            if let Some(parent) = file_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(file_path, content)?;
+            Ok(())
+        })
+        .collect::<Result<(), SyncError>>()?;
+
+    for path in deleted {
+        let full_path = repo.work_dir.join(path);
+        match fs::remove_file(&full_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let mut dir = full_path.parent();
+        while let Some(d) = dir {
+            if d == repo.work_dir {
+                break;
+            }
+            if fs::read_dir(d)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false)
+            {
+                fs::remove_dir(d)?;
+                dir = d.parent();
+            } else {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Checkout the tip tree of a timeline to the workspace directory.
 ///
 /// Writes all files from the target tree, deletes workspace files that are
@@ -553,25 +664,31 @@ fn checkout_tree_to_workspace(
     let mut files = BTreeMap::new();
     collect_tree_files(store, head_leaf.tree_root, "", &mut files)?;
 
-    // Write / update files from the target tree
-    for (path, blob_hash) in &files {
-        let (_, content) = store.load_blob(*blob_hash)?;
-        let file_path = repo.work_dir.join(path);
+    // Write / update files from the target tree. Parallel because a clone of
+    // a large tree is tens of thousands of independent read-blob/write-file
+    // pairs, and each one is syscall-bound rather than CPU-bound.
+    files
+        .par_iter()
+        .map(|(path, blob_hash)| -> Result<(), SyncError> {
+            let (_, content) = store.load_blob(*blob_hash)?;
+            let file_path = repo.work_dir.join(path);
 
-        let should_write = if file_path.exists() {
-            let existing = fs::read(&file_path)?;
-            existing != content
-        } else {
-            true
-        };
+            let should_write = if file_path.exists() {
+                let existing = fs::read(&file_path)?;
+                existing != content
+            } else {
+                true
+            };
 
-        if should_write {
-            if let Some(parent) = file_path.parent() {
-                fs::create_dir_all(parent).ok();
+            if should_write {
+                if let Some(parent) = file_path.parent() {
+                    fs::create_dir_all(parent).ok();
+                }
+                fs::write(&file_path, &content)?;
             }
-            fs::write(&file_path, &content)?;
-        }
-    }
+            Ok(())
+        })
+        .collect::<Result<(), SyncError>>()?;
 
     // Delete workspace files that are no longer in the target tree
     let ignore_cache = ignore::load_pattern_cache(&repo.work_dir);
@@ -772,6 +889,7 @@ mod tests {
             commits_skipped: 5,
             blobs_downloaded: 200,
             timeline: "main".into(),
+            tags_imported: 2,
         };
         assert_eq!(r.commits_imported, 50);
         assert_eq!(r.timeline, "main");
@@ -903,6 +1021,44 @@ mod tests {
             fs::read_to_string(dir.path().join("doc.txt")).unwrap(),
             "version 2"
         );
+    }
+
+    #[test]
+    fn delta_checkout_applies_only_the_computed_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut original = BTreeMap::new();
+        original.insert("same.txt".into(), b"same".to_vec());
+        original.insert("changed.txt".into(), b"old".to_vec());
+        original.insert("old/deleted.txt".into(), b"gone".to_vec());
+        let (mut repo, cas) = setup_checkout_repo(dir.path(), &original);
+        let store = FsStore::new(&cas);
+        checkout_tree_to_workspace(&repo, &store, "main").unwrap();
+
+        let mut updated = BTreeMap::new();
+        updated.insert("same.txt".into(), b"same".to_vec());
+        updated.insert("changed.txt".into(), b"new".to_vec());
+        updated.insert("new/added.txt".into(), b"added".to_vec());
+        let tree = store.build_tree_from_map(&updated).unwrap();
+        repo.commit(tree, "test-author", "delta").unwrap();
+
+        checkout_tree_delta_to_workspace(
+            &repo,
+            &store,
+            "main",
+            &["new/added.txt".into()],
+            &["changed.txt".into()],
+            &["old/deleted.txt".into()],
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(dir.path().join("same.txt")).unwrap(), b"same");
+        assert_eq!(fs::read(dir.path().join("changed.txt")).unwrap(), b"new");
+        assert_eq!(
+            fs::read(dir.path().join("new/added.txt")).unwrap(),
+            b"added"
+        );
+        assert!(!dir.path().join("old/deleted.txt").exists());
+        assert!(!dir.path().join("old").exists());
     }
 
     #[test]

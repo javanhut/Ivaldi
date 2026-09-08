@@ -93,19 +93,22 @@ response parser trivial.
 
 The Ivaldi → git translation is in `src/git_export.rs`. For each push:
 
-1. Read the server's ref advertisement; collect the SHA-1s it already has.
+1. Read the server's ref advertisement; map its tips into the local DAG and
+   expand them through locally verified ancestors.
 2. Walk back from the local timeline head along `prev_idx + merge_idxs`,
-   collecting every leaf whose mapped git SHA-1 is **not** already
-   server-known. (This is per-server, not global — we don't skip a leaf
+   collecting every leaf whose mapped git SHA-1 is **not** reachable from an
+   advertised tip. (This is per-server, not global — we don't skip a leaf
    just because it was seen on some other portal.)
 3. For each unmapped leaf:
-   - Recursively translate its tree (Ivaldi tree → git tree).
+   - Recursively translate its tree (Ivaldi tree → git tree). Blob/tree bodies
+     reachable from an advertised remote snapshot are omitted, while their
+     cached Git identities are reused to construct new parent trees.
    - Mint git commit canonical bytes from leaf fields. For leaves
      originally imported from git, the `git.committer` /
      `git.committer_time` / `git.author_tz` meta keys carry the original
      identity verbatim, producing SHA-1-identical output.
-4. Pack everything with `src/git_pack_writer.rs` (v2, no deltas — bigger
-   wire payload but minimum new code; deltas can come later).
+4. Compress independent objects in parallel and pack the incremental object
+   set with `src/git_pack_writer.rs` (v2, no deltas).
 
 Convenient invariants from Ivaldi's storage:
 

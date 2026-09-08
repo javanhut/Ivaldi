@@ -105,7 +105,7 @@ macOS, and Windows on both `x86_64` and `arm64`. See
 
 ### From source
 
-Prerequisites: a Rust toolchain (rust 1.89+, edition 2024) — install via
+Prerequisites: a Rust toolchain (rust 1.98+, edition 2024) — install via
 [rustup.rs](https://rustup.rs).
 
 ```bash

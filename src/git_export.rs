@@ -61,6 +61,10 @@ pub struct ExportResult {
     /// Git SHA-1 of the new tip commit (the value `git-receive-pack`
     /// expects on the right-hand side of its update command).
     pub tip_sha1: [u8; 20],
+    /// Seal index → git SHA-1 for every leaf that now has one, whether it was
+    /// translated here or already mapped. Lets a caller name a seal in a ref
+    /// update without re-deriving the translation.
+    pub leaf_to_git: BTreeMap<u64, [u8; 20]>,
 }
 
 /// Translate every commit reachable from `head_idx` along `prev_idx +
@@ -79,6 +83,43 @@ pub fn export_chain(
     known_mapping: &crate::remote::HashMapping,
     server_has_sha1: &BTreeSet<[u8; 20]>,
 ) -> Result<ExportResult, ExportError> {
+    export_roots(repo, &[head_idx], known_mapping, server_has_sha1)
+}
+
+/// Translate the history reachable from several seals at once.
+///
+/// `roots[0]` is the primary — its git SHA-1 becomes `tip_sha1`. Extra roots
+/// exist so a push can carry tags whose targets sit off the branch being
+/// pushed: their commits have to reach the server too, and sharing one
+/// traversal keeps the tree/blob translation caches (and the O(leaves) seed
+/// scan) from being repeated per tag.
+pub fn export_roots(
+    repo: &Repo,
+    roots: &[u64],
+    known_mapping: &crate::remote::HashMapping,
+    server_has_sha1: &BTreeSet<[u8; 20]>,
+) -> Result<ExportResult, ExportError> {
+    export_roots_incremental(repo, roots, known_mapping, server_has_sha1, &[])
+}
+
+/// Translate several seals while omitting filesystem objects known to be
+/// reachable from the remote's advertised tips.
+///
+/// Commit reachability and filesystem-object reachability are deliberately
+/// separate. `server_has_sha1` controls where history traversal stops;
+/// `remote_tree_roots` controls which tree/blob bodies may be left out of the
+/// pack. The latter is conservative: callers pass only locally verified tree
+/// roots for commits the server directly advertised.
+pub(crate) fn export_roots_incremental(
+    repo: &Repo,
+    roots: &[u64],
+    known_mapping: &crate::remote::HashMapping,
+    server_has_sha1: &BTreeSet<[u8; 20]>,
+    remote_tree_roots: &[B3Hash],
+) -> Result<ExportResult, ExportError> {
+    let primary = *roots
+        .first()
+        .ok_or_else(|| ExportError::Other("export needs at least one root".into()))?;
     let cas = FileCas::new(repo.ivaldi_dir.join("objects"))
         .map_err(|e| ExportError::Other(format!("cas: {}", e)))?;
     let store = FsStore::new(&cas);
@@ -86,12 +127,49 @@ pub fn export_chain(
     // Topological order of leaves to translate: deepest-ancestor-first so
     // each leaf's parents already have their git SHA-1s by the time we
     // mint the commit object.
-    let order = collect_topological(repo, head_idx, known_mapping, server_has_sha1)?;
+    let order = collect_topological(repo, roots, known_mapping, server_has_sha1)?;
+
+    // A Git receiver already has every tree/blob reachable from each
+    // advertised commit. Build that set using Ivaldi's Merkle metadata only;
+    // blob bodies are not read. Avoid even this metadata walk for an up-to-date
+    // timeline, where `order` is empty and no pack will be built.
+    let remote_objects = if order.is_empty() {
+        BTreeSet::new()
+    } else {
+        collect_remote_objects(&store, remote_tree_roots)?
+    };
+
+    // A shallow-boundary leaf is a root only because `--depth` told the server
+    // to withhold its ancestry. Exporting one mints a parentless git commit,
+    // so publishing it would replace the remote's real history with a
+    // truncated copy — and `--force` would make that stick. Reaching one here
+    // means the server does NOT already have it (`collect_topological` stops
+    // at commits the server advertised), so this only fires when the push
+    // would actually rewrite history, not when adding work on top of a
+    // shallow clone.
+    for idx in &order {
+        if let Ok(Some(leaf)) = repo.get_leaf(*idx)
+            && leaf.meta.contains_key("git.shallow")
+        {
+            return Err(ExportError::Other(format!(
+                "seal {} came from a shallow download and its ancestry was never fetched — \
+                 pushing it would truncate the remote's history; \
+                 re-download without --depth/--skip-history to push this timeline",
+                leaf.hash().short8()
+            )));
+        }
+    }
 
     // Per-translation state.
     let mut objects: BTreeMap<[u8; 20], GitObject> = BTreeMap::new();
     let mut leaf_to_git: BTreeMap<u64, [u8; 20]> = BTreeMap::new();
     let mut tree_translation_cache: BTreeMap<B3Hash, [u8; 20]> = BTreeMap::new();
+    // Reload independently so identities computed during this export can be
+    // persisted without changing the caller's remote-state snapshot. The map
+    // records deterministic object identity, not proof that any one portal
+    // has the object.
+    let mut identity_mapping = crate::remote::HashMapping::new(&repo.ivaldi_dir);
+    let identity_count_before = identity_mapping.len();
 
     // Seed leaf_to_git with already-mapped ancestors so parent lookups
     // resolve without re-translating.
@@ -104,8 +182,6 @@ pub fn export_chain(
         }
     }
 
-    let mut tip_sha1 = [0u8; 20];
-
     for idx in &order {
         let leaf = repo
             .get_leaf(*idx)
@@ -113,11 +189,13 @@ pub fn export_chain(
             .ok_or_else(|| ExportError::Other(format!("leaf {} vanished", idx)))?;
 
         // Translate the tree first — commit body needs the tree SHA-1.
-        let tree_sha1 = translate_tree(
+        let tree_sha1 = translate_tree_incremental(
             &store,
             leaf.tree_root,
             &mut tree_translation_cache,
             &mut objects,
+            &remote_objects,
+            &mut identity_mapping,
         )?;
 
         // Resolve parent SHA-1s from already-translated map.
@@ -148,10 +226,134 @@ pub fn export_chain(
             },
         );
         leaf_to_git.insert(*idx, sha1);
-        tip_sha1 = sha1;
+        identity_mapping.insert(&hex::encode(sha1), leaf.hash());
     }
 
-    Ok(ExportResult { objects, tip_sha1 })
+    // This cache is an optimization and every entry is reproducible from the
+    // authenticated local object, so a cache-write failure must not turn an
+    // otherwise valid upload into a failure.
+    if identity_mapping.len() != identity_count_before
+        && let Err(e) = identity_mapping.save()
+    {
+        crate::logging::warn(&format!("could not persist Git object identities: {e}"));
+    }
+
+    // Name the primary explicitly rather than trusting traversal order: with
+    // several roots the last translated commit is not necessarily the branch
+    // tip, and a root the server already had is never translated at all.
+    let tip_sha1 = leaf_to_git
+        .get(&primary)
+        .copied()
+        .ok_or_else(|| ExportError::Other(format!("seal {primary} has no git identity to push")))?;
+
+    Ok(ExportResult {
+        objects,
+        tip_sha1,
+        leaf_to_git,
+    })
+}
+
+/// Collect Ivaldi tree/blob hashes reachable from remote-advertised snapshots.
+/// Tree nodes are read, but blob contents are intentionally not materialized.
+fn collect_remote_objects(
+    store: &FsStore<'_>,
+    roots: &[B3Hash],
+) -> Result<BTreeSet<B3Hash>, ExportError> {
+    let mut known = BTreeSet::new();
+    let mut stack = roots.to_vec();
+    while let Some(tree_hash) = stack.pop() {
+        if !known.insert(tree_hash) {
+            continue;
+        }
+        let tree = store
+            .load_tree(tree_hash)
+            .map_err(|e| ExportError::Other(e.to_string()))?;
+        for entry in tree.entries {
+            match entry.kind {
+                NodeKind::Blob => {
+                    known.insert(entry.hash);
+                }
+                NodeKind::Tree => stack.push(entry.hash),
+            }
+        }
+    }
+    Ok(known)
+}
+
+/// One ref `git-receive-pack` should be told to update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefUpdate {
+    /// Full ref name, e.g. `refs/tags/v1.0`.
+    pub name: String,
+    /// What the ref should point at afterwards.
+    pub new_sha1: [u8; 20],
+}
+
+/// Mint the git side of a set of tags, appending any new objects to `objects`.
+///
+/// A lightweight tag's ref points straight at the target commit. An annotated
+/// one needs a tag object, which is minted here byte-for-byte the way git
+/// would — the identity, timestamp and UTC offset all feed its SHA-1, which is
+/// why a downloaded tag round-trips to the same object it arrived as.
+///
+/// Every target must already appear in `leaf_to_git`; callers get that by
+/// passing the tag targets to [`export_roots`] as extra roots.
+pub fn export_tags(
+    tags: &[crate::tags::Tag],
+    leaf_to_git: &BTreeMap<u64, [u8; 20]>,
+    objects: &mut BTreeMap<[u8; 20], GitObject>,
+) -> Result<Vec<RefUpdate>, ExportError> {
+    let mut updates = Vec::with_capacity(tags.len());
+    for tag in tags {
+        let target = leaf_to_git.get(&tag.target_index).copied().ok_or_else(|| {
+            ExportError::Other(format!(
+                "tag '{}' names seal {} which has no git identity to push",
+                tag.name, tag.target_index
+            ))
+        })?;
+
+        let new_sha1 = match tag.kind {
+            crate::tags::TagKind::Lightweight => target,
+            crate::tags::TagKind::Annotated => {
+                let body = mint_git_tag_body(tag, &target);
+                let sha1 = sha1_hex_to_bytes(&git_object_id(GitObjectKind::Tag, &body))
+                    .expect("git_object_id returns 40-hex");
+                objects.insert(
+                    sha1,
+                    GitObject {
+                        sha1,
+                        kind: GitObjectKind::Tag,
+                        body,
+                    },
+                );
+                sha1
+            }
+        };
+        updates.push(RefUpdate {
+            name: format!("refs/tags/{}", tag.name),
+            new_sha1,
+        });
+    }
+    Ok(updates)
+}
+
+/// Canonical git annotated-tag body.
+fn mint_git_tag_body(tag: &crate::tags::Tag, target: &[u8; 20]) -> Vec<u8> {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(s, "object {}", hex::encode(target));
+    let _ = writeln!(s, "type commit");
+    let _ = writeln!(s, "tag {}", tag.name);
+    let _ = writeln!(
+        s,
+        "tagger {} {} {}",
+        tag.tagger.as_deref().unwrap_or("unknown <unknown>"),
+        tag.timestamp.unwrap_or(0),
+        tag.tagger_tz.as_deref().unwrap_or("+0000"),
+    );
+    s.push('\n');
+    s.push_str(tag.message.as_deref().unwrap_or(""));
+    s.into_bytes()
 }
 
 // =====================================================================
@@ -160,7 +362,7 @@ pub fn export_chain(
 
 fn collect_topological(
     repo: &Repo,
-    head_idx: u64,
+    roots: &[u64],
     known_mapping: &crate::remote::HashMapping,
     server_has_sha1: &BTreeSet<[u8; 20]>,
 ) -> Result<Vec<u64>, ExportError> {
@@ -168,7 +370,7 @@ fn collect_topological(
     // ordering produces parent-before-child chronology.
     let mut chain: Vec<u64> = Vec::new();
     let mut visited: BTreeSet<u64> = BTreeSet::new();
-    let mut stack = vec![head_idx];
+    let mut stack: Vec<u64> = roots.to_vec();
     while let Some(idx) = stack.pop() {
         if !visited.insert(idx) {
             continue;
@@ -204,14 +406,27 @@ fn collect_topological(
 // Tree translation (Ivaldi → git)
 // =====================================================================
 
-fn translate_tree(
+fn translate_tree_incremental(
     store: &FsStore<'_>,
     tree_hash: B3Hash,
     cache: &mut BTreeMap<B3Hash, [u8; 20]>,
     objects: &mut BTreeMap<[u8; 20], GitObject>,
+    remote_objects: &BTreeSet<B3Hash>,
+    identity_mapping: &mut crate::remote::HashMapping,
 ) -> Result<[u8; 20], ExportError> {
     if let Some(s) = cache.get(&tree_hash).copied() {
         return Ok(s);
+    }
+    // If this exact Merkle tree belongs to an advertised remote snapshot and
+    // its Git identity was computed by an earlier import/export, neither its
+    // metadata nor any descendant content needs to be read again.
+    if remote_objects.contains(&tree_hash)
+        && let Some(sha1) = identity_mapping
+            .get_sha1(tree_hash)
+            .and_then(sha1_hex_to_bytes)
+    {
+        cache.insert(tree_hash, sha1);
+        return Ok(sha1);
     }
     let tree = store
         .load_tree(tree_hash)
@@ -239,11 +454,19 @@ fn translate_tree(
                     fsmerkle::MODE_SYMLINK => "120000",
                     _ => "100644",
                 };
-                let sha = translate_blob(store, entry.hash, objects)?;
+                let sha =
+                    translate_blob(store, entry.hash, objects, remote_objects, identity_mapping)?;
                 (mode, sha)
             }
             NodeKind::Tree => {
-                let sha = translate_tree(store, entry.hash, cache, objects)?;
+                let sha = translate_tree_incremental(
+                    store,
+                    entry.hash,
+                    cache,
+                    objects,
+                    remote_objects,
+                    identity_mapping,
+                )?;
                 ("40000", sha)
             }
         };
@@ -256,23 +479,54 @@ fn translate_tree(
 
     let sha1 = sha1_hex_to_bytes(git_object_id(GitObjectKind::Tree, &body).as_str())
         .expect("git_object_id always returns 40 hex chars");
-    objects.insert(
-        sha1,
-        GitObject {
+    identity_mapping.insert(&hex::encode(sha1), tree_hash);
+    if !remote_objects.contains(&tree_hash) {
+        objects.insert(
             sha1,
-            kind: GitObjectKind::Tree,
-            body,
-        },
-    );
+            GitObject {
+                sha1,
+                kind: GitObjectKind::Tree,
+                body,
+            },
+        );
+    }
     cache.insert(tree_hash, sha1);
     Ok(sha1)
+}
+
+#[cfg(test)]
+fn translate_tree(
+    store: &FsStore<'_>,
+    tree_hash: B3Hash,
+    cache: &mut BTreeMap<B3Hash, [u8; 20]>,
+    objects: &mut BTreeMap<[u8; 20], GitObject>,
+) -> Result<[u8; 20], ExportError> {
+    let dir = tempfile::tempdir().map_err(|e| ExportError::Other(e.to_string()))?;
+    let mut mapping = crate::remote::HashMapping::new(dir.path());
+    translate_tree_incremental(
+        store,
+        tree_hash,
+        cache,
+        objects,
+        &BTreeSet::new(),
+        &mut mapping,
+    )
 }
 
 fn translate_blob(
     store: &FsStore<'_>,
     blob_hash: B3Hash,
     objects: &mut BTreeMap<[u8; 20], GitObject>,
+    remote_objects: &BTreeSet<B3Hash>,
+    identity_mapping: &mut crate::remote::HashMapping,
 ) -> Result<[u8; 20], ExportError> {
+    if remote_objects.contains(&blob_hash)
+        && let Some(sha1) = identity_mapping
+            .get_sha1(blob_hash)
+            .and_then(sha1_hex_to_bytes)
+    {
+        return Ok(sha1);
+    }
     // `load_blob` returns (BlobNode, raw_content). We want the raw content
     // for the git pack body; the git SHA-1 is over `blob <len>\0<content>`,
     // which is exactly the Ivaldi blob CAS canonical form.
@@ -281,11 +535,14 @@ fn translate_blob(
         .map_err(|e| ExportError::Other(e.to_string()))?;
     let sha1 = sha1_hex_to_bytes(git_object_id(GitObjectKind::Blob, &content).as_str())
         .expect("git_object_id always returns 40 hex chars");
-    objects.entry(sha1).or_insert(GitObject {
-        sha1,
-        kind: GitObjectKind::Blob,
-        body: content,
-    });
+    identity_mapping.insert(&hex::encode(sha1), blob_hash);
+    if !remote_objects.contains(&blob_hash) {
+        objects.entry(sha1).or_insert(GitObject {
+            sha1,
+            kind: GitObjectKind::Blob,
+            body: content,
+        });
+    }
     Ok(sha1)
 }
 
@@ -400,6 +657,83 @@ const _: u64 = NO_PARENT;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minted_annotated_tag_matches_gits_own_object_id() {
+        // Golden value from `git hash-object -t tag` on exactly these bytes
+        // (git 2.54). The SHA-1 covers the identity, timestamp AND offset, so
+        // this pins the whole minting format — a dropped `-0500` or a stray
+        // newline changes the id and the remote sees a different tag.
+        let tag = crate::tags::Tag::annotated(
+            "v1.0",
+            0,
+            "Release notes\n",
+            "Jane Doe <jane@example.com>",
+            1_710_000_000,
+            "-0500",
+        );
+        let target = sha1_hex_to_bytes("1111111111111111111111111111111111111111").unwrap();
+        let body = mint_git_tag_body(&tag, &target);
+        assert_eq!(
+            git_object_id(GitObjectKind::Tag, &body),
+            "4436bda88c6c3c22d95ab3ffd5ad450729d4fac1"
+        );
+    }
+
+    #[test]
+    fn lightweight_tags_point_straight_at_the_commit_and_mint_nothing() {
+        let commit = sha1_hex_to_bytes("2222222222222222222222222222222222222222").unwrap();
+        let leaf_to_git = BTreeMap::from([(4u64, commit)]);
+        let mut objects = BTreeMap::new();
+
+        let updates = export_tags(
+            &[crate::tags::Tag::lightweight("v0.1", 4)],
+            &leaf_to_git,
+            &mut objects,
+        )
+        .unwrap();
+
+        assert!(objects.is_empty(), "a lightweight tag has no object");
+        assert_eq!(
+            updates,
+            vec![RefUpdate {
+                name: "refs/tags/v0.1".into(),
+                new_sha1: commit,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_tag_whose_target_was_not_exported_is_an_error_not_a_bad_ref() {
+        // Pushing `refs/tags/x` at a commit the server never receives would
+        // leave a broken ref, so this must fail loudly rather than guess.
+        let err = export_tags(
+            &[crate::tags::Tag::lightweight("x", 7)],
+            &BTreeMap::new(),
+            &mut BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no git identity"), "{}", err);
+    }
+
+    #[test]
+    fn exporting_a_shallow_boundary_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let mut repo = Repo::open(dir.path()).unwrap();
+
+        let mut leaf = Leaf::new(B3Hash::digest(b"t"), "main", "A <a@x>", 1, "truncated root");
+        leaf.meta.insert("git.shallow".into(), "1".into());
+        let landed = repo.commit_raw(leaf, "main").unwrap();
+
+        let mapping = crate::remote::HashMapping::new(&repo.ivaldi_dir);
+        let err = export_chain(&repo, landed.index, &mapping, &BTreeSet::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("shallow download"),
+            "unexpected error: {}",
+            err
+        );
+    }
 
     #[test]
     fn mint_commit_body_includes_tree_parents_author_committer() {
