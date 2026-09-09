@@ -30,6 +30,7 @@ run = ["cargo fmt --all"]
 
 [commands.install]
 desc = "# Install ivaldi to $(PREFIX)/bin (default: /usr/local/bin)"
+escalate = true
 run = [
   "echo \"Installing {{binary}} to {{bindir}}...\"",
   "install -d {{bindir}}",
@@ -40,7 +41,8 @@ run = [
 dep = ["build"]
 
 [commands.install-only]
-desc = "# Install a pre-built ivaldi to $(PREFIX)/bin (no rebuild; safe under sudo)"
+desc = "# Install a pre-built ivaldi to $(PREFIX)/bin (no rebuild)"
+escalate = true
 run = [
   "echo \"Installing {{binary}} to {{bindir}}...\"",
   "install -d {{bindir}}",
@@ -51,6 +53,7 @@ run = [
 
 [commands.install-extras]
 desc = "# Install man pages and shell completions (bash/zsh/fish)"
+escalate = true
 run = [
   "echo \"Installing man pages to {{prefix}}/share/man/man1...\"",
   "install -d {{prefix}}/share/man/man1",
@@ -68,6 +71,7 @@ dep = ["build"]
 
 [commands.uninstall]
 desc = "# Uninstall ivaldi from $(PREFIX)/bin"
+escalate = true
 run = [
   "echo \"Removing {{bindir}}/{{binary}}...\"",
   "rm -f {{bindir}}/{{binary}}",
@@ -85,9 +89,9 @@ run = [
   "echo \"\"",
   "echo \" make build Build release binary\"",
   "echo \" make test Run all tests\"",
-  "echo \" make install Install to {{bindir}} (may need sudo)\"",
-  "echo \" make install-extras Install man pages and bash/zsh/fish completions (may need sudo)\"",
-  "echo \" make uninstall Remove from {{bindir}} (may need sudo)\"",
+  "echo \" make install Install to {{bindir}}\"",
+  "echo \" make install-extras Install man pages and bash/zsh/fish completions\"",
+  "echo \" make uninstall Remove from {{bindir}}\"",
   "echo \" make clean Clean build artifacts\"",
   "echo \"\"",
   "echo \"Override install location:\"",
