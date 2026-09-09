@@ -142,6 +142,18 @@ impl Store {
         Ok(v)
     }
 
+    /// Read history in index order from one database snapshot.
+    pub fn all_leaves(&self) -> Result<Vec<(u64, Vec<u8>)>, StoreError> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(LEAVES)?;
+        let mut leaves = Vec::new();
+        for entry in t.iter()? {
+            let (index, bytes) = entry?;
+            leaves.push((index.value(), bytes.value().to_vec()));
+        }
+        Ok(leaves)
+    }
+
     // -- Timeline heads --
 
     pub fn set_timeline_head(&self, name: &str, idx: u64) -> Result<(), StoreError> {

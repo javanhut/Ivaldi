@@ -73,8 +73,9 @@ impl Repo {
 
         // Validate the append-only index sequence before rebuilding. A leaf
         // count alone cannot distinguish [0, 1, 2] from [0, 1, 7].
-        let indices = store.all_leaf_indices().map_err(RepoError::Store)?;
-        for (expected, actual) in indices.iter().copied().enumerate() {
+        let history = store.all_leaves().map_err(RepoError::Store)?;
+        for (expected, (actual, _)) in history.iter().enumerate() {
+            let actual = *actual;
             let expected = expected as u64;
             if actual != expected {
                 return Err(RepoError::Integrity(format!(
@@ -83,7 +84,7 @@ impl Repo {
                 )));
             }
         }
-        let actual_size = indices.len() as u64;
+        let actual_size = history.len() as u64;
         for (name, head) in &timeline_heads {
             if *head >= actual_size {
                 return Err(RepoError::Integrity(format!(
@@ -121,13 +122,7 @@ impl Repo {
 
         // Rebuild the in-memory MMR and compare it with the durable root.
         let mut mmr = Mmr::new();
-        for idx in indices {
-            let data = store
-                .get_leaf(idx)
-                .map_err(RepoError::Store)?
-                .ok_or_else(|| {
-                    RepoError::Integrity(format!("MMR leaf {} disappeared during open", idx))
-                })?;
+        for (idx, data) in history {
             let parsed_leaf = leaf::parse_leaf(&data)
                 .map_err(|e| RepoError::Integrity(format!("corrupt leaf {}: {}", idx, e)))?;
             validate_timeline_name(&parsed_leaf.timeline_id).map_err(|e| {
@@ -415,6 +410,11 @@ impl Repo {
             .map_err(RepoError::Store)?;
         self.mmr = next_mmr;
         Ok(results)
+    }
+
+    /// History already validated on open or published by this Repo instance.
+    pub(crate) fn verified_leaves(&self) -> impl Iterator<Item = (u64, &Leaf)> {
+        (0..self.mmr.size()).map(|idx| (idx, self.mmr.get_leaf(idx).expect("contiguous MMR")))
     }
 
     /// Get a leaf by index.

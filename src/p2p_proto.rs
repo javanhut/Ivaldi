@@ -1,4 +1,4 @@
-//! Protobuf wire encoding for the `ivaldi://` protocol (v2).
+//! Protobuf wire encoding for the `ivaldi://` protocol (v3).
 //!
 //! Payloads on the Noise channel are protobuf-encoded [`Envelope`] values,
 //! defined with prost derives — pure Rust, no protoc or build.rs. The field
@@ -12,14 +12,15 @@
 //! both sides exchange `Hello { version, repo }` immediately after the
 //! handshake
 //! and refuse a mismatch explicitly; unknown protobuf fields are ignored by
-//! prost, so additive v2.x changes stay compatible.
+//! prost. Version 3 adds mandatory push inventory negotiation; both peers
+//! must upgrade. The protobuf framing and Noise prologue remain unchanged.
 
 use crate::p2p::{Message, WireBlob, WireLeaf};
 use prost::Message as _;
 
 /// Wire protocol version carried in `Hello`. Bump on breaking changes
 /// (also bump the Noise prologue in `p2p.rs` when the framing itself changes).
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Sentinel for a leaf that arrived without its sender index. Landing such
 /// a leaf fails loudly instead of guessing at its lineage.
@@ -29,7 +30,7 @@ pub const MISSING_SENDER_IDX: u64 = u64::MAX;
 pub struct Envelope {
     #[prost(
         oneof = "envelope::Msg",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15"
     )]
     pub msg: Option<envelope::Msg>,
 }
@@ -63,6 +64,10 @@ pub mod envelope {
         Error(super::ProtocolError),
         #[prost(message, tag = "13")]
         BlobChunk(super::BlobChunk),
+        #[prost(message, tag = "14")]
+        PushInventory(super::PushInventory),
+        #[prost(message, tag = "15")]
+        PushMissing(super::PushMissing),
     }
 }
 
@@ -131,6 +136,22 @@ pub struct Done {
 pub struct PushStart {
     #[prost(string, tag = "1")]
     pub timeline: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct PushInventory {
+    #[prost(message, repeated, tag = "1")]
+    pub leaves: Vec<PbWireLeaf>,
+    #[prost(string, repeated, tag = "2")]
+    pub objects: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct PushMissing {
+    #[prost(uint64, repeated, tag = "1")]
+    pub leaves: Vec<u64>,
+    #[prost(string, repeated, tag = "2")]
+    pub objects: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -224,6 +245,14 @@ pub fn encode(msg: &Message) -> Vec<u8> {
         Message::PushStart { timeline } => M::PushStart(PushStart {
             timeline: timeline.clone(),
         }),
+        Message::PushInventory { leaves, objects } => M::PushInventory(PushInventory {
+            leaves: leaves.iter().map(pb_leaf).collect(),
+            objects: objects.clone(),
+        }),
+        Message::PushMissing { leaves, objects } => M::PushMissing(PushMissing {
+            leaves: leaves.clone(),
+            objects: objects.clone(),
+        }),
         Message::PushBundle { leaves, blobs } => M::PushBundle(pb_bundle(leaves, blobs)),
         Message::PushDone { head_b3_hex } => M::PushDone(Done {
             head_b3_hex: head_b3_hex.clone(),
@@ -280,6 +309,14 @@ pub fn decode(bytes: &[u8]) -> Result<Message, String> {
         },
         M::PushStart(v) => Message::PushStart {
             timeline: v.timeline,
+        },
+        M::PushInventory(v) => Message::PushInventory {
+            leaves: v.leaves.into_iter().map(leaf_from_pb).collect(),
+            objects: v.objects,
+        },
+        M::PushMissing(v) => Message::PushMissing {
+            leaves: v.leaves,
+            objects: v.objects,
         },
         M::PushBundle(v) => Message::PushBundle {
             leaves: v.leaves.into_iter().map(leaf_from_pb).collect(),
@@ -342,6 +379,14 @@ mod tests {
             },
             Message::PushStart {
                 timeline: "main".into(),
+            },
+            Message::PushInventory {
+                leaves: vec![leaf.clone()],
+                objects: vec!["ab".repeat(32)],
+            },
+            Message::PushMissing {
+                leaves: vec![42],
+                objects: vec!["ab".repeat(32)],
             },
             Message::PushBundle {
                 leaves: vec![leaf],

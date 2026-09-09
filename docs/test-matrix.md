@@ -13,6 +13,14 @@ cargo test --locked --all-targets --all-features
 
 The two HAMT scale benchmarks are intentionally ignored by the normal suite;
 their source files document the release-mode commands used to run them.
+`tests/workspace_bench.rs` adds an opt-in release benchmark for filesystem
+status and gather, with and without the working-file hash cache.
+
+Workspace regressions cover timestamp race exclusion, same-size edits with
+restored modification times, corrupt-cache fallback, status-to-gather CAS
+publication, unchanged gathers making zero CAS puts, and selective parent
+tree lookup. Native push tests also require zero object and leaf payloads
+on repeat upload and correct parent remapping for the next incremental seal.
 
 | Guarantee | Executable evidence |
 |---|---|

@@ -569,13 +569,8 @@ fn advertised_remote_state(
     // One store scan avoids an O(refs × leaves) resolve for repositories with
     // many branches/tags.
     let mut leaf_by_hash = std::collections::BTreeMap::new();
-    for idx in 0..repo.commit_count() {
-        if let Some(leaf) = repo
-            .get_leaf(idx)
-            .map_err(|e| GitRemoteError::Io(e.to_string()))?
-        {
-            leaf_by_hash.insert(leaf.hash(), (idx, leaf.tree_root));
-        }
+    for (idx, leaf) in repo.verified_leaves() {
+        leaf_by_hash.insert(leaf.hash(), (idx, leaf.tree_root));
     }
 
     let mut remote_tree_roots = BTreeSet::new();

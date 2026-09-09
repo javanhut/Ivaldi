@@ -80,8 +80,10 @@ impl BlobNode {
 
     /// Compute the BLAKE3 hash of blob canonical bytes.
     pub fn hash_content(content: &[u8]) -> B3Hash {
-        let canonical = Self::canonical_bytes(content);
-        B3Hash::digest(&canonical)
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&Self::header_bytes(content.len()));
+        hasher.update(content);
+        B3Hash::from_bytes(*hasher.finalize().as_bytes())
     }
 }
 

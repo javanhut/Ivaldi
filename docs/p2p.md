@@ -53,12 +53,12 @@ on the server side. The outbound list uses TOFU by default (see below).
             │ (mutual ed25519 auth) │
             │   ChaCha20-Poly1305    │
             ▼                        ▼
-       length-prefixed JSON Message frames
+       length-prefixed protobuf Message frames
 ```
 
 After the handshake, frames are 4-byte big-endian length + AEAD ciphertext.
 Each "logical" message can span multiple Noise transport chunks (the high
-bit of the length prefix marks the last chunk). Payloads are JSON-encoded
+bit of the length prefix marks the last chunk). Payloads are protobuf-encoded
 `Message` enums:
 
 | Direction | Variant | Purpose |
@@ -69,14 +69,24 @@ bit of the length prefix marks the last chunk). Payloads are JSON-encoded
 | S→C | `Bundle { leaves, blobs }` | Chunk of leaves + tree-nodes + blobs (server may send several) |
 | S→C | `Done { head_b3_hex }` | End of stream; carries the tip's BLAKE3 |
 | C→S | `PushStart { timeline }` | Begin a push under the named timeline |
+| C→S | `PushInventory { leaves, objects }` | Offer up to 128 leaves or 1024 object hashes |
+| S→C | `PushMissing { leaves, objects }` | Request only missing leaf indices and object hashes |
 | C→S | `PushBundle { leaves, blobs }` | Chunk of objects to land |
 | C→S | `PushDone { head_b3_hex }` | End of push |
 | S→C | `PushAccepted { landed_as }` | Push wrote to `peers/<sender>/<timeline>` |
 | S→C | `PushRejected { reason }` | Verification failure |
 | S→C | `Error { message }` | Logical (not transport) error |
 
-The Message enum is `#[serde(tag = "kind")]` and additive — new variants
-can be added without breaking existing peers.
+Hello negotiates protocol version 3. Both peers must run this version;
+older peers fail with an explicit version mismatch. The Noise prologue
+remains `ivaldi/2` because the protobuf framing has not changed.
+
+Push inventories establish parent remappings for existing leaves before
+new leaves are sent. Object payloads are sent only when missing on the
+receiver, then new leaves are published in bounded batches. Repeat pushes
+still exchange history metadata and object hashes, but send no existing
+object bodies or duplicate leaf bundles. Authentication, content checks,
+and durable objects-before-history publication apply as before.
 
 ## Server side: `ivaldi serve`
 

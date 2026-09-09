@@ -171,10 +171,21 @@ pub(crate) fn export_roots_incremental(
     let mut identity_mapping = crate::remote::HashMapping::new(&repo.ivaldi_dir);
     let identity_count_before = identity_mapping.len();
 
-    // Seed leaf_to_git with already-mapped ancestors so parent lookups
-    // resolve without re-translating.
-    for idx in 0..repo.commit_count() {
-        if let Ok(Some(leaf)) = repo.get_leaf(idx)
+    // Only roots and parents of outgoing commits need pre-existing identities.
+    // Avoid a second full-history seed scan for a one-commit or no-op push.
+    let mut required: BTreeSet<u64> = roots.iter().copied().collect();
+    for idx in &order {
+        if let Some(leaf) = repo
+            .get_leaf(*idx)
+            .map_err(|e| ExportError::Other(e.to_string()))?
+        {
+            required.extend(leaf.all_parents());
+        }
+    }
+    for idx in required {
+        if let Some(leaf) = repo
+            .get_leaf(idx)
+            .map_err(|e| ExportError::Other(e.to_string()))?
             && let Some(sha_str) = known_mapping.get_sha1(leaf.hash())
             && let Some(b) = sha1_hex_to_bytes(sha_str)
         {
