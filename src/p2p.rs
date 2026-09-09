@@ -227,6 +227,17 @@ pub enum Message {
     /// `PushBundle` / `PushDone` messages target this timeline.
     PushStart { timeline: String },
 
+    /// Bounded inventory, oldest leaves first. Existing leaves establish
+    /// sender-to-local parent mappings without publishing any new history.
+    PushInventory {
+        leaves: Vec<WireLeaf>,
+        objects: Vec<String>,
+    },
+    PushMissing {
+        leaves: Vec<u64>,
+        objects: Vec<String>,
+    },
+
     /// Client → server: a chunk of leaves + objects to land. Multiple
     /// `PushBundle` messages may follow `PushStart` before `PushDone`.
     PushBundle {
@@ -901,6 +912,33 @@ fn serve_push(
             let mut asm = BlobAssembler::default();
             let claimed_head = loop {
                 match chan.recv()? {
+                    Message::PushInventory { leaves, objects } => {
+                        use crate::cas::Cas;
+                        if leaves.len() > 128 || objects.len() > 1024 {
+                            return Err(P2pError::Protocol(
+                                "push inventory exceeds batch limit".into(),
+                            ));
+                        }
+                        let mut missing_leaves = Vec::new();
+                        for wl in leaves {
+                            if !lander.recognize(repo, &wl)? {
+                                missing_leaves.push(wl.sender_idx);
+                            }
+                        }
+                        let mut missing_objects = Vec::new();
+                        for hex in objects {
+                            let hash = B3Hash::from_hex(&hex).ok_or_else(|| {
+                                P2pError::Protocol("invalid inventory object hash".into())
+                            })?;
+                            if !cas.has(hash).map_err(|e| P2pError::Io(e.to_string()))? {
+                                missing_objects.push(hex);
+                            }
+                        }
+                        chan.send(&Message::PushMissing {
+                            leaves: missing_leaves,
+                            objects: missing_objects,
+                        })?;
+                    }
                     Message::BlobChunk {
                         hash_hex,
                         total_len,
@@ -1030,6 +1068,7 @@ fn serve_push(
 /// silently graft the pushed chain onto unrelated local history.
 #[derive(Default)]
 struct LeafLander {
+    known: Option<std::collections::BTreeMap<B3Hash, u64>>,
     /// sender-local index → recipient-local index.
     sender_to_local: std::collections::BTreeMap<u64, u64>,
     /// BLAKE3(wire canonical bytes) hex → recipient-local index. Used to
@@ -1043,6 +1082,48 @@ struct LeafLander {
 }
 
 impl LeafLander {
+    fn known_index(&mut self, repo: &crate::repo::Repo, hash: B3Hash) -> Option<u64> {
+        self.known
+            .get_or_insert_with(|| {
+                let mut known = std::collections::BTreeMap::new();
+                for (idx, leaf) in repo.verified_leaves() {
+                    known.entry(leaf.hash()).or_insert(idx);
+                }
+                known
+            })
+            .get(&hash)
+            .copied()
+    }
+
+    fn recognize(&mut self, repo: &crate::repo::Repo, wl: &WireLeaf) -> Result<bool, P2pError> {
+        if wl.sender_idx == u64::MAX || self.sender_to_local.contains_key(&wl.sender_idx) {
+            return Err(P2pError::Protocol(
+                "invalid or repeated inventory leaf index".into(),
+            ));
+        }
+        let mut leaf = crate::leaf::parse_leaf(&wl.canonical)
+            .map_err(|e| P2pError::Protocol(e.to_string()))?;
+        let wire_hash = B3Hash::digest(&wl.canonical).to_hex();
+        if leaf.has_parent() {
+            let Some(&idx) = self.sender_to_local.get(&leaf.prev_idx) else {
+                return Ok(false);
+            };
+            leaf.prev_idx = idx;
+        }
+        for parent in &mut leaf.merge_idxs {
+            let Some(&idx) = self.sender_to_local.get(parent) else {
+                return Ok(false);
+            };
+            *parent = idx;
+        }
+        if let Some(idx) = self.known_index(repo, leaf.hash()) {
+            self.sender_to_local.insert(wl.sender_idx, idx);
+            self.local_by_wire_hash.insert(wire_hash, idx);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Land one wire leaf on `timeline`: parse, rewrite parents through the
     /// sender→local map, deduplicate against leaves already in the MMR, and
     /// commit. Old-or-new per leaf (single store transaction inside
@@ -1076,17 +1157,8 @@ impl LeafLander {
             .collect::<Result<Vec<_>, _>>()?;
 
         let hash = leaf.hash();
-        let already = repo
-            .get_seal_name(hash)
-            .map_err(|e| P2pError::Protocol(e.to_string()))?
-            .is_some();
-        let local_idx = if already {
-            // ponytail: O(n) scan per duplicate leaf; index hash→idx in the
-            // store if re-pushing huge histories ever gets hot.
-            repo.resolve_seal(&hex::encode(hash.as_bytes()))
-                .map_err(|e| P2pError::Protocol(e.to_string()))?
-                .map(|(idx, _)| idx)
-                .ok_or_else(|| P2pError::Protocol("seal name exists but leaf not found".into()))?
+        let local_idx = if let Some(idx) = self.known_index(repo, hash) {
+            idx
         } else {
             let tree_root = leaf.tree_root;
             let result = repo
@@ -1096,6 +1168,10 @@ impl LeafLander {
             self.leaves_landed += 1;
             result.index
         };
+        self.known
+            .as_mut()
+            .expect("initialized history index")
+            .insert(hash, local_idx);
         self.sender_to_local.insert(wl.sender_idx, local_idx);
         self.local_by_wire_hash.insert(wire_hash, local_idx);
         Ok(())
@@ -1923,12 +1999,66 @@ pub fn push_to(
     // Objects first, then leaves: the server lands each leaf durably as it
     // arrives, so every tree/blob a leaf references must already be present —
     // an interrupted push then always leaves a valid, verifiable prefix.
+    let mut needed_leaves = BTreeSet::new();
+    for batch in wire_leaves.chunks(128) {
+        chan.send(&Message::PushInventory {
+            leaves: batch.to_vec(),
+            objects: Vec::new(),
+        })?;
+        match chan.recv()? {
+            Message::PushMissing { leaves, objects } if objects.is_empty() => {
+                for idx in leaves {
+                    if !batch.iter().any(|leaf| leaf.sender_idx == idx) {
+                        return Err(P2pError::Protocol(
+                            "peer requested an unoffered leaf".into(),
+                        ));
+                    }
+                    needed_leaves.insert(idx);
+                }
+            }
+            other => {
+                return Err(P2pError::Protocol(format!(
+                    "expected push inventory reply, got {other:?}"
+                )));
+            }
+        }
+    }
+    let hashes: Vec<_> = object_hashes.iter().copied().collect();
+    let mut missing_objects = BTreeSet::new();
+    for batch in hashes.chunks(1024) {
+        chan.send(&Message::PushInventory {
+            leaves: Vec::new(),
+            objects: batch.iter().map(|h| h.to_hex()).collect(),
+        })?;
+        match chan.recv()? {
+            Message::PushMissing { leaves, objects } if leaves.is_empty() => {
+                for hex in objects {
+                    let hash = B3Hash::from_hex(&hex)
+                        .ok_or_else(|| P2pError::Protocol("invalid requested hash".into()))?;
+                    if !batch.contains(&hash) {
+                        return Err(P2pError::Protocol(
+                            "peer requested an unoffered object".into(),
+                        ));
+                    }
+                    missing_objects.insert(hash);
+                }
+            }
+            other => {
+                return Err(P2pError::Protocol(format!(
+                    "expected push inventory reply, got {other:?}"
+                )));
+            }
+        }
+    }
+    let objects_sent = send_objects(&mut chan, &cas, &missing_objects, true)?;
+    wire_leaves.retain(|wl| needed_leaves.contains(&wl.sender_idx));
     let leaves_sent = wire_leaves.len();
-    let objects_sent = send_objects(&mut chan, &cas, &object_hashes, true)?;
-    chan.send(&Message::PushBundle {
-        leaves: wire_leaves,
-        blobs: Vec::new(),
-    })?;
+    for batch in wire_leaves.chunks(128) {
+        chan.send(&Message::PushBundle {
+            leaves: batch.to_vec(),
+            blobs: Vec::new(),
+        })?;
+    }
 
     chan.send(&Message::PushDone { head_b3_hex })?;
 
@@ -2564,7 +2694,24 @@ mod tests {
         let summary2 =
             with_isolated_known_peers(|| push_once(&bob_id)).expect("re-push should succeed");
         assert_eq!(summary2.landed_as, "peers/bob/main");
+        assert_eq!(summary2.leaves_sent, 0);
+        assert_eq!(summary2.objects_sent, 0);
         check(4);
+        // New work above the negotiated boundary keeps remapped parents and
+        // sends only the new blob and tree, not either historical snapshot.
+        let next_tree = seal_file(bob_dir.path(), "bob3.txt", b"b3");
+        let delta = with_isolated_known_peers(|| push_once(&bob_id)).unwrap();
+        assert_eq!(delta.leaves_sent, 1);
+        assert_eq!(delta.objects_sent, 2);
+        let receiver = alice_repo_arc.lock().unwrap();
+        let head = receiver
+            .get_timeline_head("peers/bob/main")
+            .unwrap()
+            .unwrap();
+        let leaf = receiver.get_leaf(head).unwrap().unwrap();
+        assert_eq!(receiver.commit_count(), 5);
+        assert_eq!(leaf.prev_idx, 3);
+        assert_eq!(leaf.tree_root, next_tree);
         // (No verify --full here: the serve thread keeps Alice's redb handle
         // open for the process lifetime, and redb is single-open per file.)
     }

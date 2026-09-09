@@ -6,8 +6,11 @@
 //! - Workspace materialization (applying tree state to disk)
 //! - File state tracking (untracked, modified, staged, ignored)
 
+use crate::workspace_cache::{FileCache, Stamp};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::cas::{Cas, CasError};
@@ -168,6 +171,43 @@ impl StagingArea {
     }
 }
 
+struct PreparedFile {
+    hash: B3Hash,
+    before: Option<Stamp>,
+    after: Option<Stamp>,
+    observed: Option<u64>,
+}
+
+fn prepare_file(
+    cas: &dyn Cas,
+    path: &Path,
+    before: Option<Stamp>,
+    cached: Option<B3Hash>,
+) -> Result<PreparedFile, WorkspaceError> {
+    if let Some(hash) = cached
+        && cas.has(hash)?
+    {
+        return Ok(PreparedFile {
+            hash,
+            before,
+            after: None,
+            observed: None,
+        });
+    }
+    let observed = FileCache::now();
+    let content = fs::read(path)?;
+    let hash = BlobNode::hash_content(&content);
+    if !cas.has(hash)? {
+        cas.put(hash, &BlobNode::canonical_bytes(&content))?;
+    }
+    Ok(PreparedFile {
+        hash,
+        before,
+        after: Stamp::read(path),
+        observed: Some(observed),
+    })
+}
+
 /// Workspace scanner and manager.
 pub struct Workspace<'a> {
     cas: &'a dyn Cas,
@@ -175,6 +215,7 @@ pub struct Workspace<'a> {
     ivaldi_dir: PathBuf,
     pub staging: StagingArea,
     pub skipped: SkipSet,
+    file_cache: RefCell<FileCache>,
 }
 
 impl<'a> Workspace<'a> {
@@ -186,16 +227,27 @@ impl<'a> Workspace<'a> {
             ivaldi_dir: ivaldi_dir.clone(),
             staging: StagingArea::load(&ivaldi_dir),
             skipped: SkipSet::load(&ivaldi_dir),
+            file_cache: RefCell::new(FileCache::load(&ivaldi_dir)),
         }
     }
 
     /// Scan the working directory and return all file paths (relative),
     /// respecting ignore patterns. Skips `.ivaldi/` directory.
     pub fn scan(&self, ignore: &PatternCache) -> Result<Vec<String>, WorkspaceError> {
+        self.scan_with_dotfiles(ignore).map(|(files, _)| files)
+    }
+
+    /// One directory walk supplies gather candidates and hidden-file reporting.
+    pub fn scan_with_dotfiles(
+        &self,
+        ignore: &PatternCache,
+    ) -> Result<(Vec<String>, Vec<String>), WorkspaceError> {
         let mut files = Vec::new();
-        self.scan_dir(&self.work_dir, "", ignore, &mut files)?;
+        let mut dotfiles = Vec::new();
+        self.scan_dir(&self.work_dir, "", ignore, &mut files, &mut dotfiles)?;
         files.sort();
-        Ok(files)
+        dotfiles.sort();
+        Ok((files, dotfiles))
     }
 
     fn scan_dir(
@@ -204,6 +256,7 @@ impl<'a> Workspace<'a> {
         prefix: &str,
         ignore: &PatternCache,
         files: &mut Vec<String>,
+        dotfiles: &mut Vec<String>,
     ) -> Result<(), WorkspaceError> {
         let entries = fs::read_dir(dir).map_err(WorkspaceError::Io)?;
 
@@ -228,9 +281,17 @@ impl<'a> Workspace<'a> {
                 if ignore.is_dir_ignored(&rel_path) {
                     continue;
                 }
-                self.scan_dir(&entry.path(), &rel_path, ignore, files)?;
-            } else if file_type.is_file() && !ignore.is_ignored(&rel_path) {
-                files.push(rel_path);
+                self.scan_dir(&entry.path(), &rel_path, ignore, files, dotfiles)?;
+            } else if file_type.is_file() {
+                if name.starts_with('.')
+                    && name != ".ivaldiignore"
+                    && !crate::ignore::is_security_blocked(&rel_path)
+                {
+                    dotfiles.push(rel_path.clone());
+                }
+                if !ignore.is_ignored(&rel_path) {
+                    files.push(rel_path);
+                }
             }
         }
 
@@ -281,9 +342,11 @@ impl<'a> Workspace<'a> {
             }
 
             let full_path = self.work_dir.join(path);
-            if !full_path.exists() {
-                continue;
-            }
+            let metadata = match fs::metadata(&full_path) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(WorkspaceError::Io(e)),
+            };
 
             // Dotfiles and dot-directories need explicit confirmation unless
             // already allowed. The trailing slash a user may type on a
@@ -304,23 +367,22 @@ impl<'a> Workspace<'a> {
             // Directory arguments expand into the (non-ignored) files beneath
             // them, mirroring `gather .`. Without this, the fs::read in
             // stage_path would fail with "Is a directory (os error 21)".
-            if full_path.is_dir() {
+            if metadata.is_dir() {
                 let cache = &*ignore
                     .get_or_insert_with(|| crate::ignore::load_pattern_cache(&self.work_dir));
                 for rel in self.expand_dir(path, cache)? {
                     if self.skipped.covers(&rel) {
                         continue;
                     }
-                    self.stage_path(&rel, on)?;
                     gathered.push(rel);
                 }
                 continue;
             }
 
-            self.stage_path(path, on)?;
             gathered.push(path.to_string());
         }
 
+        self.stage_paths(&gathered, on)?;
         Ok(GatherResult {
             gathered,
             needs_confirmation,
@@ -342,24 +404,80 @@ impl<'a> Workspace<'a> {
             return Ok(Vec::new());
         }
         let mut files = Vec::new();
-        self.scan_dir(&self.work_dir.join(rel_dir), rel_dir, cache, &mut files)?;
+        self.scan_dir(
+            &self.work_dir.join(rel_dir),
+            rel_dir,
+            cache,
+            &mut files,
+            &mut Vec::new(),
+        )?;
         files.sort();
         Ok(files)
     }
 
-    /// Read a single file at workspace-relative `rel`, store its canonical
-    /// blob in the CAS, and record it in the staging area. `on` is invoked
-    /// with `rel` right after the blob is stored (drives progress bars).
+    /// Prepare at most eight small files concurrently, bounded by a 16 MiB
+    /// input-size budget per batch. Oversized files run alone. Publish staging
+    /// entries and progress in input order only after object writes complete.
+    fn stage_paths(
+        &mut self,
+        paths: &[String],
+        on: &mut dyn FnMut(&str),
+    ) -> Result<(), WorkspaceError> {
+        use rayon::prelude::*;
+        let mut offset = 0;
+        while offset < paths.len() {
+            let mut jobs = Vec::new();
+            let mut bytes = 0u64;
+            while offset + jobs.len() < paths.len() && jobs.len() < 8 {
+                let rel = &paths[offset + jobs.len()];
+                let full_path = self.work_dir.join(rel);
+                let before = Stamp::read(&full_path);
+                let size = match &before {
+                    Some(stamp) => stamp.size(),
+                    None => fs::metadata(&full_path).map_err(WorkspaceError::Io)?.len(),
+                };
+                if !jobs.is_empty() && bytes.saturating_add(size) > 16 * 1024 * 1024 {
+                    break;
+                }
+                bytes = bytes.saturating_add(size);
+                let cached = self.file_cache.borrow().lookup(rel, &before);
+                jobs.push((full_path, before, cached));
+            }
+            let cas = self.cas;
+            let prepare = |(path, before, cached): &(PathBuf, Option<Stamp>, Option<B3Hash>)| {
+                prepare_file(cas, path, before.clone(), *cached)
+            };
+            // Cache hits are cheap metadata work; avoid waking the pool for
+            // the common unchanged-workspace case.
+            let prepared: Vec<_> = if jobs.len() == 1 || jobs.iter().all(|job| job.2.is_some()) {
+                jobs.iter().map(prepare).collect()
+            } else {
+                jobs.par_iter().map(prepare).collect()
+            };
+            for (rel, result) in paths[offset..offset + jobs.len()].iter().zip(prepared) {
+                self.stage_prepared(rel, result?, on);
+            }
+            offset += jobs.len();
+        }
+        Ok(())
+    }
+
+    fn stage_prepared(&mut self, rel: &str, file: PreparedFile, on: &mut dyn FnMut(&str)) {
+        if let Some(observed) = file.observed {
+            self.file_cache
+                .borrow_mut()
+                .record(rel, file.before, file.after, file.hash, observed);
+        }
+        on(rel);
+        self.staging.stage(rel, file.hash);
+    }
+
     fn stage_path(&mut self, rel: &str, on: &mut dyn FnMut(&str)) -> Result<(), WorkspaceError> {
         let full_path = self.work_dir.join(rel);
-        let content = fs::read(&full_path).map_err(WorkspaceError::Io)?;
-        let canonical = BlobNode::canonical_bytes(&content);
-        let hash = B3Hash::digest(&canonical);
-        self.cas
-            .put(hash, &canonical)
-            .map_err(WorkspaceError::Cas)?;
-        on(rel);
-        self.staging.stage(rel, hash);
+        let before = Stamp::read(&full_path);
+        let cached = self.file_cache.borrow().lookup(rel, &before);
+        let prepared = prepare_file(self.cas, &full_path, before, cached)?;
+        self.stage_prepared(rel, prepared, on);
         Ok(())
     }
 
@@ -380,13 +498,15 @@ impl<'a> Workspace<'a> {
             }
 
             let full_path = self.work_dir.join(path);
-            if !full_path.exists() {
-                continue;
-            }
+            let metadata = match fs::metadata(&full_path) {
+                Ok(meta) => meta,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(WorkspaceError::Io(e)),
+            };
 
             // A confirmed directory (e.g. a dot-directory the user approved at
             // the prompt) expands the same way as in `gather_with_progress`.
-            if full_path.is_dir() {
+            if metadata.is_dir() {
                 let cache = &*ignore
                     .get_or_insert_with(|| crate::ignore::load_pattern_cache(&self.work_dir));
                 for rel in self.expand_dir(path, cache)? {
@@ -420,83 +540,34 @@ impl<'a> Workspace<'a> {
         ignore: &PatternCache,
         on: &mut dyn FnMut(&str),
     ) -> Result<GatherResult, WorkspaceError> {
-        let files: Vec<String> = self
-            .scan(ignore)?
-            .into_iter()
-            .filter(|path| !self.skipped.covers(path))
-            .collect();
-        // scan() already excludes dotfiles via is_ignored(), so no allowlist needed
+        let (files, dotfiles) = self.scan_with_dotfiles(ignore)?;
+        self.gather_scanned_with_progress(&files, dotfiles, on)
+    }
+
+    /// Reuse the CLI's scan for staging, deletion detection and progress.
+    pub fn gather_scanned_with_progress(
+        &mut self,
+        files: &[String],
+        dotfiles: Vec<String>,
+        on: &mut dyn FnMut(&str),
+    ) -> Result<GatherResult, WorkspaceError> {
         let allowlist = DotfileAllowlist::load(&self.ivaldi_dir);
-        let result = self.gather_with_progress(
-            &files.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-            &allowlist,
-            on,
-        )?;
-
-        // Discover dotfiles that were skipped so the caller can report them
-        let skipped_dotfiles = self.find_dotfiles(ignore)?;
-
+        let paths: Vec<&str> = files
+            .iter()
+            .filter(|p| !self.skipped.covers(p))
+            .map(String::as_str)
+            .collect();
+        let result = self.gather_with_progress(&paths, &allowlist, on)?;
         Ok(GatherResult {
             gathered: result.gathered,
-            needs_confirmation: skipped_dotfiles,
+            needs_confirmation: dotfiles,
             skipped: result.skipped,
         })
     }
 
-    /// Walk the workspace and return dotfile paths that exist on disk but were
-    /// excluded from `scan()`. Skips `.ivaldi/`, `.ivaldiignore`, security-blocked
-    /// files, and ignored directories.
     pub fn find_dotfiles(&self, ignore: &PatternCache) -> Result<Vec<String>, WorkspaceError> {
-        let mut dotfiles = Vec::new();
-        self.find_dotfiles_in(&self.work_dir, "", ignore, &mut dotfiles)?;
-        dotfiles.sort();
-        Ok(dotfiles)
-    }
-
-    fn find_dotfiles_in(
-        &self,
-        dir: &Path,
-        prefix: &str,
-        ignore: &PatternCache,
-        dotfiles: &mut Vec<String>,
-    ) -> Result<(), WorkspaceError> {
-        let entries = fs::read_dir(dir).map_err(WorkspaceError::Io)?;
-
-        for entry in entries {
-            let entry = entry.map_err(WorkspaceError::Io)?;
-            let name = entry.file_name().to_string_lossy().to_string();
-
-            let rel_path = if prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{}/{}", prefix, name)
-            };
-
-            // Skip .ivaldi directory
-            if rel_path == ".ivaldi" || rel_path.starts_with(".ivaldi/") {
-                continue;
-            }
-
-            let file_type = entry.file_type().map_err(WorkspaceError::Io)?;
-
-            if file_type.is_dir() {
-                if ignore.is_dir_ignored(&rel_path) {
-                    continue;
-                }
-                self.find_dotfiles_in(&entry.path(), &rel_path, ignore, dotfiles)?;
-            } else if file_type.is_file() {
-                let basename = name.as_str();
-                // Only collect dotfiles that aren't .ivaldiignore and aren't security-blocked
-                if basename.starts_with('.')
-                    && basename != ".ivaldiignore"
-                    && !crate::ignore::is_security_blocked(&rel_path)
-                {
-                    dotfiles.push(rel_path);
-                }
-            }
-        }
-
-        Ok(())
+        self.scan_with_dotfiles(ignore)
+            .map(|(_, dotfiles)| dotfiles)
     }
 
     /// Build a tree from currently staged files and return the root hash.
@@ -566,6 +637,47 @@ impl<'a> Workspace<'a> {
     }
 
     /// Public accessor for the working directory root.
+    pub fn list_tree_files_matching(
+        &self,
+        tree_hash: B3Hash,
+        paths: &[String],
+    ) -> Result<BTreeMap<String, B3Hash>, WorkspaceError> {
+        let store = FsStore::new(self.cas);
+        let mut files = BTreeMap::new();
+        for path in paths {
+            let parts: Vec<_> = path
+                .split('/')
+                .filter(|s| !s.is_empty() && *s != ".")
+                .collect();
+            if parts.is_empty() || parts.contains(&"..") {
+                return self.list_tree_files(tree_hash);
+            }
+            let mut root = tree_hash;
+            for (i, part) in parts.iter().enumerate() {
+                if root == B3Hash::ZERO {
+                    break;
+                }
+                let tree = store.load_tree(root).map_err(WorkspaceError::FsMerkle)?;
+                let Some(entry) = tree.entries.iter().find(|entry| entry.name == *part) else {
+                    break;
+                };
+                if i + 1 == parts.len() {
+                    if entry.kind == NodeKind::Tree {
+                        self.collect_tree_files(&store, entry.hash, &parts.join("/"), &mut files)?;
+                    } else {
+                        files.insert(path.clone(), entry.hash);
+                    }
+                } else if entry.kind == NodeKind::Tree {
+                    root = entry.hash;
+                } else {
+                    break;
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    /// Public accessor for the working directory root.
     pub fn work_dir(&self) -> &Path {
         &self.work_dir
     }
@@ -597,9 +709,7 @@ impl<'a> Workspace<'a> {
 
         // Check each file on disk
         for path in &disk_files {
-            let full_path = self.work_dir.join(path);
-            let content = fs::read(&full_path).map_err(WorkspaceError::Io)?;
-            let current_hash = BlobNode::hash_content(&content);
+            let current_hash = self.hash_working_file(path)?;
 
             let state = if self.staging.is_staged(path) {
                 FileState::Staged
@@ -633,8 +743,49 @@ impl<'a> Workspace<'a> {
             }
         }
 
+        self.file_cache.borrow_mut().save(&self.ivaldi_dir);
         result.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(result)
+    }
+
+    /// Hash with bounded memory; repeated status/gather share the stat cache.
+    fn hash_working_file(&self, path: &str) -> Result<B3Hash, WorkspaceError> {
+        let full_path = self.work_dir.join(path);
+        let before = Stamp::read(&full_path);
+        if let Some(hash) = self.file_cache.borrow().lookup(path, &before) {
+            return Ok(hash);
+        }
+        let observed = FileCache::now();
+        let mut file = fs::File::open(&full_path).map_err(WorkspaceError::Io)?;
+        let size = file.metadata().map_err(WorkspaceError::Io)?.len();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(format!("blob {}\0", size).as_bytes());
+        let mut buffer = [0u8; 64 * 1024];
+        let mut read = 0u64;
+        loop {
+            let n = file.read(&mut buffer).map_err(WorkspaceError::Io)?;
+            if n == 0 {
+                break;
+            }
+            read += n as u64;
+            hasher.update(&buffer[..n]);
+        }
+        if read != size {
+            return Err(WorkspaceError::Io(std::io::Error::other(format!(
+                "file changed while hashing: {path}"
+            ))));
+        }
+        let hash = B3Hash::from_bytes(*hasher.finalize().as_bytes());
+        let after = Stamp::read(&full_path);
+        if before != after {
+            return Err(WorkspaceError::Io(std::io::Error::other(format!(
+                "file changed while hashing: {path}"
+            ))));
+        }
+        self.file_cache
+            .borrow_mut()
+            .record(path, before, after, hash, observed);
+        Ok(hash)
     }
 
     /// Materialize a tree hash to the working directory.
@@ -819,6 +970,7 @@ impl<'a> Workspace<'a> {
 
     /// Save workspace state to disk.
     pub fn save(&self) -> Result<(), WorkspaceError> {
+        self.file_cache.borrow_mut().save(&self.ivaldi_dir);
         self.staging
             .save(&self.ivaldi_dir)
             .map_err(WorkspaceError::Io)
@@ -1056,6 +1208,118 @@ mod tests {
 
     fn empty_allowlist(dir: &tempfile::TempDir) -> DotfileAllowlist {
         DotfileAllowlist::load(&dir.path().join(".ivaldi"))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cache_reuses_stable_hash_but_detects_restored_timestamp_edit() {
+        let (dir, cas) = setup_workspace();
+        let path = dir.path().join("file");
+        fs::write(&path, b"old").unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        // Settle both mtime and ctime beyond the cache's conservative window.
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        let meta = dir.path().join(".ivaldi");
+        let ws = Workspace::new(&cas, dir.path(), &meta);
+        let ignore = PatternCache::new(&[]);
+        assert_eq!(
+            ws.status(None, &ignore).unwrap()[0].hash,
+            Some(BlobNode::hash_content(b"old"))
+        );
+        let cache_path = meta.join("workspace-cache-v1");
+        let cache_modified = fs::metadata(&cache_path).unwrap().modified().unwrap();
+        let mut ws = Workspace::new(&cas, dir.path(), &meta);
+        ws.status(None, &ignore).unwrap();
+        assert_eq!(
+            fs::metadata(&cache_path).unwrap().modified().unwrap(),
+            cache_modified
+        );
+        // Status did not store a blob: gather must still create the CAS object.
+        ws.gather(&["file"], &empty_allowlist(&dir)).unwrap();
+        assert!(cas.has(BlobNode::hash_content(b"old")).unwrap());
+        fs::write(&path, b"new").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(
+            ws.status(None, &ignore).unwrap()[0].hash,
+            Some(BlobNode::hash_content(b"new"))
+        );
+        ws.gather(&["file"], &empty_allowlist(&dir)).unwrap();
+        assert_eq!(
+            ws.staging.staged_files()["file"],
+            BlobNode::hash_content(b"new")
+        );
+    }
+
+    #[test]
+    fn explicit_parent_lookup_only_loads_requested_subtrees() {
+        let (dir, cas) = setup_workspace();
+        let store = FsStore::new(&cas);
+        let (wanted, _) = store.put_blob(b"wanted").unwrap();
+        let root = store
+            .put_tree(vec![
+                Entry {
+                    name: "wanted".into(),
+                    mode: MODE_FILE,
+                    kind: NodeKind::Blob,
+                    hash: wanted,
+                },
+                // Deliberately absent subtree: unrelated paths need not be opened.
+                Entry {
+                    name: "unrelated".into(),
+                    mode: MODE_DIR,
+                    kind: NodeKind::Tree,
+                    hash: B3Hash::digest(b"absent"),
+                },
+            ])
+            .unwrap();
+        let ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        let files = ws
+            .list_tree_files_matching(root, &["wanted".into()])
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files["wanted"], wanted);
+    }
+
+    #[test]
+    fn repeat_gather_performs_no_cas_puts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CountedCas {
+            inner: MemoryCas,
+            puts: AtomicUsize,
+        }
+        impl Cas for CountedCas {
+            fn put(&self, hash: B3Hash, bytes: &[u8]) -> Result<(), CasError> {
+                self.puts.fetch_add(1, Ordering::Relaxed);
+                self.inner.put(hash, bytes)
+            }
+            fn get(&self, hash: B3Hash) -> Result<Vec<u8>, CasError> {
+                self.inner.get(hash)
+            }
+            fn has(&self, hash: B3Hash) -> Result<bool, CasError> {
+                self.inner.has(hash)
+            }
+        }
+        let (dir, inner) = setup_workspace();
+        let cas = CountedCas {
+            inner,
+            puts: AtomicUsize::new(0),
+        };
+        for i in 0..20 {
+            fs::write(dir.path().join(format!("f{i}")), format!("contents {i}")).unwrap();
+        }
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        let ignore = PatternCache::new(&[]);
+        ws.gather_all(&ignore).unwrap();
+        assert_eq!(cas.puts.swap(0, Ordering::Relaxed), 20);
+        let original = ws.staging.staged_files().clone();
+        ws.gather_all(&ignore).unwrap();
+        assert_eq!(cas.puts.load(Ordering::Relaxed), 0);
+        assert_eq!(ws.staging.staged_files(), &original);
     }
 
     #[test]

@@ -49,6 +49,9 @@ pub(super) fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
             .and_then(|idx| repo.get_leaf(idx).ok().flatten())
             .map(|l| l.tree_root)
         {
+            Some(root) if !args.files.is_empty() && args.files != ["."] && !args.patch => ws
+                .list_tree_files_matching(root, &args.files)
+                .map_err(|e| e.to_string())?,
             Some(root) => ws.list_tree_files(root).map_err(|e| e.to_string())?,
             None => std::collections::BTreeMap::new(),
         }
@@ -81,11 +84,10 @@ pub(super) fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
         // Scan first (under a spinner) so we know how many files are about to
         // be hashed; the same listing also drives deletion detection below.
         let scan_spinner = (!quiet).then(|| crate::progress::spinner("Scanning workspace..."));
-        let on_disk: std::collections::BTreeSet<String> = ws
-            .scan(&ignore_cache)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .collect();
+        let (files, dotfiles) = ws
+            .scan_with_dotfiles(&ignore_cache)
+            .map_err(|e| e.to_string())?;
+        let on_disk: std::collections::BTreeSet<&str> = files.iter().map(String::as_str).collect();
         if let Some(sp) = scan_spinner {
             sp.finish_and_clear();
         }
@@ -93,7 +95,7 @@ pub(super) fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
         let bar = (!quiet && on_disk.len() > 1)
             .then(|| crate::progress::file_bar(on_disk.len() as u64, "Gathering"));
         let result = ws
-            .gather_all_with_progress(&ignore_cache, &mut |_path| {
+            .gather_scanned_with_progress(&files, dotfiles, &mut |_path| {
                 if let Some(b) = &bar {
                     b.inc(1);
                 }
