@@ -62,26 +62,37 @@ mod editor_message {
     }
 
     #[test]
-    fn editor_prefers_visual_then_editor_then_vim() {
+    fn editor_prefers_config_then_visual_then_editor_then_vim() {
         // SAFETY: single-threaded test; we restore the env afterward.
         let saved_visual = std::env::var_os("VISUAL");
         let saved_editor = std::env::var_os("EDITOR");
+
+        let mut cfg = Config::new();
 
         unsafe {
             std::env::remove_var("VISUAL");
             std::env::remove_var("EDITOR");
         }
-        assert_eq!(resolve_editor(), "vim");
+        assert_eq!(resolve_editor(&cfg), "vim");
 
         unsafe { std::env::set_var("EDITOR", "nano") };
-        assert_eq!(resolve_editor(), "nano");
+        assert_eq!(resolve_editor(&cfg), "nano");
 
         unsafe { std::env::set_var("VISUAL", "code --wait") };
-        assert_eq!(resolve_editor(), "code --wait");
+        assert_eq!(resolve_editor(&cfg), "code --wait");
 
         // Whitespace-only values are ignored in favor of the next source.
         unsafe { std::env::set_var("VISUAL", "  ") };
-        assert_eq!(resolve_editor(), "nano");
+        assert_eq!(resolve_editor(&cfg), "nano");
+
+        // core.editor in config wins over both env vars.
+        unsafe { std::env::set_var("VISUAL", "code --wait") };
+        cfg.set("core.editor", "hx");
+        assert_eq!(resolve_editor(&cfg), "hx");
+
+        // ...unless it is blank, in which case the env chain applies.
+        cfg.set("core.editor", "  ");
+        assert_eq!(resolve_editor(&cfg), "code --wait");
 
         unsafe {
             match saved_visual {

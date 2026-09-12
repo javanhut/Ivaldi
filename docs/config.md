@@ -18,10 +18,11 @@ These are the keys ivaldi reads (also shown by `ivaldi config --help`):
 | `user.email` | Author email recorded alongside the name | `name@domain.tld` |
 | `color.ui` | Colored CLI output | `true` / `false` |
 | `core.autoshelf` | Auto-shelve uncommitted changes on timeline switch | `true` / `false` |
+| `core.editor` | Editor launched by `ivaldi seal` when no `-m` is given | command line, e.g. `nano` or `code --wait` |
 | `portal.default` | Default remote for upload/sync with several portals | repo spec (`owner/repo` or URL) |
 
-`--set` validates values per key (bad emails, non-boolean toggles, and
-malformed repo specs are rejected). Keys must use the `section.field`
+`--set` validates values per key (bad emails, non-boolean toggles, empty
+editor commands, and malformed repo specs are rejected). Keys must use the `section.field`
 form — a dotless key is an error. Unknown dotted keys are saved with a
 warning, so forward-compatible/custom keys still work.
 
@@ -39,6 +40,7 @@ INI-style with sections:
 
 [core]
     autoshelf = true
+    editor = code --wait
 
 [portal]
     default = owner/repo
@@ -104,6 +106,7 @@ Invoking `ivaldi config` (or its alias `ivaldi configure`) without
 │                                            │
 │  Core                                      │
 │     autoshelf        (●) true  ( ) false   │
+│     editor           [code --wait      ]   │
 │                                            │
 │  Remote                                    │
 │     portal.default   [owner/repo       ]   │
@@ -184,4 +187,17 @@ let path = global_config_path();
 | `user.email` | string | Required to create seals |
 | `color.ui` | bool | |
 | `core.autoshelf` | bool | |
+| `core.editor` | string | Seal-message editor; beats `$VISUAL` and `$EDITOR`, falls back to `vim` |
 | `portal.default` | `owner/repo` | Default remote for `upload` / `sync` / `scout` |
+
+## Editor resolution
+
+`ivaldi seal` with no message opens an editor on `.ivaldi/SEAL_EDITMSG`.
+The command is chosen from the first non-blank source in this order:
+
+1. `core.editor` (merged config; repo-local overrides global)
+2. `$VISUAL`
+3. `$EDITOR`
+4. `vim`
+
+The value is split on whitespace, so flags such as `code --wait` work.

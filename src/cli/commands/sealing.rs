@@ -3,12 +3,18 @@
 use super::*;
 
 /// Resolve which editor to launch for composing a seal message. Honors
-/// `$VISUAL`, then `$EDITOR`, and falls back to `vim` when neither is set
-/// (or is set to an empty/whitespace-only value).
-pub(super) fn resolve_editor() -> String {
-    std::env::var("VISUAL")
-        .ok()
+/// `core.editor` from the merged config, then `$VISUAL`, then `$EDITOR`,
+/// and falls back to `vim` when none is set (or is set to an
+/// empty/whitespace-only value).
+pub(super) fn resolve_editor(cfg: &Config) -> String {
+    cfg.get("core.editor")
+        .map(str::to_string)
         .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("VISUAL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
         .or_else(|| {
             std::env::var("EDITOR")
                 .ok()
@@ -68,7 +74,7 @@ pub(super) fn compose_message_via_editor(
     std::fs::write(&editmsg_path, &template)
         .map_err(|e| format!("could not write seal message template: {e}"))?;
 
-    let editor = resolve_editor();
+    let editor = resolve_editor(&config::load_config(ivaldi_dir));
     let mut parts = editor.split_whitespace();
     let program = parts.next().unwrap_or("vim");
     let status = process::Command::new(program)
