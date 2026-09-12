@@ -29,6 +29,11 @@ pub const KNOWN_KEYS: &[(&str, &str, &str)] = &[
         "true",
     ),
     (
+        "core.editor",
+        "Editor for composing seal messages (overrides $VISUAL/$EDITOR)",
+        "\"code --wait\"",
+    ),
+    (
         "portal.default",
         "Default remote for upload/sync when several portals are configured",
         "owner/repo",
@@ -67,9 +72,9 @@ pub fn validate_set(key: &str, value: &str) -> Result<Option<String>, String> {
         ));
     }
     match key {
-        "user.name" => {
+        "user.name" | "core.editor" => {
             if value.trim().is_empty() {
-                return Err("user.name cannot be empty".into());
+                return Err(format!("{} cannot be empty", key));
             }
         }
         "user.email" => {
@@ -297,6 +302,7 @@ mod tests {
         assert_eq!(validate_set("user.email", "ada@example.com"), Ok(None));
         assert_eq!(validate_set("color.ui", "false"), Ok(None));
         assert_eq!(validate_set("core.autoshelf", "true"), Ok(None));
+        assert_eq!(validate_set("core.editor", "code --wait"), Ok(None));
         assert_eq!(validate_set("portal.default", "owner/repo"), Ok(None));
     }
 
@@ -312,6 +318,7 @@ mod tests {
         assert!(validate_set("user.email", "a@b").is_err());
         assert!(validate_set("color.ui", "yes").is_err());
         assert!(validate_set("core.autoshelf", "1").is_err());
+        assert!(validate_set("core.editor", "  ").is_err());
         assert!(validate_set("portal.default", "not a spec").is_err());
     }
 

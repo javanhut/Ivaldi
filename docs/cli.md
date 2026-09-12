@@ -182,8 +182,9 @@ keys. See [config.md](config.md) for the full key reference.
 The interactive form's first field is the **scope** — toggle between
 repo-local and global with ←/→ or Enter; the form reloads from (and saves
 to) whichever config file is selected. Below that it covers `user.name`,
-`user.email`, `color.ui`, `core.autoshelf`, and (local scope only)
-`portal.default`. Email and repo-spec values are validated as you type.
+`user.email`, `color.ui`, `core.autoshelf`, `core.editor`, and (local
+scope only) `portal.default`. Email and repo-spec values are validated as
+you type.
 
 `ivaldi config` **no longer requires being inside an Ivaldi repo** — outside
 a repo it automatically operates on the global config (the scope selector

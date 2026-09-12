@@ -98,6 +98,13 @@ impl State {
                 kind: FieldKind::Bool,
                 value: cfg.get("core.autoshelf").unwrap_or("true").to_string(),
             },
+            Field {
+                section: "Core",
+                key: "core.editor",
+                label: "editor",
+                kind: FieldKind::Text,
+                value: cfg.get("core.editor").unwrap_or("").to_string(),
+            },
         ];
         // Per-repo concern; only meaningful in local scope.
         if !self.use_global {
