@@ -228,8 +228,9 @@ fn device_barrier(dir: &fs::File) -> std::io::Result<()> {
 }
 
 /// Elsewhere `sync_bytes_to_device` already flushed the device per object, so
-/// this only needs to make the directory entries durable.
-#[cfg(not(target_vendor = "apple"))]
+/// this only needs to make the directory entries durable. (Windows skips the
+/// barrier entirely — see `FileCas::sync_directories`.)
+#[cfg(not(any(target_vendor = "apple", windows)))]
 fn device_barrier(dir: &fs::File) -> std::io::Result<()> {
     dir.sync_all()
 }
@@ -252,8 +253,15 @@ impl FileCas {
         if shards.is_empty() {
             return Ok(());
         }
+        self.sync_directories(&shards)
+    }
+
+    /// Fsync the dirty shard directories, then issue the device barrier on
+    /// the CAS root.
+    #[cfg(not(windows))]
+    fn sync_directories(&self, shards: &[PathBuf]) -> Result<(), CasError> {
         for shard in shards {
-            if let Ok(dir) = fs::File::open(&shard) {
+            if let Ok(dir) = fs::File::open(shard) {
                 let _ = dir.sync_all();
             }
         }
@@ -262,6 +270,18 @@ impl FileCas {
         // objects' own durability. A silent failure here would let a commit
         // record claim bytes the device can still lose, so it propagates.
         device_barrier(&fs::File::open(&self.root)?)?;
+        Ok(())
+    }
+
+    /// Windows has no directory fsync: `File::open` on a directory fails with
+    /// ERROR_ACCESS_DENIED (it needs FILE_FLAG_BACKUP_SEMANTICS) and
+    /// FlushFileBuffers refuses directory handles anyway. The durability the
+    /// barrier provides elsewhere is already paid here: `sync_bytes_to_device`
+    /// is a full `sync_all` (FlushFileBuffers) per object, which flushes the
+    /// volume's write cache, and NTFS journals the rename that publishes each
+    /// object. Nothing is left to sync.
+    #[cfg(windows)]
+    fn sync_directories(&self, _shards: &[PathBuf]) -> Result<(), CasError> {
         Ok(())
     }
 
