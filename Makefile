@@ -22,7 +22,7 @@ test:
 ## Install ivaldi to $(PREFIX)/bin (default: /usr/local/bin)
 install: build
 	@echo "Installing $(BINARY) to $(BINDIR)..."
-	@install -d $(BINDIR)
+	@mkdir -p $(BINDIR)
 	@install -m 755 $(TARGET) $(BINDIR)/$(BINARY)
 	@echo "Installed $(BINARY) to $(BINDIR)/$(BINARY)"
 	@echo "Run 'ivaldi --version' to verify."
@@ -30,14 +30,14 @@ install: build
 ## Install man pages and shell completions (bash/zsh/fish)
 install-extras: build
 	@echo "Installing man pages to $(PREFIX)/share/man/man1..."
-	@install -d $(PREFIX)/share/man/man1
+	@mkdir -p $(PREFIX)/share/man/man1
 	@$(TARGET) man --out $(PREFIX)/share/man/man1
 	@echo "Installing shell completions..."
-	@install -d $(PREFIX)/share/bash-completion/completions
+	@mkdir -p $(PREFIX)/share/bash-completion/completions
 	@$(TARGET) completions bash > $(PREFIX)/share/bash-completion/completions/ivaldi
-	@install -d $(PREFIX)/share/zsh/site-functions
+	@mkdir -p $(PREFIX)/share/zsh/site-functions
 	@$(TARGET) completions zsh > $(PREFIX)/share/zsh/site-functions/_ivaldi
-	@install -d $(PREFIX)/share/fish/vendor_completions.d
+	@mkdir -p $(PREFIX)/share/fish/vendor_completions.d
 	@$(TARGET) completions fish > $(PREFIX)/share/fish/vendor_completions.d/ivaldi.fish
 	@echo "Installed man pages and completions under $(PREFIX)/share"
 
@@ -45,7 +45,7 @@ install-extras: build
 ## (per-user config, so no sudo — kept separate from install-extras)
 install-raven-completions: build
 	@echo "Installing RavenShell completion spec..."
-	@install -d $(HOME)/.config/ravenshell/completions
+	@mkdir -p $(HOME)/.config/ravenshell/completions
 	@$(TARGET) completions raven > $(HOME)/.config/ravenshell/completions/ivaldi.json
 	@echo "Installed $(HOME)/.config/ravenshell/completions/ivaldi.json"
 
