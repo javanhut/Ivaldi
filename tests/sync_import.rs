@@ -83,6 +83,7 @@ fn fetch_result(branch: &str, head: &str, objects: HashMap<String, GitObject>) -
         head_sha: head.to_string(),
         refs: Vec::new(),
         objects,
+        pack: None,
         shallow: Default::default(),
     }
 }

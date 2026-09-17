@@ -78,12 +78,21 @@ ivaldi download https://github.com/owner/repo/tree/feature-branch  # auto-select
 
 Flow:
 1. Gets repo info and default branch (or the URL-encoded branch hint)
-2. Fetches the packfile via Git smart-HTTP (`.../info/refs` + `git-upload-pack`)
-3. Parses commits, trees, and blobs
-4. Stores in CAS with BLAKE3 hashing
+2. Fetches the packfile via Git smart-HTTP (`.../info/refs` + `git-upload-pack`),
+   spooling it to a file in the target directory and indexing it as it arrives
+3. Loads commits, trees, and tags from the spool
+4. Streams blobs from the spool into the CAS with BLAKE3 hashing, one delta
+   tree at a time, then imports trees level by level in parallel
 5. Creates SHA1↔BLAKE3 mappings
 6. Writes files to working directory
 7. Creates the initial Ivaldi timeline
+
+Memory stays bounded regardless of repository size: the pack is never held
+in RAM, and blobs are rebuilt and written a few per thread
+(`src/git_unpack.rs`). The spool sits beside the repository rather than in
+the system temp directory, which is often RAM-backed; it is unlinked as soon
+as it is created, so it cannot outlive the process. `harvest` spools under
+`.ivaldi/`.
 
 Public repos require no authentication; a stale token triggers automatic
 anonymous retry.
@@ -113,6 +122,23 @@ ivaldi harvest branch-a branch-b
 ```
 Downloads specific branches into CAS and creates local timelines. Works on
 public repos without auth.
+
+Only what is missing is transferred. Harvest offers the server the git id of
+every local seal that has one (`have` lines — timeline heads first, then
+newest to oldest, capped at `MAX_HAVES`), and the server replies with a pack
+that leaves out everything reachable from them:
+
+- A branch whose tip is already sealed locally costs no pack request at all.
+- Boundaries of a `--depth` clone are sent as `shallow` lines, so the server
+  does not assume the history behind them is present.
+- A new annotated tag on a commit already held is requested explicitly; the
+  server only volunteers tags for commits it is sending.
+- The import resolves objects the pack omits (parents, unchanged trees and
+  blobs) from the local store, and only trusts a hash-map entry whose object
+  is really in the CAS. If something the haves promised turns out to be gone
+  (pruned by `gc`, or uploaded by a build that recorded no mapping), the
+  import stops before sealing anything and harvest retries once with a full,
+  un-negotiated fetch.
 
 ## Force Push Safety
 ```bash

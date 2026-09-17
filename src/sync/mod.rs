@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use crate::atomic_io::atomic_write;
 use crate::cas::FileCas;
 use crate::fsmerkle::FsStore;
-use crate::git_remote::{self, FetchResult, SmartHttpClient};
+use crate::git_remote::{self, FetchResult, GitRemoteError, Negotiation, SmartHttpClient};
 use crate::github::{GitHubClient, GitHubError};
 use crate::hash::B3Hash;
 use crate::ignore;
@@ -105,16 +105,23 @@ impl RemoteFetcher {
         }
     }
 
-    /// Fetch a branch's full pack.
+    /// Fetch a branch's pack — all of it, or with a non-empty `negotiation`
+    /// only what the local repository lacks. The pack is spooled under
+    /// `spool_dir` while it is imported, so pass somewhere on the
+    /// repository's disk.
     pub fn fetch_repo(
         &self,
         owner: &str,
         repo_name: &str,
         branch: Option<&str>,
+        spool_dir: &Path,
+        negotiation: Negotiation,
     ) -> Result<FetchResult, SyncError> {
         match self {
             RemoteFetcher::Https { token, base_url } => {
-                let c = SmartHttpClient::new(token.as_deref());
+                let c = SmartHttpClient::new(token.as_deref())
+                    .with_spool_dir(spool_dir)
+                    .with_negotiation(negotiation);
                 match base_url {
                     Some(base) => c.fetch_repo_url(base, branch).map_err(SyncError::from),
                     None => c
@@ -123,6 +130,8 @@ impl RemoteFetcher {
                 }
             }
             RemoteFetcher::Ssh { target } => SshClient::new(target.clone())
+                .with_spool_dir(spool_dir)
+                .with_negotiation(negotiation)
                 .fetch_repo(branch)
                 .map_err(SyncError::from),
         }
@@ -187,6 +196,7 @@ pub fn download(
             SmartHttpClient::new(client.token())
                 .with_depth(options.depth)
                 .with_tags(options.include_tags)
+                .with_spool_dir(target_dir)
                 .fetch_repo(owner, repo_name, branch)
                 .map_err(SyncError::from)
         },
@@ -209,6 +219,7 @@ pub fn download_url(
 ) -> Result<DownloadResult, SyncError> {
     let base = base_url.to_string();
     let tok = token.map(str::to_string);
+    let spool_dir = target_dir.to_path_buf();
     download_with_fetch(
         target_dir,
         owner,
@@ -218,6 +229,7 @@ pub fn download_url(
             SmartHttpClient::new(tok.as_deref())
                 .with_depth(options.depth)
                 .with_tags(options.include_tags)
+                .with_spool_dir(&spool_dir)
                 .fetch_repo_url(&base, branch)
                 .map_err(SyncError::from)
         },
@@ -236,6 +248,7 @@ pub fn download_ssh(
 ) -> Result<DownloadResult, SyncError> {
     let (owner, repo_name) = derive_owner_repo_from_path(&target.repo_path);
     let target_clone = target.clone();
+    let spool_dir = target_dir.to_path_buf();
     download_with_fetch(
         target_dir,
         &owner,
@@ -245,6 +258,7 @@ pub fn download_ssh(
             crate::ssh_transport::SshClient::new(target_clone.clone())
                 .with_depth(options.depth)
                 .with_tags(options.include_tags)
+                .with_spool_dir(&spool_dir)
                 .fetch_repo(branch)
                 .map_err(SyncError::from)
         },
@@ -419,7 +433,11 @@ pub fn scout_with_status(
         .collect())
 }
 
-/// Harvest — download specific branches with full history.
+/// Harvest — bring specific remote branches into local timelines.
+///
+/// Only what is missing is transferred: the seals already held are offered
+/// to the server as `have`s, and a branch whose tip is already sealed here
+/// costs no fetch at all.
 pub fn harvest(
     client: &GitHubClient,
     repo: &mut Repo,
@@ -428,7 +446,6 @@ pub fn harvest(
 ) -> Result<Vec<String>, SyncError> {
     let fetcher = RemoteFetcher::for_portal(portal, client.token());
     let branches = fetcher.list_branch_refs(&portal.owner, &portal.repo)?;
-    let mapping = HashMapping::new(&repo.ivaldi_dir);
 
     let mut harvested = Vec::new();
 
@@ -440,6 +457,10 @@ pub fn harvest(
                 SyncError::Other(format!("remote timeline '{}' not found", target_name))
             })?;
 
+        // Reloaded per timeline: each import below extends the mapping on
+        // disk, and the next branch should negotiate with those seals too.
+        let mapping = HashMapping::new(&repo.ivaldi_dir);
+
         eprintln!("Harvesting timeline '{}'...", target_name);
         match timeline_sync_state(repo, &mapping, branch) {
             RemoteTimelineState::NotDownloaded => eprintln!("  Local state: not downloaded"),
@@ -448,8 +469,7 @@ pub fn harvest(
             RemoteTimelineState::LocalOnly => eprintln!("  Local state: local only"),
         }
 
-        let fetch = fetcher.fetch_repo(&portal.owner, &portal.repo, Some(target_name))?;
-        let import = git_remote::import_fetch_result(repo, &fetch)?;
+        let import = harvest_branch(&fetcher, repo, portal, branch, &mapping)?;
         if import.commits_skipped > 0 {
             eprintln!(
                 "  {} new commits imported ({} already present)",
@@ -463,6 +483,117 @@ pub fn harvest(
     }
 
     Ok(harvested)
+}
+
+/// Fetch and import one branch, transferring as little as possible.
+fn harvest_branch(
+    fetcher: &RemoteFetcher,
+    repo: &mut Repo,
+    portal: &Portal,
+    branch: &RemoteBranch,
+    mapping: &HashMapping,
+) -> Result<ImportResult, SyncError> {
+    let local = local_git_history(repo, mapping);
+
+    // The tip is already sealed here: there is nothing to download. The
+    // import still runs, on an empty fetch, because it is what points the
+    // timeline at that seal.
+    if local.sealed.contains(&branch.sha1) {
+        let nothing = FetchResult {
+            branch: branch.name.clone(),
+            head_sha: branch.sha1.clone(),
+            refs: Vec::new(),
+            objects: Default::default(),
+            pack: None,
+            shallow: Default::default(),
+        };
+        return Ok(git_remote::import_fetch_result(repo, &nothing)?);
+    }
+
+    let negotiated = !local.negotiation.is_empty();
+    let fetch = fetcher.fetch_repo(
+        &portal.owner,
+        &portal.repo,
+        Some(&branch.name),
+        &repo.ivaldi_dir,
+        local.negotiation,
+    )?;
+    match git_remote::import_fetch_result(repo, &fetch) {
+        // Our haves promised objects the local store turned out not to hold
+        // (pruned by gc, or sealed by a build that didn't record them). The
+        // import checks for that before it writes any seal, so starting over
+        // with a complete pack is safe.
+        Err(GitRemoteError::MissingObject { kind, sha }) if negotiated => {
+            crate::logging::warn(&format!(
+                "local history is missing {} {} — downloading the full timeline instead",
+                kind, sha
+            ));
+            drop(fetch);
+            let full = fetcher.fetch_repo(
+                &portal.owner,
+                &portal.repo,
+                Some(&branch.name),
+                &repo.ivaldi_dir,
+                Negotiation::default(),
+            )?;
+            Ok(git_remote::import_fetch_result(repo, &full)?)
+        }
+        other => Ok(other?),
+    }
+}
+
+/// The git commits this repository holds, as the server needs to hear them.
+struct LocalGitHistory {
+    negotiation: Negotiation,
+    /// Every git commit id with a seal here.
+    sealed: std::collections::HashSet<String>,
+}
+
+/// Collect the git identity of every local seal: timeline heads first, then
+/// newest to oldest, so that if the have list is capped it keeps the commits
+/// most likely to be the fork point.
+///
+/// Imported seals carry their id as authenticated `git.sha1` metadata;
+/// natively sealed, uploaded ones are known through the mapping.
+fn local_git_history(repo: &Repo, mapping: &HashMapping) -> LocalGitHistory {
+    let git_sha = |leaf: &crate::leaf::Leaf| -> Option<String> {
+        leaf.meta
+            .get("git.sha1")
+            .cloned()
+            .or_else(|| mapping.get_sha1(leaf.hash()).map(str::to_string))
+    };
+
+    let mut haves = Vec::new();
+    let mut shallow = Vec::new();
+    let mut sealed = std::collections::HashSet::new();
+
+    let heads = repo.list_timelines().unwrap_or_default();
+    let indices = heads
+        .iter()
+        .map(|(_, idx)| *idx)
+        .chain((0..repo.commit_count()).rev());
+    for idx in indices {
+        let Ok(Some(leaf)) = repo.get_leaf(idx) else {
+            continue;
+        };
+        let Some(sha) = git_sha(&leaf) else {
+            continue;
+        };
+        if !sealed.insert(sha.clone()) {
+            continue;
+        }
+        // The server must not assume we hold what lies behind a truncated
+        // clone's boundary.
+        if leaf.meta.contains_key("git.shallow") {
+            shallow.push(sha.clone());
+        }
+        haves.push(sha);
+    }
+
+    LocalGitHistory {
+        negotiation: Negotiation { haves, shallow },
+        sealed,
+    }
 }
 
 fn timeline_sync_state(
@@ -1120,6 +1251,47 @@ mod tests {
             !dir.path().join("sub").exists(),
             "empty sub/ dir should be cleaned up"
         );
+    }
+
+    #[test]
+    fn local_git_history_offers_heads_first_and_flags_shallow_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let mut repo = Repo::open(dir.path()).unwrap();
+        let sha = |c: char| c.to_string().repeat(40);
+
+        // main: an imported shallow root, an imported seal, then a native
+        // seal that was uploaded (its git id lives only in the mapping).
+        let mut root = Leaf::new(B3Hash::digest(b"t0"), "main", "a", 1000, "root");
+        root.prev_idx = crate::leaf::NO_PARENT;
+        root.meta.insert("git.sha1".into(), sha('a'));
+        root.meta.insert("git.shallow".into(), "1".into());
+        let root_idx = repo.commit_raw(root, "main").unwrap().index;
+        let mut imported = Leaf::new(B3Hash::digest(b"t1"), "main", "a", 1001, "imported");
+        imported.prev_idx = root_idx;
+        imported.meta.insert("git.sha1".into(), sha('b'));
+        let imported_idx = repo.commit_raw(imported, "main").unwrap().index;
+        let mut native = Leaf::new(B3Hash::digest(b"t2"), "main", "a", 1002, "native");
+        native.prev_idx = imported_idx;
+        let native_result = repo.commit_raw(native, "main").unwrap();
+        // A seal that never left this machine has no git identity to offer.
+        let mut private = Leaf::new(B3Hash::digest(b"t3"), "wip", "a", 1003, "private");
+        private.prev_idx = imported_idx;
+        repo.commit_raw(private, "wip").unwrap();
+
+        let mut mapping = HashMapping::new(&repo.ivaldi_dir);
+        mapping.insert(&sha('c'), native_result.hash);
+
+        let local = local_git_history(&repo, &mapping);
+        assert_eq!(local.negotiation.haves[0], sha('c'), "timeline head first");
+        assert_eq!(
+            local.negotiation.haves.len(),
+            3,
+            "no duplicates, no private seal"
+        );
+        assert_eq!(local.negotiation.shallow, vec![sha('a')]);
+        assert!(local.sealed.contains(&sha('b')));
+        assert!(!local.sealed.contains(&sha('d')));
     }
 
     #[test]

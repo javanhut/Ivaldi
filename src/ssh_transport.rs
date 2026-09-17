@@ -23,8 +23,8 @@ use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use crate::git_remote::{
-    FetchResult, GitRemoteError, PushReport, extract_pack_from_upload_pack, parse_discovery,
-    parse_packfile, parse_report_status, select_branch_from_discovery,
+    FetchResult, GitRemoteError, PushReport, parse_discovery, parse_report_status,
+    select_branch_from_discovery,
 };
 use crate::progress;
 use crate::remote::RemoteBranch;
@@ -115,6 +115,8 @@ pub struct SshClient {
     target: SshTarget,
     depth: usize,
     include_tags: bool,
+    spool_dir: Option<std::path::PathBuf>,
+    negotiation: crate::git_remote::Negotiation,
 }
 
 impl SshClient {
@@ -123,7 +125,23 @@ impl SshClient {
             target,
             depth: 0,
             include_tags: false,
+            spool_dir: None,
+            negotiation: Default::default(),
         }
+    }
+
+    /// Offer the server what is already held locally. See
+    /// [`crate::git_remote::SmartHttpClient::with_negotiation`].
+    pub fn with_negotiation(mut self, negotiation: crate::git_remote::Negotiation) -> Self {
+        self.negotiation = negotiation;
+        self
+    }
+
+    /// Directory to park the received pack in while it is imported. See
+    /// [`crate::git_remote::SmartHttpClient::with_spool_dir`].
+    pub fn with_spool_dir(mut self, dir: impl AsRef<std::path::Path>) -> Self {
+        self.spool_dir = Some(dir.as_ref().to_path_buf());
+        self
     }
 
     /// Truncate the fetch to `depth` commits of history per branch tip
@@ -171,27 +189,19 @@ impl SshClient {
         let (discovery, mut stdin, mut child) = read_advertisement(session)?;
         let (branch_name, head_sha) = select_branch_from_discovery(&discovery, branch)?;
 
-        // Send the upload-pack request body: one `want`, an optional depth
-        // request, then flush + `done`.
-        let mut body = Vec::new();
-        body.extend(crate::git_remote::pkt_line(&format!(
-            "want {} {}\n",
-            head_sha,
-            crate::git_remote::UPLOAD_PACK_CAPS
-        )));
+        // Send the upload-pack request body: wants, shallow/depth lines,
+        // flush, then our haves and `done`.
+        let mut wants = vec![head_sha.clone()];
         if self.include_tags {
-            for want in crate::git_remote::tag_wants(&discovery.refs, &head_sha) {
-                body.extend(crate::git_remote::pkt_line(&format!("want {}\n", want)));
-            }
+            wants.extend(crate::git_remote::tag_wants(&discovery.refs, &head_sha));
+        } else {
+            wants.extend(crate::git_remote::negotiated_tag_wants(
+                &discovery.refs,
+                &self.negotiation,
+                &head_sha,
+            ));
         }
-        if self.depth > 0 {
-            body.extend(crate::git_remote::pkt_line(&format!(
-                "deepen {}\n",
-                self.depth
-            )));
-        }
-        body.extend_from_slice(b"0000");
-        body.extend(crate::git_remote::pkt_line("done\n"));
+        let body = crate::git_remote::upload_pack_request(&wants, self.depth, &self.negotiation);
         stdin
             .write_all(&body)
             .map_err(|e| GitRemoteError::Io(e.to_string()))?;
@@ -201,35 +211,31 @@ impl SshClient {
             .flush()
             .map_err(|e| GitRemoteError::Io(e.to_string()))?;
 
-        // Drain stdout (NAK + sideband-multiplexed pack).
-        let pb = progress::spinner("Downloading pack (ssh)");
-        let mut response = Vec::new();
-        let mut stdout = child
+        // Stream stdout (NAK + sideband-multiplexed pack) straight into the
+        // spooling indexer — the response is never buffered whole.
+        let pb = progress::byte_spinner("Downloading pack (ssh)");
+        let stdout = child
             .stdout
             .take()
             .ok_or_else(|| GitRemoteError::Io("ssh child has no stdout".into()))?;
-        let mut chunk = [0u8; 8192];
-        loop {
-            let n = stdout
-                .read(&mut chunk)
-                .map_err(|e| GitRemoteError::Io(e.to_string()))?;
-            if n == 0 {
-                break;
+        let spool_dir = self.spool_dir.clone().unwrap_or_else(std::env::temp_dir);
+        let received = match crate::git_unpack::receive_pack(stdout, &spool_dir, pb.clone()) {
+            Ok(received) => received,
+            Err(e) => {
+                pb.finish_and_clear();
+                return Err(e);
             }
-            response.extend_from_slice(&chunk[..n]);
-            pb.inc(n as u64);
-        }
-        pb.finish_with_message(format!("ssh pack downloaded ({} bytes)", response.len()));
+        };
+        pb.finish_with_message("ssh pack downloaded");
         finish_child(child)?;
 
-        let response = extract_pack_from_upload_pack(&response)?;
-        let objects = parse_packfile(&response.pack)?;
         Ok(FetchResult {
             branch: branch_name,
             head_sha,
             refs: discovery.refs,
-            objects,
-            shallow: response.shallow,
+            objects: received.objects,
+            pack: Some(std::sync::Arc::new(received.pack)),
+            shallow: received.shallow,
         })
     }
 

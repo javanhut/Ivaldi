@@ -4,15 +4,17 @@
 //! ref advertisement, upload-pack fetch, packfile parsing, and object import.
 
 use std::collections::{BTreeSet, HashMap};
-use std::io::{Cursor, Read, Write};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use base64::Engine;
 use flate2::Compression;
-use flate2::bufread::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use indicatif::MultiProgress;
 use rayon::prelude::*;
 
+use crate::git_unpack::SpooledPack;
 use crate::hash::B3Hash;
 use crate::progress;
 use crate::remote::RemoteBranch;
@@ -38,6 +40,40 @@ pub(crate) fn tag_wants(refs: &[AdvertisedRef], head_sha: &str) -> Vec<String> {
         .filter(|r| r.name.starts_with("refs/tags/") && !r.name.ends_with("^{}"))
         .filter(|r| seen.insert(r.id.clone()))
         .map(|r| r.id.clone())
+        .collect()
+}
+
+/// Annotated tags to `want` during a negotiated fetch.
+///
+/// The server volunteers a tag object (`include-tag`) only when it is also
+/// sending the commit the tag names. A tag created since the last harvest on
+/// a commit we already hold would therefore never arrive. Such tags are
+/// recognisable from the advertisement alone — their peeled `^{}` companion
+/// is one of our haves — and wanting them costs a few hundred bytes each,
+/// since everything behind them is already here.
+pub(crate) fn negotiated_tag_wants(
+    refs: &[AdvertisedRef],
+    negotiation: &Negotiation,
+    head_sha: &str,
+) -> Vec<String> {
+    if negotiation.is_empty() {
+        return Vec::new();
+    }
+    let held: std::collections::HashSet<&str> =
+        negotiation.haves.iter().map(String::as_str).collect();
+    let mut seen = BTreeSet::new();
+    seen.insert(head_sha.to_string());
+    refs.iter()
+        .filter_map(|peeled| {
+            let tag_ref = peeled.name.strip_suffix("^{}")?;
+            if !tag_ref.starts_with("refs/tags/") || !held.contains(peeled.id.as_str()) {
+                return None;
+            }
+            refs.iter()
+                .find(|r| r.name == tag_ref)
+                .map(|r| r.id.clone())
+        })
+        .filter(|id| seen.insert(id.clone()))
         .collect()
 }
 
@@ -73,7 +109,13 @@ pub struct FetchResult {
     pub branch: String,
     pub head_sha: String,
     pub refs: Vec<AdvertisedRef>,
+    /// Objects held in memory. For a fetch off the wire that is the history
+    /// (commits, trees, tags); the blobs stay in `pack`.
     pub objects: HashMap<String, GitObject>,
+    /// The received pack, spooled to disk, from which import streams blobs
+    /// into the CAS without ever holding them all in memory. `None` when
+    /// every object is already in `objects`.
+    pub pack: Option<Arc<SpooledPack>>,
     /// Commits the server declared as shallow boundaries: their parents were
     /// deliberately left out of the pack, so importing them as roots is
     /// correct rather than corruption. Empty for a full fetch, where a
@@ -122,6 +164,75 @@ pub struct SmartHttpClient {
     agent: ureq::Agent,
     depth: usize,
     include_tags: bool,
+    spool_dir: Option<PathBuf>,
+    negotiation: Negotiation,
+}
+
+/// What the local repository already holds, offered to the server so the
+/// pack only carries what is new.
+///
+/// A `have` is a promise: the named commit *and everything reachable from
+/// it* is already here. That promise is false below a shallow boundary, so
+/// the boundaries travel with the haves and the server stops assuming
+/// ancestry there.
+#[derive(Debug, Clone, Default)]
+pub struct Negotiation {
+    /// Git commit ids held locally, most useful first (timeline heads, then
+    /// newest seals).
+    pub haves: Vec<String>,
+    /// Git ids of local commits whose parents were never downloaded.
+    pub shallow: Vec<String>,
+}
+
+impl Negotiation {
+    pub fn is_empty(&self) -> bool {
+        self.haves.is_empty()
+    }
+}
+
+/// Upper bound on `have` lines in one request (~50 bytes each). Heads go
+/// first, so a cap only costs a slightly larger pack on a repository whose
+/// fork point is more than this many seals back.
+pub const MAX_HAVES: usize = 1024;
+
+/// Build the body of a `git-upload-pack` request.
+///
+/// `wants[0]` carries the capability list. Per the pack protocol the shallow
+/// and depth lines go after the wants and before the flush; the haves follow
+/// it. Everything is sent in one round ending in `done`, which is all a
+/// stateless smart-HTTP exchange allows and is just as valid over SSH: the
+/// server answers the haves it recognises with `ACK`s and then sends a pack
+/// without anything reachable from them.
+pub(crate) fn upload_pack_request(
+    wants: &[String],
+    depth: usize,
+    negotiation: &Negotiation,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    for (i, want) in wants.iter().enumerate() {
+        if i == 0 {
+            body.extend(pkt_line(&format!("want {} {}\n", want, UPLOAD_PACK_CAPS)));
+        } else {
+            body.extend(pkt_line(&format!("want {}\n", want)));
+        }
+    }
+    // Only meaningful alongside haves: without them the server assumes
+    // nothing about us, and a full clone must not be truncated at our old
+    // boundaries.
+    if !negotiation.is_empty() {
+        for sha in &negotiation.shallow {
+            body.extend(pkt_line(&format!("shallow {}\n", sha)));
+        }
+    }
+    if depth > 0 {
+        body.extend(pkt_line(&format!("deepen {}\n", depth)));
+    }
+    body.extend_from_slice(b"0000");
+    for have in negotiation.haves.iter().take(MAX_HAVES) {
+        body.extend(pkt_line(&format!("have {}\n", have)));
+    }
+    body.extend(pkt_line("done\n"));
+    body
 }
 
 impl SmartHttpClient {
@@ -137,7 +248,25 @@ impl SmartHttpClient {
             agent,
             depth: 0,
             include_tags: false,
+            spool_dir: None,
+            negotiation: Negotiation::default(),
         }
+    }
+
+    /// Tell the server what is already held locally so it sends only the
+    /// difference. Only for fetching into an existing repository.
+    pub fn with_negotiation(mut self, negotiation: Negotiation) -> Self {
+        self.negotiation = negotiation;
+        self
+    }
+
+    /// Directory to park the received pack in while it is imported — pass
+    /// somewhere on the destination's filesystem. Defaults to the system
+    /// temp directory, which on many systems is RAM-backed and so a poor
+    /// home for a large pack.
+    pub fn with_spool_dir(mut self, dir: impl AsRef<Path>) -> Self {
+        self.spool_dir = Some(dir.as_ref().to_path_buf());
+        self
     }
 
     /// Truncate the fetch to `depth` commits of history per branch tip
@@ -181,17 +310,17 @@ impl SmartHttpClient {
         let extra_wants = if self.include_tags {
             tag_wants(&discovery.refs, &head_sha)
         } else {
-            Vec::new()
+            negotiated_tag_wants(&discovery.refs, &self.negotiation, &head_sha)
         };
-        let response = self.fetch_pack(base, &head_sha, &extra_wants)?;
-        let objects = parse_packfile(&response.pack)?;
+        let received = self.fetch_pack(base, &head_sha, &extra_wants)?;
 
         Ok(FetchResult {
             branch: branch_name,
             head_sha,
             refs: discovery.refs,
-            objects,
-            shallow: response.shallow,
+            objects: received.objects,
+            pack: Some(Arc::new(received.pack)),
+            shallow: received.shallow,
         })
     }
 
@@ -296,24 +425,11 @@ impl SmartHttpClient {
         base: &str,
         want_sha: &str,
         extra_wants: &[String],
-    ) -> Result<UploadPackResponse, GitRemoteError> {
+    ) -> Result<crate::git_unpack::ReceivedPack, GitRemoteError> {
         let url = format!("{}/git-upload-pack", base);
-        let mut body = Vec::new();
-        // Only the first want carries the capability list; the rest are bare.
-        body.extend(pkt_line(&format!(
-            "want {} {}\n",
-            want_sha, UPLOAD_PACK_CAPS
-        )));
-        for want in extra_wants {
-            body.extend(pkt_line(&format!("want {}\n", want)));
-        }
-        // Per the pack protocol the depth request goes after the wants and
-        // before the flush that ends the request.
-        if self.depth > 0 {
-            body.extend(pkt_line(&format!("deepen {}\n", self.depth)));
-        }
-        body.extend_from_slice(b"0000");
-        body.extend(pkt_line("done\n"));
+        let mut wants = vec![want_sha.to_string()];
+        wants.extend_from_slice(extra_wants);
+        let body = upload_pack_request(&wants, self.depth, &self.negotiation);
 
         let do_call = |token: Option<&str>,
                        body: &[u8]|
@@ -362,26 +478,26 @@ impl SmartHttpClient {
             .and_then(|h| h.parse::<u64>().ok());
         let pb = total
             .map(|len| progress::byte_bar(len, "Downloading pack"))
-            .unwrap_or_else(|| progress::spinner("Downloading pack"));
-        let mut bytes = Vec::new();
-        let mut reader = resp.into_body().into_reader();
-        let mut chunk = [0u8; 8192];
-        loop {
-            let n = reader
-                .read(&mut chunk)
-                .map_err(|e| GitRemoteError::Io(e.to_string()))?;
-            if n == 0 {
-                break;
+            .unwrap_or_else(|| progress::byte_spinner("Downloading pack"));
+        // The pack is demultiplexed, spooled, and indexed as it arrives —
+        // the response is never buffered whole.
+        let spool_dir = self.spool_dir.clone().unwrap_or_else(std::env::temp_dir);
+        let reader = resp.into_body().into_reader();
+        match crate::git_unpack::receive_pack(reader, &spool_dir, pb.clone()) {
+            Ok(received) => {
+                if total.is_some() {
+                    pb.finish_with_message(format!("{} bytes downloaded", received.raw_bytes));
+                } else {
+                    // The spinner's template already reports the byte count.
+                    pb.finish_with_message("Pack downloaded");
+                }
+                Ok(received)
             }
-            bytes.extend_from_slice(&chunk[..n]);
-            pb.inc(n as u64);
+            Err(e) => {
+                pb.finish_and_clear();
+                Err(e)
+            }
         }
-        if total.is_some() {
-            pb.finish_with_message(format!("{} bytes downloaded", bytes.len()));
-        } else {
-            pb.finish_with_message(format!("Pack downloaded ({} bytes)", bytes.len()));
-        }
-        extract_pack_from_upload_pack(&bytes)
     }
 
     /// Push `branch`'s history to a Git-compatible server over smart-HTTP
@@ -1156,70 +1272,34 @@ fn parse_pkt_text_lines(data: &[u8]) -> Result<Vec<String>, GitRemoteError> {
 }
 
 /// A demultiplexed `git-upload-pack` response.
+#[cfg(test)]
 pub(crate) struct UploadPackResponse {
     pub pack: Vec<u8>,
     /// Shallow boundaries declared by the server (empty unless we deepened).
     pub shallow: BTreeSet<String>,
 }
 
+/// Whole-buffer convenience over [`crate::git_unpack::SidebandReader`], which
+/// is what the transports use.
+#[cfg(test)]
 pub(crate) fn extract_pack_from_upload_pack(
     data: &[u8],
 ) -> Result<UploadPackResponse, GitRemoteError> {
+    let mut reader = crate::git_unpack::SidebandReader::new(data);
     let mut pack = Vec::new();
-    let mut shallow = BTreeSet::new();
-    for line in parse_pkt_lines(data)? {
-        let Some(line) = line else { continue };
-        if line == b"NAK\n" || line.starts_with(b"ACK ") {
-            continue;
-        }
-        // Shallow-update block, sent ahead of the pack when we asked to
-        // `deepen`. `unshallow` only appears when deepening an existing
-        // shallow repo, which `download` never does (it clones into an
-        // empty directory), so the boundary set is purely additive here.
-        if let Some(sha) = line.strip_prefix(b"shallow ".as_slice()) {
-            shallow.insert(String::from_utf8_lossy(sha).trim().to_string());
-            continue;
-        }
-        if line.starts_with(b"PACK") {
-            pack.extend_from_slice(&line);
-            continue;
-        }
-        if line.is_empty() {
-            continue;
-        }
-        match line[0] {
-            1 => pack.extend_from_slice(&line[1..]),
-            2 => {}
-            3 => {
-                let msg = String::from_utf8_lossy(&line[1..]).trim().to_string();
-                return Err(GitRemoteError::Protocol(format!("remote error: {}", msg)));
-            }
-            _ => {}
-        }
-    }
-
+    reader
+        .read_to_end(&mut pack)
+        .map_err(|e| GitRemoteError::Protocol(e.to_string()))?;
     if pack.len() < 12 || &pack[..4] != b"PACK" {
         return Err(GitRemoteError::Protocol(
             "upload-pack response did not contain a packfile".into(),
         ));
     }
-    Ok(UploadPackResponse { pack, shallow })
+    Ok(UploadPackResponse {
+        pack,
+        shallow: reader.shallow,
+    })
 }
-
-enum PackedKind {
-    Base(GitObjectKind),
-    OfsDelta { base_offset: usize },
-    RefDelta { base_sha: String },
-}
-
-struct PackedEntry {
-    offset: usize,
-    kind: PackedKind,
-    data: Vec<u8>,
-}
-
-/// One resolved delta entry: `(entry index, object data, sha1, object kind)`.
-type ResolvedDelta = (usize, Vec<u8>, String, GitObjectKind);
 
 /// Parse a git packfile into a `sha1 → object` map.
 ///
@@ -1227,187 +1307,15 @@ type ResolvedDelta = (usize, Vec<u8>, String, GitObjectKind);
 /// against the actual byte length before it drives an allocation, and each
 /// object's zlib stream is capped at its declared size. Public so the fuzz
 /// target `git_parse_packfile` can exercise it.
+///
+/// This materializes every object at once; the transports instead go through
+/// [`crate::git_unpack::receive_pack`], which shares the same parser but
+/// keeps blobs out of memory.
 pub fn parse_packfile(data: &[u8]) -> Result<HashMap<String, GitObject>, GitRemoteError> {
-    if data.len() < 12 || &data[..4] != b"PACK" {
-        return Err(GitRemoteError::Protocol("invalid packfile header".into()));
-    }
-    let version = u32::from_be_bytes(
-        data[4..8]
-            .try_into()
-            .map_err(|_| GitRemoteError::Protocol("truncated packfile header".into()))?,
-    );
-    if !(2..=3).contains(&version) {
-        return Err(GitRemoteError::Unsupported(format!(
-            "unsupported pack version {}",
-            version
-        )));
-    }
-    let count = u32::from_be_bytes(
-        data[8..12]
-            .try_into()
-            .map_err(|_| GitRemoteError::Protocol("truncated packfile header".into()))?,
-    ) as usize;
-    // The smallest possible entry is a 1-byte header plus an ~8-byte zlib
-    // stream; a claimed count beyond that is corrupt. Checked BEFORE the
-    // `with_capacity` below so a forged 4-byte count can't allocate gigabytes.
-    if count > data.len() / 9 {
-        return Err(GitRemoteError::Protocol(format!(
-            "corrupt packfile: claims {} entries but is only {} bytes",
-            count,
-            data.len()
-        )));
-    }
-
-    let mut idx = 12usize;
-    let mut entries = Vec::with_capacity(count);
-    for _ in 0..count {
-        let offset = idx;
-        let (kind, header_len, size) = parse_object_header(&data[idx..])?;
-        idx += header_len;
-
-        let kind = match kind {
-            1 => PackedKind::Base(GitObjectKind::Commit),
-            2 => PackedKind::Base(GitObjectKind::Tree),
-            3 => PackedKind::Base(GitObjectKind::Blob),
-            4 => PackedKind::Base(GitObjectKind::Tag),
-            6 => {
-                let (base_offset, used) = parse_ofs_delta_base(&data[idx..], offset)?;
-                idx += used;
-                PackedKind::OfsDelta { base_offset }
-            }
-            7 => {
-                if idx + 20 > data.len() {
-                    return Err(GitRemoteError::Protocol("truncated ref-delta base".into()));
-                }
-                let base_sha = hex::encode(&data[idx..idx + 20]);
-                idx += 20;
-                PackedKind::RefDelta { base_sha }
-            }
-            other => {
-                return Err(GitRemoteError::Unsupported(format!(
-                    "unsupported object type {}",
-                    other
-                )));
-            }
-        };
-
-        let (inflated, consumed) = inflate_from(&data[idx..], size)?;
-        idx += consumed;
-        entries.push(PackedEntry {
-            offset,
-            kind,
-            data: inflated,
-        });
-    }
-
-    resolve_pack_entries(entries)
+    crate::git_unpack::parse_pack_bytes(data)
 }
 
-/// Resolve all pack entries (bases + delta chains) into a `sha → GitObject`
-/// map using parallel waves. Each wave contains entries whose parent has
-/// already been resolved, so SHA-1 + delta apply run on multiple cores.
-fn resolve_pack_entries(
-    entries: Vec<PackedEntry>,
-) -> Result<HashMap<String, GitObject>, GitRemoteError> {
-    let n = entries.len();
-    let entry_idx_by_offset: HashMap<usize, usize> = entries
-        .iter()
-        .enumerate()
-        .map(|(i, e)| (e.offset, i))
-        .collect();
-
-    // Slot per entry, populated as its wave completes.
-    let mut slot: Vec<Option<(Vec<u8>, String, GitObjectKind)>> = (0..n).map(|_| None).collect();
-    let mut sha_to_idx: HashMap<String, usize> = HashMap::with_capacity(n);
-
-    // Wave 0: all base objects, hashed in parallel.
-    let base_indices: Vec<usize> = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(i, e)| matches!(e.kind, PackedKind::Base(_)).then_some(i))
-        .collect();
-
-    let base_outputs: Vec<(usize, String, GitObjectKind)> = base_indices
-        .par_iter()
-        .map(|&i| {
-            let e = &entries[i];
-            let kind = match e.kind {
-                PackedKind::Base(k) => k,
-                _ => unreachable!(),
-            };
-            let sha = git_object_id(kind, &e.data);
-            (i, sha, kind)
-        })
-        .collect();
-
-    for (i, sha, kind) in base_outputs {
-        sha_to_idx.entry(sha.clone()).or_insert(i);
-        slot[i] = Some((entries[i].data.clone(), sha, kind));
-    }
-
-    let mut remaining: Vec<usize> = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(i, e)| (!matches!(e.kind, PackedKind::Base(_))).then_some(i))
-        .collect();
-
-    while !remaining.is_empty() {
-        // Partition into entries whose parent is already resolved (ready)
-        // vs. entries that need a later wave (deferred).
-        let (ready, deferred): (Vec<usize>, Vec<usize>) =
-            remaining
-                .iter()
-                .copied()
-                .partition(|&i| match &entries[i].kind {
-                    PackedKind::OfsDelta { base_offset } => entry_idx_by_offset
-                        .get(base_offset)
-                        .is_some_and(|&pi| slot[pi].is_some()),
-                    PackedKind::RefDelta { base_sha } => sha_to_idx
-                        .get(base_sha)
-                        .is_some_and(|&pi| slot[pi].is_some()),
-                    PackedKind::Base(_) => true,
-                });
-
-        if ready.is_empty() {
-            return Err(GitRemoteError::Protocol(
-                "unresolvable delta chain in packfile".into(),
-            ));
-        }
-
-        let outputs: Result<Vec<ResolvedDelta>, GitRemoteError> = ready
-            .par_iter()
-            .map(|&i| {
-                let e = &entries[i];
-                let parent_idx = match &e.kind {
-                    PackedKind::OfsDelta { base_offset } => entry_idx_by_offset[base_offset],
-                    PackedKind::RefDelta { base_sha } => sha_to_idx[base_sha],
-                    PackedKind::Base(_) => unreachable!(),
-                };
-                let (parent_data, _, parent_kind) = slot[parent_idx].as_ref().unwrap();
-                let data = apply_delta(parent_data, &e.data)?;
-                let sha = git_object_id(*parent_kind, &data);
-                Ok((i, data, sha, *parent_kind))
-            })
-            .collect();
-        let outputs = outputs?;
-
-        for (i, data, sha, kind) in outputs {
-            sha_to_idx.entry(sha.clone()).or_insert(i);
-            slot[i] = Some((data, sha, kind));
-        }
-
-        remaining = deferred;
-    }
-
-    let mut out = HashMap::with_capacity(n);
-    for opt in slot.into_iter() {
-        let (data, sha, kind) = opt.expect("every entry resolved");
-        out.entry(sha).or_insert(GitObject { kind, data });
-    }
-    Ok(out)
-}
-
-fn parse_object_header(data: &[u8]) -> Result<(u8, usize, usize), GitRemoteError> {
+pub(crate) fn parse_object_header(data: &[u8]) -> Result<(u8, usize, usize), GitRemoteError> {
     let first = *data
         .first()
         .ok_or_else(|| GitRemoteError::Protocol("truncated object header".into()))?;
@@ -1442,7 +1350,7 @@ fn parse_object_header(data: &[u8]) -> Result<(u8, usize, usize), GitRemoteError
     Ok((kind, used, size as usize))
 }
 
-fn parse_ofs_delta_base(
+pub(crate) fn parse_ofs_delta_base(
     data: &[u8],
     current_offset: usize,
 ) -> Result<(usize, usize), GitRemoteError> {
@@ -1478,39 +1386,24 @@ fn parse_ofs_delta_base(
         .ok_or_else(|| GitRemoteError::Protocol("invalid ofs-delta base offset".into()))
 }
 
-/// Inflate one zlib stream, capped at `expected` bytes (the size the pack
-/// entry header declared). A stream producing more than declared is a zlib
-/// bomb; less is truncation. Both are hard errors.
-fn inflate_from(data: &[u8], expected: usize) -> Result<(Vec<u8>, usize), GitRemoteError> {
-    let reader = Cursor::new(data);
-    let decoder = ZlibDecoder::new(reader);
-    // +1 so an over-long stream is detectable rather than silently clipped.
-    let mut limited = decoder.take(expected as u64 + 1);
-    let mut out = Vec::new();
-    limited
-        .read_to_end(&mut out)
-        .map_err(|e| GitRemoteError::Protocol(format!("zlib decode failed: {}", e)))?;
-    if out.len() != expected {
-        return Err(GitRemoteError::Protocol(format!(
-            "object inflated to {}+ bytes but its header declared {}",
-            out.len(),
-            expected
-        )));
-    }
-    let consumed = limited.into_inner().into_inner().position() as usize;
-    Ok((out, consumed))
+pub fn git_object_id(kind: GitObjectKind, data: &[u8]) -> String {
+    hex::encode(git_object_sha1(kind, data))
 }
 
-pub fn git_object_id(kind: GitObjectKind, data: &[u8]) -> String {
+/// A git object's id: SHA-1 over `"<kind> <len>\0"` followed by the content.
+/// Hashed incrementally so a large blob is never copied just to prefix it.
+pub(crate) fn git_object_sha1(kind: GitObjectKind, data: &[u8]) -> [u8; 20] {
+    use sha1::{Digest, Sha1};
     let kind_name = match kind {
         GitObjectKind::Commit => "commit",
         GitObjectKind::Tree => "tree",
         GitObjectKind::Blob => "blob",
         GitObjectKind::Tag => "tag",
     };
-    let mut canonical = format!("{} {}\0", kind_name, data.len()).into_bytes();
-    canonical.extend_from_slice(data);
-    hex::encode(sha1_digest(&canonical))
+    let mut hasher = Sha1::new();
+    hasher.update(format!("{} {}\0", kind_name, data.len()).as_bytes());
+    hasher.update(data);
+    hasher.finalize().into()
 }
 
 /// Apply a git delta stream to `base`. Public so the fuzz target
@@ -1613,13 +1506,6 @@ fn read_varint(data: &[u8], cursor: &mut usize) -> Result<usize, GitRemoteError>
         }
         shift += 7;
     }
-}
-
-fn sha1_digest(data: &[u8]) -> [u8; 20] {
-    use sha1::{Digest, Sha1};
-    let mut hasher = Sha1::new();
-    hasher.update(data);
-    hasher.finalize().into()
 }
 
 /// An annotated git tag object.
@@ -1845,6 +1731,11 @@ pub enum GitRemoteError {
     Http { status: u16, message: String },
     #[error("{0}")]
     Protocol(String),
+    /// An object the fetched history needs is neither in the pack nor in the
+    /// local store. After a negotiated fetch this means the server left out
+    /// something our `have` lines claimed; the caller can retry without them.
+    #[error("missing {kind} object {sha}")]
+    MissingObject { kind: &'static str, sha: String },
     #[error("{0}")]
     Unsupported(String),
     #[error("{0}")]
@@ -1864,31 +1755,6 @@ pub fn import_fetch_result(
         .map_err(|e| GitRemoteError::Io(e.to_string()))?;
     let store = FsStore::new(&cas);
     let mut mapping = HashMapping::new(&repo.ivaldi_dir);
-
-    let mut commit_order = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    collect_commit_order(
-        &fetch.head_sha,
-        &fetch.objects,
-        &fetch.shallow,
-        &mut seen,
-        &mut commit_order,
-    )?;
-    // Tagged commits usually sit outside the branch being cloned, so they need
-    // their own walk roots — without this their objects arrive in the pack but
-    // never become seals, and every tag then resolves to nothing.
-    // `seen` is shared, so the combined order stays topological and each commit
-    // is emitted once.
-    let tags = advertised_tags(fetch)?;
-    for tag in &tags {
-        collect_commit_order(
-            &tag.target_commit,
-            &fetch.objects,
-            &fetch.shallow,
-            &mut seen,
-            &mut commit_order,
-        )?;
-    }
 
     let mut tree_cache: HashMap<String, B3Hash> = HashMap::new();
     let mut leaf_idx_by_sha: HashMap<String, u64> = HashMap::new();
@@ -1915,16 +1781,60 @@ pub fn import_fetch_result(
         }
     }
 
+    // A negotiated fetch leaves out whatever our `have` lines covered, so the
+    // walks below have to tell "the server rightly skipped this" from "this
+    // is missing". Only what is verifiably here counts: a commit needs its
+    // seal, a tree or blob needs its object in the CAS — the mapping alone
+    // can outlive both (gc, squash).
+    let local = LocalObjects {
+        mapping: &mapping,
+        leaf_idx_by_hash: &leaf_idx_by_hash,
+        cas: &cas,
+    };
+
+    let mut commit_order = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    collect_commit_order(
+        &fetch.head_sha,
+        &fetch.objects,
+        &fetch.shallow,
+        &local,
+        &mut seen,
+        &mut commit_order,
+    )?;
+    // Tagged commits usually sit outside the branch being cloned, so they need
+    // their own walk roots — without this their objects arrive in the pack but
+    // never become seals, and every tag then resolves to nothing.
+    // `seen` is shared, so the combined order stays topological and each commit
+    // is emitted once.
+    let tags = advertised_tags(fetch, &local)?;
+    for tag in &tags {
+        collect_commit_order(
+            &tag.target_commit,
+            &fetch.objects,
+            &fetch.shallow,
+            &local,
+            &mut seen,
+            &mut commit_order,
+        )?;
+    }
+
     // Walk every reachable blob once, then write the new ones to CAS in
     // parallel up front. After this, the per-commit tree import is pure
     // mapping lookups + tree assembly — no blob I/O on the hot path.
     let tag_roots: Vec<&str> = tags.iter().map(|t| t.target_commit.as_str()).collect();
-    let all_blobs =
-        collect_reachable_blobs(&fetch.head_sha, &tag_roots, &fetch.objects, &fetch.shallow)?;
-    let pending_count = all_blobs
+    let all_blobs = collect_reachable_blobs(
+        &fetch.head_sha,
+        &tag_roots,
+        &fetch.objects,
+        &fetch.shallow,
+        &local,
+    )?;
+    let pending_blobs: Vec<&String> = all_blobs
         .iter()
-        .filter(|sha| mapping.get_blake3(sha).is_none())
-        .count();
+        .filter(|sha| local.blob(sha).is_none())
+        .collect();
+    let pending_count = pending_blobs.len();
 
     let mp = MultiProgress::new();
     let pb_blobs = mp.add(progress::file_bar(pending_count as u64, "Importing blobs"));
@@ -1933,7 +1843,7 @@ pub fn import_fetch_result(
         "Importing commits",
     ));
 
-    let prefetched = prefetch_blobs(&all_blobs, &fetch.objects, &store, &mapping, &pb_blobs)?;
+    let prefetched = prefetch_blobs(pending_blobs, fetch, &store, &pb_blobs)?;
     let blobs_downloaded = prefetched.len();
     for (git_sha, hash) in prefetched {
         mapping.insert(&git_sha, hash);
@@ -1948,6 +1858,28 @@ pub fn import_fetch_result(
     mapping
         .save()
         .map_err(|e| GitRemoteError::Io(e.to_string()))?;
+
+    // Trees next, for the same reason: with them in the CAS up front, the
+    // commit loop below is reduced to assembling leaves. Commits that will be
+    // skipped as already present don't need theirs.
+    let mut tree_roots = Vec::new();
+    for sha in commit_order.iter() {
+        let already_landed = mapping
+            .get_blake3(sha)
+            .is_some_and(|hash| leaf_idx_by_hash.contains_key(&hash));
+        if !already_landed && let Some(object) = fetch.objects.get(sha) {
+            tree_roots.push(parse_commit(&object.data)?.tree);
+        }
+    }
+    import_trees(
+        &tree_roots,
+        &fetch.objects,
+        &store,
+        &cas,
+        &mut mapping,
+        &mut tree_cache,
+        &mut submodules_skipped,
+    )?;
 
     // Leaves built but not yet landed. Drained by `land_commit_batch` every
     // COMMIT_BATCH commits and once more after the loop.
@@ -1971,15 +1903,9 @@ pub fn import_fetch_result(
             .get(sha)
             .ok_or_else(|| GitRemoteError::Protocol(format!("missing commit object {}", sha)))?;
         let commit = parse_commit(&object.data)?;
-        let tree_hash = import_tree(
-            &commit.tree,
-            "",
-            &fetch.objects,
-            &store,
-            &mut mapping,
-            &mut tree_cache,
-            &mut submodules_skipped,
-        )?;
+        let tree_hash = tree_cache.get(&commit.tree).copied().ok_or_else(|| {
+            GitRemoteError::Protocol(format!("tree {} was not imported", commit.tree))
+        })?;
         let author = if commit.author_name.is_empty() || commit.author_email.is_empty() {
             "unknown <unknown>".to_string()
         } else {
@@ -1991,7 +1917,15 @@ pub fn import_fetch_result(
         // parent means corrupted state — refusing beats silently importing
         // this commit as a fake root (severed ancestry).
         let resolve_parent = |p: &String| -> Result<u64, GitRemoteError> {
-            leaf_idx_by_sha.get(p).copied().ok_or_else(|| {
+            // A parent the pack didn't carry (negotiated fetch) is absent
+            // from `leaf_idx_by_sha` unless it was itself imported from git;
+            // a natively sealed, uploaded parent is only in the mapping.
+            let known = leaf_idx_by_sha.get(p).copied().or_else(|| {
+                mapping
+                    .get_blake3(p)
+                    .and_then(|hash| leaf_idx_by_hash.get(&hash).copied())
+            });
+            known.ok_or_else(|| {
                 GitRemoteError::Protocol(format!(
                     "commit {} lists parent {} which resolves to no local seal — \
                      refusing to sever ancestry; run 'ivaldi verify --full' and retry the harvest",
@@ -2158,6 +2092,45 @@ pub fn import_fetch_result(
     })
 }
 
+/// What the local repository verifiably holds, by git id. Lets the import
+/// walks stop at objects a negotiated fetch rightly left out of the pack.
+struct LocalObjects<'a> {
+    mapping: &'a crate::remote::HashMapping,
+    leaf_idx_by_hash: &'a HashMap<B3Hash, u64>,
+    cas: &'a dyn crate::cas::Cas,
+}
+
+impl LocalObjects<'_> {
+    /// A commit counts only if its seal exists; a mapping entry can be stale.
+    fn has_commit(&self, sha: &str) -> bool {
+        self.mapping
+            .get_blake3(sha)
+            .is_some_and(|hash| self.leaf_idx_by_hash.contains_key(&hash))
+    }
+
+    fn tree(&self, sha: &str) -> Option<B3Hash> {
+        stored_object(self.mapping, self.cas, sha)
+    }
+
+    fn blob(&self, sha: &str) -> Option<B3Hash> {
+        stored_object(self.mapping, self.cas, sha)
+    }
+}
+
+/// The Ivaldi hash a git tree or blob is mapped to, provided the object is
+/// really in the CAS. The mapping is never pruned, so after a gc or squash it
+/// can name objects that are gone; trusting it blindly would let a tree
+/// reference a hole.
+fn stored_object(
+    mapping: &crate::remote::HashMapping,
+    cas: &dyn crate::cas::Cas,
+    sha: &str,
+) -> Option<B3Hash> {
+    mapping
+        .get_blake3(sha)
+        .filter(|hash| cas.has(*hash).unwrap_or(false))
+}
+
 /// One advertised `refs/tags/<name>` resolved against the fetched objects.
 struct AdvertisedTag {
     name: String,
@@ -2174,7 +2147,10 @@ struct AdvertisedTag {
 /// that were not fetched, or that name something other than a commit, are
 /// skipped — that is the normal outcome of cloning one branch without
 /// `--include-tags`, not a broken pack.
-fn advertised_tags(fetch: &FetchResult) -> Result<Vec<AdvertisedTag>, GitRemoteError> {
+fn advertised_tags(
+    fetch: &FetchResult,
+    local: &LocalObjects<'_>,
+) -> Result<Vec<AdvertisedTag>, GitRemoteError> {
     // Chained annotated tags are legal but vanishingly rare; a cap keeps a
     // hostile pack from looping us forever.
     const MAX_TAG_CHAIN: usize = 16;
@@ -2210,10 +2186,12 @@ fn advertised_tags(fetch: &FetchResult) -> Result<Vec<AdvertisedTag>, GitRemoteE
 
         // Only commits become seals. A tag on a tree or blob has nothing to
         // point at in Ivaldi's model.
-        let is_local_commit = fetch
-            .objects
-            .get(&sha)
-            .is_some_and(|o| o.kind == GitObjectKind::Commit);
+        // The target is either in this pack or, after a negotiated fetch, a
+        // commit we already hold.
+        let is_local_commit = match fetch.objects.get(&sha) {
+            Some(object) => object.kind == GitObjectKind::Commit,
+            None => local.has_commit(&sha),
+        };
         if !is_local_commit {
             continue;
         }
@@ -2320,6 +2298,7 @@ fn collect_commit_order(
     sha: &str,
     objects: &HashMap<String, GitObject>,
     shallow: &BTreeSet<String>,
+    local: &LocalObjects<'_>,
     seen: &mut std::collections::HashSet<String>,
     out: &mut Vec<String>,
 ) -> Result<(), GitRemoteError> {
@@ -2333,9 +2312,17 @@ fn collect_commit_order(
         if !seen.insert(sha.clone()) {
             continue;
         }
-        let object = objects
-            .get(&sha)
-            .ok_or_else(|| GitRemoteError::Protocol(format!("missing commit object {}", sha)))?;
+        let Some(object) = objects.get(&sha) else {
+            // Already sealed here, so the server left it (and its ancestry)
+            // out. Nothing to import; children resolve it as a parent.
+            if local.has_commit(&sha) {
+                continue;
+            }
+            return Err(GitRemoteError::MissingObject {
+                kind: "commit",
+                sha,
+            });
+        };
         let commit = parse_commit(&object.data)?;
         let boundary = shallow.contains(&sha);
         stack.push((sha, true));
@@ -2353,35 +2340,172 @@ fn collect_commit_order(
     Ok(())
 }
 
-fn import_tree(
-    sha: &str,
-    path_prefix: &str,
+/// The name a git tree entry is imported under, or `None` if it is dropped.
+///
+/// Dotfile policy, applied at import time:
+/// - `.gitignore` is renamed to `.ivaldiignore` (same blob, new name).
+/// - `.ivaldiignore` passes through unchanged.
+/// - Every other dotfile is dropped — ivaldi auto-ignores dotfiles in the
+///   workspace, and importing them would just create phantom "deleted"
+///   entries in status/auto-shelf. Dot-directories are kept.
+fn imported_entry_name(entry: &TreeEntry) -> Option<String> {
+    match entry.name.as_str() {
+        ".ivaldiignore" => Some(entry.name.clone()),
+        ".gitignore" => Some(".ivaldiignore".to_string()),
+        n if n.starts_with('.') && !is_tree_mode(&entry.mode) => None,
+        _ => Some(entry.name.clone()),
+    }
+}
+
+/// One git tree awaiting translation, with the path it was first reached by.
+struct PlannedTree {
+    sha: String,
+    path: String,
+    entries: Vec<TreeEntry>,
+}
+
+fn is_tree_mode(mode: &str) -> bool {
+    matches!(mode, "40000" | "040000")
+}
+
+/// Import every tree under `roots` into the store, filling `tree_cache`
+/// (git tree sha → Ivaldi tree hash) for the commit loop to read.
+///
+/// Trees are written level by level — leaves first, each level in parallel.
+/// A tree only needs its children's hashes, and each store write is a
+/// synchronous disk round-trip, so importing them one at a time on a single
+/// thread left a large history import waiting on the disk while every other
+/// core sat idle.
+fn import_trees(
+    roots: &[String],
     objects: &HashMap<String, GitObject>,
     store: &crate::fsmerkle::FsStore<'_>,
+    cas: &dyn crate::cas::Cas,
     mapping: &mut crate::remote::HashMapping,
     tree_cache: &mut HashMap<String, B3Hash>,
     submodules_skipped: &mut std::collections::BTreeSet<String>,
-) -> Result<B3Hash, GitRemoteError> {
+) -> Result<(), GitRemoteError> {
+    let mut heights: HashMap<String, usize> = HashMap::new();
+    let mut levels: Vec<Vec<PlannedTree>> = Vec::new();
+    {
+        let mut plan = TreePlan {
+            objects,
+            mapping,
+            cas,
+            tree_cache,
+            heights: &mut heights,
+            levels: &mut levels,
+        };
+        for root in roots {
+            plan.visit(root, "")?;
+        }
+    }
+
+    for level in levels {
+        let known_trees = &*tree_cache;
+        let known_blobs = &*mapping;
+        let imported: Vec<(String, B3Hash, Vec<String>)> = level
+            .into_par_iter()
+            .map(|tree| {
+                let mut skipped = Vec::new();
+                let entries = translate_tree(&tree, known_trees, known_blobs, &mut skipped)?;
+                let hash = store
+                    .put_tree(entries)
+                    .map_err(|e| GitRemoteError::Io(e.to_string()))?;
+                Ok((tree.sha, hash, skipped))
+            })
+            .collect::<Result<_, GitRemoteError>>()?;
+        for (sha, hash, skipped) in imported {
+            // Tree identity is deterministic just like blob identity.
+            // Persisting it lets a later upload reference a remote-known
+            // subtree without loading and re-hashing every blob below it.
+            mapping.insert(&sha, hash);
+            tree_cache.insert(sha, hash);
+            submodules_skipped.extend(skipped);
+        }
+    }
+    Ok(())
+}
+
+/// State for scheduling trees into height levels.
+struct TreePlan<'a> {
+    objects: &'a HashMap<String, GitObject>,
+    mapping: &'a crate::remote::HashMapping,
+    cas: &'a dyn crate::cas::Cas,
+    tree_cache: &'a mut HashMap<String, B3Hash>,
+    heights: &'a mut HashMap<String, usize>,
+    levels: &'a mut Vec<Vec<PlannedTree>>,
+}
+
+impl TreePlan<'_> {
+    /// Schedule `sha` and everything below it that isn't imported yet,
+    /// bucketed by height so that every tree lands in a later level than its
+    /// children. Returns the tree's height.
+    fn visit(&mut self, sha: &str, path_prefix: &str) -> Result<usize, GitRemoteError> {
+        // Depth guard: `heights` only dedupes completed subtrees, so a
+        // self-referencing tree in a hostile pack would otherwise recurse
+        // forever. Path depth == number of separators + 1.
+        if path_prefix.split('/').count() >= MAX_TREE_DEPTH {
+            return Err(GitRemoteError::Protocol(format!(
+                "tree nesting exceeds {} levels — refusing (malformed or hostile pack)",
+                MAX_TREE_DEPTH
+            )));
+        }
+        if self.tree_cache.contains_key(sha) {
+            return Ok(0);
+        }
+        if let Some(height) = self.heights.get(sha).copied() {
+            return Ok(height);
+        }
+
+        let Some(object) = self.objects.get(sha) else {
+            // An unchanged subtree a negotiated fetch didn't resend: reuse
+            // the tree it was imported as.
+            if let Some(hash) = stored_object(self.mapping, self.cas, sha) {
+                self.tree_cache.insert(sha.to_string(), hash);
+                return Ok(0);
+            }
+            return Err(GitRemoteError::MissingObject {
+                kind: "tree",
+                sha: sha.to_string(),
+            });
+        };
+        let entries = parse_tree(&object.data)?;
+        let mut height = 0usize;
+        for entry in entries.iter().filter(|e| is_tree_mode(&e.mode)) {
+            let child_path = if path_prefix.is_empty() {
+                entry.name.clone()
+            } else {
+                format!("{}/{}", path_prefix, entry.name)
+            };
+            let child = self.visit(&entry.sha, &child_path)?;
+            height = height.max(child + 1);
+        }
+
+        self.heights.insert(sha.to_string(), height);
+        if self.levels.len() <= height {
+            self.levels.resize_with(height + 1, Vec::new);
+        }
+        self.levels[height].push(PlannedTree {
+            sha: sha.to_string(),
+            path: path_prefix.to_string(),
+            entries,
+        });
+        Ok(height)
+    }
+}
+
+/// Translate one git tree into Ivaldi entries. Every child tree and blob must
+/// already be imported; submodule paths that had to be dropped are appended
+/// to `submodules_skipped`.
+fn translate_tree(
+    tree: &PlannedTree,
+    tree_cache: &HashMap<String, B3Hash>,
+    mapping: &crate::remote::HashMapping,
+    submodules_skipped: &mut Vec<String>,
+) -> Result<Vec<crate::fsmerkle::Entry>, GitRemoteError> {
     use crate::fsmerkle::{Entry, MODE_DIR, MODE_EXEC, MODE_FILE, MODE_SYMLINK, NodeKind};
 
-    // Depth guard: `tree_cache` only dedupes completed subtrees, so a
-    // self-referencing tree in a hostile pack would otherwise recurse
-    // forever. Path depth == number of separators + 1.
-    if path_prefix.split('/').count() >= MAX_TREE_DEPTH {
-        return Err(GitRemoteError::Protocol(format!(
-            "tree nesting exceeds {} levels — refusing (malformed or hostile pack)",
-            MAX_TREE_DEPTH
-        )));
-    }
-
-    if let Some(hash) = tree_cache.get(sha).copied() {
-        return Ok(hash);
-    }
-
-    let object = objects
-        .get(sha)
-        .ok_or_else(|| GitRemoteError::Protocol(format!("missing tree object {}", sha)))?;
-    let entries = parse_tree(&object.data)?;
     // Track which output names we've added so duplicates from rename collisions
     // (`.gitignore` → `.ivaldiignore` when both exist) resolve deterministically:
     // a real `.ivaldiignore` always wins over a renamed `.gitignore`.
@@ -2389,41 +2513,21 @@ fn import_tree(
     let mut seen_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut rename_present: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-    for entry in entries {
-        // Translate dotfile policy at import time:
-        // - `.gitignore` is renamed to `.ivaldiignore` (same blob, new name).
-        // - `.ivaldiignore` passes through unchanged.
-        // - Every other dotfile is dropped — ivaldi auto-ignores dotfiles
-        //   in the workspace, and importing them would just create phantom
-        //   "deleted" entries in status/auto-shelf.
-        let mapped_name = match entry.name.as_str() {
-            ".ivaldiignore" => Some(entry.name.clone()),
-            ".gitignore" => Some(".ivaldiignore".to_string()),
-            n if n.starts_with('.') && entry.mode != "40000" && entry.mode != "040000" => None,
-            _ => Some(entry.name.clone()),
-        };
+    for entry in &tree.entries {
+        let mapped_name = imported_entry_name(entry);
 
         let Some(out_name) = mapped_name else {
             continue;
         };
 
-        let child_path = if path_prefix.is_empty() {
-            out_name.clone()
-        } else {
-            format!("{}/{}", path_prefix, out_name)
-        };
-
         match entry.mode.as_str() {
-            "40000" | "040000" => {
-                let hash = import_tree(
-                    &entry.sha,
-                    &child_path,
-                    objects,
-                    store,
-                    mapping,
-                    tree_cache,
-                    submodules_skipped,
-                )?;
+            mode if is_tree_mode(mode) => {
+                let hash = tree_cache.get(&entry.sha).copied().ok_or_else(|| {
+                    GitRemoteError::Protocol(format!(
+                        "tree {} was not imported before its parent",
+                        entry.sha
+                    ))
+                })?;
                 ivaldi_entries.push(Entry {
                     name: out_name,
                     mode: MODE_DIR,
@@ -2472,7 +2576,11 @@ fn import_tree(
                 // submodule's repository; record the path so the user can see
                 // what we skipped. Logged once via crate::logging::warn so a
                 // huge repo doesn't spam the console.
-                submodules_skipped.insert(child_path.clone());
+                submodules_skipped.push(if tree.path.is_empty() {
+                    out_name
+                } else {
+                    format!("{}/{}", tree.path, out_name)
+                });
             }
             other => {
                 return Err(GitRemoteError::Unsupported(format!(
@@ -2482,16 +2590,7 @@ fn import_tree(
             }
         }
     }
-
-    let hash = store
-        .put_tree(ivaldi_entries)
-        .map_err(|e| GitRemoteError::Io(e.to_string()))?;
-    // Tree identity is deterministic just like blob identity. Persisting it
-    // lets a later upload reference a remote-known subtree without loading
-    // and re-hashing every blob below it.
-    mapping.insert(sha, hash);
-    tree_cache.insert(sha.to_string(), hash);
-    Ok(hash)
+    Ok(ivaldi_entries)
 }
 
 fn collect_reachable_blobs(
@@ -2499,6 +2598,7 @@ fn collect_reachable_blobs(
     extra_roots: &[&str],
     objects: &HashMap<String, GitObject>,
     shallow: &BTreeSet<String>,
+    local: &LocalObjects<'_>,
 ) -> Result<Vec<String>, GitRemoteError> {
     let mut seen_commits = std::collections::HashSet::new();
     let mut seen_trees = std::collections::HashSet::new();
@@ -2512,13 +2612,20 @@ fn collect_reachable_blobs(
         if !seen_commits.insert(sha.clone()) {
             continue;
         }
-        let object = objects
-            .get(&sha)
-            .ok_or_else(|| GitRemoteError::Protocol(format!("missing commit object {}", sha)))?;
+        let Some(object) = objects.get(&sha) else {
+            if local.has_commit(&sha) {
+                continue;
+            }
+            return Err(GitRemoteError::MissingObject {
+                kind: "commit",
+                sha,
+            });
+        };
         let commit = parse_commit(&object.data)?;
         walk_tree_for_blobs(
             &commit.tree,
             objects,
+            local,
             &mut seen_trees,
             &mut seen_blobs,
             &mut order,
@@ -2541,6 +2648,7 @@ fn collect_reachable_blobs(
 fn walk_tree_for_blobs(
     sha: &str,
     objects: &HashMap<String, GitObject>,
+    local: &LocalObjects<'_>,
     seen_trees: &mut std::collections::HashSet<String>,
     seen_blobs: &mut std::collections::HashSet<String>,
     order: &mut Vec<String>,
@@ -2555,15 +2663,29 @@ fn walk_tree_for_blobs(
     if !seen_trees.insert(sha.to_string()) {
         return Ok(());
     }
-    let object = objects
-        .get(sha)
-        .ok_or_else(|| GitRemoteError::Protocol(format!("missing tree object {}", sha)))?;
+    let Some(object) = objects.get(sha) else {
+        // An unchanged subtree the server didn't resend: everything under
+        // it is already stored.
+        if local.tree(sha).is_some() {
+            return Ok(());
+        }
+        return Err(GitRemoteError::MissingObject {
+            kind: "tree",
+            sha: sha.to_string(),
+        });
+    };
     for entry in parse_tree(&object.data)? {
+        // Entries the import drops are never looked at again, so their
+        // blobs are neither required nor stored.
+        if imported_entry_name(&entry).is_none() {
+            continue;
+        }
         match entry.mode.as_str() {
             "40000" | "040000" => {
                 walk_tree_for_blobs(
                     &entry.sha,
                     objects,
+                    local,
                     seen_trees,
                     seen_blobs,
                     order,
@@ -2590,31 +2712,56 @@ fn walk_tree_for_blobs(
 /// Write every reachable blob to the CAS in parallel and return the
 /// (git_sha → blake3) pairs to merge into `HashMapping`. Skips blobs already
 /// known to the mapping. Drives the blob progress bar.
+///
+/// Blobs still inside the spooled pack are rebuilt and written one delta
+/// tree at a time, so memory stays at a few blobs per thread no matter how
+/// large the repository is.
 fn prefetch_blobs(
-    blob_shas: &[String],
-    objects: &HashMap<String, GitObject>,
+    pending: Vec<&String>,
+    fetch: &FetchResult,
     store: &crate::fsmerkle::FsStore<'_>,
-    mapping: &crate::remote::HashMapping,
     pb_blobs: &indicatif::ProgressBar,
 ) -> Result<Vec<(String, B3Hash)>, GitRemoteError> {
-    let pending: Vec<&String> = blob_shas
-        .iter()
-        .filter(|sha| mapping.get_blake3(sha).is_none())
-        .collect();
+    let put = |sha: &str, content: &[u8]| -> Result<(String, B3Hash), GitRemoteError> {
+        let (hash, _) = store
+            .put_blob(content)
+            .map_err(|e| GitRemoteError::Io(e.to_string()))?;
+        pb_blobs.inc(1);
+        Ok((sha.to_string(), hash))
+    };
 
-    pending
+    let (in_memory, in_pack): (Vec<&String>, Vec<&String>) = pending
+        .into_iter()
+        .partition(|sha| fetch.objects.contains_key(sha.as_str()));
+    let mut imported: Vec<(String, B3Hash)> = in_memory
         .par_iter()
-        .map(|sha| {
-            let blob = objects
-                .get(sha.as_str())
-                .ok_or_else(|| GitRemoteError::Protocol(format!("missing blob object {}", sha)))?;
-            let (hash, _) = store
-                .put_blob(&blob.data)
-                .map_err(|e| GitRemoteError::Io(e.to_string()))?;
-            pb_blobs.inc(1);
-            Ok(((*sha).clone(), hash))
-        })
-        .collect()
+        .map(|sha| put(sha, &fetch.objects[sha.as_str()].data))
+        .collect::<Result<_, _>>()?;
+
+    // Whatever isn't in memory has to come out of the spooled pack.
+    let wanted: std::collections::HashSet<&str> = in_pack.iter().map(|s| s.as_str()).collect();
+    let from_pack = std::sync::Mutex::new(HashMap::with_capacity(wanted.len()));
+    if let Some(pack) = fetch.pack.as_ref().filter(|_| !wanted.is_empty()) {
+        pack.for_each_blob(|sha, content| {
+            if wanted.contains(sha.as_str()) {
+                let (sha, hash) = put(&sha, content)?;
+                from_pack.lock().unwrap().insert(sha, hash);
+            }
+            Ok(())
+        })?;
+    }
+    let from_pack = from_pack.into_inner().unwrap();
+    if let Some(missing) = in_pack
+        .iter()
+        .find(|sha| !from_pack.contains_key(sha.as_str()))
+    {
+        return Err(GitRemoteError::MissingObject {
+            kind: "blob",
+            sha: missing.to_string(),
+        });
+    }
+    imported.extend(from_pack);
+    Ok(imported)
 }
 
 #[cfg(test)]
@@ -2657,6 +2804,92 @@ mod tests {
         assert!(!r.unpack_ok);
         assert_eq!(r.unpack_error.as_deref(), Some("invalid pack"));
         assert!(r.refs.is_empty());
+    }
+
+    #[test]
+    fn upload_pack_request_puts_haves_after_the_flush() {
+        let negotiation = Negotiation {
+            haves: vec!["b".repeat(40), "c".repeat(40)],
+            shallow: vec!["d".repeat(40)],
+        };
+        let body = upload_pack_request(&["a".repeat(40), "e".repeat(40)], 0, &negotiation);
+        let text = String::from_utf8(body).unwrap();
+        let (before, after) = text.split_once("0000").unwrap();
+        assert!(before.contains(&format!("want {} {}", "a".repeat(40), UPLOAD_PACK_CAPS)));
+        assert!(before.contains(&format!("want {}\n", "e".repeat(40))));
+        assert!(before.contains(&format!("shallow {}\n", "d".repeat(40))));
+        assert!(!before.contains("have "));
+        assert!(after.contains(&format!("have {}\n", "b".repeat(40))));
+        assert!(after.contains(&format!("have {}\n", "c".repeat(40))));
+        assert!(after.ends_with("0009done\n"));
+    }
+
+    #[test]
+    fn upload_pack_request_without_haves_is_a_plain_clone() {
+        // Old shallow boundaries must not truncate a full download.
+        let negotiation = Negotiation {
+            haves: Vec::new(),
+            shallow: vec!["d".repeat(40)],
+        };
+        let body = upload_pack_request(&["a".repeat(40)], 3, &negotiation);
+        let text = String::from_utf8(body).unwrap();
+        assert!(!text.contains("shallow d"));
+        assert!(!text.contains("have "));
+        assert!(text.contains("deepen 3\n"));
+        assert!(text.ends_with("00000009done\n"));
+    }
+
+    #[test]
+    fn upload_pack_request_caps_the_have_list() {
+        let negotiation = Negotiation {
+            haves: (0..MAX_HAVES + 50).map(|i| format!("{:040x}", i)).collect(),
+            shallow: Vec::new(),
+        };
+        let body = upload_pack_request(&["a".repeat(40)], 0, &negotiation);
+        let text = String::from_utf8(body).unwrap();
+        assert_eq!(text.matches("have ").count(), MAX_HAVES);
+        // Most useful first: the head of the list survives the cap.
+        assert!(text.contains(&format!("have {:040x}\n", 0)));
+    }
+
+    #[test]
+    fn negotiated_fetch_wants_annotated_tags_on_held_commits_only() {
+        let held = "1".repeat(40);
+        let unheld = "2".repeat(40);
+        let refs = vec![
+            advertised_ref("refs/heads/main", [9; 20]),
+            AdvertisedRef {
+                id: "a".repeat(40),
+                name: "refs/tags/on-held".into(),
+            },
+            AdvertisedRef {
+                id: held.clone(),
+                name: "refs/tags/on-held^{}".into(),
+            },
+            AdvertisedRef {
+                id: "b".repeat(40),
+                name: "refs/tags/on-unheld".into(),
+            },
+            AdvertisedRef {
+                id: unheld,
+                name: "refs/tags/on-unheld^{}".into(),
+            },
+            // Lightweight: no peeled companion, nothing to fetch.
+            AdvertisedRef {
+                id: held.clone(),
+                name: "refs/tags/light".into(),
+            },
+        ];
+        let negotiation = Negotiation {
+            haves: vec![held],
+            shallow: Vec::new(),
+        };
+        assert_eq!(
+            negotiated_tag_wants(&refs, &negotiation, &"9".repeat(40)),
+            vec!["a".repeat(40)]
+        );
+        // Without haves this is a plain clone and tags stay opt-in.
+        assert!(negotiated_tag_wants(&refs, &Negotiation::default(), &"9".repeat(40)).is_empty());
     }
 
     #[test]
@@ -2894,15 +3127,45 @@ mod tests {
     }
 
     #[test]
-    fn sha1_digest_matches_known_value() {
+    fn git_object_id_matches_known_value() {
+        // The empty blob's id is a fixed point every git user has seen.
         assert_eq!(
-            hex::encode(sha1_digest(b"abc")),
-            "a9993e364706816aba3e25717850c26c9cd0d89d"
+            git_object_id(GitObjectKind::Blob, b""),
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
         );
     }
 
     // ---- Hostile-input tests: network bytes must error, never allocate
     // ---- unbounded, panic, or blow the stack.
+
+    /// A repository that holds nothing, for walks that must find everything
+    /// in the pack.
+    struct EmptyLocal {
+        _dir: tempfile::TempDir,
+        mapping: HashMapping,
+        leaves: HashMap<B3Hash, u64>,
+        cas: crate::cas::MemoryCas,
+    }
+
+    impl EmptyLocal {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            Self {
+                mapping: HashMapping::new(dir.path()),
+                _dir: dir,
+                leaves: HashMap::new(),
+                cas: crate::cas::MemoryCas::new(),
+            }
+        }
+
+        fn objects(&self) -> LocalObjects<'_> {
+            LocalObjects {
+                mapping: &self.mapping,
+                leaf_idx_by_hash: &self.leaves,
+                cas: &self.cas,
+            }
+        }
+    }
 
     fn pack_header(count: u32) -> Vec<u8> {
         let mut p = Vec::new();
@@ -3028,12 +3291,23 @@ mod tests {
 
         let mut seen = std::collections::HashSet::new();
         let mut order = Vec::new();
-        collect_commit_order(&head, &objects, &BTreeSet::new(), &mut seen, &mut order).unwrap();
+        let empty = EmptyLocal::new();
+        let local = empty.objects();
+        collect_commit_order(
+            &head,
+            &objects,
+            &BTreeSet::new(),
+            &local,
+            &mut seen,
+            &mut order,
+        )
+        .unwrap();
         assert_eq!(order.len(), n);
         // Topological: every commit appears after its parent.
         assert_eq!(order.last().unwrap(), &head);
 
-        let blobs = collect_reachable_blobs(&head, &[], &objects, &BTreeSet::new()).unwrap();
+        let blobs =
+            collect_reachable_blobs(&head, &[], &objects, &BTreeSet::new(), &local).unwrap();
         assert!(blobs.is_empty());
     }
 
@@ -3074,7 +3348,9 @@ mod tests {
             },
         );
 
-        let err = collect_reachable_blobs(&head, &[], &objects, &BTreeSet::new()).unwrap_err();
+        let empty = EmptyLocal::new();
+        let err = collect_reachable_blobs(&head, &[], &objects, &BTreeSet::new(), &empty.objects())
+            .unwrap_err();
         assert!(err.to_string().contains("nesting"), "{}", err);
     }
 
