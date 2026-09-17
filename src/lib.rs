@@ -16,6 +16,7 @@ pub mod gc;
 pub mod git_export;
 pub mod git_pack_writer;
 pub mod git_remote;
+pub mod git_unpack;
 pub mod github;
 pub mod gitlab;
 pub mod hamt;

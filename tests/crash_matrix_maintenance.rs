@@ -140,6 +140,7 @@ fn import_fixture() -> FetchResult {
         head_sha: tip,
         refs: Vec::new(),
         objects,
+        pack: None,
         shallow: Default::default(),
     }
 }

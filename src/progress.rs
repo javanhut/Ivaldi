@@ -56,6 +56,20 @@ pub fn spinner(message: &str) -> ProgressBar {
     pb
 }
 
+/// Create a spinner that reports bytes transferred, for a download whose
+/// total size the server didn't announce. Advance it with `inc(bytes)`.
+pub fn byte_spinner(message: &str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg} {bytes} ({bytes_per_sec})")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    pb.set_message(message.to_string());
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    pb
+}
+
 /// Create a byte-count progress bar (for large downloads).
 pub fn byte_bar(total: u64, action: &str) -> ProgressBar {
     let pb = ProgressBar::new(total);

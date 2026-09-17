@@ -7,6 +7,7 @@ Progress bars and spinners for Ivaldi VCS, using `indicatif`.
 - `commit_bar(total)` — bar for commit processing
 - `byte_bar(total, action)` — bar with byte counts and speed
 - `spinner(message)` — indeterminate spinner for waiting operations
+- `byte_spinner(message)` — spinner with bytes transferred and speed, for downloads of unknown size
 
 ## Visual Examples
 ```
