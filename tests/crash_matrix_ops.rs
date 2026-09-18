@@ -236,6 +236,128 @@ fn fuse_conflict_crash_after_merge_state_blocks_mutations_until_abort() {
 }
 
 // ---------------------------------------------------------------------------
+// fuse carrying uncommitted work, and oops
+// ---------------------------------------------------------------------------
+
+const DIRTY: &str = "uncommitted work\n";
+
+/// [`setup_fuse_repo`] with an unsealed edit and an untracked file on `main`.
+fn setup_dirty_fuse_repo() -> tempfile::TempDir {
+    let dir = setup_fuse_repo();
+    std::fs::write(dir.path().join("file.txt"), DIRTY).unwrap();
+    std::fs::write(dir.path().join("scratch.txt"), DIRTY).unwrap();
+    dir
+}
+
+fn assert_carried_onto_the_fuse(dir: &Path) {
+    assert_eq!(read_file(dir, "file.txt"), DIRTY);
+    assert_eq!(read_file(dir, "scratch.txt"), DIRTY);
+    assert_eq!(read_file(dir, "feature.txt"), "from feature\n");
+    assert!(
+        !dir.join(".ivaldi/fuse-carry.snap").exists(),
+        "a settled fuse must not leave a carry behind"
+    );
+}
+
+/// The window the feature exists for: the uncommitted work is out of the
+/// working tree (set aside) and the merge has not happened. A retry must put
+/// it back before doing anything else, then carry it through as normal.
+#[test]
+fn fuse_crash_after_setting_work_aside_loses_nothing_and_retry_carries_it() {
+    let dir = setup_dirty_fuse_repo();
+    let before = commit_count(dir.path());
+
+    let output = ivaldi(
+        dir.path(),
+        Some("fuse.after_carry_save"),
+        &["fuse", "feature", "to", "main"],
+    );
+    assert_aborted(&output, "fuse.after_carry_save");
+    verify_full_ok(dir.path(), "fuse.after_carry_save");
+    assert_eq!(commit_count(dir.path()), before, "merge must be invisible");
+
+    ivaldi_ok(dir.path(), &["fuse", "feature", "to", "main"]);
+    assert_eq!(commit_count(dir.path()), before + 1);
+    assert_carried_onto_the_fuse(dir.path());
+    verify_full_ok(dir.path(), "fuse retry after carry save");
+}
+
+/// Same window, but the user reaches for `oops` instead of retrying.
+#[test]
+fn fuse_crash_after_setting_work_aside_is_undone_by_oops() {
+    let dir = setup_dirty_fuse_repo();
+    let before = commit_count(dir.path());
+
+    let output = ivaldi(
+        dir.path(),
+        Some("fuse.after_carry_save"),
+        &["fuse", "feature", "to", "main"],
+    );
+    assert_aborted(&output, "fuse.after_carry_save");
+
+    ivaldi_ok(dir.path(), &["oops"]);
+    assert_eq!(commit_count(dir.path()), before);
+    assert_eq!(read_file(dir.path(), "file.txt"), DIRTY);
+    assert_eq!(read_file(dir.path(), "scratch.txt"), DIRTY);
+    assert!(!dir.path().join(".ivaldi/fuse-carry.snap").exists());
+}
+
+/// The merge seal landed but the work was never given back. Retrying the fuse
+/// finds nothing to fuse — and must still finish the carry.
+#[test]
+fn fuse_crash_before_reapply_is_finished_by_retry() {
+    let dir = setup_dirty_fuse_repo();
+    let before = commit_count(dir.path());
+
+    let output = ivaldi(
+        dir.path(),
+        Some("fuse.before_reapply"),
+        &["fuse", "feature", "to", "main"],
+    );
+    assert_aborted(&output, "fuse.before_reapply");
+    verify_full_ok(dir.path(), "fuse.before_reapply");
+    assert_eq!(commit_count(dir.path()), before + 1);
+    assert_eq!(read_file(dir.path(), "file.txt"), "v1\n", "still set aside");
+
+    let retry = ivaldi_ok(dir.path(), &["fuse", "feature", "to", "main"]);
+    assert!(String::from_utf8_lossy(&retry.stdout).contains("already fused"));
+    assert_eq!(commit_count(dir.path()), before + 1, "no second merge");
+    assert_carried_onto_the_fuse(dir.path());
+}
+
+/// `oops` moves the head, then rewrites files, then records the redo. Dying
+/// at any of those leaves the target snapshot in place, so running it again
+/// converges on the same fully-undone state.
+#[test]
+fn oops_crash_windows_converge_on_retry() {
+    for failpoint in [
+        "oops.after_head",
+        "oops.after_materialize",
+        "oops.before_redo_save",
+    ] {
+        let dir = setup_dirty_fuse_repo();
+        let head_before = timeline_head(dir.path(), "main");
+        ivaldi_ok(dir.path(), &["fuse", "feature", "to", "main"]);
+        assert_carried_onto_the_fuse(dir.path());
+
+        let output = ivaldi(dir.path(), Some(failpoint), &["oops"]);
+        assert_aborted(&output, failpoint);
+        verify_full_ok(dir.path(), failpoint);
+
+        ivaldi_ok(dir.path(), &["oops"]);
+        assert_eq!(
+            timeline_head(dir.path(), "main"),
+            head_before,
+            "{failpoint}"
+        );
+        assert_eq!(read_file(dir.path(), "file.txt"), DIRTY, "{failpoint}");
+        assert_eq!(read_file(dir.path(), "scratch.txt"), DIRTY, "{failpoint}");
+        assert!(!dir.path().join("feature.txt").exists(), "{failpoint}");
+        verify_full_ok(dir.path(), "oops retry");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // undo / pluck (pick)
 // ---------------------------------------------------------------------------
 

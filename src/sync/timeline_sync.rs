@@ -183,6 +183,14 @@ pub fn sync_timeline(
         return Err(SyncError::Declined);
     }
 
+    // Sync moves the head and rewrites the working directory. Record both so
+    // `ivaldi oops` can take the whole sync back — and, under --force, so the
+    // uncommitted work being overwritten is recoverable rather than gone.
+    if repo.current_timeline().ok().as_deref() == Some(timeline) {
+        crate::snapshot::take(repo, &repo.cas, "sync")
+            .map_err(|e| SyncError::Other(e.to_string()))?;
+    }
+
     if force {
         discard_staged_changes(repo)?;
     }
@@ -248,7 +256,7 @@ fn ensure_workspace_clean(repo: &Repo, local_head_idx: Option<u64>) -> Result<()
     };
     Err(SyncError::Other(format!(
         "you have uncommitted changes that sync would overwrite:\n  {}{}\n\n\
-         Seal them ('ivaldi seal') or throw them away ('ivaldi discard') before syncing.",
+         Seal them ('ivaldi seal') or throw them away ('ivaldi reverse --all') before syncing.",
         shown.join("\n  "),
         suffix
     )))

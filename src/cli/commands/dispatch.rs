@@ -16,6 +16,7 @@ fn command_mutates(cmd: &Commands) -> bool {
         | Commands::Reseal(_)
         | Commands::Discard(_)
         | Commands::Reverse(_)
+        | Commands::Oops(_)
         | Commands::Rewind(_)
         | Commands::Undo(_)
         | Commands::Pluck(_)
@@ -97,6 +98,7 @@ pub fn run_command(cli: Cli) {
         Commands::Diff(args) => cmd_diff(args),
         Commands::Discard(args) => cmd_discard(args, cli.quiet),
         Commands::Reverse(args) => cmd_reverse(args, cli.quiet),
+        Commands::Oops(args) => cmd_oops(args, cli.quiet),
         Commands::Rewind(args) => cmd_rewind(args, cli.quiet),
         Commands::Undo(args) => cmd_undo(args, cli.quiet),
         Commands::Pluck(args) => cmd_pluck(args, cli.quiet),

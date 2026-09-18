@@ -75,6 +75,11 @@ pub enum Commands {
     /// directory from the last seal (destructive!)
     Reverse(ReverseArgs),
 
+    /// Undo the last command that rewrote your working directory (fuse,
+    /// sync, reverse, rewind) — files, staging and timeline head all go back.
+    /// Run it again to redo.
+    Oops(OopsArgs),
+
     /// Move the timeline head back to an earlier seal
     #[command(alias = "rw")]
     Rewind(RewindArgs),
@@ -577,6 +582,17 @@ pub struct ReverseArgs {
     /// Required confirmation that every uncommitted change should go
     #[arg(long, required = true)]
     pub all: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct OopsArgs {
+    /// Show the snapshots that can be restored instead of restoring one
+    #[arg(long)]
+    pub list: bool,
+
+    /// Restore this snapshot (an id from --list) instead of the latest
+    #[arg(conflicts_with = "list")]
+    pub id: Option<u64>,
 }
 
 #[derive(clap::Args, Debug)]

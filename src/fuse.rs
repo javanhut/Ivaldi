@@ -428,6 +428,20 @@ struct Edit {
 /// fuse resolvable in an editor instead of an all-or-nothing choice between
 /// two whole file versions.
 fn merge3(base: &str, ours: &str, theirs: &str, ours_label: &str, theirs_label: &str) -> String {
+    merge_text(base, ours, theirs, ours_label, theirs_label).0
+}
+
+/// [`merge3`], also reporting whether any region had to be left in conflict
+/// markers. Asking the output instead ([`has_conflict_markers`]) cannot tell a
+/// conflict from a file that merged cleanly and merely *contains* marker lines.
+pub fn merge_text(
+    base: &str,
+    ours: &str,
+    theirs: &str,
+    ours_label: &str,
+    theirs_label: &str,
+) -> (String, bool) {
+    let mut conflicted = false;
     let base_lines: Vec<&str> = base.lines().collect();
 
     // Both sides' edits in one stream, ordered by the base lines they touch.
@@ -491,11 +505,19 @@ fn merge3(base: &str, ours: &str, theirs: &str, ours_label: &str, theirs_label: 
         let theirs_side = || edits.iter().filter(|(s, _)| *s == 1).map(|(_, e)| e);
 
         if is_conflict(region) {
-            out.push(format!("{MARKER_OURS} {ours_label}"));
-            out.extend(rebuild(&base_lines, start, end, ours_side()));
-            out.push(MARKER_SEP.to_string());
-            out.extend(rebuild(&base_lines, start, end, theirs_side()));
-            out.push(format!("{MARKER_THEIRS} {theirs_label}"));
+            let ours_lines = rebuild(&base_lines, start, end, ours_side());
+            let theirs_lines = rebuild(&base_lines, start, end, theirs_side());
+            if ours_lines == theirs_lines {
+                // Both sides made the same change: nothing to choose between.
+                out.extend(ours_lines);
+            } else {
+                conflicted = true;
+                out.push(format!("{MARKER_OURS} {ours_label}"));
+                out.extend(ours_lines);
+                out.push(MARKER_SEP.to_string());
+                out.extend(theirs_lines);
+                out.push(format!("{MARKER_THEIRS} {theirs_label}"));
+            }
         } else {
             out.extend(rebuild(
                 &base_lines,
@@ -517,7 +539,7 @@ fn merge3(base: &str, ours: &str, theirs: &str, ours_label: &str, theirs_label: 
     if (ours.ends_with('\n') || theirs.ends_with('\n')) && !text.is_empty() {
         text.push('\n');
     }
-    text
+    (text, conflicted)
 }
 
 /// Rewrite base lines `start..end` as one side sees them, applying that side's
