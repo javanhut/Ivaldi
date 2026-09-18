@@ -81,19 +81,13 @@ pub(super) fn cmd_butterfly(
 }
 
 pub(super) fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
-    use crate::fuse::FuseEngine;
     use crate::repo::MergeState;
-    use std::collections::BTreeMap;
 
     let mut repo = open_repo()?;
 
     if args.abort {
         if repo.has_merge_in_progress() {
-            // A fuse that set uncommitted work aside owes it back. Restoring
-            // the carry also rewrites the conflict-marked files to the tip, so
-            // the tree ends up exactly as it was before the fuse began.
-            let restored = restore_carry(&repo)?;
-            repo.clear_merge_state().map_err(|e| e.to_string())?;
+            let restored = crate::fuse_op::abort(&repo).map_err(|e| e.to_string())?;
             if !quiet {
                 println!("Merge aborted.");
                 if restored {
@@ -135,93 +129,56 @@ pub(super) fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
         )
     })?;
 
-    let target = repo.current_timeline().map_err(|e| e.to_string())?;
-
-    // Get trees for source and target
-    let source_head = repo
-        .get_timeline_head(source)
-        .map_err(|e| e.to_string())?
-        .ok_or(format!("timeline '{}' has no commits", source))?;
-    let target_head = repo
-        .get_timeline_head(&target)
-        .map_err(|e| e.to_string())?
-        .ok_or(format!("timeline '{}' has no commits", target))?;
-
-    let source_leaf = repo
-        .get_leaf(source_head)
-        .map_err(|e| e.to_string())?
-        .ok_or("corrupt source head")?;
-    let target_leaf = repo
-        .get_leaf(target_head)
-        .map_err(|e| e.to_string())?
-        .ok_or("corrupt target head")?;
-
-    // Build file maps from trees
-    let ctx = find_repo()?;
-    let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
-    let store = crate::fsmerkle::FsStore::new(&cas);
-
     // Uncommitted work has no side in a merge of seals, and the fused tree
     // written over the working directory would erase it. Finish anything an
-    // interrupted fuse still owes first; the set-aside itself happens below,
-    // once it is certain there is something to fuse.
-    finish_interrupted_carry(&repo, &cas, quiet)?;
-
-    let mut base_files = BTreeMap::new();
-    let mut ours_files = BTreeMap::new();
-    let mut theirs_files = BTreeMap::new();
-
-    // Walk the MMR-backed commit DAG to find the lowest common ancestor of
-    // the two heads, and use its tree as the merge base. This is what makes
-    // the `auto` strategy actually useful — without it, every file differing
-    // between sides would be reported as a conflict.
-    if let Some(base_idx) = repo
-        .merge_base(target_head, source_head)
+    // interrupted fuse still owes before starting another.
+    let mut resolver = make_resolver(prefer);
+    if let Some(recovered) = crate::fuse_op::finish_interrupted(&repo, resolver.as_deref_mut())
         .map_err(|e| e.to_string())?
+        && !quiet
     {
-        // Source already reachable from the target head: nothing to fuse.
-        // This also makes retrying a fuse that crashed after its commit a
-        // clean no-op instead of a redundant merge seal.
-        if base_idx == source_head {
+        println!("Recovered uncommitted changes from an interrupted fuse.");
+        if let crate::fuse_op::Recovered::Reapplied(report) = &recovered {
+            print_carry_report(report);
+        }
+    }
+
+    let mut plan = match crate::fuse_op::plan(&repo, source, strategy).map_err(|e| e.to_string())? {
+        crate::fuse_op::Planned::Plan(plan) => plan,
+        crate::fuse_op::Planned::AlreadyFused => {
             if !quiet {
                 println!(
                     "Timeline '{}' is already fused into '{}' — nothing to do.",
-                    source, target
+                    source,
+                    repo.current_timeline().map_err(|e| e.to_string())?
                 );
             }
             return Ok(());
         }
-        if let Some(base_leaf) = repo.get_leaf(base_idx).map_err(|e| e.to_string())? {
-            collect_blob_hashes(&store, base_leaf.tree_root, "", &mut base_files)?;
-        }
-    }
-    collect_blob_hashes(&store, target_leaf.tree_root, "", &mut ours_files)?;
-    collect_blob_hashes(&store, source_leaf.tree_root, "", &mut theirs_files)?;
-
-    let result = FuseEngine::fuse(&store, &base_files, &ours_files, &theirs_files, strategy);
-    let mut merged_files = result.merged_files;
+    };
+    let target = plan.target.clone();
+    let store = crate::fsmerkle::FsStore::new(&repo.cas);
 
     // What the engine could not decide has no right answer in the text. Put
     // it to a resolver now, in memory: until every collision is settled,
     // nothing — working tree, staging, history — has been touched, so backing
     // out is free.
-    let mut resolver = make_resolver(prefer);
-    if !result.conflicts.is_empty() && !args.markers {
+    if !plan.conflicts.is_empty() && !args.markers {
         let Some(resolver) = resolver.as_deref_mut() else {
-            return Err(unattended_refusal(&store, &result.conflicts, source));
+            return Err(unattended_refusal(&store, &plan.conflicts, source));
         };
         let labels = crate::resolve::Labels {
             mine: &target,
             theirs: source,
             on_quit: "cancels the fuse; nothing has been changed",
         };
-        for conflict in &result.conflicts {
+        for conflict in &plan.conflicts {
             match crate::resolve::resolve_conflict(&store, conflict, labels, resolver) {
                 Ok(Some(hash)) => {
-                    merged_files.insert(conflict.path.clone(), hash);
+                    plan.merged_files.insert(conflict.path.clone(), hash);
                 }
                 Ok(None) => {
-                    merged_files.remove(&conflict.path);
+                    plan.merged_files.remove(&conflict.path);
                 }
                 Err(crate::resolve::Stop::Cancelled) => {
                     return Err("fuse cancelled — nothing was changed".into());
@@ -232,19 +189,12 @@ pub(super) fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
             }
         }
         if !quiet {
-            println!("Settled {} conflicted file(s).", result.conflicts.len());
+            println!("Settled {} conflicted file(s).", plan.conflicts.len());
         }
     }
-    let settled = result.conflicts.is_empty() || !args.markers;
+    let settled = plan.conflicts.is_empty() || !args.markers;
 
-    // A re-attempt of a fuse left open by --markers is exempt from the
-    // set-aside: the tree is dirty with the markers that attempt wrote, and
-    // it already set the user's own work aside.
-    let set_aside = if repo.has_merge_in_progress() {
-        0
-    } else {
-        set_aside_uncommitted(&repo, &cas, &ctx, source, target_leaf.tree_root)?
-    };
+    let set_aside = crate::fuse_op::set_aside(&repo, &plan).map_err(|e| e.to_string())?;
     if set_aside > 0 && !quiet {
         println!(
             "Carrying {} uncommitted change(s) through the fuse...",
@@ -253,64 +203,27 @@ pub(super) fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
     }
 
     if settled {
-        // Build merged tree (blobs already in CAS, just build tree structure)
-        let merged_tree = store
-            .build_tree_from_hash_map(&merged_files)
-            .map_err(|e| e.to_string())?;
-
-        let cfg = repo.config();
-        let author = cfg.author().unwrap_or_else(|| "ivaldi".into());
-        let message = format!("Fuse {} into {}", source, target);
-
-        // Build a raw leaf so we can record the source head as a merge parent.
-        // This preserves merge topology for GitHub uploads.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let mut fuse_leaf = crate::leaf::Leaf::new(merged_tree, &target, &author, now, &message);
-        fuse_leaf.prev_idx = target_head;
-        fuse_leaf.merge_idxs = vec![source_head];
-
-        // Make the merged tree nodes (and any union-strategy concat blobs —
-        // content that exists nowhere else) durable BEFORE the commit record
-        // that references them. Without this, power loss after the store
-        // transaction could persist a merge seal whose tree is gone, which
-        // `verify --full` would reject.
-        cas.flush().map_err(|e| e.to_string())?;
-        crate::failpoint::fail_point("fuse.before_commit");
-        let commit_result = repo
-            .commit_raw(fuse_leaf, &target)
-            .map_err(|e| e.to_string())?;
-        crate::failpoint::fail_point("fuse.after_commit");
-
-        // Write the merged tree out to the workspace so the user actually
-        // sees the resolved files. Without this the seal exists in the MMR
-        // but the working tree still shows pre-merge content.
-        let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
-        ws.materialize(merged_tree)
-            .map_err(|e| format!("merge committed but failed to materialize: {}", e))?;
-
-        // A re-attempt that succeeds (e.g. --strategy=theirs after a
-        // conflicted auto fuse) resolves the recorded merge.
-        repo.clear_merge_state().map_err(|e| e.to_string())?;
-
+        let sealed = crate::fuse_op::seal(&mut repo, &plan).map_err(|e| e.to_string())?;
         if !quiet {
             println!("[OK] Merge completed successfully!");
             println!(
                 "  Merge seal: {} ({})",
-                commit_result.seal_name,
-                commit_result.hash.short8()
+                sealed.seal_name,
+                sealed.hash.short8()
             );
         }
         crate::failpoint::fail_point("fuse.before_reapply");
-        reapply_carry(&repo, &cas, source, resolver.as_deref_mut(), quiet)?;
+        let report = crate::fuse_op::reapply(&repo, source, resolver.as_deref_mut())
+            .map_err(|e| carry_failure(&e.to_string(), source))?;
         if !quiet {
+            if let Some(report) = &report {
+                print_carry_report(report);
+            }
             println!("  Not what you wanted? 'ivaldi oops' undoes the whole fuse.");
         }
     } else {
         // Save merge state with conflicts
-        let conflict_paths: Vec<String> = result.conflicts.iter().map(|c| c.path.clone()).collect();
+        let conflict_paths: Vec<String> = plan.conflicts.iter().map(|c| c.path.clone()).collect();
         let state = MergeState {
             source_timeline: source.to_string(),
             target_timeline: target.clone(),
@@ -323,8 +236,8 @@ pub(super) fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
         // Put both sides in front of the user, in the files themselves.
         let (marked, skipped) = crate::fuse::write_conflict_markers(
             &store,
-            &ctx.work_dir,
-            &result.conflicts,
+            &repo.work_dir,
+            &plan.conflicts,
             &target,
             source,
         );
@@ -363,81 +276,10 @@ pub(super) fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Step one of carrying uncommitted work through a fuse (see [`crate::carry`]):
-/// snapshot it, park it in the carry file, and put the working directory back
-/// to the tip so the fuse has a clean tree. Returns how many changes were set
-/// aside; zero means the tree was already clean and nothing was touched.
-///
-/// The snapshot is recorded for `ivaldi oops` either way — from a clean tree
-/// it is what lets `oops` take the merge seal back off the timeline.
-fn set_aside_uncommitted(
-    repo: &Repo,
-    cas: &FileCas,
-    ctx: &RepoContext,
-    source: &str,
-    tip_tree: crate::hash::B3Hash,
-) -> Result<usize, String> {
-    let snapshot = crate::snapshot::capture(repo, cas, &format!("fuse {}", source))
-        .map_err(|e| e.to_string())?;
-    crate::snapshot::SnapshotManager::new(&ctx.ivaldi_dir)
-        .save(&snapshot)
-        .map_err(|e| e.to_string())?;
-    if snapshot.is_clean() {
-        return Ok(0);
-    }
-
-    // The carry file must be durable before the first working-tree byte is
-    // overwritten: from here until it is cleared, it is what any later fuse,
-    // `--continue` or `--abort` uses to give the work back.
-    crate::snapshot::save_carry(&ctx.ivaldi_dir, &snapshot).map_err(|e| e.to_string())?;
-    crate::failpoint::fail_point("fuse.after_carry_save");
-
-    let mut ws = Workspace::new(cas, &ctx.work_dir, &ctx.ivaldi_dir);
-    ws.materialize(tip_tree).map_err(|e| e.to_string())?;
-    ws.staging.clear();
-    ws.save().map_err(|e| e.to_string())?;
-
-    Ok(snapshot.workspace_changes.len()
-        + snapshot.staged_files.len()
-        + snapshot.staged_deletions.len())
-}
-
-/// Step three: merge the set-aside work onto the freshly materialized fused
-/// tree and report, file by file, anything that wants a look. No-op when the
-/// fuse carried nothing.
-fn reapply_carry(
-    repo: &Repo,
-    cas: &FileCas,
-    source: &str,
-    resolver: Option<&mut (dyn crate::resolve::Resolver + 'static)>,
-    quiet: bool,
-) -> Result<(), String> {
+/// Tell the user what became of the uncommitted work a fuse carried.
+fn print_carry_report(report: &crate::carry::CarryReport) {
     use crate::carry::Outcome;
 
-    let Some(carry) = crate::snapshot::load_carry(&repo.ivaldi_dir).map_err(|e| e.to_string())?
-    else {
-        return Ok(());
-    };
-    let report = crate::carry::reapply(
-        repo,
-        cas,
-        &carry,
-        &format!("fused from {}", source),
-        resolver,
-    )
-    .map_err(|e| {
-        format!(
-            "the fuse is sealed, but re-applying your uncommitted changes failed: {}\n\
-                 They are safe — run 'ivaldi fuse {}' again to retry, or 'ivaldi oops' to \
-                 go back to before the fuse.",
-            e, source
-        )
-    })?;
-    crate::snapshot::clear_carry(&repo.ivaldi_dir).map_err(|e| e.to_string())?;
-
-    if quiet {
-        return Ok(());
-    }
     let attention: Vec<_> = report.attention().collect();
     if attention.is_empty() {
         println!(
@@ -476,77 +318,21 @@ fn reapply_carry(
             report.ungathered
         );
     }
-    Ok(())
 }
 
-/// `fuse --abort`: put set-aside work back untouched. Returns whether there
-/// was any.
-fn restore_carry(repo: &Repo) -> Result<bool, String> {
-    let Some(carry) = crate::snapshot::load_carry(&repo.ivaldi_dir).map_err(|e| e.to_string())?
-    else {
-        return Ok(false);
-    };
-    let cas = FileCas::new(repo.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
-    crate::snapshot::restore(repo, &cas, &carry).map_err(|e| e.to_string())?;
-    crate::snapshot::clear_carry(&repo.ivaldi_dir).map_err(|e| e.to_string())?;
-    Ok(true)
-}
-
-/// A carry file with no merge in progress means a fuse died between setting
-/// work aside and giving it back. Which way to finish depends on whether the
-/// merge seal landed: if the head moved, the fuse happened and the work goes
-/// on top of it; if not, nothing happened and the work goes back as it was.
-fn finish_interrupted_carry(repo: &Repo, cas: &FileCas, quiet: bool) -> Result<(), String> {
-    if repo.has_merge_in_progress() {
-        return Ok(()); // the carry belongs to that merge; --continue/--abort settle it
-    }
-    let Some(carry) = crate::snapshot::load_carry(&repo.ivaldi_dir).map_err(|e| e.to_string())?
-    else {
-        return Ok(());
-    };
-    let timeline = repo.current_timeline().map_err(|e| e.to_string())?;
-    if timeline != carry.timeline {
-        return Err(format!(
-            "an interrupted fuse on timeline '{}' still holds uncommitted changes. \
-             Run 'ivaldi timeline switch {}' and fuse again there to get them back first.",
-            carry.timeline, carry.timeline
-        ));
-    }
-    if !quiet {
-        println!("Recovering uncommitted changes from an interrupted fuse...");
-    }
-
-    // Whatever is in the working directory now is about to be rewritten; it
-    // may include edits made since the crash.
-    crate::snapshot::take(repo, cas, "fuse (recovery)").map_err(|e| e.to_string())?;
-
-    let head = repo
-        .get_timeline_head(&timeline)
-        .map_err(|e| e.to_string())?;
-    if head == carry.head {
-        crate::snapshot::restore(repo, cas, &carry).map_err(|e| e.to_string())?;
-        crate::snapshot::clear_carry(&repo.ivaldi_dir).map_err(|e| e.to_string())?;
-        return Ok(());
-    }
-    if let Some(idx) = head
-        && let Some(leaf) = repo.get_leaf(idx).map_err(|e| e.to_string())?
-    {
-        Workspace::new(cas, &repo.work_dir, &repo.ivaldi_dir)
-            .materialize(leaf.tree_root)
-            .map_err(|e| e.to_string())?;
-    }
-    reapply_carry(
-        repo,
-        cas,
-        "the interrupted fuse",
-        make_resolver(None).as_deref_mut(),
-        quiet,
+/// The fuse is sealed by the time a re-apply can fail, so say so — and that
+/// the work is safe, and how to get it.
+fn carry_failure(error: &str, source: &str) -> String {
+    format!(
+        "the fuse is sealed, but re-applying your uncommitted changes failed: {error}\n\
+         They are safe — run 'ivaldi fuse {source}' again to retry, or 'ivaldi oops' to \
+         go back to before the fuse."
     )
 }
 
 /// Whether there is a person to ask. `IVALDI_INTERACTIVE=1` says there is
 /// when the streams say otherwise — a driver feeding answers on stdin.
-fn interactive() -> bool {
+pub(super) fn interactive() -> bool {
     use std::io::IsTerminal;
     match std::env::var("IVALDI_INTERACTIVE").as_deref() {
         Ok("1") => true,
@@ -557,7 +343,7 @@ fn interactive() -> bool {
 
 /// Who settles collisions: the standing `--prefer` answer if one was given,
 /// else the person at the terminal, else nobody.
-fn make_resolver(
+pub(super) fn make_resolver(
     prefer: Option<crate::resolve::Prefer>,
 ) -> Option<Box<dyn crate::resolve::Resolver>> {
     use crate::resolve::{PreferResolver, PromptResolver, system_editor};
@@ -580,34 +366,16 @@ fn unattended_refusal(
     conflicts: &[crate::fuse::Conflict],
     source: &str,
 ) -> String {
-    let text = |hash: Option<crate::hash::B3Hash>| -> Option<String> {
-        let bytes = match hash {
-            Some(hash) => store.load_blob(hash).ok()?.1,
-            None => Vec::new(),
-        };
-        (!crate::diff::is_binary(&bytes))
-            .then(|| String::from_utf8(bytes).ok())
-            .flatten()
-    };
     let mut lines = vec![format!(
         "{} file(s) changed on both sides in ways that collide, and there is no terminal \
          to ask which to keep:",
         conflicts.len()
     )];
-    for c in conflicts {
-        let what = match (c.ours, c.theirs) {
-            (Some(_), None) => "changed here, deleted there".to_string(),
-            (None, Some(_)) => "deleted here, changed there".to_string(),
-            _ => match (text(c.base), text(c.ours), text(c.theirs)) {
-                (Some(base), Some(ours), Some(theirs)) => format!(
-                    "{} collision(s)",
-                    crate::fuse::Merge3::new(&base, &ours, &theirs).collisions()
-                ),
-                _ => "binary".to_string(),
-            },
-        };
-        lines.push(format!("  {}  ({})", c.path, what));
-    }
+    lines.extend(
+        crate::resolve::describe_conflicts(store, conflicts)
+            .into_iter()
+            .map(|line| format!("  {line}")),
+    );
     lines.push(format!(
         "\nNothing was changed. Choose how to settle them:\n  \
          ivaldi fuse {source} --prefer mine|theirs|both   settle every collision that way\n  \
@@ -757,13 +525,15 @@ fn continue_merge(
         );
     }
     crate::failpoint::fail_point("fuse.before_reapply");
-    reapply_carry(
+    let report = crate::fuse_op::reapply(
         repo,
-        &cas,
         &state.source_timeline,
         make_resolver(prefer).as_deref_mut(),
-        quiet,
-    )?;
+    )
+    .map_err(|e| carry_failure(&e.to_string(), &state.source_timeline))?;
+    if !quiet && let Some(report) = &report {
+        print_carry_report(report);
+    }
     Ok(())
 }
 

@@ -165,22 +165,10 @@ pub fn resolve_regions(
     labels: Labels<'_>,
     resolver: &mut dyn Resolver,
 ) -> Result<Vec<Option<Resolution>>, Stop> {
-    const CONTEXT: usize = 3;
     let total = merge.collisions();
     let mut resolutions = Vec::with_capacity(total);
 
-    for (i, chunk) in merge.chunks.iter().enumerate() {
-        let Chunk::Collision(collision) = chunk else {
-            continue;
-        };
-        let before = match i.checked_sub(1).map(|j| &merge.chunks[j]) {
-            Some(Chunk::Clean(lines)) => &lines[lines.len().saturating_sub(CONTEXT)..],
-            _ => &[],
-        };
-        let after = match merge.chunks.get(i + 1) {
-            Some(Chunk::Clean(lines)) => &lines[..lines.len().min(CONTEXT)],
-            _ => &[],
-        };
+    for (collision, before, after) in collisions_in_context(merge) {
         resolutions.push(Some(resolver.region(&Region {
             path,
             index: resolutions.len() + 1,
@@ -192,6 +180,299 @@ pub fn resolve_regions(
         })?));
     }
     Ok(resolutions)
+}
+
+/// Every collision in `merge`, in file order, with the merged lines just
+/// before and after it for context.
+fn collisions_in_context(
+    merge: &Merge3,
+) -> impl Iterator<Item = (&Collision, &[String], &[String])> {
+    const CONTEXT: usize = 3;
+    merge.chunks.iter().enumerate().filter_map(|(i, chunk)| {
+        let Chunk::Collision(collision) = chunk else {
+            return None;
+        };
+        let before: &[String] = match i.checked_sub(1).map(|j| &merge.chunks[j]) {
+            Some(Chunk::Clean(lines)) => &lines[lines.len().saturating_sub(CONTEXT)..],
+            _ => &[],
+        };
+        let after: &[String] = match merge.chunks.get(i + 1) {
+            Some(Chunk::Clean(lines)) => &lines[..lines.len().min(CONTEXT)],
+            _ => &[],
+        };
+        Some((collision, before, after))
+    })
+}
+
+// -- Questions, for front ends that cannot block --------------------------------
+
+/// The same questions a [`Resolver`] is asked, laid out as a list.
+///
+/// A `Resolver` is a callback: it suits a front end that can stop and wait for
+/// an answer. An event loop cannot — it has to draw a question, return, and
+/// get the answer as a later event. So it takes the whole list up front, keeps
+/// it as state, records answers as they come, and calls [`Questions::apply`]
+/// once there are none left.
+pub struct Questions {
+    files: Vec<FileQuestions>,
+}
+
+enum FileQuestions {
+    Text {
+        path: String,
+        merge: Merge3,
+        answers: Vec<Option<Resolution>>,
+    },
+    Whole {
+        path: String,
+        why: WholeFile,
+        ours: Option<B3Hash>,
+        theirs: Option<B3Hash>,
+        answer: Option<Side>,
+    },
+}
+
+/// One thing to ask.
+pub enum Question<'a> {
+    Region {
+        path: &'a str,
+        /// 1-based position among this file's collisions, and how many.
+        index: usize,
+        total: usize,
+        collision: &'a Collision,
+        before: &'a [String],
+        after: &'a [String],
+    },
+    WholeFile {
+        path: &'a str,
+        why: WholeFile,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    Region(Resolution),
+    WholeFile(Side),
+}
+
+impl Questions {
+    /// Lay out everything there is to ask about `conflicts`.
+    pub fn new(store: &FsStore<'_>, conflicts: &[Conflict]) -> Result<Self, String> {
+        let text = |hash: Option<B3Hash>| -> Result<Option<String>, String> {
+            let bytes = match hash {
+                Some(hash) => store.load_blob(hash).map_err(|e| e.to_string())?.1,
+                None => Vec::new(),
+            };
+            Ok((!crate::diff::is_binary(&bytes))
+                .then(|| String::from_utf8(bytes).ok())
+                .flatten())
+        };
+        let mut files = Vec::new();
+        for c in conflicts {
+            let whole = |why| FileQuestions::Whole {
+                path: c.path.clone(),
+                why,
+                ours: c.ours,
+                theirs: c.theirs,
+                answer: None,
+            };
+            files.push(match (c.ours, c.theirs) {
+                (None, None) => continue,
+                (Some(_), None) => whole(WholeFile::DeletedByTheirs),
+                (None, Some(_)) => whole(WholeFile::DeletedByMine),
+                (Some(_), Some(_)) => match (text(c.base)?, text(c.ours)?, text(c.theirs)?) {
+                    (Some(base), Some(ours), Some(theirs)) => {
+                        let merge = Merge3::new(&base, &ours, &theirs);
+                        let answers = vec![None; merge.collisions()];
+                        FileQuestions::Text {
+                            path: c.path.clone(),
+                            merge,
+                            answers,
+                        }
+                    }
+                    _ => whole(WholeFile::Binary),
+                },
+            });
+        }
+        Ok(Self { files })
+    }
+
+    pub fn len(&self) -> usize {
+        self.files
+            .iter()
+            .map(|f| match f {
+                FileQuestions::Text { answers, .. } => answers.len(),
+                FileQuestions::Whole { .. } => 1,
+            })
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Which file question `i` falls in, and its position within that file.
+    fn locate(&self, mut i: usize) -> Option<(usize, usize)> {
+        for (f, file) in self.files.iter().enumerate() {
+            let n = match file {
+                FileQuestions::Text { answers, .. } => answers.len(),
+                FileQuestions::Whole { .. } => 1,
+            };
+            if i < n {
+                return Some((f, i));
+            }
+            i -= n;
+        }
+        None
+    }
+
+    pub fn get(&self, i: usize) -> Option<Question<'_>> {
+        let (f, within) = self.locate(i)?;
+        Some(match &self.files[f] {
+            FileQuestions::Text {
+                path,
+                merge,
+                answers,
+            } => {
+                let (collision, before, after) = collisions_in_context(merge).nth(within)?;
+                Question::Region {
+                    path,
+                    index: within + 1,
+                    total: answers.len(),
+                    collision,
+                    before,
+                    after,
+                }
+            }
+            FileQuestions::Whole { path, why, .. } => Question::WholeFile { path, why: *why },
+        })
+    }
+
+    /// Record an answer. `false` if `i` is out of range or the answer is the
+    /// wrong kind for that question — in which case nothing is recorded.
+    pub fn answer(&mut self, i: usize, answer: Answer) -> bool {
+        let Some((f, within)) = self.locate(i) else {
+            return false;
+        };
+        match (&mut self.files[f], answer) {
+            (FileQuestions::Text { answers, .. }, Answer::Region(resolution)) => {
+                answers[within] = Some(resolution);
+                true
+            }
+            (FileQuestions::Whole { answer, .. }, Answer::WholeFile(side)) => {
+                *answer = Some(side);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn answered(&self, i: usize) -> bool {
+        match self.locate(i).map(|(f, within)| (&self.files[f], within)) {
+            Some((FileQuestions::Text { answers, .. }, within)) => answers[within].is_some(),
+            Some((FileQuestions::Whole { answer, .. }, _)) => answer.is_some(),
+            None => false,
+        }
+    }
+
+    /// The first question at or after `from` (wrapping) with no answer yet.
+    pub fn next_unanswered(&self, from: usize) -> Option<usize> {
+        let n = self.len();
+        (0..n).map(|k| (from + k) % n).find(|&i| !self.answered(i))
+    }
+
+    /// Write the answers into `merged`: each settled file's content, or its
+    /// removal. Refuses unless every question has an answer — a collision
+    /// nobody decided must never be sealed as conflict markers.
+    pub fn apply(
+        &self,
+        store: &FsStore<'_>,
+        merged: &mut std::collections::BTreeMap<String, B3Hash>,
+    ) -> Result<(), String> {
+        if let Some(i) = self.next_unanswered(0) {
+            return Err(format!(
+                "question {} of {} is unanswered",
+                i + 1,
+                self.len()
+            ));
+        }
+        for file in &self.files {
+            match file {
+                FileQuestions::Text {
+                    path,
+                    merge,
+                    answers,
+                } => {
+                    let text = merge.render(answers, "", "");
+                    let (hash, _) = store.put_blob(text.as_bytes()).map_err(|e| e.to_string())?;
+                    merged.insert(path.clone(), hash);
+                }
+                FileQuestions::Whole {
+                    path,
+                    ours,
+                    theirs,
+                    answer,
+                    ..
+                } => {
+                    let kept = match answer {
+                        Some(Side::Mine) => *ours,
+                        Some(Side::Theirs) => *theirs,
+                        None => unreachable!("checked above"),
+                    };
+                    match kept {
+                        Some(hash) => merged.insert(path.clone(), hash),
+                        None => merged.remove(path),
+                    };
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One line per conflict — path and what kind of collision it is — for telling
+/// a user what a fuse or sync would have had to ask about.
+pub fn describe_conflicts(store: &FsStore<'_>, conflicts: &[Conflict]) -> Vec<String> {
+    let text = |hash: Option<B3Hash>| -> Option<String> {
+        let bytes = match hash {
+            Some(hash) => store.load_blob(hash).ok()?.1,
+            None => Vec::new(),
+        };
+        (!crate::diff::is_binary(&bytes))
+            .then(|| String::from_utf8(bytes).ok())
+            .flatten()
+    };
+    conflicts
+        .iter()
+        .map(|c| {
+            let what = match (c.ours, c.theirs) {
+                (Some(_), None) => "changed here, deleted there".to_string(),
+                (None, Some(_)) => "deleted here, changed there".to_string(),
+                _ => match (text(c.base), text(c.ours), text(c.theirs)) {
+                    (Some(base), Some(ours), Some(theirs)) => format!(
+                        "{} collision(s)",
+                        Merge3::new(&base, &ours, &theirs).collisions()
+                    ),
+                    _ => "binary".to_string(),
+                },
+            };
+            format!("{}  ({})", c.path, what)
+        })
+        .collect()
+}
+
+/// What a caller with collisions on its hands should do about them.
+pub enum Collisions<'a> {
+    /// Settle them with this resolver, before anything is written.
+    Ask(&'a mut (dyn Resolver + 'static)),
+    /// Write conflict markers and leave the merge open for `fuse --continue`.
+    Markers,
+    /// There is nobody to ask and no standing answer: change nothing.
+    Refuse,
+    /// Nobody to ask *here*, but there will be: change nothing, and keep what
+    /// was fetched on its scratch timeline so a front end that can ask — the
+    /// TUI's Fuse tab — can fuse it from there without fetching again.
+    Park,
 }
 
 // -- Policy -------------------------------------------------------------------
@@ -621,6 +902,87 @@ mod tests {
         let shown = String::from_utf8(resolver.out).unwrap();
         assert!(shown.contains("delete it, as they did"), "{shown}");
         assert!(shown.contains("[q]uit — changes nothing"), "{shown}");
+    }
+
+    #[test]
+    fn questions_list_every_collision_and_apply_the_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = crate::cas::FileCas::new(dir.path().join("objects")).unwrap();
+        let store = FsStore::new(&cas);
+        let put = |bytes: &[u8]| Some(store.put_blob(bytes).unwrap().0);
+        let conflicts = [
+            Conflict {
+                path: "a.rs".into(),
+                base: put(doc(&[]).as_bytes()),
+                ours: put(doc(&[(3, "MINE A"), (25, "MINE B"), (14, "MINE ONLY")]).as_bytes()),
+                theirs: put(doc(&[(3, "THEIRS A"), (25, "THEIRS B")]).as_bytes()),
+            },
+            Conflict {
+                path: "gone.txt".into(),
+                base: put(b"base\n"),
+                ours: put(b"changed\n"),
+                theirs: None,
+            },
+            Conflict {
+                path: "logo.png".into(),
+                base: put(b"\x00b"),
+                ours: put(b"\x00mine"),
+                theirs: put(b"\x00theirs"),
+            },
+        ];
+        let mut q = Questions::new(&store, &conflicts).unwrap();
+        assert_eq!(q.len(), 4, "two regions, a deletion, a binary");
+
+        match q.get(1).unwrap() {
+            Question::Region {
+                path,
+                index,
+                total,
+                collision,
+                before,
+                ..
+            } => {
+                assert_eq!((path, index, total), ("a.rs", 2, 2));
+                assert_eq!(collision.ours, ["MINE B"]);
+                assert_eq!(before.last().map(String::as_str), Some("line 24"));
+            }
+            Question::WholeFile { .. } => panic!("expected a region"),
+        }
+        assert!(matches!(
+            q.get(2),
+            Some(Question::WholeFile {
+                path: "gone.txt",
+                why: WholeFile::DeletedByTheirs
+            })
+        ));
+        assert!(q.get(4).is_none());
+
+        // Nothing is applied while anything is unanswered.
+        let mut merged = std::collections::BTreeMap::new();
+        assert!(q.apply(&store, &mut merged).is_err());
+        assert!(merged.is_empty());
+
+        // The wrong kind of answer is not recorded.
+        assert!(!q.answer(0, Answer::WholeFile(Side::Mine)));
+        assert!(!q.answer(2, Answer::Region(Resolution::Both)));
+        assert_eq!(q.next_unanswered(0), Some(0));
+
+        assert!(q.answer(1, Answer::Region(Resolution::Both)));
+        assert_eq!(q.next_unanswered(1), Some(2), "skips what is answered");
+        assert!(q.answer(0, Answer::Region(Resolution::Theirs)));
+        assert!(q.answer(2, Answer::WholeFile(Side::Theirs)));
+        assert!(q.answer(3, Answer::WholeFile(Side::Mine)));
+        assert_eq!(q.next_unanswered(0), None);
+
+        merged.insert("gone.txt".into(), B3Hash::digest(b"stale"));
+        q.apply(&store, &mut merged).unwrap();
+        let load = |path: &str| store.load_blob(merged[path]).unwrap().1;
+        assert_eq!(
+            load("a.rs"),
+            doc(&[(3, "THEIRS A"), (14, "MINE ONLY"), (25, "MINE B\nTHEIRS B")]).as_bytes()
+        );
+        assert!(!merged.contains_key("gone.txt"), "theirs deleted it");
+        assert_eq!(load("logo.png"), b"\x00mine");
     }
 
     #[test]

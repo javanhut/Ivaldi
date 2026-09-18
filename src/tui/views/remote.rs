@@ -344,7 +344,10 @@ impl RemoteView {
                     // this background thread has no stdin to prompt on.
                     // ponytail: a proper in-TUI confirm dialog showing the
                     // incoming count is the upgrade path.
-                    crate::sync::sync_timeline(
+                    //
+                    // Nor can it ask about collisions. Park the fetched seals
+                    // instead and send the user to the Fuse tab, which can.
+                    match crate::sync::sync_timeline(
                         &client,
                         &mut repo,
                         &owner,
@@ -352,9 +355,17 @@ impl RemoteView {
                         &timeline,
                         &mut |_, _| true,
                         false,
-                    )
-                    .map(|_| "Sync complete".to_string())
-                    .map_err(|e| e.to_string())
+                        crate::sync::Collisions::Park,
+                    ) {
+                        Ok(_) => Ok("Sync complete".to_string()),
+                        Err(crate::sync::SyncError::Parked { timeline, files }) => Err(format!(
+                            "Remote changes collide with yours in {} file(s); nothing was \
+                             integrated. Open the Fuse tab and fuse '{}' to choose.",
+                            files.len(),
+                            timeline
+                        )),
+                        Err(e) => Err(e.to_string()),
+                    }
                 })();
                 let _ = tx.send(BgResult::SyncDone(result));
             });

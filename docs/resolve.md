@@ -36,6 +36,9 @@ Settled 1 conflicted file(s).
 There are no conflict markers in the working files, no half-open merge, and
 no `--continue`. The fuse either completes or changes nothing at all.
 
+The same applies to `ivaldi sync` when local and remote have diverged — it is
+a fuse of the two — and to the TUI's Fuse tab.
+
 ## Who answers
 
 | Situation | Resolver |
@@ -98,8 +101,16 @@ for conflict in &result.conflicts {
 }
 ```
 
-`Resolver` is a trait (`region`, `whole_file`), so another front end — the
-TUI, a GUI — can put the same questions its own way. `fuse::Merge3` is the
+`Resolver` is a trait (`region`, `whole_file`): a callback, for a front end
+that can stop and wait. An event loop cannot, so `Questions` lays the same
+questions out as a list instead — `get(i)`, `answer(i, …)`,
+`next_unanswered(from)`, and `apply(&store, &mut merged_files)`, which refuses
+while anything is unanswered. The TUI's Fuse tab is built on it.
+
+The steps around the merge — snapshot, set-aside, merge seal with the source
+as a parent, materialize, re-apply — live in `fuse_op` (`plan`, `set_aside`,
+`seal`, `reapply`, `complete`, `abort`, `finish_interrupted`) and are shared by
+every front end; only the asking differs. `fuse::Merge3` is the
 structured merge underneath: `chunks` of `Clean` lines and `Collision`s, and
 `render(&resolutions, …)`, which falls back to markers for any collision left
 unanswered.

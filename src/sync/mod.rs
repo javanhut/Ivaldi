@@ -27,6 +27,8 @@ mod timeline_sync;
 pub use import::{ImportResult, import_full_history, parse_iso8601_to_unix};
 pub use timeline_sync::{SyncResult, sync_timeline};
 
+pub use crate::resolve::Collisions;
+
 /// Workspace delta as `(added, modified, deleted)` relative paths.
 type WorkspaceDelta = (Vec<String>, Vec<String>, Vec<String>);
 
@@ -930,6 +932,23 @@ pub enum SyncError {
     /// nothing was mutated.
     #[error("sync declined; no changes were made")]
     Declined,
+    /// The user backed out while settling collisions. Nothing was integrated.
+    #[error("sync cancelled; nothing was integrated")]
+    Cancelled,
+    /// Local and remote seals collide and there was nobody to ask. Nothing
+    /// was integrated. One entry per file: path and kind of collision.
+    #[error("local and remote changes collide in {} file(s); nothing was integrated", .0.len())]
+    Collisions(Vec<String>),
+    /// As [`SyncError::Collisions`], but the fetched remote seals were kept
+    /// on scratch timeline `timeline`, ready to be fused from there.
+    #[error(
+        "local and remote changes collide in {} file(s); nothing was integrated. \
+         The remote seals are on timeline '{timeline}'", .files.len()
+    )]
+    Parked {
+        timeline: String,
+        files: Vec<String>,
+    },
     #[error("{0}")]
     Other(String),
 }

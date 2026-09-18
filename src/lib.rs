@@ -13,6 +13,7 @@ pub mod filechunk;
 pub mod forge;
 pub mod fsmerkle;
 pub mod fuse;
+pub mod fuse_op;
 pub mod gc;
 pub mod git_export;
 pub mod git_pack_writer;

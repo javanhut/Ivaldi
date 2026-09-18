@@ -932,6 +932,18 @@ pub(super) fn cmd_sync(args: SyncArgs, quiet: bool) -> Result<(), String> {
         matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
     };
 
+    let prefer = args
+        .prefer
+        .as_deref()
+        .map(str::parse::<crate::resolve::Prefer>)
+        .transpose()?;
+    let mut resolver = make_resolver(prefer);
+    let collisions = match resolver.as_deref_mut() {
+        _ if args.markers => sync::Collisions::Markers,
+        Some(resolver) => sync::Collisions::Ask(resolver),
+        None => sync::Collisions::Refuse,
+    };
+
     let result = match sync::sync_timeline(
         &client,
         &mut repo,
@@ -940,8 +952,33 @@ pub(super) fn cmd_sync(args: SyncArgs, quiet: bool) -> Result<(), String> {
         &timeline,
         &mut consent,
         args.force,
+        collisions,
     ) {
         Ok(result) => result,
+        // Backing out of the questions is a clean outcome too.
+        Err(sync::SyncError::Cancelled) => {
+            println!(
+                "Sync cancelled — nothing was integrated and timeline '{}' is unchanged.",
+                color::bold(&timeline)
+            );
+            return Ok(());
+        }
+        Err(sync::SyncError::Collisions(files)) => {
+            let mut lines = vec![format!(
+                "{} file(s) changed both here and on the remote in ways that collide, and \
+                 there is no terminal to ask which to keep:",
+                files.len()
+            )];
+            lines.extend(files.iter().map(|f| format!("  {f}")));
+            lines.push(
+                "\nNothing was integrated. Choose how to settle them:\n  \
+                 ivaldi sync --prefer mine|theirs|both   settle every collision that way\n  \
+                 ivaldi sync --markers                   write conflict markers, resolve by hand\n  \
+                 ivaldi sync                             from a terminal, to be asked one at a time"
+                    .to_string(),
+            );
+            return Err(lines.join("\n"));
+        }
         // Declining is a clean outcome, not a failure: nothing was mutated.
         Err(sync::SyncError::Declined) => {
             println!(
@@ -988,7 +1025,7 @@ pub(super) fn cmd_sync(args: SyncArgs, quiet: bool) -> Result<(), String> {
         println!("\nTo finish the merge:");
         println!("  edit the files above, then 'ivaldi fuse --continue'");
         println!("  or 'ivaldi fuse --strategy=theirs {source}' to take the remote wholesale");
-        println!("  or 'ivaldi fuse --abort' to drop the merge");
+        println!("  or 'ivaldi fuse --abort' (or 'ivaldi oops') to drop the merge");
         return Err(format!(
             "{} conflicted file(s) — merge not completed",
             result.conflicts.len()

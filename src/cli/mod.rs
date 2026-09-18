@@ -1045,6 +1045,15 @@ pub struct SyncArgs {
     /// Sync from this portal (owner/repo) instead of the default
     #[arg(long)]
     pub portal: Option<String>,
+    /// If local and remote seals changed the same lines, settle every such
+    /// collision this way without asking: mine, theirs, or both. Without
+    /// this, a terminal is asked per collision and a script is refused.
+    #[arg(long, value_name = "SIDE")]
+    pub prefer: Option<String>,
+    /// Resolve collisions by hand instead: write conflict markers and leave
+    /// the merge open for 'ivaldi fuse --continue'
+    #[arg(long, conflicts_with = "prefer")]
+    pub markers: bool,
 }
 
 #[derive(clap::Args, Debug)]
