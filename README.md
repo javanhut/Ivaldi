@@ -207,7 +207,7 @@ tradition. Common aliases are shown in parentheses.
 |---------|-------|-------------|
 | `ivaldi timeline create/switch/list/rename/remove` | `tl` | Manage timelines; dirty work shelves automatically on switch |
 | `ivaldi timeline butterfly create/up/down/rm` | `tl bf` | Experimental sandbox timelines |
-| `ivaldi fuse <src> to <tgt>` | `fu` | Merge timelines (no conflict markers — strategy selection) |
+| `ivaldi fuse <src> to <tgt>` | `fu` | Merge timelines. Auto-merges down to the line, carries uncommitted work through, and asks only about true collisions (`--prefer mine\|theirs\|both` for scripts) — in one command, no conflict markers |
 
 **Sharing**
 

@@ -214,7 +214,7 @@ fn fuse_conflict_crash_after_merge_state_blocks_mutations_until_abort() {
     let output = ivaldi(
         dir.path(),
         Some("fuse.after_merge_state"),
-        &["fuse", "feature", "to", "main"],
+        &["fuse", "feature", "to", "main", "--markers"],
     );
     assert_aborted(&output, "fuse.after_merge_state");
 

@@ -8,7 +8,9 @@ The fuse engine merges file sets from two divergent timelines using a common anc
 
 **Uncommitted work**: `ivaldi fuse` on a dirty working directory does not refuse and does not overwrite — it carries the work through the merge and re-applies it on top. See [carry.md](carry.md). Every fuse is also undoable with `ivaldi oops` ([snapshot.md](snapshot.md)).
 
-**Conflicts**: the engine decides per file by content hash, so identical changes never conflict. A file both sides changed differently is merged line by line (`merge_text`), and only regions both sides touched are wrapped in conflict markers for `fuse --continue`.
+**What conflicts, and what does not**: the engine first decides per file by content hash, so identical changes never conflict. A file both sides changed *differently* is then merged line by line inside the engine (`merge_lines`): edits in different places simply both land, and the fuse carries on. Only a **collision** — the same lines changed two ways, a binary changed on both sides, a change against a deletion — is reported as a conflict.
+
+**Collisions are settled by a resolver, not by hand-editing files**: the CLI puts each one to the user (or to `--prefer`) before anything is written, and seals in the same command. See [resolve.md](resolve.md). Conflict markers are written only on request (`--markers`), or into an uncommitted working file when carried work collides and there is nobody to ask.
 
 ## Strategies
 
@@ -48,7 +50,7 @@ For each file path across all three versions:
 | - | A | - | Take A (added left) |
 | - | - | A | Take A (added right) |
 | - | A | A | Take A (same addition) |
-| - | A | B | **CONFLICT** (different additions) |
+| - | A | B | **CONFLICT** (different additions; identical ones merge) |
 | X | - | - | Delete (both deleted) |
 | X | X | - | Delete (unchanged left, deleted right) |
 | X | A | - | **CONFLICT** (modified left, deleted right) |
@@ -57,7 +59,7 @@ For each file path across all three versions:
 | X | A | A | Take A (both same change) |
 | X | A | X | Take A (only left changed) |
 | X | X | A | Take A (only right changed) |
-| X | A | B | **CONFLICT** (both changed differently) |
+| X | A | B | Line merge; **CONFLICT** only if the same lines collide (or binary) |
 
 ## Fast-Forward Detection
 
@@ -72,7 +74,7 @@ A fast-forward occurs when the target timeline hasn't changed since the divergen
 ## Design Decisions
 
 - **Hash-based comparison**: Identical changes are auto-merged regardless of file content. No false conflicts from whitespace or formatting.
-- **Conflicts are data first**: the engine reports conflicts as structures; the CLI then writes diff3-style markers only into the conflicted regions of those files so they can be resolved in an editor.
+- **Conflicts are data first**: the engine reports conflicts as structures, and `Merge3` keeps a line merge as `Clean` chunks and `Collision`s rather than text — so a front end can count, show and settle collisions one at a time, and markers are just one way (`render` with no resolutions) to present them.
 - **Strategy as parameter**: Same engine handles all strategies, simplifying the API.
 - **BTreeMap for file sets**: Deterministic ordering, efficient lookup.
 - **Union concatenation**: On a genuine conflict, union combines both versions by

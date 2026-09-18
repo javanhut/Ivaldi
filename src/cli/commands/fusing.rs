@@ -106,8 +106,14 @@ pub(super) fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
         return Ok(());
     }
 
+    let prefer = args
+        .prefer
+        .as_deref()
+        .map(str::parse::<crate::resolve::Prefer>)
+        .transpose()?;
+
     if args.continue_merge {
-        return continue_merge(&mut repo, quiet);
+        return continue_merge(&mut repo, prefer, quiet);
     }
 
     // A merge in progress only blocks *bare* re-invocations. Naming a source
@@ -192,9 +198,48 @@ pub(super) fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
     collect_blob_hashes(&store, target_leaf.tree_root, "", &mut ours_files)?;
     collect_blob_hashes(&store, source_leaf.tree_root, "", &mut theirs_files)?;
 
-    // A re-attempt of a conflicted fuse is exempt: the tree is dirty with the
-    // conflict markers the first attempt wrote, and that attempt already set
-    // the user's own work aside.
+    let result = FuseEngine::fuse(&store, &base_files, &ours_files, &theirs_files, strategy);
+    let mut merged_files = result.merged_files;
+
+    // What the engine could not decide has no right answer in the text. Put
+    // it to a resolver now, in memory: until every collision is settled,
+    // nothing — working tree, staging, history — has been touched, so backing
+    // out is free.
+    let mut resolver = make_resolver(prefer);
+    if !result.conflicts.is_empty() && !args.markers {
+        let Some(resolver) = resolver.as_deref_mut() else {
+            return Err(unattended_refusal(&store, &result.conflicts, source));
+        };
+        let labels = crate::resolve::Labels {
+            mine: &target,
+            theirs: source,
+            on_quit: "cancels the fuse; nothing has been changed",
+        };
+        for conflict in &result.conflicts {
+            match crate::resolve::resolve_conflict(&store, conflict, labels, resolver) {
+                Ok(Some(hash)) => {
+                    merged_files.insert(conflict.path.clone(), hash);
+                }
+                Ok(None) => {
+                    merged_files.remove(&conflict.path);
+                }
+                Err(crate::resolve::Stop::Cancelled) => {
+                    return Err("fuse cancelled — nothing was changed".into());
+                }
+                Err(crate::resolve::Stop::Unresolvable(why)) => {
+                    return Err(format!("{why}\nNothing was changed."));
+                }
+            }
+        }
+        if !quiet {
+            println!("Settled {} conflicted file(s).", result.conflicts.len());
+        }
+    }
+    let settled = result.conflicts.is_empty() || !args.markers;
+
+    // A re-attempt of a fuse left open by --markers is exempt from the
+    // set-aside: the tree is dirty with the markers that attempt wrote, and
+    // it already set the user's own work aside.
     let set_aside = if repo.has_merge_in_progress() {
         0
     } else {
@@ -207,12 +252,10 @@ pub(super) fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
         );
     }
 
-    let result = FuseEngine::fuse(&store, &base_files, &ours_files, &theirs_files, strategy);
-
-    if result.success {
+    if settled {
         // Build merged tree (blobs already in CAS, just build tree structure)
         let merged_tree = store
-            .build_tree_from_hash_map(&result.merged_files)
+            .build_tree_from_hash_map(&merged_files)
             .map_err(|e| e.to_string())?;
 
         let cfg = repo.config();
@@ -261,7 +304,10 @@ pub(super) fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
             );
         }
         crate::failpoint::fail_point("fuse.before_reapply");
-        reapply_carry(&repo, &cas, source, quiet)?;
+        reapply_carry(&repo, &cas, source, resolver.as_deref_mut(), quiet)?;
+        if !quiet {
+            println!("  Not what you wanted? 'ivaldi oops' undoes the whole fuse.");
+        }
     } else {
         // Save merge state with conflicts
         let conflict_paths: Vec<String> = result.conflicts.iter().map(|c| c.path.clone()).collect();
@@ -296,7 +342,7 @@ pub(super) fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
             "  ivaldi fuse --strategy=theirs {}   - take the source wholesale",
             source
         );
-        println!("  ivaldi fuse --abort                - abort merge");
+        println!("  ivaldi fuse --abort  (or 'ivaldi oops')  - give up the fuse");
         if set_aside > 0 {
             println!(
                 "\nYour {} uncommitted change(s) are set aside until then: '--continue' \
@@ -359,22 +405,34 @@ fn set_aside_uncommitted(
 /// Step three: merge the set-aside work onto the freshly materialized fused
 /// tree and report, file by file, anything that wants a look. No-op when the
 /// fuse carried nothing.
-fn reapply_carry(repo: &Repo, cas: &FileCas, source: &str, quiet: bool) -> Result<(), String> {
+fn reapply_carry(
+    repo: &Repo,
+    cas: &FileCas,
+    source: &str,
+    resolver: Option<&mut (dyn crate::resolve::Resolver + 'static)>,
+    quiet: bool,
+) -> Result<(), String> {
     use crate::carry::Outcome;
 
     let Some(carry) = crate::snapshot::load_carry(&repo.ivaldi_dir).map_err(|e| e.to_string())?
     else {
         return Ok(());
     };
-    let report = crate::carry::reapply(repo, cas, &carry, &format!("fused from {}", source))
-        .map_err(|e| {
-            format!(
-                "the fuse is sealed, but re-applying your uncommitted changes failed: {}\n\
+    let report = crate::carry::reapply(
+        repo,
+        cas,
+        &carry,
+        &format!("fused from {}", source),
+        resolver,
+    )
+    .map_err(|e| {
+        format!(
+            "the fuse is sealed, but re-applying your uncommitted changes failed: {}\n\
                  They are safe — run 'ivaldi fuse {}' again to retry, or 'ivaldi oops' to \
                  go back to before the fuse.",
-                e, source
-            )
-        })?;
+            e, source
+        )
+    })?;
     crate::snapshot::clear_carry(&repo.ivaldi_dir).map_err(|e| e.to_string())?;
 
     if quiet {
@@ -394,7 +452,7 @@ fn reapply_carry(repo: &Repo, cas: &FileCas, source: &str, quiet: bool) -> Resul
         );
         for (path, outcome) in attention {
             let why = match outcome {
-                Outcome::Conflict => "conflict markers written",
+                Outcome::Conflict => "collides with the fuse — conflict markers written",
                 Outcome::BinaryKeptFused => {
                     "binary, changed on both sides — fused version kept; yours is in the snapshot"
                 }
@@ -404,7 +462,9 @@ fn reapply_carry(repo: &Repo, cas: &FileCas, source: &str, quiet: bool) -> Resul
                 Outcome::KeptChangedByFuse => {
                     "you deleted it, the fuse changed it — fused version kept"
                 }
-                Outcome::Clean | Outcome::AlreadyFused => unreachable!("not attention outcomes"),
+                Outcome::Clean | Outcome::Settled | Outcome::AlreadyFused => {
+                    unreachable!("not attention outcomes")
+                }
             };
             println!("       {}  ({})", path, why);
         }
@@ -416,9 +476,6 @@ fn reapply_carry(repo: &Repo, cas: &FileCas, source: &str, quiet: bool) -> Resul
             report.ungathered
         );
     }
-    println!(
-        "  Not what you wanted? 'ivaldi oops' puts everything back as it was before the fuse."
-    );
     Ok(())
 }
 
@@ -478,7 +535,86 @@ fn finish_interrupted_carry(repo: &Repo, cas: &FileCas, quiet: bool) -> Result<(
             .materialize(leaf.tree_root)
             .map_err(|e| e.to_string())?;
     }
-    reapply_carry(repo, cas, "the interrupted fuse", quiet)
+    reapply_carry(
+        repo,
+        cas,
+        "the interrupted fuse",
+        make_resolver(None).as_deref_mut(),
+        quiet,
+    )
+}
+
+/// Whether there is a person to ask. `IVALDI_INTERACTIVE=1` says there is
+/// when the streams say otherwise — a driver feeding answers on stdin.
+fn interactive() -> bool {
+    use std::io::IsTerminal;
+    match std::env::var("IVALDI_INTERACTIVE").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+    }
+}
+
+/// Who settles collisions: the standing `--prefer` answer if one was given,
+/// else the person at the terminal, else nobody.
+fn make_resolver(
+    prefer: Option<crate::resolve::Prefer>,
+) -> Option<Box<dyn crate::resolve::Resolver>> {
+    use crate::resolve::{PreferResolver, PromptResolver, system_editor};
+    match prefer {
+        Some(prefer) => Some(Box::new(PreferResolver(prefer))),
+        None if interactive() => Some(Box::new(PromptResolver::new(
+            std::io::BufReader::new(std::io::stdin()),
+            std::io::stdout(),
+            system_editor(),
+        ))),
+        None => None,
+    }
+}
+
+/// The error for a fuse with collisions and nobody to ask. Picking a side by
+/// rule is never the silent default: a rule-picked region can compile and
+/// still be wrong.
+fn unattended_refusal(
+    store: &crate::fsmerkle::FsStore<'_>,
+    conflicts: &[crate::fuse::Conflict],
+    source: &str,
+) -> String {
+    let text = |hash: Option<crate::hash::B3Hash>| -> Option<String> {
+        let bytes = match hash {
+            Some(hash) => store.load_blob(hash).ok()?.1,
+            None => Vec::new(),
+        };
+        (!crate::diff::is_binary(&bytes))
+            .then(|| String::from_utf8(bytes).ok())
+            .flatten()
+    };
+    let mut lines = vec![format!(
+        "{} file(s) changed on both sides in ways that collide, and there is no terminal \
+         to ask which to keep:",
+        conflicts.len()
+    )];
+    for c in conflicts {
+        let what = match (c.ours, c.theirs) {
+            (Some(_), None) => "changed here, deleted there".to_string(),
+            (None, Some(_)) => "deleted here, changed there".to_string(),
+            _ => match (text(c.base), text(c.ours), text(c.theirs)) {
+                (Some(base), Some(ours), Some(theirs)) => format!(
+                    "{} collision(s)",
+                    crate::fuse::Merge3::new(&base, &ours, &theirs).collisions()
+                ),
+                _ => "binary".to_string(),
+            },
+        };
+        lines.push(format!("  {}  ({})", c.path, what));
+    }
+    lines.push(format!(
+        "\nNothing was changed. Choose how to settle them:\n  \
+         ivaldi fuse {source} --prefer mine|theirs|both   settle every collision that way\n  \
+         ivaldi fuse {source} --markers                   write conflict markers, resolve by hand\n  \
+         ivaldi fuse {source}                             from a terminal, to be asked one at a time"
+    ));
+    lines.join("\n")
 }
 
 /// Finish a conflicted fuse. Re-runs the three-way merge to recover everything
@@ -486,7 +622,11 @@ fn finish_interrupted_carry(repo: &Repo, cas: &FileCas, quiet: bool) -> Result<(
 /// where the user resolved them. Both parents are recorded, so the merge is a
 /// real merge seal — which is also what makes a diverged `upload` fast-forward
 /// again.
-fn continue_merge(repo: &mut Repo, quiet: bool) -> Result<(), String> {
+fn continue_merge(
+    repo: &mut Repo,
+    prefer: Option<crate::resolve::Prefer>,
+    quiet: bool,
+) -> Result<(), String> {
     use crate::fuse::FuseEngine;
     use std::collections::BTreeMap;
 
@@ -617,7 +757,13 @@ fn continue_merge(repo: &mut Repo, quiet: bool) -> Result<(), String> {
         );
     }
     crate::failpoint::fail_point("fuse.before_reapply");
-    reapply_carry(repo, &cas, &state.source_timeline, quiet)?;
+    reapply_carry(
+        repo,
+        &cas,
+        &state.source_timeline,
+        make_resolver(prefer).as_deref_mut(),
+        quiet,
+    )?;
     Ok(())
 }
 

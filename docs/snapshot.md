@@ -73,7 +73,7 @@ refused rather than half-applied.
 - **Moving the head back orphans seals, it does not delete them.** History is
   append-only; an undone merge seal stays reachable by name and via
   `travel --all`, and redo puts the head back on it.
-- **During a conflicted fuse**, a bare `oops` is `fuse --abort`: no seal was
+- **During a fuse left open by `--markers`**, a bare `oops` is `fuse --abort`: no seal was
   made, so there is nothing to redo. Any other snapshot is refused until the
   fuse is settled.
 - Snapshots belong to a timeline. Restoring one from another timeline is
