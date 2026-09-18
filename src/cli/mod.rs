@@ -732,11 +732,25 @@ pub struct FuseArgs {
     #[arg(long, default_value = "auto")]
     pub strategy: String,
 
-    /// Continue merge after resolving conflicts
+    /// Settle every collision — lines both sides changed differently — the
+    /// same way, without asking: mine, theirs, or both (mine then theirs).
+    /// Only collisions are affected; everything else still merges normally.
+    /// Without this, a terminal is asked per collision and a script is refused.
+    #[arg(long, value_name = "SIDE")]
+    pub prefer: Option<String>,
+
+    /// Resolve by hand instead: write conflict markers into the files and
+    /// leave the fuse open for --continue or --abort
+    #[arg(long, conflicts_with = "prefer")]
+    pub markers: bool,
+
+    /// Finish a fuse left open by --markers (or by a diverged sync) once the
+    /// marked files are edited
     #[arg(long = "continue", visible_alias = "continue-merge")]
     pub continue_merge: bool,
 
-    /// Abort current merge
+    /// Give up a fuse left open by --markers. `ivaldi oops` does the same,
+    /// and also undoes a fuse that completed
     #[arg(long)]
     pub abort: bool,
 }

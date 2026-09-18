@@ -133,6 +133,15 @@ impl FuseEngine {
                             // File removed — don't include
                         }
                         MergeDecision::Conflict => {
+                            // Hashes only say both sides changed the *file*.
+                            // Whether they changed the same *lines* is a
+                            // separate question, and usually the answer is no.
+                            if let (Some(o), Some(t)) = (o, t)
+                                && let Some(hash) = merge_lines(store, b, o, t)
+                            {
+                                merged.insert(path.to_string(), hash);
+                                continue;
+                            }
                             conflicts.push(Conflict {
                                 path: path.to_string(),
                                 base: b.copied(),
@@ -231,6 +240,38 @@ pub(crate) fn concat_blobs(
     let (_, theirs_bytes) = store.load_blob(*theirs)?;
     combined.extend_from_slice(&theirs_bytes);
     Ok(store.put_blob(&combined)?.0)
+}
+
+/// Line-merge a file both sides changed. `Some(blob)` if every edit found its
+/// own place; `None` if any lines collide, either side is binary, or a blob
+/// cannot be read — in all of which the caller reports a conflict as before.
+fn merge_lines(
+    store: &FsStore<'_>,
+    base: Option<&B3Hash>,
+    ours: &B3Hash,
+    theirs: &B3Hash,
+) -> Option<B3Hash> {
+    let base = match base {
+        Some(hash) => store.load_blob(*hash).ok()?.1,
+        // Added on both sides: everything either side wrote is an insertion
+        // into nothing, so only identical additions can merge.
+        None => Vec::new(),
+    };
+    let ours = store.load_blob(*ours).ok()?.1;
+    let theirs = store.load_blob(*theirs).ok()?.1;
+    if crate::diff::is_binary(&ours) || crate::diff::is_binary(&theirs) {
+        return None;
+    }
+    // Lossy decoding would silently rewrite bytes it cannot represent.
+    let merge = Merge3::new(
+        std::str::from_utf8(&base).ok()?,
+        std::str::from_utf8(&ours).ok()?,
+        std::str::from_utf8(&theirs).ok()?,
+    );
+    if merge.collisions() > 0 {
+        return None;
+    }
+    Some(store.put_blob(merge.render(&[], "", "").as_bytes()).ok()?.0)
 }
 
 /// Three-way merge logic for a single file (auto strategy).
@@ -431,7 +472,7 @@ fn merge3(base: &str, ours: &str, theirs: &str, ours_label: &str, theirs_label: 
     merge_text(base, ours, theirs, ours_label, theirs_label).0
 }
 
-/// [`merge3`], also reporting whether any region had to be left in conflict
+/// `merge3`, also reporting whether any region had to be left in conflict
 /// markers. Asking the output instead ([`has_conflict_markers`]) cannot tell a
 /// conflict from a file that merged cleanly and merely *contains* marker lines.
 pub fn merge_text(
@@ -441,105 +482,225 @@ pub fn merge_text(
     ours_label: &str,
     theirs_label: &str,
 ) -> (String, bool) {
-    let mut conflicted = false;
-    let base_lines: Vec<&str> = base.lines().collect();
+    let merge = Merge3::new(base, ours, theirs);
+    let conflicted = merge.collisions() > 0;
+    (merge.render(&[], ours_label, theirs_label), conflicted)
+}
 
-    // Both sides' edits in one stream, ordered by the base lines they touch.
-    let mut all: Vec<(u8, Edit)> = base_edits(base, ours)
-        .into_iter()
-        .map(|e| (0u8, e))
-        .chain(base_edits(base, theirs).into_iter().map(|e| (1u8, e)))
-        .collect();
-    all.sort_by_key(|(side, e)| (e.start, e.end, *side));
+/// One stretch of a three-way line merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Chunk {
+    /// Lines with a single right answer: untouched, changed by one side only,
+    /// or changed identically by both.
+    Clean(Vec<String>),
+    /// Base lines both sides changed, differently. There is no right answer in
+    /// the text itself; somebody has to say which.
+    Collision(Collision),
+}
 
-    // Group the edits into regions of base lines: overlapping or directly
-    // adjacent edits belong to the same region. Independent changes a line or
-    // more apart stay separate regions and merge cleanly.
-    let mut regions: Vec<(usize, usize, usize, usize)> = Vec::new(); // start, end, k, m
-    let mut k = 0usize;
-    while k < all.len() {
-        let start = all[k].1.start;
-        let mut end = all[k].1.end;
-        let mut m = k + 1;
-        while m < all.len() && all[m].1.start <= end {
-            end = end.max(all[m].1.end);
-            m += 1;
-        }
-        regions.push((start, end, k, m));
-        k = m;
+/// The three versions of a region both sides changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Collision {
+    pub base: Vec<String>,
+    pub ours: Vec<String>,
+    pub theirs: Vec<String>,
+    /// 1-based line in *ours* where the region starts, for showing the user
+    /// where they are.
+    pub ours_line: usize,
+}
+
+/// How a [`Collision`] is settled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    Ours,
+    Theirs,
+    /// Ours, then theirs.
+    Both,
+    /// Neither: these lines instead.
+    Custom(Vec<String>),
+}
+
+/// A three-way line merge kept as structure rather than text, so collisions
+/// can be counted, shown and settled one at a time before anything is written.
+#[derive(Debug, Clone)]
+pub struct Merge3 {
+    pub chunks: Vec<Chunk>,
+    trailing_newline: bool,
+}
+
+impl Merge3 {
+    pub fn collisions(&self) -> usize {
+        self.chunks
+            .iter()
+            .filter(|c| matches!(c, Chunk::Collision(_)))
+            .count()
     }
 
-    let is_conflict = |&(_, _, k, m): &(usize, usize, usize, usize)| {
-        all[k..m].iter().any(|(s, _)| *s == 0) && all[k..m].iter().any(|(s, _)| *s == 1)
-    };
-
-    // Two sides rewriting the same function produce edits that alternate every
-    // few lines. Applying those independently splices both rewrites together
-    // into code that was never on either side, so a conflict swallows anything
-    // within a marker's distance of it — the result is one honest conflict
-    // instead of a plausible-looking merge nobody wrote.
-    const SETTLE: usize = 7;
-    let mut i = 0;
-    while i + 1 < regions.len() {
-        let gap = regions[i + 1].0.saturating_sub(regions[i].1);
-        if gap < SETTLE && (is_conflict(&regions[i]) || is_conflict(&regions[i + 1])) {
-            regions[i].1 = regions[i + 1].1;
-            regions[i].3 = regions[i + 1].3;
-            regions.remove(i + 1);
-            continue; // re-test the widened region against what follows
+    /// The merged text. `resolutions[i]` settles the i-th collision; a missing
+    /// or `None` entry leaves that collision in conflict markers.
+    pub fn render(
+        &self,
+        resolutions: &[Option<Resolution>],
+        ours_label: &str,
+        theirs_label: &str,
+    ) -> String {
+        let mut out: Vec<&str> = Vec::new();
+        let ours_marker = format!("{MARKER_OURS} {ours_label}");
+        let theirs_marker = format!("{MARKER_THEIRS} {theirs_label}");
+        let mut n = 0;
+        for chunk in &self.chunks {
+            match chunk {
+                Chunk::Clean(lines) => out.extend(lines.iter().map(String::as_str)),
+                Chunk::Collision(c) => {
+                    match resolutions.get(n).and_then(Option::as_ref) {
+                        Some(Resolution::Ours) => out.extend(c.ours.iter().map(String::as_str)),
+                        Some(Resolution::Theirs) => out.extend(c.theirs.iter().map(String::as_str)),
+                        Some(Resolution::Both) => {
+                            out.extend(c.ours.iter().map(String::as_str));
+                            out.extend(c.theirs.iter().map(String::as_str));
+                        }
+                        Some(Resolution::Custom(lines)) => {
+                            out.extend(lines.iter().map(String::as_str))
+                        }
+                        None => {
+                            out.push(&ours_marker);
+                            out.extend(c.ours.iter().map(String::as_str));
+                            out.push(MARKER_SEP);
+                            out.extend(c.theirs.iter().map(String::as_str));
+                            out.push(&theirs_marker);
+                        }
+                    }
+                    n += 1;
+                }
+            }
         }
-        i += 1;
+        let mut text = out.join("\n");
+        if self.trailing_newline && !text.is_empty() {
+            text.push('\n');
+        }
+        text
     }
 
-    let mut out: Vec<String> = Vec::new();
-    let mut b = 0usize;
-    for region in &regions {
-        let (start, end, k, m) = *region;
-        while b < start {
-            out.push(base_lines[b].to_string());
+    pub fn new(base: &str, ours: &str, theirs: &str) -> Self {
+        let base_lines: Vec<&str> = base.lines().collect();
+
+        // Both sides' edits in one stream, ordered by the base lines they touch.
+        let mut all: Vec<(u8, Edit)> = base_edits(base, ours)
+            .into_iter()
+            .map(|e| (0u8, e))
+            .chain(base_edits(base, theirs).into_iter().map(|e| (1u8, e)))
+            .collect();
+        all.sort_by_key(|(side, e)| (e.start, e.end, *side));
+
+        // Group the edits into regions of base lines: overlapping or directly
+        // adjacent edits belong to the same region. Independent changes a line or
+        // more apart stay separate regions and merge cleanly.
+        let mut regions: Vec<(usize, usize, usize, usize)> = Vec::new(); // start, end, k, m
+        let mut k = 0usize;
+        while k < all.len() {
+            let start = all[k].1.start;
+            let mut end = all[k].1.end;
+            let mut m = k + 1;
+            while m < all.len() && all[m].1.start <= end {
+                end = end.max(all[m].1.end);
+                m += 1;
+            }
+            regions.push((start, end, k, m));
+            k = m;
+        }
+
+        let is_conflict = |&(_, _, k, m): &(usize, usize, usize, usize)| {
+            all[k..m].iter().any(|(s, _)| *s == 0) && all[k..m].iter().any(|(s, _)| *s == 1)
+        };
+
+        // Two sides rewriting the same function produce edits that alternate every
+        // few lines. Applying those independently splices both rewrites together
+        // into code that was never on either side, so a conflict swallows anything
+        // within a marker's distance of it — the result is one honest conflict
+        // instead of a plausible-looking merge nobody wrote.
+        const SETTLE: usize = 7;
+        let mut i = 0;
+        while i + 1 < regions.len() {
+            let gap = regions[i + 1].0.saturating_sub(regions[i].1);
+            if gap < SETTLE && (is_conflict(&regions[i]) || is_conflict(&regions[i + 1])) {
+                regions[i].1 = regions[i + 1].1;
+                regions[i].3 = regions[i + 1].3;
+                regions.remove(i + 1);
+                continue; // re-test the widened region against what follows
+            }
+            i += 1;
+        }
+
+        let mut chunks: Vec<Chunk> = Vec::new();
+        let mut clean: Vec<String> = Vec::new();
+        // Lines of *ours* emitted so far, to tell the user where a collision is.
+        let mut ours_emitted = 0usize;
+        let mut b = 0usize;
+        for region in &regions {
+            let (start, end, k, m) = *region;
+            while b < start {
+                clean.push(base_lines[b].to_string());
+                ours_emitted += 1;
+                b += 1;
+            }
+
+            let edits = &all[k..m];
+            let ours_side = || edits.iter().filter(|(s, _)| *s == 0).map(|(_, e)| e);
+            let theirs_side = || edits.iter().filter(|(s, _)| *s == 1).map(|(_, e)| e);
+
+            if is_conflict(region) {
+                let ours_lines = rebuild(&base_lines, start, end, ours_side());
+                let theirs_lines = rebuild(&base_lines, start, end, theirs_side());
+                if ours_lines == theirs_lines {
+                    // Both sides made the same change: nothing to choose between.
+                    ours_emitted += ours_lines.len();
+                    clean.extend(ours_lines);
+                } else {
+                    if !clean.is_empty() {
+                        chunks.push(Chunk::Clean(std::mem::take(&mut clean)));
+                    }
+                    let ours_line = ours_emitted + 1;
+                    ours_emitted += ours_lines.len();
+                    chunks.push(Chunk::Collision(Collision {
+                        base: base_lines[start..end]
+                            .iter()
+                            .map(|l| l.to_string())
+                            .collect(),
+                        ours: ours_lines,
+                        theirs: theirs_lines,
+                        ours_line,
+                    }));
+                }
+            } else {
+                // Only one side has edits here, so rebuilding with all of them
+                // is rebuilding that side — and if it is theirs, ours is just
+                // the base lines.
+                let ours_len = if ours_side().next().is_some() {
+                    None
+                } else {
+                    Some(end - start)
+                };
+                let lines = rebuild(&base_lines, start, end, edits.iter().map(|(_, e)| e));
+                ours_emitted += ours_len.unwrap_or(lines.len());
+                clean.extend(lines);
+            }
+
+            b = end;
+        }
+        while b < base_lines.len() {
+            clean.push(base_lines[b].to_string());
             b += 1;
         }
-
-        let edits = &all[k..m];
-        let ours_side = || edits.iter().filter(|(s, _)| *s == 0).map(|(_, e)| e);
-        let theirs_side = || edits.iter().filter(|(s, _)| *s == 1).map(|(_, e)| e);
-
-        if is_conflict(region) {
-            let ours_lines = rebuild(&base_lines, start, end, ours_side());
-            let theirs_lines = rebuild(&base_lines, start, end, theirs_side());
-            if ours_lines == theirs_lines {
-                // Both sides made the same change: nothing to choose between.
-                out.extend(ours_lines);
-            } else {
-                conflicted = true;
-                out.push(format!("{MARKER_OURS} {ours_label}"));
-                out.extend(ours_lines);
-                out.push(MARKER_SEP.to_string());
-                out.extend(theirs_lines);
-                out.push(format!("{MARKER_THEIRS} {theirs_label}"));
-            }
-        } else {
-            out.extend(rebuild(
-                &base_lines,
-                start,
-                end,
-                edits.iter().map(|(_, e)| e),
-            ));
+        if !clean.is_empty() {
+            chunks.push(Chunk::Clean(clean));
         }
 
-        b = end;
+        Merge3 {
+            chunks,
+            // `lines()` drops the terminator; restore it if either side had one.
+            trailing_newline: ours.ends_with('\n') || theirs.ends_with('\n'),
+        }
     }
-    while b < base_lines.len() {
-        out.push(base_lines[b].to_string());
-        b += 1;
-    }
-
-    let mut text = out.join("\n");
-    // `lines()` drops the terminator; restore it if either side had one.
-    if (ours.ends_with('\n') || theirs.ends_with('\n')) && !text.is_empty() {
-        text.push('\n');
-    }
-    (text, conflicted)
 }
 
 /// Rewrite base lines `start..end` as one side sees them, applying that side's
@@ -1023,6 +1184,143 @@ mod tests {
     }
 
     // ---- diff3 conflict markers ----
+
+    // ---- Line-level auto-merge inside the engine ----
+
+    fn doc(edits: &[(usize, &str)]) -> String {
+        (1..=30)
+            .map(|n| match edits.iter().find(|(line, _)| *line == n) {
+                Some((_, text)) => format!("{text}\n"),
+                None => format!("line {n}\n"),
+            })
+            .collect()
+    }
+
+    fn one_file(store: &FsStore<'_>, path: &str, content: &str) -> BTreeMap<String, B3Hash> {
+        let mut map = BTreeMap::new();
+        map.insert(
+            path.to_string(),
+            store.put_blob(content.as_bytes()).unwrap().0,
+        );
+        map
+    }
+
+    #[test]
+    fn auto_merges_a_file_both_sides_changed_in_different_places() {
+        let (_dir, cas) = tmp_cas();
+        let store = FsStore::new(&cas);
+        let base = one_file(&store, "f", &doc(&[]));
+        let ours = one_file(&store, "f", &doc(&[(3, "OURS")]));
+        let theirs = one_file(&store, "f", &doc(&[(27, "THEIRS")]));
+
+        let result = FuseEngine::fuse(&store, &base, &ours, &theirs, Strategy::Auto);
+        assert!(result.success, "edits 24 lines apart must not conflict");
+        let merged = store.load_blob(result.merged_files["f"]).unwrap().1;
+        assert_eq!(
+            String::from_utf8(merged).unwrap(),
+            doc(&[(3, "OURS"), (27, "THEIRS")])
+        );
+    }
+
+    #[test]
+    fn auto_still_conflicts_when_the_same_line_changed_both_ways() {
+        let (_dir, cas) = tmp_cas();
+        let store = FsStore::new(&cas);
+        let base = one_file(&store, "f", &doc(&[]));
+        let ours = one_file(&store, "f", &doc(&[(3, "OURS")]));
+        let theirs = one_file(&store, "f", &doc(&[(3, "THEIRS")]));
+
+        let result = FuseEngine::fuse(&store, &base, &ours, &theirs, Strategy::Auto);
+        assert!(!result.success);
+        assert_eq!(result.conflicts[0].path, "f");
+    }
+
+    #[test]
+    fn auto_never_line_merges_binary_or_non_utf8_content() {
+        let (_dir, cas) = tmp_cas();
+        let store = FsStore::new(&cas);
+        for (b, o, t) in [
+            (&b"\x00base"[..], &b"\x00ours"[..], &b"\x00theirs"[..]),
+            (
+                &b"caf\xe9 1\n"[..],
+                &b"caf\xe9 2\n"[..],
+                &b"caf\xe9 3\n"[..],
+            ),
+        ] {
+            let put = |bytes: &[u8]| {
+                let mut map = BTreeMap::new();
+                map.insert("f".to_string(), store.put_blob(bytes).unwrap().0);
+                map
+            };
+            let result = FuseEngine::fuse(&store, &put(b), &put(o), &put(t), Strategy::Auto);
+            assert!(!result.success);
+        }
+    }
+
+    // ---- Merge3: collisions as structure ----
+
+    #[test]
+    fn merge3_structure_separates_clean_edits_from_collisions() {
+        let merge = Merge3::new(
+            &doc(&[]),
+            &doc(&[(3, "OURS"), (20, "OURS TOO")]),
+            &doc(&[(3, "THEIRS"), (28, "THEIRS ONLY")]),
+        );
+        assert_eq!(merge.collisions(), 1);
+        let collision = merge
+            .chunks
+            .iter()
+            .find_map(|c| match c {
+                Chunk::Collision(c) => Some(c),
+                Chunk::Clean(_) => None,
+            })
+            .unwrap();
+        assert_eq!(collision.base, ["line 3"]);
+        assert_eq!(collision.ours, ["OURS"]);
+        assert_eq!(collision.theirs, ["THEIRS"]);
+        assert_eq!(collision.ours_line, 3);
+    }
+
+    #[test]
+    fn merge3_render_applies_each_kind_of_resolution() {
+        let merge = Merge3::new(&doc(&[]), &doc(&[(3, "OURS")]), &doc(&[(3, "THEIRS")]));
+        let with = |r: Resolution| merge.render(&[Some(r)], "o", "t");
+
+        assert_eq!(with(Resolution::Ours), doc(&[(3, "OURS")]));
+        assert_eq!(with(Resolution::Theirs), doc(&[(3, "THEIRS")]));
+        assert_eq!(with(Resolution::Both), doc(&[(3, "OURS\nTHEIRS")]));
+        assert_eq!(
+            with(Resolution::Custom(vec!["COMBINED".into()])),
+            doc(&[(3, "COMBINED")])
+        );
+        // Deleting the region outright is a valid answer too.
+        assert_eq!(
+            with(Resolution::Custom(Vec::new())),
+            doc(&[]).replace("line 3\n", "")
+        );
+        // Unsettled collisions fall back to markers.
+        assert!(merge.render(&[], "o", "t").contains("<<<<<<< o"));
+    }
+
+    #[test]
+    fn merge3_ours_line_accounts_for_lines_ours_added_earlier() {
+        let ours = doc(&[(2, "extra a\nextra b\nline 2"), (20, "OURS")]);
+        let theirs = doc(&[(20, "THEIRS")]);
+        let merge = Merge3::new(&doc(&[]), &ours, &theirs);
+        let collision = merge
+            .chunks
+            .iter()
+            .find_map(|c| match c {
+                Chunk::Collision(c) => Some(c),
+                Chunk::Clean(_) => None,
+            })
+            .unwrap();
+        assert_eq!(
+            collision.ours_line, 22,
+            "20 shifted by the two lines ours inserted"
+        );
+        assert_eq!(ours.lines().nth(21), Some("OURS"));
+    }
 
     #[test]
     fn merge3_takes_each_side_when_regions_do_not_overlap() {

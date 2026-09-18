@@ -47,6 +47,7 @@ pub mod refname;
 pub mod remote;
 pub mod repo;
 pub mod rescue;
+pub mod resolve;
 pub mod review;
 pub mod seal;
 pub mod shelf;

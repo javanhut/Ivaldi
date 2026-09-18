@@ -61,8 +61,9 @@ in Ivaldi the same afternoon.
 | Delete a branch | `git branch -D feature` | `ivaldi timeline remove feature` (alias `tl rm`) |
 | Merge into current | `git merge feature` | `ivaldi fuse feature` |
 | Merge A into B | `git checkout B && git merge A` | `ivaldi fuse A to B` |
-| Abort merge | `git merge --abort` | `ivaldi fuse --abort` |
-| Continue merge | `git merge --continue` | `ivaldi fuse --continue` |
+| Abort merge | `git merge --abort` | `q` at the question (nothing was changed), or `ivaldi oops` |
+| Continue merge | `git merge --continue` | *(not needed — fuse finishes in one command; `--continue` only after `--markers`)* |
+| Resolve conflicts favouring one side | `git merge -X ours\|theirs` | `ivaldi fuse X --prefer mine\|theirs\|both` |
 | Throwaway scratch branch | `git worktree add` or `git switch -c` | `ivaldi tl bf create scratch` (butterfly) |
 | Push butterfly into parent | (n/a — manual rebase) | `ivaldi tl bf up` |
 | Pull parent into butterfly | (n/a — manual merge) | `ivaldi tl bf down` |
@@ -117,12 +118,17 @@ Portal URLs Ivaldi understands:
 A few places where the translation isn't 1:1 because Ivaldi rejects a
 git design choice rather than reproducing it.
 
-**No conflict markers in your files.** `git merge` writes `<<<<<<<` /
-`=======` / `>>>>>>>` directly into your source. Ivaldi's `fuse`
-auto-resolves with one of several strategies (`auto`, `ours`, `theirs`,
-`union`, `base`); your working tree never contains a half-merged file.
-If you want git's behavior, the strategies map to it — `--strategy
-ours` and `--strategy theirs` are the two-sided choices.
+**No conflict markers in your files, and no half-finished merges.**
+When `git merge` hits something it cannot decide, it writes `<<<<<<<` /
+`=======` / `>>>>>>>` into your source, leaves the merge open, and has
+you edit the files and come back with `--continue`. `ivaldi fuse` merges everything
+with one right answer itself — per file, then per line — and puts only
+true collisions (the same lines changed two ways) to you as a question:
+mine, theirs, both, or edit just that region. It asks before writing
+anything and seals in the same command, so it either finishes or changes
+nothing. Scripts say `--prefer mine|theirs|both`; a wrong answer is one
+`ivaldi oops` away. If you want git's behavior, `--markers` is it, and
+the whole-tree strategies (`--strategy ours|theirs|union|base`) remain.
 
 **No detached HEAD.** Browsing history with `travel` doesn't put you
 into a state where commits you make get garbage-collected. You either

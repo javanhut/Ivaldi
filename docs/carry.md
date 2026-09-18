@@ -12,10 +12,9 @@ $ ivaldi fuse main
 Carrying 6 uncommitted change(s) through the fuse...
 [OK] Merge completed successfully!
   Merge seal: simple-ocean-watches-gentle (8e3f60d6)
-[OK] Re-applied your uncommitted changes: 4 clean, 2 need a look
-       crates/comp/huginn-comp/src/backend/input.rs  (conflict markers written)
-       crates/comp/huginn-comp/src/render.rs  (conflict markers written)
-  Not what you wanted? 'ivaldi oops' puts everything back as it was before the fuse.
+  ... asked about the two places your edits collide with main's ...
+[OK] Your 6 uncommitted change(s) are back on top, still unsealed.
+  Not what you wanted? 'ivaldi oops' undoes the whole fuse.
 ```
 
 ## How it works
@@ -37,7 +36,7 @@ The result is left uncommitted, as it was.
 |-----------|-----------|---------|
 | did not touch the file | changed / added / deleted it | Change drops straight back in |
 | changed it | changed other lines | Both sets of edits, merged line by line |
-| changed it | changed the same lines | Conflict markers: `your uncommitted changes` vs `fused from <source>` |
+| changed it | changed the same lines | Asked about, like any collision ([resolve.md](resolve.md)); with nobody to ask, conflict markers: `your uncommitted changes` vs `fused from <source>` |
 | made the identical change | — | Nothing left to carry |
 | deleted it | changed it | User's version kept (now a new file), reported |
 | changed it | deleted it | Fused version kept, reported |
@@ -48,13 +47,16 @@ the old tip; sealed after the fuse they would silently write those blobs over
 whatever the fuse brought in for the same paths. Their content is carried like
 any other edit.
 
-## When the fuse itself conflicts
+## When the fuse itself has collisions
 
-The set-aside work stays parked while the merge is open:
+They are settled first, in memory, before the work is set aside — so
+cancelling at a question leaves the uncommitted work exactly where it was,
+never touched.
 
-- `ivaldi fuse --continue` seals the merge, then re-applies it on top.
-- `ivaldi fuse --abort` (or a bare `ivaldi oops`) puts it back untouched, and
-  rewrites the conflict-marked files back to the tip.
+Only `fuse --markers` leaves a fuse open. The set-aside work then stays parked
+until it is settled: `fuse --continue` seals the merge and re-applies it on
+top; `fuse --abort` (or a bare `ivaldi oops`) puts it back untouched, and
+rewrites the conflict-marked files back to the tip.
 
 ## Crash safety
 

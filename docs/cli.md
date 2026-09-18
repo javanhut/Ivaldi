@@ -23,7 +23,9 @@ Command-line interface for Ivaldi VCS, built with `clap`.
 | `pluck <seal>` | `cherry-pick` | New seal that applies another seal's changes |
 | `timeline create/switch/list/rename/remove` | `tl` | Manage timelines |
 | `timeline butterfly create/up/down/rm` | `tl bf` | Butterfly timelines |
-| `fuse <src> to <tgt>` | | Merge timelines (auto strategy uses MMR-based merge base) |
+| `fuse <src> [to <tgt>]` | | Merge timelines. Merges per file and per line, carries uncommitted work through ([carry.md](carry.md)), and settles true collisions by asking, in the same command ([resolve.md](resolve.md)). Undo with `oops` |
+| `fuse <src> --prefer mine\|theirs\|both` | | Settle every collision that way, without asking (required when there is no terminal) |
+| `fuse <src> --markers` | | Resolve by hand instead: write conflict markers, leave the fuse open for `--continue` / `--abort` |
 | `travel [--all] [--search Q]` | | Interactive history browser (DAG walk by default; `--all` shows every MMR leaf) |
 | `weld --last N` / `weld START to END` | `w` | Combine seal range into one (linear history) |
 | `config` | | View/modify settings |

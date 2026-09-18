@@ -290,8 +290,9 @@ fn conflicted_fuse_is_reported_resolvable_and_completable() {
     std::fs::write(path.join("shared.txt"), "a\nOURS\nc\n").unwrap();
     seal_all(path, "main edit");
 
-    // The fuse conflicts, says so, and writes both sides into the file.
-    let fuse = ivaldi(path, &["fuse", "feature"]);
+    // With --markers the fuse stops, says so, and writes both sides into the
+    // file for resolving by hand.
+    let fuse = ivaldi(path, &["fuse", "feature", "--markers"]);
     assert!(!fuse.status.success(), "a conflicted fuse must not exit 0");
     let out = String::from_utf8_lossy(&fuse.stdout);
     assert!(out.contains("CONFLICT: shared.txt"), "{out}");
@@ -447,6 +448,10 @@ fn fuse_marks_a_carried_change_that_collides() {
     );
     assert!(merged.contains(">>>>>>> fused from main"), "{merged}");
     assert_eq!(last_seal_message(path), "Fuse main into feature");
+    // Markers in an uncommitted working file leave no merge open.
+    let status = ivaldi_ok(path, &["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(status["merge"].is_null(), "{status}");
 }
 
 /// Gathered entries name blobs made against the old tip; sealed after the
@@ -475,8 +480,8 @@ fn fuse_ungathers_but_keeps_gathered_content() {
     assert_eq!(a["state"], "modified", "{status}");
 }
 
-/// A fuse whose *sealed* sides conflict has to stop for the user. Work it set
-/// aside comes back merged on `--continue`...
+/// A fuse left open with `--markers` holds set-aside work until it is settled.
+/// It comes back merged on `--continue`...
 #[test]
 fn conflicted_fuse_returns_carried_changes_on_continue() {
     let dir = tempfile::tempdir().unwrap();
@@ -487,7 +492,7 @@ fn conflicted_fuse_returns_carried_changes_on_continue() {
 
     std::fs::write(path.join("a.txt"), numbered(&[(19, "MINE")])).unwrap();
 
-    let fuse = ivaldi(path, &["fuse", "main"]);
+    let fuse = ivaldi(path, &["fuse", "main", "--markers"]);
     assert!(!fuse.status.success());
     let out = stdout(&fuse);
     assert!(out.contains("CONFLICT: b.txt"), "{out}");
@@ -513,7 +518,11 @@ fn conflicted_fuse_returns_carried_changes_on_abort() {
     seal_all(path, "feature edit");
 
     std::fs::write(path.join("a.txt"), numbered(&[(19, "MINE")])).unwrap();
-    assert!(!ivaldi(path, &["fuse", "main"]).status.success());
+    assert!(
+        !ivaldi(path, &["fuse", "main", "--markers"])
+            .status
+            .success()
+    );
     assert!(read(path, "b.txt").contains("<<<<<<<"));
 
     ivaldi_ok(path, &["fuse", "--abort"]);
@@ -550,7 +559,7 @@ fn oops_undoes_and_redoes_a_fuse() {
     assert_eq!(read(path, "new.txt"), "untracked\n");
 }
 
-/// A bare `oops` right after a fuse that stopped on conflicts aborts it.
+/// A bare `oops` right after a fuse left open with `--markers` aborts it.
 #[test]
 fn oops_aborts_a_conflicted_fuse() {
     let dir = tempfile::tempdir().unwrap();
@@ -559,7 +568,11 @@ fn oops_aborts_a_conflicted_fuse() {
     std::fs::write(path.join("b.txt"), "changed on feature\n").unwrap();
     seal_all(path, "feature edit");
     std::fs::write(path.join("a.txt"), numbered(&[(19, "MINE")])).unwrap();
-    assert!(!ivaldi(path, &["fuse", "main"]).status.success());
+    assert!(
+        !ivaldi(path, &["fuse", "main", "--markers"])
+            .status
+            .success()
+    );
 
     let out = stdout(&ivaldi_ok(path, &["oops"]));
     assert!(out.contains("Fuse aborted"), "{out}");
@@ -610,4 +623,304 @@ fn oops_with_nothing_to_undo_says_so() {
     let oops = ivaldi(dir.path(), &["oops"]);
     assert!(!oops.status.success());
     assert!(String::from_utf8_lossy(&oops.stderr).contains("nothing to undo"));
+}
+
+// ---------------------------------------------------------------------------
+// Fuse settles what it can, and asks about the rest — in one command
+// ---------------------------------------------------------------------------
+
+/// Run with answers on stdin, as if at a terminal.
+fn ivaldi_answering(
+    dir: &std::path::Path,
+    args: &[&str],
+    answers: &str,
+    envs: &[(&str, &str)],
+) -> Output {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ivaldi"))
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .env("IVALDI_INTERACTIVE", "1")
+        .envs(envs.iter().copied())
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run ivaldi binary");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(answers.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// Both timelines have sealed edits to `a.txt`: they collide on lines 2 and
+/// 10, and each also has an edit of its own (feature: 19, main: 28). `b.txt`
+/// is changed on main only. Current timeline is `feature`.
+fn colliding_timelines(path: &std::path::Path) {
+    forge_with_identity(path);
+    std::fs::write(path.join("a.txt"), numbered30(&[])).unwrap();
+    std::fs::write(path.join("b.txt"), "base\n").unwrap();
+    seal_all(path, "base");
+
+    ivaldi_ok(path, &["timeline", "create", "feature"]);
+    std::fs::write(
+        path.join("a.txt"),
+        numbered30(&[(2, "FEATURE 2"), (10, "FEATURE 10"), (19, "FEATURE ONLY")]),
+    )
+    .unwrap();
+    seal_all(path, "feature edit");
+
+    ivaldi_ok(path, &["timeline", "switch", "main"]);
+    std::fs::write(
+        path.join("a.txt"),
+        numbered30(&[(2, "MAIN 2"), (10, "MAIN 10"), (28, "MAIN ONLY")]),
+    )
+    .unwrap();
+    std::fs::write(path.join("b.txt"), "changed on main\n").unwrap();
+    seal_all(path, "main edit");
+    ivaldi_ok(path, &["timeline", "switch", "feature"]);
+}
+
+fn numbered30(edits: &[(usize, &str)]) -> String {
+    (1..=30)
+        .map(|n| match edits.iter().find(|(line, _)| *line == n) {
+            Some((_, text)) => format!("{text}\n"),
+            None => format!("line {n}\n"),
+        })
+        .collect()
+}
+
+/// Two timelines editing the same file is not a conflict; editing the same
+/// *lines* is. The first needs nobody.
+#[test]
+fn fuse_merges_one_file_changed_in_different_places_without_asking() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    forge_with_identity(path);
+    std::fs::write(path.join("a.txt"), numbered30(&[])).unwrap();
+    seal_all(path, "base");
+    ivaldi_ok(path, &["timeline", "create", "feature"]);
+    std::fs::write(path.join("a.txt"), numbered30(&[(3, "FEATURE")])).unwrap();
+    seal_all(path, "feature edit");
+    ivaldi_ok(path, &["timeline", "switch", "main"]);
+    std::fs::write(path.join("a.txt"), numbered30(&[(27, "MAIN")])).unwrap();
+    seal_all(path, "main edit");
+
+    // No terminal, no --prefer: it must not need either.
+    ivaldi_ok(path, &["fuse", "feature"]);
+    assert_eq!(
+        read(path, "a.txt"),
+        numbered30(&[(3, "FEATURE"), (27, "MAIN")])
+    );
+    assert_eq!(last_seal_message(path), "Fuse feature into main");
+}
+
+/// With collisions and nobody to ask, picking a side by rule would be a
+/// guess. The fuse refuses — and refusing must leave no trace at all.
+#[test]
+fn fuse_with_nobody_to_ask_refuses_and_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    colliding_timelines(path);
+    std::fs::write(path.join("b.txt"), "unsealed\n").unwrap();
+
+    let fuse = ivaldi(path, &["fuse", "main"]);
+    assert!(!fuse.status.success());
+    let err = String::from_utf8_lossy(&fuse.stderr);
+    assert!(err.contains("a.txt  (2 collision(s))"), "{err}");
+    assert!(err.contains("--prefer mine|theirs|both"), "{err}");
+    assert!(err.contains("Nothing was changed"), "{err}");
+
+    assert_eq!(
+        read(path, "a.txt"),
+        numbered30(&[(2, "FEATURE 2"), (10, "FEATURE 10"), (19, "FEATURE ONLY")])
+    );
+    assert_eq!(read(path, "b.txt"), "unsealed\n");
+    assert_eq!(last_seal_message(path), "feature edit");
+    let status = ivaldi_ok(path, &["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(status["merge"].is_null(), "{status}");
+    assert!(!path.join(".ivaldi/fuse-carry.snap").exists());
+    assert!(!ivaldi(path, &["oops"]).status.success(), "nothing to undo");
+}
+
+/// `--prefer` settles the collisions and *only* the collisions: each side's
+/// own edits to the same file still both land.
+#[test]
+fn fuse_prefer_settles_only_the_collisions() {
+    for (prefer, two, ten) in [
+        ("mine", "FEATURE 2", "FEATURE 10"),
+        ("theirs", "MAIN 2", "MAIN 10"),
+        ("both", "FEATURE 2\nMAIN 2", "FEATURE 10\nMAIN 10"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        colliding_timelines(path);
+
+        ivaldi_ok(path, &["fuse", "main", "--prefer", prefer]);
+        assert_eq!(
+            read(path, "a.txt"),
+            numbered30(&[(2, two), (10, ten), (19, "FEATURE ONLY"), (28, "MAIN ONLY")]),
+            "--prefer {prefer}"
+        );
+        assert_eq!(read(path, "b.txt"), "changed on main\n");
+        assert_eq!(last_seal_message(path), "Fuse main into feature");
+        assert!(!read(path, "a.txt").contains("<<<<<<<"));
+    }
+}
+
+/// At a terminal each collision is its own question, and the fuse is sealed
+/// by the same command that asked.
+#[test]
+fn fuse_asks_about_each_collision_and_finishes_in_one_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    colliding_timelines(path);
+
+    let fuse = ivaldi_answering(path, &["fuse", "main"], "t\nm\n", &[]);
+    assert!(
+        fuse.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fuse.stderr)
+    );
+    let out = stdout(&fuse);
+    assert!(
+        out.contains("a.txt — collision 1 of 2, around line 2"),
+        "{out}"
+    );
+    assert!(
+        out.contains("a.txt — collision 2 of 2, around line 10"),
+        "{out}"
+    );
+    assert!(
+        out.contains("mine (feature)") && out.contains("theirs (main)"),
+        "{out}"
+    );
+    assert!(out.contains("ivaldi oops"), "{out}");
+
+    assert_eq!(
+        read(path, "a.txt"),
+        numbered30(&[
+            (2, "MAIN 2"),
+            (10, "FEATURE 10"),
+            (19, "FEATURE ONLY"),
+            (28, "MAIN ONLY")
+        ])
+    );
+    assert_eq!(last_seal_message(path), "Fuse main into feature");
+    let status = ivaldi_ok(path, &["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(status["merge"].is_null(), "{status}");
+    assert_eq!(
+        status["files"].as_array().map_or(0, Vec::len),
+        0,
+        "{status}"
+    );
+}
+
+/// Quitting — even after answering some — is free: nothing was written yet.
+#[test]
+fn quitting_the_questions_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    colliding_timelines(path);
+    std::fs::write(path.join("b.txt"), "unsealed\n").unwrap();
+
+    let fuse = ivaldi_answering(path, &["fuse", "main"], "t\nq\n", &[]);
+    assert!(!fuse.status.success());
+    assert!(String::from_utf8_lossy(&fuse.stderr).contains("nothing was changed"));
+    assert_eq!(read(path, "b.txt"), "unsealed\n");
+    assert_eq!(last_seal_message(path), "feature edit");
+    assert!(!path.join(".ivaldi/fuse-carry.snap").exists());
+}
+
+/// When the right answer is neither side — the usual case being both edits
+/// combined on one line — `edit` opens just that region.
+#[cfg(unix)]
+#[test]
+fn edit_settles_a_collision_with_lines_neither_side_had() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    colliding_timelines(path);
+
+    let editor = dir.path().join("editor.sh");
+    std::fs::write(
+        &editor,
+        "#!/bin/sh\n\
+         grep -v -e '^<<<<<<<' -e '^=======' -e '^>>>>>>>' -e '^MAIN' \"$1\" \
+           | sed 's/^FEATURE \\(.*\\)$/FEATURE \\1 \\&\\& MAIN \\1/' > \"$1.new\"\n\
+         mv \"$1.new\" \"$1\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let fuse = ivaldi_answering(
+        path,
+        &["fuse", "main"],
+        "e\nt\n",
+        &[("VISUAL", editor.to_str().unwrap())],
+    );
+    assert!(
+        fuse.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fuse.stderr)
+    );
+    assert_eq!(
+        read(path, "a.txt"),
+        numbered30(&[
+            (2, "FEATURE 2 && MAIN 2"),
+            (10, "MAIN 10"),
+            (19, "FEATURE ONLY"),
+            (28, "MAIN ONLY")
+        ])
+    );
+}
+
+/// Carried uncommitted work that collides with the fuse is asked about the
+/// same way, instead of getting markers.
+#[test]
+fn carried_collisions_are_asked_about_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    diverged_with_feature_current(path);
+    std::fs::write(path.join("a.txt"), numbered(&[(2, "MINE")])).unwrap();
+
+    let fuse = ivaldi_answering(path, &["fuse", "main"], "b\n", &[]);
+    assert!(
+        fuse.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fuse.stderr)
+    );
+    let out = stdout(&fuse);
+    assert!(out.contains("mine (your uncommitted changes)"), "{out}");
+    assert!(out.contains("back on top"), "{out}");
+    assert_eq!(read(path, "a.txt"), numbered(&[(2, "MINE\nMAIN")]));
+}
+
+/// A wrong answer costs one command: `oops` takes the whole fuse back, and
+/// the question can be answered differently.
+#[test]
+fn oops_lets_a_collision_be_answered_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    colliding_timelines(path);
+
+    ivaldi_ok(path, &["fuse", "main", "--prefer", "theirs"]);
+    assert!(read(path, "a.txt").contains("MAIN 2"));
+
+    ivaldi_ok(path, &["oops"]);
+    assert_eq!(last_seal_message(path), "feature edit");
+    assert_eq!(
+        read(path, "a.txt"),
+        numbered30(&[(2, "FEATURE 2"), (10, "FEATURE 10"), (19, "FEATURE ONLY")])
+    );
+
+    ivaldi_ok(path, &["fuse", "main", "--prefer", "mine"]);
+    assert!(read(path, "a.txt").contains("FEATURE 2"));
+    assert!(read(path, "a.txt").contains("MAIN ONLY"));
 }

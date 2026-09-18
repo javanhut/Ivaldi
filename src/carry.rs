@@ -46,7 +46,11 @@ pub enum Outcome {
     /// The fuse already contains exactly this change; there is nothing left
     /// of it to carry.
     AlreadyFused,
-    /// Both sides changed the same lines. The file holds conflict markers.
+    /// Both sides changed the same lines, and a resolver said which to keep.
+    Settled,
+    /// Both sides changed the same lines and there was nobody to ask (or they
+    /// declined). The file holds conflict markers — harmless here, since it is
+    /// an uncommitted working file either way, with no merge left open.
     Conflict,
     /// A binary file changed on both sides. The fused version is on disk; the
     /// user's is still in the snapshot.
@@ -61,7 +65,10 @@ pub enum Outcome {
 impl Outcome {
     /// Whether the user should open this file before sealing.
     pub fn needs_attention(&self) -> bool {
-        !matches!(self, Outcome::Clean | Outcome::AlreadyFused)
+        !matches!(
+            self,
+            Outcome::Clean | Outcome::Settled | Outcome::AlreadyFused
+        )
     }
 }
 
@@ -101,7 +108,10 @@ pub fn reapply(
     cas: &FileCas,
     carry: &Snapshot,
     theirs_label: &str,
+    mut resolver: Option<&mut (dyn crate::resolve::Resolver + 'static)>,
 ) -> Result<CarryReport, SnapshotError> {
+    const MINE_LABEL: &str = "your uncommitted changes";
+
     let ws = Workspace::new(cas, &repo.work_dir, &repo.ivaldi_dir);
     let store = FsStore::new(cas);
 
@@ -156,18 +166,41 @@ pub fn reapply(
                         if crate::diff::is_binary(&mine) || crate::diff::is_binary(&fused) {
                             Outcome::BinaryKeptFused
                         } else {
-                            let (text, conflicted) = crate::fuse::merge_text(
+                            let merge = crate::fuse::Merge3::new(
                                 &String::from_utf8_lossy(&base),
                                 &String::from_utf8_lossy(&mine),
                                 &String::from_utf8_lossy(&fused),
-                                "your uncommitted changes",
+                            );
+                            // The fuse is sealed by now, so declining to answer
+                            // cannot undo anything: it just means markers, for
+                            // this collision and every later one.
+                            let resolutions = match resolver.as_deref_mut() {
+                                Some(r) if merge.collisions() > 0 => {
+                                    let labels = crate::resolve::Labels {
+                                        mine: MINE_LABEL,
+                                        theirs: theirs_label,
+                                        on_quit: "the fuse is sealed; leaves conflict \
+                                                  markers in this file instead",
+                                    };
+                                    let answers =
+                                        crate::resolve::resolve_regions(&merge, path, labels, r);
+                                    if answers.is_err() {
+                                        resolver = None;
+                                    }
+                                    answers.ok()
+                                }
+                                _ => None,
+                            };
+                            let text = merge.render(
+                                resolutions.as_deref().unwrap_or(&[]),
+                                MINE_LABEL,
                                 theirs_label,
                             );
                             write(&full, text.as_bytes())?;
-                            if conflicted {
-                                Outcome::Conflict
-                            } else {
-                                Outcome::Clean
+                            match (merge.collisions(), resolutions) {
+                                (0, _) => Outcome::Clean,
+                                (_, Some(_)) => Outcome::Settled,
+                                (_, None) => Outcome::Conflict,
                             }
                         }
                     }
@@ -272,7 +305,7 @@ mod tests {
                 hash: mine,
             }],
         );
-        let report = reapply(&repo, &repo.cas, &snapshot, "fused").unwrap();
+        let report = reapply(&repo, &repo.cas, &snapshot, "fused", None).unwrap();
         assert_eq!(outcome_of(&report, "a"), Outcome::AlreadyFused);
         assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"same\n");
     }
@@ -293,7 +326,7 @@ mod tests {
                 hash: mine,
             }],
         );
-        let report = reapply(&repo, &repo.cas, &snapshot, "fused").unwrap();
+        let report = reapply(&repo, &repo.cas, &snapshot, "fused", None).unwrap();
         assert_eq!(outcome_of(&report, "a"), Outcome::KeptDeletedByFuse);
         assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"edited\n");
     }
@@ -303,7 +336,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (repo, old) = moved(dir.path(), &[("a", b"base\n")], &[("a", b"changed\n")]);
         let snapshot = carry(old, vec![WorkspaceChange::Deleted { path: "a".into() }]);
-        let report = reapply(&repo, &repo.cas, &snapshot, "fused").unwrap();
+        let report = reapply(&repo, &repo.cas, &snapshot, "fused", None).unwrap();
         assert_eq!(outcome_of(&report, "a"), Outcome::KeptChangedByFuse);
         assert_eq!(fs::read(dir.path().join("a")).unwrap(), b"changed\n");
     }
@@ -317,7 +350,7 @@ mod tests {
             &[("a", b"base\n"), ("b", b"2\n")],
         );
         let snapshot = carry(old, vec![WorkspaceChange::Deleted { path: "a".into() }]);
-        let report = reapply(&repo, &repo.cas, &snapshot, "fused").unwrap();
+        let report = reapply(&repo, &repo.cas, &snapshot, "fused", None).unwrap();
         assert_eq!(outcome_of(&report, "a"), Outcome::Clean);
         assert!(!dir.path().join("a").exists());
     }
@@ -338,7 +371,7 @@ mod tests {
                 hash: mine,
             }],
         );
-        let report = reapply(&repo, &repo.cas, &snapshot, "fused").unwrap();
+        let report = reapply(&repo, &repo.cas, &snapshot, "fused", None).unwrap();
         assert_eq!(outcome_of(&report, "img"), Outcome::BinaryKeptFused);
         assert!(outcome_of(&report, "img").needs_attention());
         assert_eq!(fs::read(dir.path().join("img")).unwrap(), b"\x00fused");
@@ -365,7 +398,7 @@ mod tests {
                 hash: mine,
             }],
         );
-        let report = reapply(&repo, &repo.cas, &snapshot, "fused").unwrap();
+        let report = reapply(&repo, &repo.cas, &snapshot, "fused", None).unwrap();
         assert_eq!(outcome_of(&report, "n"), Outcome::Conflict);
         let text = fs::read_to_string(dir.path().join("n")).unwrap();
         assert!(text.contains("mine") && text.contains("theirs"), "{text}");
