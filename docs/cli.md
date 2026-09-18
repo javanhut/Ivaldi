@@ -16,7 +16,8 @@ Command-line interface for Ivaldi VCS, built with `clap`.
 | `whodidit <file> [--summary]` | `wdi` | Line-by-line seal attribution |
 | `diff` | | Compare changes |
 | `discard [files]` | | Remove files from the gathered set (none = everything) |
-| `reverse --all` | | Throw away all uncommitted changes, restore from last seal (destructive!) |
+| `reverse --all` | | Throw away all uncommitted changes, restore from last seal (undo with `oops`) |
+| `oops [id] [--list]` | | Undo the last command that rewrote the working directory (fuse, sync, reverse, rewind): files, gathered set and timeline head. Run again to redo. See [snapshot.md](snapshot.md) |
 | `rewind <seal> [--discard]` | | Move the timeline head back to an earlier seal (`--discard` also rewrites files) |
 | `undo <seal>` | | New seal that removes an earlier seal's changes |
 | `pluck <seal>` | `cherry-pick` | New seal that applies another seal's changes |

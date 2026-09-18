@@ -6,7 +6,9 @@ Three-way merge engine for Ivaldi VCS.
 
 The fuse engine merges file sets from two divergent timelines using a common ancestor as the base. Unlike Git's line-based merge, Ivaldi operates at the file level using BLAKE3 content hashes, eliminating false conflicts from identical changes.
 
-**Key guarantee**: No conflict markers are ever written to workspace files. The workspace always stays clean.
+**Uncommitted work**: `ivaldi fuse` on a dirty working directory does not refuse and does not overwrite — it carries the work through the merge and re-applies it on top. See [carry.md](carry.md). Every fuse is also undoable with `ivaldi oops` ([snapshot.md](snapshot.md)).
+
+**Conflicts**: the engine decides per file by content hash, so identical changes never conflict. A file both sides changed differently is merged line by line (`merge_text`), and only regions both sides touched are wrapped in conflict markers for `fuse --continue`.
 
 ## Strategies
 
@@ -70,7 +72,7 @@ A fast-forward occurs when the target timeline hasn't changed since the divergen
 ## Design Decisions
 
 - **Hash-based comparison**: Identical changes are auto-merged regardless of file content. No false conflicts from whitespace or formatting.
-- **No conflict markers**: Conflicts are tracked as data structures, never written to files.
+- **Conflicts are data first**: the engine reports conflicts as structures; the CLI then writes diff3-style markers only into the conflicted regions of those files so they can be resolved in an editor.
 - **Strategy as parameter**: Same engine handles all strategies, simplifying the API.
 - **BTreeMap for file sets**: Deterministic ordering, efficient lookup.
 - **Union concatenation**: On a genuine conflict, union combines both versions by

@@ -196,7 +196,8 @@ tradition. Common aliases are shown in parentheses.
 | `ivaldi undo <seal>` | `ud` | New seal that removes an earlier seal's changes |
 | `ivaldi pluck <seal>` | `cherry-pick` | New seal that applies another seal's changes |
 | `ivaldi rewind <seal> [--discard]` | `rw` | Move the timeline head back to an earlier seal |
-| `ivaldi reverse --all` | | Throw away all uncommitted changes (destructive!) |
+| `ivaldi reverse --all` | | Throw away all uncommitted changes (undo with `oops`) |
+| `ivaldi oops` | | Undo the last fuse, sync, reverse or rewind — uncommitted work included. Run again to redo |
 | `ivaldi travel [--all]` | `tv` | Interactive history browser |
 | `ivaldi weld --last N` | `w` | Combine a range of seals into one (linear history) |
 

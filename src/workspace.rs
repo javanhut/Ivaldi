@@ -1001,6 +1001,15 @@ impl<'a> Workspace<'a> {
         let mut changes = Vec::new();
 
         for path in &disk_files {
+            // Snapshots run this ahead of every workspace-rewriting command,
+            // so the common case — an unchanged file — must cost a stat, not
+            // a read. Only content that actually has to be saved is loaded.
+            if let Some(known_hash) = known_files.get(path.as_str())
+                && *known_hash == self.hash_working_file(path)?
+            {
+                continue;
+            }
+
             let full_path = self.work_dir.join(path);
             let content = fs::read(&full_path).map_err(WorkspaceError::Io)?;
             let current_hash = BlobNode::hash_content(&content);
@@ -1035,6 +1044,7 @@ impl<'a> Workspace<'a> {
             }
         }
 
+        self.file_cache.borrow_mut().save(&self.ivaldi_dir);
         Ok(changes)
     }
 

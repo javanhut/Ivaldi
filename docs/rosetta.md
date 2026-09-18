@@ -39,6 +39,9 @@ in Ivaldi the same afternoon.
 | Diff between two refs | `git diff A B` | `ivaldi diff A B` |
 | Unstage a file | `git restore --staged f.txt` | `ivaldi discard f.txt` |
 | Discard local changes | `git reset --hard` | `ivaldi reverse --all` |
+| Get discarded local changes back | *(not possible)* | `ivaldi oops` |
+| Undo a merge or pull, uncommitted work included | `git reset --hard ORIG_HEAD` *(loses uncommitted work)* | `ivaldi oops` |
+| Merge with uncommitted changes | `git stash && git merge X && git stash pop` | `ivaldi fuse X` |
 | Stage parts of a file | `git add -p` | `ivaldi gather -p` |
 | Fix the last commit | `git commit --amend` | `ivaldi reseal` |
 | Undo a commit safely | `git revert <sha>` | `ivaldi undo <seal>` |
@@ -130,6 +133,13 @@ into a state where commits you make get garbage-collected. You either
 destroys uncommitted work. Ivaldi auto-shelves on switch — your
 uncommitted changes follow you back when you return to the timeline.
 There's nothing to stash because nothing is at risk.
+
+**Uncommitted work is never in the way, and never gone.** `git merge`
+refuses when your edits overlap the incoming ones; `ivaldi fuse` sets
+them aside, fuses, and merges them back on top, still uncommitted. And
+every command that rewrites your working directory (`fuse`, `sync`,
+`reverse`, `rewind`) snapshots it first, so `ivaldi oops` undoes the
+whole thing — a reflog only remembers commits.
 
 **One verb per intent.** `git reset` is `--soft`, `--mixed`, `--hard`,
 each doing wildly different things. Ivaldi splits these:

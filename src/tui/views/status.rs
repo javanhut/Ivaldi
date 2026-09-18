@@ -246,6 +246,11 @@ impl StatusView {
             Err(e) => return Action::Error(format!("Failed to read timeline: {}", e)),
         };
 
+        // Same safety net as `ivaldi reverse --all`: `ivaldi oops` undoes this.
+        if let Err(e) = crate::snapshot::take(&ctx.repo, &ctx.repo.cas, "reverse --all") {
+            return Action::Error(format!("Reverse failed (could not snapshot): {}", e));
+        }
+
         let ws = Workspace::new(&ctx.repo.cas, &ctx.work_dir, &ctx.ivaldi_dir);
         if let Err(e) = ws.materialize(tree_root) {
             return Action::Error(format!("Reverse failed: {}", e));
@@ -255,7 +260,8 @@ impl StatusView {
         let empty = StagingArea::new();
         let _ = empty.save(&ctx.ivaldi_dir);
 
-        self.message = Some("Reversed all changes; restored to tip".into());
+        self.message =
+            Some("Reversed all changes; restored to tip ('ivaldi oops' undoes this)".into());
         Action::Refresh
     }
 }

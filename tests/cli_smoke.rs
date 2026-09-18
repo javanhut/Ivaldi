@@ -338,3 +338,276 @@ fn conflicted_fuse_is_reported_resolvable_and_completable() {
     let log: serde_json::Value = serde_json::from_slice(&log.stdout).unwrap();
     assert_eq!(log[0]["is_merge"], true, "{log}");
 }
+
+// ---------------------------------------------------------------------------
+// Uncommitted work vs. commands that rewrite the working directory
+// ---------------------------------------------------------------------------
+
+/// Twenty numbered lines, with `edits` applied as (line number, replacement).
+/// Long enough that edits at opposite ends merge without touching.
+fn numbered(edits: &[(usize, &str)]) -> String {
+    (1..=20)
+        .map(|n| match edits.iter().find(|(line, _)| *line == n) {
+            Some((_, text)) => format!("{text}\n"),
+            None => format!("line {n}\n"),
+        })
+        .collect()
+}
+
+fn read(path: &std::path::Path, file: &str) -> String {
+    std::fs::read_to_string(path.join(file)).unwrap()
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn last_seal_message(path: &std::path::Path) -> String {
+    let log = ivaldi_ok(path, &["log", "--format", "json"]);
+    let log: serde_json::Value = serde_json::from_slice(&log.stdout).unwrap();
+    log[0]["message"].as_str().unwrap().to_string()
+}
+
+/// `main` has moved on in `a.txt` (line 2) and `b.txt`; the current timeline,
+/// `feature`, is left with nothing sealed of its own.
+fn diverged_with_feature_current(path: &std::path::Path) {
+    forge_with_identity(path);
+    std::fs::write(path.join("a.txt"), numbered(&[])).unwrap();
+    std::fs::write(path.join("b.txt"), "base\n").unwrap();
+    std::fs::write(path.join("doomed.txt"), "base\n").unwrap();
+    seal_all(path, "base");
+
+    ivaldi_ok(path, &["timeline", "create", "feature"]);
+    ivaldi_ok(path, &["timeline", "switch", "main"]);
+    std::fs::write(path.join("a.txt"), numbered(&[(2, "MAIN")])).unwrap();
+    std::fs::write(path.join("b.txt"), "changed on main\n").unwrap();
+    seal_all(path, "main edit");
+    ivaldi_ok(path, &["timeline", "switch", "feature"]);
+}
+
+/// The shape that used to lose work: uncommitted edits on a timeline, then
+/// `fuse main`. They must come out the other side merged onto the fused tree
+/// and still uncommitted — modified, new and deleted files alike.
+#[test]
+fn fuse_carries_uncommitted_changes_through() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    diverged_with_feature_current(path);
+
+    std::fs::write(path.join("a.txt"), numbered(&[(19, "MINE")])).unwrap();
+    std::fs::write(path.join("new.txt"), "untracked\n").unwrap();
+    std::fs::remove_file(path.join("doomed.txt")).unwrap();
+
+    let out = stdout(&ivaldi_ok(path, &["fuse", "main"]));
+    assert!(out.contains("Carrying 3 uncommitted change(s)"), "{out}");
+    assert!(out.contains("back on top"), "{out}");
+
+    // Same file edited on both sides, in different places: both edits land.
+    assert_eq!(read(path, "a.txt"), numbered(&[(2, "MAIN"), (19, "MINE")]));
+    assert_eq!(read(path, "b.txt"), "changed on main\n");
+    assert_eq!(read(path, "new.txt"), "untracked\n");
+    assert!(!path.join("doomed.txt").exists());
+
+    // The fuse was sealed; the carried work was not.
+    assert_eq!(last_seal_message(path), "Fuse main into feature");
+    let status = ivaldi_ok(path, &["status", "--json"]);
+    let status = String::from_utf8_lossy(&status.stdout).into_owned();
+    for file in ["a.txt", "new.txt", "doomed.txt"] {
+        assert!(
+            status.contains(file),
+            "{file} should still be uncommitted: {status}"
+        );
+    }
+    assert!(!status.contains("b.txt"), "{status}");
+    assert!(!path.join(".ivaldi/fuse-carry.snap").exists());
+}
+
+/// Where the carried edit and the fuse really collide, the file gets conflict
+/// markers — but the fuse itself still succeeds and nothing is dropped.
+#[test]
+fn fuse_marks_a_carried_change_that_collides() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    diverged_with_feature_current(path);
+
+    std::fs::write(path.join("a.txt"), numbered(&[(2, "MINE")])).unwrap();
+
+    let out = stdout(&ivaldi_ok(path, &["fuse", "main"]));
+    assert!(out.contains("1 need a look"), "{out}");
+    assert!(out.contains("a.txt"), "{out}");
+
+    let merged = read(path, "a.txt");
+    assert!(
+        merged.contains("<<<<<<< your uncommitted changes"),
+        "{merged}"
+    );
+    assert!(
+        merged.contains("MINE") && merged.contains("MAIN"),
+        "{merged}"
+    );
+    assert!(merged.contains(">>>>>>> fused from main"), "{merged}");
+    assert_eq!(last_seal_message(path), "Fuse main into feature");
+}
+
+/// Gathered entries name blobs made against the old tip; sealed after the
+/// fuse they would silently undo what it brought in. They are un-gathered,
+/// and their content carried like any other edit.
+#[test]
+fn fuse_ungathers_but_keeps_gathered_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    diverged_with_feature_current(path);
+
+    std::fs::write(path.join("a.txt"), numbered(&[(19, "MINE")])).unwrap();
+    ivaldi_ok(path, &["gather", "a.txt"]);
+
+    let out = stdout(&ivaldi_ok(path, &["fuse", "main"]));
+    assert!(out.contains("un-gathered"), "{out}");
+    assert_eq!(read(path, "a.txt"), numbered(&[(2, "MAIN"), (19, "MINE")]));
+    let status = ivaldi_ok(path, &["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let a = status["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "a.txt")
+        .unwrap_or_else(|| panic!("a.txt should still be uncommitted: {status}"));
+    assert_eq!(a["state"], "modified", "{status}");
+}
+
+/// A fuse whose *sealed* sides conflict has to stop for the user. Work it set
+/// aside comes back merged on `--continue`...
+#[test]
+fn conflicted_fuse_returns_carried_changes_on_continue() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    diverged_with_feature_current(path);
+    std::fs::write(path.join("b.txt"), "changed on feature\n").unwrap();
+    seal_all(path, "feature edit");
+
+    std::fs::write(path.join("a.txt"), numbered(&[(19, "MINE")])).unwrap();
+
+    let fuse = ivaldi(path, &["fuse", "main"]);
+    assert!(!fuse.status.success());
+    let out = stdout(&fuse);
+    assert!(out.contains("CONFLICT: b.txt"), "{out}");
+    assert!(out.contains("set aside"), "{out}");
+    // Set aside means the fuse got a clean tree to resolve in.
+    assert_eq!(read(path, "a.txt"), numbered(&[]));
+
+    std::fs::write(path.join("b.txt"), "resolved\n").unwrap();
+    ivaldi_ok(path, &["fuse", "--continue"]);
+
+    assert_eq!(read(path, "b.txt"), "resolved\n");
+    assert_eq!(read(path, "a.txt"), numbered(&[(2, "MAIN"), (19, "MINE")]));
+    assert!(!path.join(".ivaldi/fuse-carry.snap").exists());
+}
+
+/// ...and untouched on `--abort`, which also clears the conflict markers.
+#[test]
+fn conflicted_fuse_returns_carried_changes_on_abort() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    diverged_with_feature_current(path);
+    std::fs::write(path.join("b.txt"), "changed on feature\n").unwrap();
+    seal_all(path, "feature edit");
+
+    std::fs::write(path.join("a.txt"), numbered(&[(19, "MINE")])).unwrap();
+    assert!(!ivaldi(path, &["fuse", "main"]).status.success());
+    assert!(read(path, "b.txt").contains("<<<<<<<"));
+
+    ivaldi_ok(path, &["fuse", "--abort"]);
+    assert_eq!(read(path, "a.txt"), numbered(&[(19, "MINE")]));
+    assert_eq!(read(path, "b.txt"), "changed on feature\n");
+    assert_eq!(last_seal_message(path), "feature edit");
+    assert!(!path.join(".ivaldi/fuse-carry.snap").exists());
+}
+
+/// `oops` takes back a whole fuse — merge seal, files, carried work — and is
+/// its own inverse.
+#[test]
+fn oops_undoes_and_redoes_a_fuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    diverged_with_feature_current(path);
+    std::fs::write(path.join("a.txt"), numbered(&[(19, "MINE")])).unwrap();
+    std::fs::write(path.join("new.txt"), "untracked\n").unwrap();
+
+    ivaldi_ok(path, &["fuse", "main"]);
+    assert_eq!(last_seal_message(path), "Fuse main into feature");
+
+    let out = stdout(&ivaldi_ok(path, &["oops"]));
+    assert!(out.contains("fuse main"), "{out}");
+    assert_eq!(last_seal_message(path), "base");
+    assert_eq!(read(path, "a.txt"), numbered(&[(19, "MINE")]));
+    assert_eq!(read(path, "b.txt"), "base\n");
+    assert_eq!(read(path, "new.txt"), "untracked\n");
+
+    ivaldi_ok(path, &["oops"]);
+    assert_eq!(last_seal_message(path), "Fuse main into feature");
+    assert_eq!(read(path, "a.txt"), numbered(&[(2, "MAIN"), (19, "MINE")]));
+    assert_eq!(read(path, "b.txt"), "changed on main\n");
+    assert_eq!(read(path, "new.txt"), "untracked\n");
+}
+
+/// A bare `oops` right after a fuse that stopped on conflicts aborts it.
+#[test]
+fn oops_aborts_a_conflicted_fuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    diverged_with_feature_current(path);
+    std::fs::write(path.join("b.txt"), "changed on feature\n").unwrap();
+    seal_all(path, "feature edit");
+    std::fs::write(path.join("a.txt"), numbered(&[(19, "MINE")])).unwrap();
+    assert!(!ivaldi(path, &["fuse", "main"]).status.success());
+
+    let out = stdout(&ivaldi_ok(path, &["oops"]));
+    assert!(out.contains("Fuse aborted"), "{out}");
+    assert_eq!(read(path, "a.txt"), numbered(&[(19, "MINE")]));
+    assert_eq!(read(path, "b.txt"), "changed on feature\n");
+    let status = ivaldi_ok(path, &["status", "--json"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(status["merge"].is_null(), "{status}");
+}
+
+/// `reverse --all` exists to destroy uncommitted work, so it is the command
+/// most worth being able to take back — staging included.
+#[test]
+fn oops_brings_back_what_reverse_threw_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    forge_with_identity(path);
+    std::fs::write(path.join("a.txt"), "base\n").unwrap();
+    std::fs::write(path.join("gone.txt"), "base\n").unwrap();
+    seal_all(path, "base");
+
+    std::fs::write(path.join("a.txt"), "hours of work\n").unwrap();
+    std::fs::write(path.join("new.txt"), "untracked\n").unwrap();
+    std::fs::remove_file(path.join("gone.txt")).unwrap();
+    ivaldi_ok(path, &["gather", "new.txt"]);
+
+    let out = stdout(&ivaldi_ok(path, &["reverse", "--all"]));
+    assert!(out.contains("ivaldi oops"), "{out}");
+    assert_eq!(read(path, "a.txt"), "base\n");
+    assert!(!path.join("new.txt").exists());
+
+    ivaldi_ok(path, &["oops"]);
+    assert_eq!(read(path, "a.txt"), "hours of work\n");
+    assert_eq!(read(path, "new.txt"), "untracked\n");
+    assert!(!path.join("gone.txt").exists());
+    let status = ivaldi_ok(path, &["status", "--json"]);
+    let status = String::from_utf8_lossy(&status.stdout).into_owned();
+    assert!(status.contains("new.txt"), "{status}");
+
+    let list = stdout(&ivaldi_ok(path, &["oops", "--list"]));
+    assert!(list.contains("oops (undo of 'reverse --all')"), "{list}");
+}
+
+#[test]
+fn oops_with_nothing_to_undo_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    forge_with_identity(dir.path());
+    let oops = ivaldi(dir.path(), &["oops"]);
+    assert!(!oops.status.success());
+    assert!(String::from_utf8_lossy(&oops.stderr).contains("nothing to undo"));
+}

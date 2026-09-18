@@ -1,4 +1,4 @@
-//! History-editing commands: rewind, reverse, discard, undo, pluck.
+//! History-editing commands: rewind, reverse, oops, discard, undo, pluck.
 
 use super::*;
 
@@ -50,13 +50,18 @@ pub(super) fn cmd_rewind(args: RewindArgs, quiet: bool) -> Result<(), String> {
         );
     }
 
+    // Rewind drops the staging area and, with --discard, the working tree.
+    // Both go into a snapshot first, along with the head being left behind.
+    let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
+    crate::snapshot::take(&repo, &cas, &format!("rewind {}", args.seal))
+        .map_err(|e| e.to_string())?;
+
     if !already_there {
         repo.set_timeline_head(&timeline, target_idx)
             .map_err(|e| e.to_string())?;
     }
     crate::failpoint::fail_point("rewind.after_head");
 
-    let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
     {
         let mut ws_mut = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
         ws_mut.staging.clear();
@@ -102,6 +107,17 @@ pub(super) fn cmd_reverse(_args: ReverseArgs, quiet: bool) -> Result<(), String>
         && let Some(leaf) = repo.get_leaf(head_idx).map_err(|e| e.to_string())?
     {
         let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
+        // `reverse` is the one command whose whole purpose is to destroy
+        // uncommitted work, which makes it the one most worth being able to
+        // take back.
+        let snapshot =
+            crate::snapshot::capture(&repo, &cas, "reverse --all").map_err(|e| e.to_string())?;
+        let discarded = !snapshot.is_clean();
+        if discarded {
+            crate::snapshot::SnapshotManager::new(&ctx.ivaldi_dir)
+                .save(&snapshot)
+                .map_err(|e| e.to_string())?;
+        }
         let ws = Workspace::new(&cas, &ctx.work_dir, &ctx.ivaldi_dir);
         ws.materialize(leaf.tree_root).map_err(|e| e.to_string())?;
         // A crash here leaves stale staging behind; retrying `reverse`
@@ -113,10 +129,148 @@ pub(super) fn cmd_reverse(_args: ReverseArgs, quiet: bool) -> Result<(), String>
         ws_mut.save().map_err(|e| e.to_string())?;
         if !quiet {
             println!("Reversed all changes. Working directory restored to last seal.");
+            if discarded {
+                println!("Changed your mind? 'ivaldi oops' brings them back.");
+            }
         }
         return Ok(());
     }
     Err("no seals to restore the working directory from".into())
+}
+
+/// `oops`: put the repository back the way it was before the last command
+/// that rewrote the working directory.
+///
+/// The state being left is snapshotted in turn, so `oops` is its own inverse:
+/// running it twice is a no-op, and nothing it overwrites is ever lost.
+pub(super) fn cmd_oops(args: OopsArgs, quiet: bool) -> Result<(), String> {
+    use crate::snapshot::{self, SnapshotManager};
+
+    let ctx = find_repo()?;
+    let mgr = SnapshotManager::new(&ctx.ivaldi_dir);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let describe = |s: &snapshot::Snapshot| {
+        let changes = s.workspace_changes.len() + s.staged_files.len() + s.staged_deletions.len();
+        let what = if changes == 0 {
+            "clean tree".to_string()
+        } else {
+            format!("{} uncommitted change(s)", changes)
+        };
+        format!(
+            "before '{}' on {} — {}, {}",
+            s.command,
+            color::timeline(&s.timeline),
+            what,
+            ivaldi_log::relative_time(s.created_at, now)
+        )
+    };
+
+    if args.list {
+        let all = mgr.list().map_err(|e| e.to_string())?;
+        if all.is_empty() {
+            println!(
+                "No snapshots yet. They are taken automatically before fuse, sync, reverse and rewind."
+            );
+        }
+        for s in &all {
+            println!("{:>4}  {}", s.id, describe(s));
+        }
+        return Ok(());
+    }
+
+    let target = match args.id {
+        Some(id) => mgr
+            .load(id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no snapshot {}. See 'ivaldi oops --list'.", id))?,
+        None => mgr.latest().map_err(|e| e.to_string())?.ok_or(
+            "nothing to undo: no snapshots yet. They are taken automatically before \
+             fuse, sync, reverse and rewind.",
+        )?,
+    };
+
+    let repo = open_repo()?;
+    let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;
+
+    // A conflicted fuse has made no seal yet, so there is nothing to redo:
+    // undoing it is aborting it. Only the fuse's own snapshot will do — any
+    // other would rewrite the tree underneath a merge that is still open.
+    if repo.has_merge_in_progress() {
+        if args.id.is_some() || !target.command.starts_with("fuse ") {
+            return Err(
+                "a fuse is in progress. Finish it with 'ivaldi fuse --continue', or give it \
+                 up with 'ivaldi fuse --abort' (or a bare 'ivaldi oops' right after it)."
+                    .into(),
+            );
+        }
+        snapshot::restore(&repo, &cas, &target).map_err(|e| e.to_string())?;
+        repo.clear_merge_state().map_err(|e| e.to_string())?;
+        snapshot::clear_carry(&ctx.ivaldi_dir).map_err(|e| e.to_string())?;
+        mgr.remove(target.id).map_err(|e| e.to_string())?;
+        if !quiet {
+            println!("Fuse aborted. Restored: {}", describe(&target));
+        }
+        return Ok(());
+    }
+
+    // Capture what is about to be replaced before replacing it, but only
+    // record it once the restore has succeeded: if the restore is interrupted,
+    // `target` must still be the latest snapshot so a retry finishes the job.
+    // Undoing X leaves a snapshot labelled as the undo of X; restoring *that*
+    // is redoing X, and leaves one labelled X again. The labels alternate
+    // instead of nesting, however many times the user flips back and forth.
+    let redo_label = match target
+        .command
+        .strip_prefix("oops (undo of '")
+        .and_then(|rest| rest.strip_suffix("')"))
+    {
+        Some(original) => original.to_string(),
+        None => format!("oops (undo of '{}')", target.command),
+    };
+    let redo = snapshot::capture(&repo, &cas, &redo_label).map_err(|e| e.to_string())?;
+    snapshot::restore(&repo, &cas, &target).map_err(|e| e.to_string())?;
+    crate::failpoint::fail_point("oops.before_redo_save");
+    mgr.save(&redo).map_err(|e| e.to_string())?;
+    mgr.remove(target.id).map_err(|e| e.to_string())?;
+    // If that fuse died still owing its set-aside work, this just paid it.
+    if let Some(carry) = snapshot::load_carry(&ctx.ivaldi_dir).map_err(|e| e.to_string())?
+        && carry.created_at == target.created_at
+        && carry.command == target.command
+    {
+        snapshot::clear_carry(&ctx.ivaldi_dir).map_err(|e| e.to_string())?;
+    }
+
+    if !quiet {
+        println!("Restored: {}", describe(&target));
+        if redo.head != target.head
+            && let Some(left) = redo.head
+            && let Some(leaf) = repo.get_leaf(left).map_err(|e| e.to_string())?
+        {
+            let name = repo
+                .get_seal_name(leaf.hash())
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| leaf.hash().short8());
+            // Undo steps the head back and orphans the seal it leaves; redo
+            // steps forward onto that seal again, leaving nothing behind.
+            let stepped_back = match target.head {
+                Some(to) => repo.is_ancestor(to, left).map_err(|e| e.to_string())?,
+                None => true,
+            };
+            if stepped_back {
+                println!(
+                    "  timeline head moved back; seal '{}' is kept, just no longer the head",
+                    name
+                );
+            } else {
+                println!("  timeline head moved forward again from '{}'", name);
+            }
+        }
+        println!("Run 'ivaldi oops' again to redo.");
+    }
+    Ok(())
 }
 
 pub(super) fn cmd_discard(args: DiscardArgs, quiet: bool) -> Result<(), String> {
