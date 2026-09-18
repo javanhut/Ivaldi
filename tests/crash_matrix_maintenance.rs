@@ -236,6 +236,13 @@ fn serve_connection(mut stream: TcpStream) {
 }
 
 fn run_sync(dir: &Path) {
+    sync_against_mock(dir, ivaldi::sync::Collisions::Markers).unwrap();
+}
+
+fn sync_against_mock(
+    dir: &Path,
+    collisions: ivaldi::sync::Collisions<'_>,
+) -> Result<ivaldi::sync::SyncResult, ivaldi::sync::SyncError> {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -263,10 +270,11 @@ fn run_sync(dir: &Path) {
         "main",
         &mut |_, _| true,
         false,
+        collisions,
     );
     done.store(true, Ordering::Release);
     server.join().unwrap();
-    result.unwrap();
+    result
 }
 
 /// Child entry point invoked by the parent tests above. With no marker it is a
@@ -780,4 +788,218 @@ fn interrupted_pack_receive_exposes_only_verified_objects_and_retry_completes() 
         let hash = B3Hash::digest(data);
         assert_eq!(cas.get(hash).unwrap(), data);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Diverged sync whose two sides collide
+// ---------------------------------------------------------------------------
+
+const LOCAL_VERSION: &str = "local version\n";
+
+/// [`setup_diverged_sync_repo`], plus a local seal adding `remote.txt` — the
+/// same path the remote adds, with different content. Both sides adding one
+/// file two ways is a collision no merge can decide.
+fn setup_colliding_sync_repo() -> tempfile::TempDir {
+    let dir = setup_diverged_sync_repo();
+    let mut repo = Repo::open(dir.path()).unwrap();
+    let files: std::collections::BTreeMap<String, Vec<u8>> = [
+        ("base.txt", "base\n"),
+        ("local.txt", "local\n"),
+        ("remote.txt", LOCAL_VERSION),
+    ]
+    .into_iter()
+    .map(|(path, content)| (path.to_string(), content.as_bytes().to_vec()))
+    .collect();
+    let tree = ivaldi::fsmerkle::FsStore::new(&repo.cas)
+        .build_tree_from_map(&files)
+        .unwrap();
+    repo.cas.flush().unwrap();
+    repo.commit(tree, "Local", "local adds remote.txt too")
+        .unwrap();
+    drop(repo);
+    std::fs::write(dir.path().join("remote.txt"), LOCAL_VERSION).unwrap();
+    dir
+}
+
+fn scratch_timelines(dir: &Path) -> Vec<String> {
+    Repo::open(dir)
+        .unwrap()
+        .list_timelines()
+        .unwrap()
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| name.starts_with("__sync_"))
+        .collect()
+}
+
+/// A sync that integrated nothing must leave nothing: head, files, scratch
+/// timeline, journal, open merge, and `oops` history all as they were.
+fn assert_sync_left_no_trace(dir: &Path, head_before: Option<u64>) {
+    let repo = Repo::open(dir).unwrap();
+    assert_eq!(repo.get_timeline_head("main").unwrap(), head_before);
+    assert!(!repo.has_merge_in_progress());
+    assert!(!dir.join(".ivaldi/sync-journal.json").exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("remote.txt")).unwrap(),
+        LOCAL_VERSION,
+        "no conflict markers, no remote content"
+    );
+    assert!(
+        ivaldi::snapshot::SnapshotManager::new(&dir.join(".ivaldi"))
+            .latest()
+            .unwrap()
+            .is_none(),
+        "nothing happened, so there must be nothing for oops to undo"
+    );
+}
+
+#[test]
+fn colliding_sync_settles_by_preference_and_fuses_in_one_go() {
+    use ivaldi::resolve::{Prefer, PreferResolver};
+    for (prefer, expected) in [
+        (Prefer::Theirs, "remote\n".to_string()),
+        (Prefer::Mine, LOCAL_VERSION.to_string()),
+        (Prefer::Both, format!("{LOCAL_VERSION}remote\n")),
+    ] {
+        let dir = setup_colliding_sync_repo();
+        let mut resolver = PreferResolver(prefer);
+        let result =
+            sync_against_mock(dir.path(), ivaldi::sync::Collisions::Ask(&mut resolver)).unwrap();
+
+        assert!(
+            result.was_fused && result.conflicts.is_empty(),
+            "{prefer:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("remote.txt")).unwrap(),
+            expected,
+            "{prefer:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("local.txt")).unwrap(),
+            "local\n"
+        );
+        let repo = Repo::open(dir.path()).unwrap();
+        let head = repo.get_timeline_head("main").unwrap().unwrap();
+        assert!(repo.get_leaf(head).unwrap().unwrap().is_merge());
+        assert!(!repo.has_merge_in_progress());
+        drop(repo);
+        assert!(scratch_timelines(dir.path()).is_empty());
+        assert!(!dir.path().join(".ivaldi/sync-journal.json").exists());
+    }
+}
+
+#[test]
+fn colliding_sync_with_nobody_to_ask_refuses_and_leaves_no_trace() {
+    let dir = setup_colliding_sync_repo();
+    let head_before = Repo::open(dir.path())
+        .unwrap()
+        .get_timeline_head("main")
+        .unwrap();
+
+    let error = sync_against_mock(dir.path(), ivaldi::sync::Collisions::Refuse).unwrap_err();
+    match error {
+        ivaldi::sync::SyncError::Collisions(files) => {
+            assert_eq!(files, ["remote.txt  (1 collision(s))"]);
+        }
+        other => panic!("expected Collisions, got {other}"),
+    }
+    assert_sync_left_no_trace(dir.path(), head_before);
+    assert!(scratch_timelines(dir.path()).is_empty());
+
+    // And having refused, it can simply be run again with an answer.
+    let mut resolver = ivaldi::resolve::PreferResolver(ivaldi::resolve::Prefer::Theirs);
+    let result =
+        sync_against_mock(dir.path(), ivaldi::sync::Collisions::Ask(&mut resolver)).unwrap();
+    assert!(result.was_fused);
+}
+
+#[test]
+fn cancelling_a_colliding_sync_leaves_no_trace() {
+    struct Quits;
+    impl ivaldi::resolve::Resolver for Quits {
+        fn region(
+            &mut self,
+            _: &ivaldi::resolve::Region<'_>,
+        ) -> Result<ivaldi::fuse::Resolution, ivaldi::resolve::Stop> {
+            Err(ivaldi::resolve::Stop::Cancelled)
+        }
+        fn whole_file(
+            &mut self,
+            _: &str,
+            _: ivaldi::resolve::WholeFile,
+            _: ivaldi::resolve::Labels<'_>,
+        ) -> Result<ivaldi::resolve::Side, ivaldi::resolve::Stop> {
+            Err(ivaldi::resolve::Stop::Cancelled)
+        }
+    }
+
+    let dir = setup_colliding_sync_repo();
+    let head_before = Repo::open(dir.path())
+        .unwrap()
+        .get_timeline_head("main")
+        .unwrap();
+    let error =
+        sync_against_mock(dir.path(), ivaldi::sync::Collisions::Ask(&mut Quits)).unwrap_err();
+    assert!(
+        matches!(error, ivaldi::sync::SyncError::Cancelled),
+        "{error}"
+    );
+    assert_sync_left_no_trace(dir.path(), head_before);
+    assert!(scratch_timelines(dir.path()).is_empty());
+}
+
+/// The TUI's path: its sync cannot ask, so it parks what it fetched; the Fuse
+/// tab then fuses the parked timeline, asking as it would for any other. The
+/// result has to be a sync in every way that matters — above all, the next
+/// sync must see the remote seals as integrated.
+#[test]
+fn parked_sync_is_finished_by_fusing_the_scratch_timeline() {
+    use ivaldi::resolve::{Answer, Questions, Side};
+
+    let dir = setup_colliding_sync_repo();
+    let head_before = Repo::open(dir.path())
+        .unwrap()
+        .get_timeline_head("main")
+        .unwrap();
+
+    let error = sync_against_mock(dir.path(), ivaldi::sync::Collisions::Park).unwrap_err();
+    let ivaldi::sync::SyncError::Parked { timeline, files } = error else {
+        panic!("expected Parked");
+    };
+    assert_eq!(files.len(), 1);
+    assert_sync_left_no_trace(dir.path(), head_before);
+    assert_eq!(
+        scratch_timelines(dir.path()),
+        std::slice::from_ref(&timeline)
+    );
+
+    // What the Fuse tab does with it.
+    let mut repo = Repo::open(dir.path()).unwrap();
+    let ivaldi::fuse_op::Planned::Plan(mut plan) =
+        ivaldi::fuse_op::plan(&repo, &timeline, ivaldi::fuse::Strategy::Auto).unwrap()
+    else {
+        panic!("the parked seals are not fused yet");
+    };
+    let store = ivaldi::fsmerkle::FsStore::new(&repo.cas);
+    let mut questions = Questions::new(&store, &plan.conflicts).unwrap();
+    assert_eq!(questions.len(), 1);
+    // Added on both sides with nothing in common: one region, whole file.
+    assert!(questions.answer(0, Answer::Region(ivaldi::fuse::Resolution::Theirs)));
+    assert!(!questions.answer(0, Answer::WholeFile(Side::Theirs)));
+    questions.apply(&store, &mut plan.merged_files).unwrap();
+    ivaldi::fuse_op::complete(&mut repo, &plan, None).unwrap();
+    drop(repo);
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("remote.txt")).unwrap(),
+        "remote\n"
+    );
+    assert!(
+        scratch_timelines(dir.path()).is_empty(),
+        "fusing it removes it"
+    );
+
+    let again = sync_against_mock(dir.path(), ivaldi::sync::Collisions::Refuse).unwrap();
+    assert!(again.no_changes, "the remote tip is an ancestor now");
 }

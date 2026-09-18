@@ -38,7 +38,9 @@ Command-line interface for Ivaldi VCS, built with `clap`.
 | `upload [--portal P]` | | Push via HTTPS / SSH / `ivaldi://` (auto-detected from portal; default portal unless `--portal` names one) |
 | `scout` | | Discover remote branches (HTTPS / SSH) |
 | `harvest <name>` | | Fetch specific branches (HTTPS / SSH) |
-| `sync [branch] [--force] [--portal P]` | | Pull remote changes, delta only (HTTPS; `--force` discards uncommitted changes instead of refusing) |
+| `sync [branch] [--force] [--portal P]` | | Pull remote changes, delta only (HTTPS; `--force` discards uncommitted changes instead of refusing). If local and remote have diverged they are fused — line by line — and true collisions are asked about, in the same command ([resolve.md](resolve.md)). Undo with `oops` |
+| `sync --prefer mine\|theirs\|both` | | Settle every collision that way, without asking (required when there is no terminal) |
+| `sync --markers` | | Resolve by hand instead: write conflict markers, leave the merge open for `fuse --continue` / `--abort` |
 | `serve [--bind addr:port]` | | Run an `ivaldi://` peer server |
 | `peer trust/list/forget/whoami/known` | | Manage peer pubkey allowlists + TOFU known servers |
 | `review create/list/show/diff/comment/approve/request-changes/merge/close/reopen` | `rv` | Local code review system |

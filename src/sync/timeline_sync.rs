@@ -13,6 +13,7 @@ use crate::leaf::Leaf;
 use crate::refname::timeline_ref_path;
 use crate::remote::HashMapping;
 use crate::repo::Repo;
+use crate::resolve::Collisions;
 
 use super::import::import_commit_history_into;
 use super::{
@@ -60,6 +61,10 @@ pub struct SyncResult {
 /// has uncommitted changes, sync overwrites them — the integration checkout
 /// rewrites the workspace to the incoming tree either way — and drops staged
 /// entries gathered against the pre-sync state.
+///
+/// `collisions` only matters when local and remote have diverged *and* changed
+/// the same lines (everything else fuses by itself): see [`Collisions`].
+#[allow(clippy::too_many_arguments)]
 pub fn sync_timeline(
     client: &GitHubClient,
     repo: &mut Repo,
@@ -68,6 +73,7 @@ pub fn sync_timeline(
     timeline: &str,
     consent: &mut dyn FnMut(usize, usize) -> bool,
     force: bool,
+    collisions: Collisions<'_>,
 ) -> Result<SyncResult, SyncError> {
     recover_interrupted_sync(repo)?;
     let mut hash_mapping = HashMapping::new(&repo.ivaldi_dir);
@@ -186,10 +192,14 @@ pub fn sync_timeline(
     // Sync moves the head and rewrites the working directory. Record both so
     // `ivaldi oops` can take the whole sync back — and, under --force, so the
     // uncommitted work being overwritten is recoverable rather than gone.
-    if repo.current_timeline().ok().as_deref() == Some(timeline) {
-        crate::snapshot::take(repo, &repo.cas, "sync")
-            .map_err(|e| SyncError::Other(e.to_string()))?;
-    }
+    let snapshot = if repo.current_timeline().ok().as_deref() == Some(timeline) {
+        Some(
+            crate::snapshot::take(repo, &repo.cas, "sync")
+                .map_err(|e| SyncError::Other(e.to_string()))?,
+        )
+    } else {
+        None
+    };
 
     if force {
         discard_staged_changes(repo)?;
@@ -209,7 +219,7 @@ pub fn sync_timeline(
         );
     }
 
-    sync_diverged(
+    let result = sync_diverged(
         client,
         repo,
         owner,
@@ -218,7 +228,19 @@ pub fn sync_timeline(
         common_ancestor_idx,
         &remote_tip_sha,
         remote_commits,
-    )
+        collisions,
+    );
+    // A sync that backed out integrated nothing, so there is nothing for
+    // `oops` to undo — and a snapshot of it would sit in front of the one the
+    // user actually wants.
+    if let (
+        Err(SyncError::Cancelled | SyncError::Collisions(_) | SyncError::Parked { .. }),
+        Some(id),
+    ) = (&result, snapshot)
+    {
+        let _ = crate::snapshot::SnapshotManager::new(&repo.ivaldi_dir).remove(id);
+    }
+    result
 }
 
 /// `checkout_tree_to_workspace` (used by every sync path) makes the workspace
@@ -513,6 +535,7 @@ fn sync_diverged(
     common_ancestor_idx: Option<u64>,
     remote_tip_sha: &str,
     remote_commits: Vec<CommitInfo>,
+    collisions: Collisions<'_>,
 ) -> Result<SyncResult, SyncError> {
     // Same value as captured before the ancestor search: nothing between
     // there and here mutates this timeline's head.
@@ -582,32 +605,88 @@ fn sync_diverged(
         crate::fuse::Strategy::Auto,
     );
 
-    if !fuse_result.success {
-        // Conflicts — write both sides into the workspace, save merge state,
-        // and report. The timeline head does NOT move: the merge is finished
-        // by 'ivaldi fuse --continue', not by sync.
-        let (_marked, _binary) = crate::fuse::write_conflict_markers(
-            &store,
-            &repo.work_dir,
-            &fuse_result.conflicts,
-            timeline,
-            &temp_timeline,
-        );
-        let conflicts: Vec<String> = fuse_result
-            .conflicts
-            .iter()
-            .map(|c| c.path.clone())
-            .collect();
-        let result = save_sync_conflicts(repo, &temp_timeline, timeline, conflicts)?;
-        // The successfully published merge-state record now owns the temporary
-        // timeline. Leaving the sync journal would block `fuse --continue`,
-        // which is the command needed to resolve this documented state.
-        fs::remove_file(repo.ivaldi_dir.join(SYNC_JOURNAL))?;
-        return Ok(result);
+    let mut merged_files = fuse_result.merged_files;
+    if !fuse_result.conflicts.is_empty() {
+        // Nothing local has moved yet: the remote seals are imported under a
+        // scratch timeline and that is all. Backing out is dropping that
+        // timeline and the journal that owns it — the same thing
+        // `recover_interrupted_sync` does for a sync that never fused.
+        let back_out = |repo: &Repo| {
+            cleanup_temp_timeline(repo, &temp_timeline);
+            let _ = fs::remove_file(repo.ivaldi_dir.join(SYNC_JOURNAL));
+        };
+        match collisions {
+            Collisions::Ask(resolver) => {
+                let remote = format!("{owner}/{repo_name}");
+                let labels = crate::resolve::Labels {
+                    mine: timeline,
+                    theirs: &remote,
+                    on_quit: "cancels the sync; nothing has been integrated",
+                };
+                for conflict in &fuse_result.conflicts {
+                    match crate::resolve::resolve_conflict(&store, conflict, labels, resolver) {
+                        Ok(Some(hash)) => {
+                            merged_files.insert(conflict.path.clone(), hash);
+                        }
+                        Ok(None) => {
+                            merged_files.remove(&conflict.path);
+                        }
+                        Err(stop) => {
+                            back_out(repo);
+                            return Err(match stop {
+                                crate::resolve::Stop::Cancelled => SyncError::Cancelled,
+                                crate::resolve::Stop::Unresolvable(why) => {
+                                    SyncError::Other(format!("{why}\nNothing was integrated."))
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+            Collisions::Refuse => {
+                let described = crate::resolve::describe_conflicts(&store, &fuse_result.conflicts);
+                back_out(repo);
+                return Err(SyncError::Collisions(described));
+            }
+            Collisions::Park => {
+                let files = crate::resolve::describe_conflicts(&store, &fuse_result.conflicts);
+                // Only the journal goes: it marks a sync in flight and would
+                // block every other command. The scratch timeline stays, as
+                // an ordinary timeline; fusing it removes it.
+                fs::remove_file(repo.ivaldi_dir.join(SYNC_JOURNAL))?;
+                return Err(SyncError::Parked {
+                    timeline: temp_timeline,
+                    files,
+                });
+            }
+            Collisions::Markers => {
+                // Conflicts — write both sides into the workspace, save merge state,
+                // and report. The timeline head does NOT move: the merge is finished
+                // by 'ivaldi fuse --continue', not by sync.
+                let (_marked, _binary) = crate::fuse::write_conflict_markers(
+                    &store,
+                    &repo.work_dir,
+                    &fuse_result.conflicts,
+                    timeline,
+                    &temp_timeline,
+                );
+                let conflicts: Vec<String> = fuse_result
+                    .conflicts
+                    .iter()
+                    .map(|c| c.path.clone())
+                    .collect();
+                let result = save_sync_conflicts(repo, &temp_timeline, timeline, conflicts)?;
+                // The successfully published merge-state record now owns the temporary
+                // timeline. Leaving the sync journal would block `fuse --continue`,
+                // which is the command needed to resolve this documented state.
+                fs::remove_file(repo.ivaldi_dir.join(SYNC_JOURNAL))?;
+                return Ok(result);
+            }
+        }
     }
 
     // Build merged tree
-    let merged_tree = store.build_tree_from_hash_map(&fuse_result.merged_files)?;
+    let merged_tree = store.build_tree_from_hash_map(&merged_files)?;
 
     // Create fuse commit
     let their_head = their_head_idx.unwrap_or(crate::leaf::NO_PARENT);
@@ -660,7 +739,7 @@ fn sync_diverged(
     let _ = fs::remove_file(repo.ivaldi_dir.join(SYNC_JOURNAL));
     crate::failpoint::fail_point("sync.after_cleanup");
 
-    let (added, modified, deleted) = compute_file_changes(&base_files, &fuse_result.merged_files);
+    let (added, modified, deleted) = compute_file_changes(&base_files, &merged_files);
 
     Ok(SyncResult {
         added,
@@ -985,6 +1064,7 @@ mod tests {
             "main",
             &mut |_, _| panic!("up-to-date sync must not request consent"),
             false,
+            Collisions::Refuse,
         )
         .unwrap();
         let path = server.join().unwrap();

@@ -1,14 +1,18 @@
 //! Fuse (merge) tab — merge timelines together.
-
-use std::collections::BTreeMap;
+//!
+//! The fuse itself is [`crate::fuse_op`], the same as the CLI's. What this
+//! view adds is a way of asking: collisions the engine could not settle are
+//! laid out as [`Questions`] and put to the user one at a time as a modal,
+//! each showing both versions. Nothing is written until the last one is
+//! answered, so backing out of the modal leaves the repository untouched.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
-use crate::fuse::Strategy;
-use crate::hash::B3Hash;
-use crate::tui::resolver::{CHOICES, ConflictItem, Resolution};
+use crate::fuse::{Resolution, Strategy};
+use crate::fuse_op::{FusePlan, Planned};
+use crate::resolve::{Answer, Question, Questions, Side, WholeFile};
 use crate::tui::theme::Theme;
 use crate::tui::types::{Action, AppContext};
 use crate::tui::views::TabView;
@@ -21,21 +25,48 @@ const STRATEGIES: [Strategy; 5] = [
     Strategy::Base,
 ];
 
-/// In-flight interactive resolution state, held while the resolver modal is up.
+/// A planned fuse waiting on answers, held while the modal is up.
 struct PendingFuse {
-    source_name: String,
-    target_name: String,
-    ours: BTreeMap<String, B3Hash>,
-    theirs: BTreeMap<String, B3Hash>,
-    /// Auto-resolved (non-conflicting) files.
-    merged_files: BTreeMap<String, B3Hash>,
-    conflicts: Vec<ConflictItem>,
-    /// Parallel to `conflicts`.
-    resolutions: Vec<Option<Resolution>>,
-    /// Conflict currently being decided.
+    plan: FusePlan,
+    questions: Questions,
+    /// Question on screen.
     current: usize,
-    /// Highlighted choice within CHOICES.
+    /// Highlighted choice.
     cursor: usize,
+}
+
+impl PendingFuse {
+    /// The answers on offer for the question on screen, in hotkey order.
+    fn choices(&self) -> Vec<(String, Answer)> {
+        let (mine, theirs) = (&self.plan.target, &self.plan.source);
+        match self.questions.get(self.current) {
+            Some(Question::Region { .. }) => vec![
+                (format!("Mine ({mine})"), Answer::Region(Resolution::Ours)),
+                (
+                    format!("Theirs ({theirs})"),
+                    Answer::Region(Resolution::Theirs),
+                ),
+                (
+                    "Both — mine, then theirs".into(),
+                    Answer::Region(Resolution::Both),
+                ),
+            ],
+            Some(Question::WholeFile { why, .. }) => {
+                let (m, t) = match why {
+                    WholeFile::Binary => ("Keep my version", "Take their version"),
+                    WholeFile::DeletedByTheirs => {
+                        ("Keep my changed file", "Delete it, as they did")
+                    }
+                    WholeFile::DeletedByMine => ("Keep it deleted", "Take their changed file"),
+                };
+                vec![
+                    (format!("{m} ({mine})"), Answer::WholeFile(Side::Mine)),
+                    (format!("{t} ({theirs})"), Answer::WholeFile(Side::Theirs)),
+                ]
+            }
+            None => Vec::new(),
+        }
+    }
 }
 
 pub struct FuseView {
@@ -72,433 +103,289 @@ impl FuseView {
     }
 
     fn do_fuse(&mut self, ctx: &mut AppContext) -> Action {
-        let source_name = match self.timelines.get(self.cursor) {
+        let source = match self.timelines.get(self.cursor) {
             Some((name, _)) => name.clone(),
             None => return Action::Error("No timeline selected".into()),
         };
 
-        let current = match ctx.repo.current_timeline() {
-            Ok(t) => t,
-            Err(e) => return Action::Error(format!("Failed: {}", e)),
-        };
+        // An earlier fuse that died still owing set-aside work is settled
+        // before another is started.
+        if let Err(e) = crate::fuse_op::finish_interrupted(&ctx.repo, None) {
+            return Action::Error(format!("Fuse failed: {e}"));
+        }
 
-        // Resolve head indices for both timelines.
-        let our_idx = match ctx.repo.get_timeline_head(&current) {
-            Ok(Some(idx)) => idx,
-            Ok(None) => return Action::Error("Current timeline has no commits".into()),
-            Err(e) => return Action::Error(format!("Failed: {}", e)),
-        };
-        let their_idx = match ctx.repo.get_timeline_head(&source_name) {
-            Ok(Some(idx)) => idx,
-            Ok(None) => {
-                return Action::Error(format!("Timeline '{}' has no commits", source_name));
+        let plan = match crate::fuse_op::plan(&ctx.repo, &source, self.current_strategy()) {
+            Ok(Planned::Plan(plan)) => plan,
+            Ok(Planned::AlreadyFused) => {
+                return Action::Success(format!("'{source}' is already fused — nothing to do"));
             }
-            Err(e) => return Action::Error(format!("Failed: {}", e)),
+            Err(e) => return Action::Error(format!("Fuse failed: {e}")),
         };
-
-        let our_tree = match ctx.repo.get_leaf(our_idx) {
-            Ok(Some(l)) => l.tree_root,
-            _ => return Action::Error("Current timeline has no commits".into()),
-        };
-        let their_tree = match ctx.repo.get_leaf(their_idx) {
-            Ok(Some(l)) => l.tree_root,
-            _ => return Action::Error(format!("Timeline '{}' has no commits", source_name)),
-        };
-
-        // Real LCA-based merge base (empty only for unrelated histories),
-        // mirroring the CLI. Using an empty base here would flag every
-        // differing file as a spurious conflict.
-        let base = match ctx.repo.merge_base(our_idx, their_idx) {
-            Ok(Some(base_idx)) => match ctx.repo.get_leaf(base_idx) {
-                Ok(Some(l)) => self.load_tree_map(ctx, l.tree_root),
-                _ => BTreeMap::new(),
-            },
-            Ok(None) => BTreeMap::new(),
-            Err(e) => return Action::Error(format!("Merge base failed: {}", e)),
-        };
-
-        let ours = self.load_tree_map(ctx, our_tree);
-        let theirs = self.load_tree_map(ctx, their_tree);
-
-        let store = crate::fsmerkle::FsStore::new(&ctx.repo.cas);
-        let result =
-            crate::fuse::FuseEngine::fuse(&store, &base, &ours, &theirs, self.current_strategy());
-
-        if result.success {
-            return self.commit_merged(ctx, &result.merged_files, &source_name, &current);
+        if plan.conflicts.is_empty() {
+            return self.complete(ctx, &plan);
         }
 
-        // Conflicts: open the interactive resolver modal.
-        let conflicts: Vec<ConflictItem> = result
-            .conflicts
-            .iter()
-            .map(|c| ConflictItem {
-                path: c.path.clone(),
-                description: conflict_description(c),
-            })
-            .collect();
-        let n = conflicts.len();
-        self.pending = Some(PendingFuse {
-            source_name,
-            target_name: current,
-            ours,
-            theirs,
-            merged_files: result.merged_files,
-            conflicts,
-            resolutions: vec![None; n],
-            current: 0,
-            cursor: 0,
-        });
-        Action::Consumed
-    }
-
-    /// Build a tree from `merged` and commit it as a fuse seal.
-    fn commit_merged(
-        &mut self,
-        ctx: &mut AppContext,
-        merged: &BTreeMap<String, B3Hash>,
-        source: &str,
-        target: &str,
-    ) -> Action {
-        let config = crate::config::load_config(&ctx.ivaldi_dir);
-        let author = config
-            .author()
-            .unwrap_or_else(|| "unknown <unknown>".into());
-        let msg = format!("Fuse {} into {}", source, target);
-
+        // True collisions: ask, one at a time, before anything is written.
         let store = crate::fsmerkle::FsStore::new(&ctx.repo.cas);
-        match store.build_tree_from_hash_map(merged) {
-            Ok(tree_root) => match ctx.repo.commit(tree_root, &author, &msg) {
-                Ok(cr) => {
-                    let _ = ctx.repo.clear_merge_state();
-                    self.merge_in_progress = false;
-                    self.merge_conflicts.clear();
-                    Action::Success(format!("Fuse complete: {}", cr.seal_name))
-                }
-                Err(e) => Action::Error(format!("Commit failed: {}", e)),
-            },
-            Err(e) => Action::Error(format!("Tree build failed: {}", e)),
+        match Questions::new(&store, &plan.conflicts) {
+            Ok(questions) => {
+                self.pending = Some(PendingFuse {
+                    plan,
+                    questions,
+                    current: 0,
+                    cursor: 0,
+                });
+                Action::Consumed
+            }
+            Err(e) => Action::Error(format!("Fuse failed: {e}")),
         }
     }
 
-    // --- resolver modal -------------------------------------------------
+    /// Seal, materialize, and carry uncommitted work through — everything the
+    /// CLI's fuse does, because it is the same code.
+    fn complete(&mut self, ctx: &mut AppContext, plan: &FusePlan) -> Action {
+        // Collisions between the fuse and *uncommitted* work are not asked
+        // about here; with no resolver they get conflict markers in the
+        // (still uncommitted) file, and the message says so.
+        let fused = match crate::fuse_op::complete(&mut ctx.repo, plan, None) {
+            Ok(fused) => fused,
+            Err(e) => return Action::Error(format!("Fuse failed: {e}")),
+        };
+        self.merge_in_progress = false;
+        self.merge_conflicts.clear();
 
-    fn handle_resolver_event(&mut self, event: &KeyEvent, ctx: &mut AppContext) -> Action {
-        match event.code {
+        let mut msg = format!("Fuse complete: {}", fused.seal.seal_name);
+        if let Some(report) = &fused.carry {
+            let attention = report.attention().count();
+            msg.push_str(&format!(
+                " — {} uncommitted change(s) carried through",
+                report.outcomes.len()
+            ));
+            if attention > 0 {
+                msg.push_str(&format!(", {attention} need a look (see Status)"));
+            }
+        }
+        msg.push_str(". Undo: 'ivaldi oops'");
+        Action::Success(msg)
+    }
+
+    // --- question modal ---------------------------------------------------
+
+    fn handle_question_event(&mut self, event: &KeyEvent, ctx: &mut AppContext) -> Action {
+        let Some(p) = self.pending.as_mut() else {
+            return Action::Consumed;
+        };
+        let choices = p.choices();
+        let picked = match event.code {
+            // Nothing has been written, so backing out is just forgetting.
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('a') => {
-                return self.abort_resolver(ctx);
+                self.pending = None;
+                return Action::Success("Fuse cancelled — nothing was changed".into());
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if let Some(p) = self.pending.as_mut()
-                    && p.cursor > 0
-                {
-                    p.cursor -= 1;
-                }
+                p.cursor = p.cursor.saturating_sub(1);
                 return Action::Consumed;
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if let Some(p) = self.pending.as_mut()
-                    && p.cursor + 1 < CHOICES.len()
-                {
+                if p.cursor + 1 < choices.len() {
                     p.cursor += 1;
                 }
                 return Action::Consumed;
             }
-            KeyCode::Char('1') => self.resolve_current(Resolution::Ours),
-            KeyCode::Char('2') => self.resolve_current(Resolution::Theirs),
-            KeyCode::Char('3') => self.resolve_current(Resolution::Both),
-            KeyCode::Char('4') => self.resolve_current(Resolution::Skip),
-            KeyCode::Enter => {
-                if let Some(choice) = self.pending.as_ref().map(|p| CHOICES[p.cursor].1) {
-                    self.resolve_current(choice);
-                }
-            }
+            KeyCode::Char(c @ '1'..='9') => (c as usize) - ('1' as usize),
+            KeyCode::Enter => p.cursor,
             _ => return Action::Consumed,
-        }
+        };
+        let Some((_, answer)) = choices.into_iter().nth(picked) else {
+            return Action::Consumed;
+        };
+        p.questions.answer(p.current, answer);
 
-        // Apply once every conflict has a decision.
-        let all_done = self
-            .pending
-            .as_ref()
-            .map(|p| p.resolutions.iter().all(|r| r.is_some()))
-            .unwrap_or(false);
-        if all_done {
-            return self.apply_pending(ctx);
-        }
-        Action::Consumed
-    }
-
-    fn resolve_current(&mut self, res: Resolution) {
-        if let Some(p) = self.pending.as_mut() {
-            if p.conflicts.is_empty() {
-                return;
+        match p.questions.next_unanswered(p.current) {
+            Some(next) => {
+                p.current = next;
+                p.cursor = 0;
+                Action::Consumed
             }
-            p.resolutions[p.current] = Some(res);
-            // Advance to the next undecided conflict.
-            for i in 0..p.conflicts.len() {
-                let idx = (p.current + 1 + i) % p.conflicts.len();
-                if p.resolutions[idx].is_none() {
-                    p.current = idx;
-                    p.cursor = 0;
-                    return;
+            None => {
+                let Some(mut p) = self.pending.take() else {
+                    return Action::Consumed;
+                };
+                let store = crate::fsmerkle::FsStore::new(&ctx.repo.cas);
+                if let Err(e) = p.questions.apply(&store, &mut p.plan.merged_files) {
+                    return Action::Error(format!("Fuse failed: {e}"));
                 }
+                self.complete(ctx, &p.plan)
             }
         }
     }
 
-    fn abort_resolver(&mut self, ctx: &mut AppContext) -> Action {
-        let Some(p) = self.pending.take() else {
-            return Action::Consumed;
-        };
-        let conflicts: Vec<String> = p.conflicts.iter().map(|c| c.path.clone()).collect();
-        let state = crate::repo::MergeState {
-            source_timeline: p.source_name,
-            target_timeline: p.target_name,
-            strategy: self.current_strategy().to_string(),
-            conflicts: conflicts.clone(),
-        };
-        match ctx.repo.save_merge_state(&state) {
-            Ok(()) => {
-                self.merge_in_progress = true;
-                self.merge_conflicts = conflicts;
-                Action::Error("Resolution cancelled; merge left in progress.".into())
-            }
-            Err(e) => Action::Error(format!("Failed to save merge state: {}", e)),
-        }
-    }
+    fn render_question(&self, frame: &mut Frame, area: Rect, theme: &Theme, p: &PendingFuse) {
+        let total = p.questions.len();
+        let answered = (0..total).filter(|&i| p.questions.answered(i)).count();
+        let choices = p.choices();
 
-    fn apply_pending(&mut self, ctx: &mut AppContext) -> Action {
-        let Some(p) = self.pending.take() else {
-            return Action::Consumed;
-        };
-        let resolutions: Vec<(String, Resolution)> = p
-            .conflicts
-            .iter()
-            .zip(p.resolutions.iter())
-            .filter_map(|(c, r)| r.map(|res| (c.path.clone(), res)))
-            .collect();
+        let header_h = 3.min(area.height);
+        let choices_h = (choices.len() as u16 + 2).min(area.height.saturating_sub(header_h));
+        let help_h = 1.min(area.height.saturating_sub(header_h + choices_h));
+        let body_h = area.height.saturating_sub(header_h + choices_h + help_h);
 
-        let store = crate::fsmerkle::FsStore::new(&ctx.repo.cas);
-        let (final_map, skipped) =
-            apply_resolutions(&store, &p.merged_files, &p.ours, &p.theirs, &resolutions);
-
-        if !skipped.is_empty() {
-            // Skipped files stay unresolved — do not commit; keep the merge
-            // in progress with only those paths outstanding.
-            let state = crate::repo::MergeState {
-                source_timeline: p.source_name.clone(),
-                target_timeline: p.target_name.clone(),
-                strategy: self.current_strategy().to_string(),
-                conflicts: skipped.clone(),
-            };
-            let _ = ctx.repo.save_merge_state(&state);
-            self.merge_in_progress = true;
-            self.merge_conflicts = skipped.clone();
-            return Action::Error(format!(
-                "{} file(s) skipped; merge left in progress.",
-                skipped.len()
-            ));
-        }
-
-        self.commit_merged(ctx, &final_map, &p.source_name, &p.target_name)
-    }
-
-    fn load_tree_map(&self, ctx: &AppContext, tree_hash: B3Hash) -> BTreeMap<String, B3Hash> {
-        let store = crate::fsmerkle::FsStore::new(&ctx.repo.cas);
-        let mut map = BTreeMap::new();
-        let _ = Self::collect_tree(&store, tree_hash, "", &mut map);
-        map
-    }
-
-    fn collect_tree(
-        store: &crate::fsmerkle::FsStore<'_>,
-        hash: B3Hash,
-        prefix: &str,
-        map: &mut BTreeMap<String, B3Hash>,
-    ) -> Result<(), String> {
-        let tree = store.load_tree(hash).map_err(|e| e.to_string())?;
-        for entry in &tree.entries {
-            let path = if prefix.is_empty() {
-                entry.name.clone()
-            } else {
-                format!("{}/{}", prefix, entry.name)
-            };
-            if entry.kind == crate::fsmerkle::NodeKind::Tree {
-                let _ = Self::collect_tree(store, entry.hash, &path, map);
-            } else {
-                map.insert(path, entry.hash);
-            }
-        }
-        Ok(())
-    }
-
-    fn render_resolver(&self, frame: &mut Frame, area: Rect, theme: &Theme, p: &PendingFuse) {
-        let resolved = p.resolutions.iter().filter(|r| r.is_some()).count();
-        let total = p.conflicts.len();
-
-        // Header.
         let header = Paragraph::new(Span::styled(
-            format!(" Resolve conflicts — {}/{} decided", resolved, total),
+            format!(
+                " Fusing {} into {} — {answered} of {total} collision(s) settled. \
+                 Nothing is changed until the last one.",
+                p.plan.source, p.plan.target
+            ),
             theme.title,
         ))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Fuse Resolver "),
+        .block(Block::default().borders(Borders::ALL).title(" Fuse "));
+        frame.render_widget(
+            header,
+            Rect {
+                height: header_h,
+                ..area
+            },
         );
-        let header_area = Rect {
-            height: 3.min(area.height),
-            ..area
-        };
-        frame.render_widget(header, header_area);
 
-        if let Some(conflict) = p.conflicts.get(p.current) {
-            let status = match p.resolutions[p.current] {
-                Some(Resolution::Ours) => " [→ OURS]",
-                Some(Resolution::Theirs) => " [→ THEIRS]",
-                Some(Resolution::Both) => " [→ BOTH]",
-                Some(Resolution::Skip) => " [→ SKIPPED]",
-                None => "",
-            };
-            let conflict_area = Rect {
-                x: area.x,
-                y: area.y + 3,
-                width: area.width,
-                height: 3.min(area.height.saturating_sub(3)),
-            };
-            let text = Paragraph::new(vec![
-                Line::from(Span::styled(
+        // The question: both versions, with a little of what surrounds them.
+        let mine = Style::default().fg(Color::Green);
+        let theirs = Style::default().fg(Color::Cyan);
+        let mut lines: Vec<Line> = Vec::new();
+        match p.questions.get(p.current) {
+            Some(Question::Region {
+                path,
+                index,
+                total: in_file,
+                collision,
+                before,
+                after,
+            }) => {
+                lines.push(Line::from(Span::styled(
                     format!(
-                        " Conflict {} of {}: {}{}",
-                        p.current + 1,
-                        total,
-                        conflict.path,
-                        status
+                        " {path} — collision {index} of {in_file}, around line {}",
+                        collision.ours_line
                     ),
                     theme.warning,
-                )),
-                Line::from(Span::styled(
-                    format!(" {}", conflict.description),
+                )));
+                // Both sides get the same share of the room that is left once
+                // the fixed lines are in; a long side says how much it hid.
+                let fixed = 3 + before.len() + after.len();
+                let room = (body_h.saturating_sub(2) as usize).saturating_sub(fixed);
+                let per_side = (room / 2).max(1);
+                let side =
+                    |lines: &mut Vec<Line>, label: String, content: &[String], style: Style| {
+                        lines.push(Line::from(Span::styled(format!(" {label}:"), style)));
+                        if content.is_empty() {
+                            lines.push(Line::from(Span::styled(
+                                "   (these lines deleted)",
+                                theme.dim,
+                            )));
+                        }
+                        for l in content.iter().take(per_side) {
+                            lines.push(Line::from(vec![
+                                Span::styled(" | ", style),
+                                Span::raw(l.clone()),
+                            ]));
+                        }
+                        if content.len() > per_side {
+                            lines.push(Line::from(Span::styled(
+                                format!("   … {} more line(s)", content.len() - per_side),
+                                theme.dim,
+                            )));
+                        }
+                    };
+                for l in before {
+                    lines.push(Line::from(Span::styled(format!("   {l}"), theme.dim)));
+                }
+                side(
+                    &mut lines,
+                    format!("mine ({})", p.plan.target),
+                    &collision.ours,
+                    mine,
+                );
+                side(
+                    &mut lines,
+                    format!("theirs ({})", p.plan.source),
+                    &collision.theirs,
+                    theirs,
+                );
+                for l in after {
+                    lines.push(Line::from(Span::styled(format!("   {l}"), theme.dim)));
+                }
+            }
+            Some(Question::WholeFile { path, why }) => {
+                lines.push(Line::from(Span::styled(format!(" {path}"), theme.warning)));
+                lines.push(Line::from(Span::styled(
+                    match why {
+                        WholeFile::Binary => {
+                            " Binary, changed on both sides — it can only be one or the other."
+                        }
+                        WholeFile::DeletedByTheirs => " Changed here, deleted there.",
+                        WholeFile::DeletedByMine => " Deleted here, changed there.",
+                    },
                     theme.dim,
-                )),
-            ])
-            .block(Block::default().borders(Borders::ALL));
-            frame.render_widget(text, conflict_area);
+                )));
+            }
+            None => {}
         }
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!(" Question {} of {total} ", p.current + 1)),
+            ),
+            Rect {
+                y: area.y + header_h,
+                height: body_h,
+                ..area
+            },
+        );
 
-        // Choices.
-        let choices_y = area.y + 6;
-        let choices_area = Rect {
-            x: area.x,
-            y: choices_y,
-            width: area.width,
-            height: area.height.saturating_sub(9),
-        };
-        let items: Vec<ListItem> = CHOICES
+        let items: Vec<ListItem> = choices
             .iter()
             .enumerate()
             .map(|(i, (label, _))| {
                 let marker = if i == p.cursor { "→" } else { " " };
-                let text = format!("{} [{}] {}", marker, i + 1, label);
                 let style = if i == p.cursor {
                     theme.cursor
                 } else {
                     Style::default().fg(Color::White)
                 };
-                ListItem::new(Span::styled(text, style))
+                ListItem::new(Span::styled(format!("{marker} [{}] {label}", i + 1), style))
             })
             .collect();
-        let list = List::new(items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Choose resolution "),
+        frame.render_widget(
+            List::new(items).block(Block::default().borders(Borders::ALL).title(" Keep ")),
+            Rect {
+                y: area.y + header_h + body_h,
+                height: choices_h,
+                ..area
+            },
         );
-        frame.render_widget(list, choices_area);
 
-        // Footer help.
-        if area.height > 1 {
-            let help_area = Rect {
-                x: area.x,
-                y: area.y + area.height - 1,
-                width: area.width,
-                height: 1,
-            };
+        if help_h > 0 {
             let help = Paragraph::new(Span::styled(
-                " ↑/↓ choose • 1-4 pick • Enter confirm • a/q abort",
+                " ↑/↓ choose • 1-3 pick • Enter confirm • q cancel (nothing changed) • \
+                 neither fits? cancel, and 'ivaldi fuse' in a terminal can edit the lines",
                 theme.dim,
             ));
-            frame.render_widget(help, help_area);
+            frame.render_widget(
+                help,
+                Rect {
+                    y: area.y + area.height - 1,
+                    height: 1,
+                    ..area
+                },
+            );
         }
-    }
-}
-
-/// Apply per-file resolutions on top of the auto-merged map.
-///
-/// Returns the final `path → hash` map and the list of paths the user chose to
-/// skip (left unresolved). Skipped paths are omitted from the map and signal the
-/// caller not to commit.
-pub(crate) fn apply_resolutions(
-    store: &crate::fsmerkle::FsStore<'_>,
-    merged: &BTreeMap<String, B3Hash>,
-    ours: &BTreeMap<String, B3Hash>,
-    theirs: &BTreeMap<String, B3Hash>,
-    resolutions: &[(String, Resolution)],
-) -> (BTreeMap<String, B3Hash>, Vec<String>) {
-    let mut final_map = merged.clone();
-    let mut skipped = Vec::new();
-
-    for (path, res) in resolutions {
-        match res {
-            Resolution::Ours => match ours.get(path) {
-                Some(h) => {
-                    final_map.insert(path.clone(), *h);
-                }
-                None => {
-                    final_map.remove(path);
-                }
-            },
-            Resolution::Theirs => match theirs.get(path) {
-                Some(h) => {
-                    final_map.insert(path.clone(), *h);
-                }
-                None => {
-                    final_map.remove(path);
-                }
-            },
-            Resolution::Both => match (ours.get(path), theirs.get(path)) {
-                (Some(o), Some(t)) => {
-                    let h = crate::fuse::concat_blobs(store, o, t).unwrap_or(*o);
-                    final_map.insert(path.clone(), h);
-                }
-                (Some(h), None) | (None, Some(h)) => {
-                    final_map.insert(path.clone(), *h);
-                }
-                (None, None) => {
-                    final_map.remove(path);
-                }
-            },
-            Resolution::Skip => skipped.push(path.clone()),
-        }
-    }
-
-    (final_map, skipped)
-}
-
-/// Human-readable summary of a file conflict.
-fn conflict_description(c: &crate::fuse::Conflict) -> String {
-    match (c.base.is_some(), c.ours.is_some(), c.theirs.is_some()) {
-        (_, true, true) => "modified on both sides".into(),
-        (true, true, false) => "modified here, deleted on the other side".into(),
-        (true, false, true) => "deleted here, modified on the other side".into(),
-        _ => "conflicting change".into(),
     }
 }
 
 impl TabView for FuseView {
     fn handle_event(&mut self, event: &KeyEvent, ctx: &mut AppContext) -> Action {
-        // Interactive resolver modal takes precedence.
+        // The question modal takes precedence.
         if self.pending.is_some() {
-            return self.handle_resolver_event(event, ctx);
+            return self.handle_question_event(event, ctx);
         }
 
         // Abort confirmation
@@ -506,11 +393,17 @@ impl TabView for FuseView {
             match event.code {
                 KeyCode::Char('y') => {
                     self.confirm_abort = false;
-                    match ctx.repo.clear_merge_state() {
-                        Ok(()) => {
+                    // Also gives back any uncommitted work the fuse had set
+                    // aside, and clears conflict markers out of the files.
+                    match crate::fuse_op::abort(&ctx.repo) {
+                        Ok(restored) => {
                             self.merge_in_progress = false;
                             self.merge_conflicts.clear();
-                            Action::Success("Merge aborted".into())
+                            Action::Success(if restored {
+                                "Merge aborted; your uncommitted changes are back".into()
+                            } else {
+                                "Merge aborted".into()
+                            })
                         }
                         Err(e) => Action::Error(format!("Abort failed: {}", e)),
                     }
@@ -552,9 +445,9 @@ impl TabView for FuseView {
     }
 
     fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        // Resolver modal replaces the normal view.
+        // The question modal replaces the normal view.
         if let Some(p) = self.pending.as_ref() {
-            self.render_resolver(frame, area, theme, p);
+            self.render_question(frame, area, theme, p);
             return;
         }
 
@@ -704,58 +597,224 @@ impl TabView for FuseView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyModifiers;
+    use std::collections::BTreeMap;
 
-    fn tmp_store() -> (tempfile::TempDir, crate::cas::FileCas) {
-        let dir = tempfile::tempdir().unwrap();
-        let cas = crate::cas::FileCas::new(dir.path().join("objects")).unwrap();
-        (dir, cas)
+    fn doc(edits: &[(usize, &str)]) -> String {
+        (1..=30)
+            .map(|n| match edits.iter().find(|(line, _)| *line == n) {
+                Some((_, text)) => format!("{text}\n"),
+                None => format!("line {n}\n"),
+            })
+            .collect()
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn seal(repo: &mut crate::repo::Repo, files: &[(&str, &str)], message: &str) {
+        let files: BTreeMap<String, Vec<u8>> = files
+            .iter()
+            .map(|(path, content)| (path.to_string(), content.as_bytes().to_vec()))
+            .collect();
+        let tree = crate::fsmerkle::FsStore::new(&repo.cas)
+            .build_tree_from_map(&files)
+            .unwrap();
+        repo.commit(tree, "author", message).unwrap();
+    }
+
+    /// `main` (current) and `feature` collide on lines 3 and 25 of `a.txt`;
+    /// each also has an edit of its own — kept well clear of those lines,
+    /// because the engine folds any edit within a few lines of a collision
+    /// into it rather than splice around it. The working directory matches
+    /// `main`.
+    fn colliding(dir: &std::path::Path) -> AppContext {
+        crate::forge::forge(dir).unwrap();
+        let mut repo = crate::repo::Repo::open(dir).unwrap();
+        seal(&mut repo, &[("a.txt", &doc(&[]))], "base");
+        repo.create_timeline("feature", None).unwrap();
+        repo.switch_timeline("feature").unwrap();
+        seal(
+            &mut repo,
+            &[(
+                "a.txt",
+                &doc(&[(3, "FEATURE 3"), (25, "FEATURE 25"), (17, "FEATURE ONLY")]),
+            )],
+            "feature edit",
+        );
+        repo.switch_timeline("main").unwrap();
+        let mine = doc(&[(3, "MAIN 3"), (25, "MAIN 25"), (11, "MAIN ONLY")]);
+        seal(&mut repo, &[("a.txt", &mine)], "main edit");
+        std::fs::write(dir.join("a.txt"), &mine).unwrap();
+        AppContext {
+            work_dir: dir.to_path_buf(),
+            ivaldi_dir: dir.join(".ivaldi"),
+            repo,
+        }
+    }
+
+    fn view_on_feature(ctx: &AppContext) -> FuseView {
+        let mut view = FuseView::new();
+        view.load_data(ctx);
+        assert_eq!(view.timelines, [("feature".to_string(), false)]);
+        view
     }
 
     #[test]
-    fn apply_resolutions_covers_all_choices() {
-        let (_dir, cas) = tmp_store();
-        let store = crate::fsmerkle::FsStore::new(&cas);
+    fn answers_each_collision_then_seals_a_real_merge_in_one_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = colliding(dir.path());
+        let mut view = view_on_feature(&ctx);
+        let head_before = ctx.repo.get_timeline_head("main").unwrap();
 
-        // Auto-merged, non-conflicting file carries through untouched.
-        let (clean, _) = store.put_blob(b"clean").unwrap();
-        let merged: BTreeMap<String, B3Hash> = [("clean.txt".to_string(), clean)].into();
+        // Fusing opens the modal on the first collision; nothing is written.
+        assert!(matches!(
+            view.handle_event(&key(KeyCode::Enter), &mut ctx),
+            Action::Consumed
+        ));
+        let pending = view.pending.as_ref().expect("collisions open the modal");
+        assert_eq!(pending.questions.len(), 2);
+        assert!(view.has_active_input());
+        assert_eq!(ctx.repo.get_timeline_head("main").unwrap(), head_before);
 
-        let put = |c: &[u8]| store.put_blob(c).unwrap().0;
-        let ours: BTreeMap<String, B3Hash> = [
-            ("a.txt".to_string(), put(b"OURS_A")),
-            ("b.txt".to_string(), put(b"OURS_B")),
-            ("c.txt".to_string(), put(b"OURS_C")),
-            ("d.txt".to_string(), put(b"OURS_D")),
-        ]
-        .into();
-        let theirs: BTreeMap<String, B3Hash> = [
-            ("a.txt".to_string(), put(b"THEIRS_A")),
-            ("b.txt".to_string(), put(b"THEIRS_B")),
-            ("c.txt".to_string(), put(b"THEIRS_C")),
-            ("d.txt".to_string(), put(b"THEIRS_D")),
-        ]
-        .into();
+        // Theirs for the first, both for the second.
+        assert!(matches!(
+            view.handle_event(&key(KeyCode::Char('2')), &mut ctx),
+            Action::Consumed
+        ));
+        assert_eq!(view.pending.as_ref().unwrap().current, 1);
+        let done = view.handle_event(&key(KeyCode::Char('3')), &mut ctx);
+        let Action::Success(message) = done else {
+            panic!("the last answer completes the fuse");
+        };
+        assert!(message.contains("ivaldi oops"), "{message}");
+        assert!(view.pending.is_none());
 
-        let resolutions = vec![
-            ("a.txt".to_string(), Resolution::Ours),
-            ("b.txt".to_string(), Resolution::Theirs),
-            ("c.txt".to_string(), Resolution::Both),
-            ("d.txt".to_string(), Resolution::Skip),
-        ];
+        // The merged tree is in the working directory — collisions as
+        // answered, and each side's own edit kept.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            doc(&[
+                (3, "FEATURE 3"),
+                (11, "MAIN ONLY"),
+                (17, "FEATURE ONLY"),
+                (25, "MAIN 25\nFEATURE 25")
+            ])
+        );
+        // It is a merge: the source head is a parent, so fusing again is a no-op.
+        let head = ctx.repo.get_timeline_head("main").unwrap().unwrap();
+        let leaf = ctx.repo.get_leaf(head).unwrap().unwrap();
+        assert!(leaf.is_merge());
+        assert!(matches!(
+            view.handle_event(&key(KeyCode::Enter), &mut ctx),
+            Action::Success(m) if m.contains("already fused")
+        ));
+        // And it can be taken back.
+        let snapshot = crate::snapshot::SnapshotManager::new(&ctx.ivaldi_dir)
+            .latest()
+            .unwrap()
+            .expect("the fuse is snapshotted for oops");
+        assert_eq!(snapshot.command, "fuse feature");
+        assert_eq!(snapshot.head, head_before);
+    }
 
-        let (final_map, skipped) = apply_resolutions(&store, &merged, &ours, &theirs, &resolutions);
+    #[test]
+    fn cancelling_the_modal_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = colliding(dir.path());
+        let mut view = view_on_feature(&ctx);
+        let head_before = ctx.repo.get_timeline_head("main").unwrap();
+        let file_before = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
 
-        // Skip leaves the file unresolved and out of the committed map.
-        assert_eq!(skipped, vec!["d.txt".to_string()]);
-        assert!(!final_map.contains_key("d.txt"));
+        view.handle_event(&key(KeyCode::Enter), &mut ctx);
+        view.handle_event(&key(KeyCode::Char('1')), &mut ctx); // one answer in
+        let cancelled = view.handle_event(&key(KeyCode::Esc), &mut ctx);
+        assert!(matches!(cancelled, Action::Success(m) if m.contains("nothing was changed")));
 
-        // Clean auto-merge survives.
-        assert_eq!(final_map["clean.txt"], clean);
+        assert!(view.pending.is_none());
+        assert_eq!(ctx.repo.get_timeline_head("main").unwrap(), head_before);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            file_before
+        );
+        assert!(!ctx.repo.has_merge_in_progress(), "no merge is left open");
+        assert!(
+            crate::snapshot::SnapshotManager::new(&ctx.ivaldi_dir)
+                .latest()
+                .unwrap()
+                .is_none()
+        );
+    }
 
-        let load = |h: B3Hash| store.load_blob(h).unwrap().1;
-        assert_eq!(load(final_map["a.txt"]), b"OURS_A");
-        assert_eq!(load(final_map["b.txt"]), b"THEIRS_B");
-        // Both concatenates ours then theirs.
-        assert_eq!(load(final_map["c.txt"]), b"OURS_CTHEIRS_C");
+    #[test]
+    fn uncommitted_work_is_carried_through_a_tui_fuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = colliding(dir.path());
+        let mut view = view_on_feature(&ctx);
+        // An unsealed edit far from everything else, and a new file.
+        let dirty = doc(&[
+            (3, "MAIN 3"),
+            (25, "MAIN 25"),
+            (11, "MAIN ONLY"),
+            (30, "UNSEALED"),
+        ]);
+        std::fs::write(dir.path().join("a.txt"), &dirty).unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "scratch\n").unwrap();
+
+        view.handle_event(&key(KeyCode::Enter), &mut ctx);
+        view.handle_event(&key(KeyCode::Char('1')), &mut ctx);
+        let done = view.handle_event(&key(KeyCode::Char('1')), &mut ctx);
+        assert!(
+            matches!(&done, Action::Success(m) if m.contains("2 uncommitted change(s) carried")),
+            "unexpected result"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            doc(&[
+                (3, "MAIN 3"),
+                (11, "MAIN ONLY"),
+                (17, "FEATURE ONLY"),
+                (25, "MAIN 25"),
+                (30, "UNSEALED")
+            ])
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+            "scratch\n"
+        );
+    }
+
+    #[test]
+    fn renders_both_sides_of_the_collision() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = colliding(dir.path());
+        let mut view = view_on_feature(&ctx);
+        view.handle_event(&key(KeyCode::Enter), &mut ctx);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| view.render(frame, frame.area(), &Theme::default_theme()))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for expected in [
+            "a.txt — collision 1 of 2, around line 3",
+            "mine (main)",
+            "MAIN 3",
+            "theirs (feature)",
+            "FEATURE 3",
+            "[3] Both",
+            "0 of 2 collision(s) settled",
+        ] {
+            assert!(screen.contains(expected), "missing {expected:?}");
+        }
     }
 }

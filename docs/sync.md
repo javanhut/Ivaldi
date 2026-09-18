@@ -14,6 +14,21 @@ peer-to-peer).
 | `sync/import.rs` | `import_full_history(_into)` and its phase helpers |
 | `sync/timeline_sync.rs` | `sync_timeline` (fast-forward and diverged-merge paths) |
 
+**Diverged sync and collisions.** When both sides have new seals, sync fuses
+them with the same engine as `ivaldi fuse`, so edits to the same file in
+different places merge by themselves. What `sync_timeline` does about true
+collisions is the caller's choice, passed as `Collisions`:
+
+| `Collisions::` | Used by | Effect |
+|---|---|---|
+| `Ask(resolver)` | CLI on a terminal, or with `--prefer` | Settled in memory, then fused in the same call. Cancelling integrates nothing |
+| `Refuse` | CLI with no terminal and no `--prefer` | `SyncError::Collisions(files)`; nothing integrated |
+| `Park` | TUI (its sync thread cannot ask) | `SyncError::Parked { timeline, files }`; nothing integrated, but the fetched seals stay on scratch timeline `timeline` for the Fuse tab to fuse |
+| `Markers` | CLI `--markers` | Conflict markers written, merge left open for `fuse --continue` |
+
+Except for `Markers`, a sync that does not integrate leaves no trace: no
+scratch timeline (bar `Park`'s), no journal, no open merge, no `oops` entry.
+
 All public paths are re-exported from `mod.rs`, so callers still use
 `crate::sync::upload(...)` etc. `SyncError` carries typed `#[from]`
 variants (`Repo`, `Forge`, `GitRemote`, `Cas`, `FsMerkle`, `Remote`,

@@ -85,23 +85,41 @@ no flags. Works both inside a repo (writes `.ivaldi/config`) and outside
 Validates `user.email` (`x@y.z`) and `portal.default` (must parse via
 `parse_repo_spec`). See [config.md](config.md) for the full field list.
 
-### Resolver (`tui/resolver.rs`)
+### Fuse tab: settling collisions (`tui/views/fuse.rs`)
 
-Per-file conflict resolution during fuse operations.
+The Fuse tab runs the same fuse as the CLI — [`fuse_op`](fuse.md): line-level
+auto-merge, a real merge seal, the merged tree written to the working
+directory, uncommitted work carried through ([carry.md](carry.md)), and a
+snapshot for `ivaldi oops`. It differs only in how it asks about true
+collisions ([resolve.md](resolve.md)): as a modal, one collision at a time,
+showing both versions with a few lines of context.
 
 **Controls:**
 | Key | Action |
 |-----|--------|
-| ↑/↓ or 1-4 | Choose resolution |
-| Enter | Confirm choice |
-| a | Abort merge |
-| q/Esc | Quit |
+| ↑/↓, Enter | Choose and confirm |
+| 1 / 2 / 3 | Mine / Theirs / Both (mine, then theirs) |
+| q / Esc | Cancel the fuse — nothing has been changed |
 
-**Resolution choices:**
-1. Keep OURS (target timeline)
-2. Keep THEIRS (source timeline)
-3. Keep BOTH (concatenate)
-4. Skip this file
+Whole-file collisions (binary; changed vs. deleted) offer Mine / Theirs, each
+spelled out. Nothing is written until the last question is answered, so
+cancelling never leaves a merge open.
+
+There is no in-TUI `edit`: when the right answer is neither side, cancel and
+run `ivaldi fuse <timeline>` in a terminal, which opens just that region in
+`$EDITOR`. Collisions between the fuse and *uncommitted* work are not asked
+about in the TUI either; those files get conflict markers and the result
+message says how many need a look.
+
+`a` aborts a merge left open by `ivaldi fuse --markers` or a CLI sync
+`--markers`, giving back any uncommitted work it had set aside.
+
+**Remote tab sync.** The TUI syncs on a background thread, which cannot ask.
+If local and remote seals collide it integrates nothing, keeps the fetched
+seals on a scratch timeline (`__sync_<timeline>`), and says to fuse that
+timeline from the Fuse tab — where the questions above settle it. Fusing the
+scratch timeline removes it, and later syncs see the remote seals as
+integrated.
 
 ## Dashboard Tabs (`ivaldi tui`)
 
@@ -161,7 +179,6 @@ tui/views/       — Tab view implementations (status, log, diff, timeline, remo
 tui/components/  — Reusable widgets (tab_bar, status_bar, file_list, diff_view, dialog)
 tui/travel.rs      — History browser
 tui/shift.rs       — Squash range selector
-tui/resolver.rs    — Conflict resolver
 tui/config_form.rs — Interactive config form
 ```
 
