@@ -95,6 +95,83 @@ impl CarryReport {
     }
 }
 
+/// How the user's side is named in questions and conflict markers.
+pub const MINE_LABEL: &str = "your uncommitted changes";
+
+/// The three-way line merge of one carried file — old tip as base, the user's
+/// version, the fused version — or `None` if either side is binary.
+fn line_merge(
+    store: &FsStore<'_>,
+    base: Option<&B3Hash>,
+    mine: &B3Hash,
+    fused: &B3Hash,
+) -> Result<Option<crate::fuse::Merge3>, SnapshotError> {
+    let load = |hash: &B3Hash| -> Result<Vec<u8>, SnapshotError> {
+        Ok(store
+            .load_blob(*hash)
+            .map_err(crate::workspace::WorkspaceError::FsMerkle)?
+            .1)
+    };
+    let base = match base {
+        Some(hash) => load(hash)?,
+        None => Vec::new(),
+    };
+    let (mine, fused) = (load(mine)?, load(fused)?);
+    if crate::diff::is_binary(&mine) || crate::diff::is_binary(&fused) {
+        return Ok(None);
+    }
+    Ok(Some(crate::fuse::Merge3::new(
+        &String::from_utf8_lossy(&base),
+        &String::from_utf8_lossy(&mine),
+        &String::from_utf8_lossy(&fused),
+    )))
+}
+
+/// Which carried files *would* collide if `fused` became the head's tree —
+/// worked out in memory, before anything is sealed or written.
+///
+/// This is what lets a front end ask about carried collisions up front, along
+/// with the fuse's own, while backing out is still free. The answers go back
+/// in through [`reapply`]'s resolver
+/// ([`crate::resolve::Questions::into_resolver`]). Uses the same merge as
+/// `reapply`, so the questions asked are the questions it will put.
+pub fn preview(
+    repo: &Repo,
+    cas: &FileCas,
+    carry: &Snapshot,
+    fused: &BTreeMap<String, B3Hash>,
+) -> Result<Vec<(String, crate::fuse::Merge3)>, SnapshotError> {
+    let old = match carry.head {
+        Some(idx) => {
+            let leaf = repo.get_leaf(idx)?.ok_or(SnapshotError::MissingHead(idx))?;
+            Workspace::new(cas, &repo.work_dir, &repo.ivaldi_dir).list_tree_files(leaf.tree_root)?
+        }
+        None => BTreeMap::new(),
+    };
+    let store = FsStore::new(cas);
+    let mut collisions = Vec::new();
+    for change in &carry.workspace_changes {
+        let (WorkspaceChange::Modified { path, hash } | WorkspaceChange::Untracked { path, hash }) =
+            change
+        else {
+            continue;
+        };
+        let (base, new) = (old.get(path), fused.get(path));
+        // Mirrors `reapply`: nothing to merge if the fuse has this exact
+        // change, left the path alone, or deleted it.
+        let Some(new) = new else { continue };
+        if new == hash || base == Some(new) {
+            continue;
+        }
+        if let Some(merge) = line_merge(&store, base, hash, new)?
+            && merge.collisions() > 0
+        {
+            collisions.push((path.clone(), merge));
+        }
+    }
+    Ok(collisions)
+}
+
 /// Merge the changes in `carry` onto the timeline's current head.
 ///
 /// Precondition: the working directory matches the current head's tree — the
@@ -110,8 +187,6 @@ pub fn reapply(
     theirs_label: &str,
     mut resolver: Option<&mut (dyn crate::resolve::Resolver + 'static)>,
 ) -> Result<CarryReport, SnapshotError> {
-    const MINE_LABEL: &str = "your uncommitted changes";
-
     let ws = Workspace::new(cas, &repo.work_dir, &repo.ivaldi_dir);
     let store = FsStore::new(cas);
 
@@ -157,23 +232,12 @@ pub fn reapply(
                         Outcome::KeptDeletedByFuse
                     }
                     (base, Some(fused)) => {
-                        let base = match base {
-                            Some(h) => load(*h)?,
-                            None => Vec::new(),
-                        };
-                        let mine = load(*hash)?;
-                        let fused = load(*fused)?;
-                        if crate::diff::is_binary(&mine) || crate::diff::is_binary(&fused) {
-                            Outcome::BinaryKeptFused
-                        } else {
-                            let merge = crate::fuse::Merge3::new(
-                                &String::from_utf8_lossy(&base),
-                                &String::from_utf8_lossy(&mine),
-                                &String::from_utf8_lossy(&fused),
-                            );
+                        if let Some(merge) = line_merge(&store, base, hash, fused)? {
                             // The fuse is sealed by now, so declining to answer
-                            // cannot undo anything: it just means markers, for
-                            // this collision and every later one.
+                            // cannot undo anything: it just means markers. A
+                            // person who quits is not asked again; a resolver
+                            // with no answer for *this* file may have one for
+                            // the next.
                             let resolutions = match resolver.as_deref_mut() {
                                 Some(r) if merge.collisions() > 0 => {
                                     let labels = crate::resolve::Labels {
@@ -184,7 +248,7 @@ pub fn reapply(
                                     };
                                     let answers =
                                         crate::resolve::resolve_regions(&merge, path, labels, r);
-                                    if answers.is_err() {
+                                    if answers == Err(crate::resolve::Stop::Cancelled) {
                                         resolver = None;
                                     }
                                     answers.ok()
@@ -202,6 +266,8 @@ pub fn reapply(
                                 (_, Some(_)) => Outcome::Settled,
                                 (_, None) => Outcome::Conflict,
                             }
+                        } else {
+                            Outcome::BinaryKeptFused
                         }
                     }
                     // `base == fused` above already covers (None, None).

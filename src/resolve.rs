@@ -297,6 +297,68 @@ impl Questions {
         Ok(Self { files })
     }
 
+    /// Questions about line merges already worked out — the collisions
+    /// between a fuse and uncommitted work ([`crate::carry::preview`]).
+    /// Merges without collisions contribute nothing.
+    pub fn from_merges(merges: Vec<(String, Merge3)>) -> Self {
+        Self {
+            files: merges
+                .into_iter()
+                .filter(|(_, merge)| merge.collisions() > 0)
+                .map(|(path, merge)| FileQuestions::Text {
+                    answers: vec![None; merge.collisions()],
+                    path,
+                    merge,
+                })
+                .collect(),
+        }
+    }
+
+    /// Put every question to `resolver`, in order, recording the answers —
+    /// for a front end that *can* block but wants its answers before acting.
+    /// Stops at the first the resolver will not answer.
+    pub fn ask(&mut self, resolver: &mut dyn Resolver, labels: Labels<'_>) -> Result<(), Stop> {
+        for file in &mut self.files {
+            match file {
+                FileQuestions::Text {
+                    path,
+                    merge,
+                    answers,
+                } => *answers = resolve_regions(merge, path, labels, resolver)?,
+                FileQuestions::Whole {
+                    path, why, answer, ..
+                } => *answer = Some(resolver.whole_file(path, *why, labels)?),
+            }
+        }
+        Ok(())
+    }
+
+    /// The answers, as a [`Resolver`] that gives them back when the same
+    /// questions are asked again — for answers collected *before* the
+    /// operation that will ask.
+    pub fn into_resolver(self) -> AnsweredResolver {
+        let mut answers = std::collections::BTreeMap::new();
+        for file in self.files {
+            if let FileQuestions::Text {
+                path,
+                merge,
+                answers: given,
+            } = file
+            {
+                let collisions: Vec<Collision> = merge
+                    .chunks
+                    .into_iter()
+                    .filter_map(|chunk| match chunk {
+                        Chunk::Collision(c) => Some(c),
+                        Chunk::Clean(_) => None,
+                    })
+                    .collect();
+                answers.insert(path, collisions.into_iter().zip(given).collect());
+            }
+        }
+        AnsweredResolver { answers }
+    }
+
     pub fn len(&self) -> usize {
         self.files
             .iter()
@@ -427,6 +489,41 @@ impl Questions {
             }
         }
         Ok(())
+    }
+}
+
+/// Answers given ahead of time, replayed when the questions are asked.
+///
+/// An answer is only given back for the *same* collision it was given to: if
+/// the files changed between asking and replaying, so the collision there now
+/// is a different one, it declines rather than apply an answer to a question
+/// nobody was asked.
+pub struct AnsweredResolver {
+    answers: std::collections::BTreeMap<String, Vec<(Collision, Option<Resolution>)>>,
+}
+
+impl AnsweredResolver {
+    /// Not [`Stop::Cancelled`]: nobody backed out. Having no answer for this
+    /// file says nothing about the next one.
+    fn no_answer(path: &str) -> Stop {
+        Stop::Unresolvable(format!(
+            "{path} changed since its collisions were asked about"
+        ))
+    }
+}
+
+impl Resolver for AnsweredResolver {
+    fn region(&mut self, region: &Region<'_>) -> Result<Resolution, Stop> {
+        self.answers
+            .get(region.path)
+            .and_then(|file| file.get(region.index - 1))
+            .filter(|(asked, _)| asked == region.collision)
+            .and_then(|(_, answer)| answer.clone())
+            .ok_or_else(|| Self::no_answer(region.path))
+    }
+
+    fn whole_file(&mut self, path: &str, _: WholeFile, _: Labels<'_>) -> Result<Side, Stop> {
+        Err(Self::no_answer(path))
     }
 }
 
@@ -588,62 +685,22 @@ impl<R: BufRead, W: Write> PromptResolver<R, W> {
     /// back whatever they leave — unless they leave the markers, which means
     /// they have not decided.
     fn edit(&mut self, region: &Region<'_>) -> Result<Option<Vec<String>>, Stop> {
-        let failed = |e: std::io::Error| Stop::Unresolvable(format!("could not run editor: {e}"));
-        let c = region.collision;
-        let mut text = String::new();
-        let mut push = |line: &str| {
-            text.push_str(line);
-            text.push('\n');
-        };
-        region.before.iter().for_each(|l| push(l));
-        push(&format!(
-            "{} mine ({})",
-            crate::fuse::MARKER_OURS,
-            region.labels.mine
-        ));
-        c.ours.iter().for_each(|l| push(l));
-        push(crate::fuse::MARKER_SEP);
-        c.theirs.iter().for_each(|l| push(l));
-        push(&format!(
-            "{} theirs ({})",
-            crate::fuse::MARKER_THEIRS,
-            region.labels.theirs
-        ));
-        region.after.iter().for_each(|l| push(l));
-
-        // Keep the extension so the editor highlights it as what it is.
-        let suffix = Path::new(region.path)
-            .extension()
-            .map(|e| format!(".{}", e.to_string_lossy()))
-            .unwrap_or_default();
-        let file = ScratchFile::create(&suffix, &text).map_err(failed)?;
-        (self.editor)(&file.0).map_err(failed)?;
-        let edited = std::fs::read_to_string(&file.0).map_err(failed)?;
-
-        if crate::fuse::has_conflict_markers(edited.as_bytes()) {
-            let _ = writeln!(
-                self.out,
-                "  The markers are still there — not taken as an answer."
-            );
-            return Ok(None);
+        let buffer = edit_buffer(
+            region.collision,
+            region.before,
+            region.after,
+            region.labels.mine,
+            region.labels.theirs,
+        );
+        let edited = edit_text(&mut self.editor, region.path, &buffer)
+            .map_err(|e| Stop::Unresolvable(format!("could not run editor: {e}")))?;
+        match parse_edited(&edited, region.before, region.after) {
+            Ok(lines) => Ok(Some(lines)),
+            Err(why) => {
+                let _ = writeln!(self.out, "  {why} Not taken as an answer.");
+                Ok(None)
+            }
         }
-        // The context lines were there to orient, not to be merged twice. If
-        // the user left them alone, peel them back off; if they edited them,
-        // there is no telling what they meant, so ask again.
-        let lines: Vec<String> = edited.lines().map(str::to_string).collect();
-        let (nb, na) = (region.before.len(), region.after.len());
-        if lines.len() < nb + na
-            || lines[..nb] != *region.before
-            || lines[lines.len() - na..] != *region.after
-        {
-            let _ = writeln!(
-                self.out,
-                "  The surrounding context lines were changed; only the marked region can be \
-                 edited here. Not taken as an answer."
-            );
-            return Ok(None);
-        }
-        Ok(Some(lines[nb..lines.len() - na].to_vec()))
     }
 }
 
@@ -704,6 +761,85 @@ impl<R: BufRead, W: Write> Resolver for PromptResolver<R, W> {
             }
         }
     }
+}
+
+// -- Editing a region -----------------------------------------------------------
+//
+// Three steps, separable because front ends differ in the middle one: a
+// terminal prompt just runs the editor; a TUI has to give up the screen first.
+
+/// What the user is handed to edit: the collision in conflict markers, with
+/// its context either side to orient by.
+pub fn edit_buffer(
+    collision: &Collision,
+    before: &[String],
+    after: &[String],
+    mine: &str,
+    theirs: &str,
+) -> String {
+    let mut lines: Vec<String> = before.to_vec();
+    lines.push(format!("{} mine ({mine})", crate::fuse::MARKER_OURS));
+    lines.extend(collision.ours.iter().cloned());
+    lines.push(crate::fuse::MARKER_SEP.to_string());
+    lines.extend(collision.theirs.iter().cloned());
+    lines.push(format!("{} theirs ({theirs})", crate::fuse::MARKER_THEIRS));
+    lines.extend(after.iter().cloned());
+    let mut text = lines.join("\n");
+    text.push('\n');
+    text
+}
+
+/// Run `editor` on `buffer` in a scratch file and return what was saved.
+/// `path` is only a hint: its extension is kept so the editor highlights the
+/// text as what it is.
+pub fn edit_text(editor: &mut Editor, path: &str, buffer: &str) -> std::io::Result<String> {
+    let suffix = Path::new(path)
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let file = ScratchFile::create(&suffix, buffer)?;
+    editor(&file.0)?;
+    std::fs::read_to_string(&file.0)
+}
+
+/// Why an edited buffer was not taken as an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditRejected {
+    MarkersLeft,
+    ContextChanged,
+}
+
+impl std::fmt::Display for EditRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            EditRejected::MarkersLeft => "The markers are still there.",
+            EditRejected::ContextChanged => {
+                "The surrounding context lines were changed; only the marked region can be \
+                 edited here."
+            }
+        })
+    }
+}
+
+/// The region's new lines, out of what the user saved.
+///
+/// Markers still present mean they have not decided. The context lines were
+/// there to orient, not to be merged twice: left alone they are peeled back
+/// off, but if they were edited there is no telling what was meant.
+pub fn parse_edited(
+    edited: &str,
+    before: &[String],
+    after: &[String],
+) -> Result<Vec<String>, EditRejected> {
+    if crate::fuse::has_conflict_markers(edited.as_bytes()) {
+        return Err(EditRejected::MarkersLeft);
+    }
+    let lines: Vec<String> = edited.lines().map(str::to_string).collect();
+    let (nb, na) = (before.len(), after.len());
+    if lines.len() < nb + na || lines[..nb] != *before || lines[lines.len() - na..] != *after {
+        return Err(EditRejected::ContextChanged);
+    }
+    Ok(lines[nb..lines.len() - na].to_vec())
 }
 
 /// A uniquely named file in the system temp directory, removed on drop.
@@ -983,6 +1119,71 @@ mod tests {
         );
         assert!(!merged.contains_key("gone.txt"), "theirs deleted it");
         assert_eq!(load("logo.png"), b"\x00mine");
+    }
+
+    #[test]
+    fn answers_given_up_front_are_replayed_only_to_the_same_question() {
+        let asked = two_collisions();
+        let mut questions = Questions::from_merges(vec![
+            ("f".into(), asked.clone()),
+            ("clean".into(), Merge3::new("a\n", "b\n", "a\n")),
+        ]);
+        assert_eq!(questions.len(), 2, "a merge with no collision asks nothing");
+        questions.answer(0, Answer::Region(Resolution::Theirs));
+        questions.answer(1, Answer::Region(Resolution::Custom(vec!["EDITED".into()])));
+        let mut replay = questions.into_resolver();
+
+        let r = resolve_regions(&asked, "f", LABELS, &mut replay).unwrap();
+        assert_eq!(
+            asked.render(&r, "", ""),
+            doc(&[(3, "THEIRS A"), (25, "EDITED")])
+        );
+
+        // Same path, but the file moved on since the question was put.
+        let changed = Merge3::new(
+            &doc(&[]),
+            &doc(&[(3, "MINE, REWRITTEN SINCE"), (25, "MINE B")]),
+            &doc(&[(3, "THEIRS A"), (25, "THEIRS B")]),
+        );
+        assert!(matches!(
+            resolve_regions(&changed, "f", LABELS, &mut replay),
+            Err(Stop::Unresolvable(_))
+        ));
+        assert!(matches!(
+            resolve_regions(&asked, "other", LABELS, &mut replay),
+            Err(Stop::Unresolvable(_))
+        ));
+    }
+
+    #[test]
+    fn edit_buffer_round_trips_through_parse() {
+        let merge = Merge3::new(&doc(&[]), &doc(&[(3, "MINE")]), &doc(&[(3, "THEIRS")]));
+        let (collision, before, after) = collisions_in_context(&merge).next().unwrap();
+        let buffer = edit_buffer(collision, before, after, "main", "feature");
+        assert!(buffer.starts_with("line 1\nline 2\n<<<<<<< mine (main)\nMINE\n=======\n"));
+        assert!(buffer.ends_with(">>>>>>> theirs (feature)\nline 4\nline 5\nline 6\n"));
+
+        assert_eq!(
+            parse_edited(&buffer, before, after),
+            Err(EditRejected::MarkersLeft)
+        );
+        assert_eq!(
+            parse_edited(
+                "line 1\nline 2\nA\nB\nline 4\nline 5\nline 6\n",
+                before,
+                after
+            ),
+            Ok(vec!["A".to_string(), "B".to_string()])
+        );
+        // Deleting the region outright is an answer.
+        assert_eq!(
+            parse_edited("line 1\nline 2\nline 4\nline 5\nline 6\n", before, after),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            parse_edited("line 1\nA\nline 4\nline 5\nline 6\n", before, after),
+            Err(EditRejected::ContextChanged)
+        );
     }
 
     #[test]

@@ -902,6 +902,36 @@ fn carried_collisions_are_asked_about_too() {
     assert_eq!(read(path, "a.txt"), numbered(&[(2, "MINE\nMAIN")]));
 }
 
+/// Carried collisions are asked *before* the fuse is sealed, so quitting at
+/// one is as free as quitting at any other question.
+#[test]
+fn quitting_at_a_carried_collision_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path();
+    diverged_with_feature_current(path);
+    std::fs::write(path.join("a.txt"), numbered(&[(2, "MINE")])).unwrap();
+
+    let fuse = ivaldi_answering(path, &["fuse", "main"], "q\n", &[]);
+    assert!(!fuse.status.success());
+    let out = stdout(&fuse);
+    assert!(out.contains("mine (your uncommitted changes)"), "{out}");
+    assert!(
+        out.contains("cancels the fuse; nothing has been changed"),
+        "{out}"
+    );
+    assert!(String::from_utf8_lossy(&fuse.stderr).contains("nothing was changed"));
+
+    assert_eq!(read(path, "a.txt"), numbered(&[(2, "MINE")]));
+    assert_eq!(
+        read(path, "b.txt"),
+        "base\n",
+        "main's change was not brought in"
+    );
+    assert_eq!(last_seal_message(path), "base");
+    assert!(!path.join(".ivaldi/fuse-carry.snap").exists());
+    assert!(!ivaldi(path, &["oops"]).status.success(), "nothing to undo");
+}
+
 /// A wrong answer costs one command: `oops` takes the whole fuse back, and
 /// the question can be answered differently.
 #[test]

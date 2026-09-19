@@ -84,6 +84,16 @@ pub enum Action {
     Error(String),
     /// Show a success message.
     Success(String),
+    /// Hand the terminal to the user's editor. A view cannot do this itself:
+    /// the event loop owns the screen. The loop leaves the TUI, runs the
+    /// editor on `text`, comes back, and gives what was saved to the view's
+    /// [`TabView::edited`](crate::tui::views::TabView::edited).
+    EditText {
+        /// Names the scratch file's extension, so the editor highlights the
+        /// text as what it is. Nothing is written to this path.
+        path_hint: String,
+        text: String,
+    },
     /// Quit the application.
     Quit,
 }

@@ -99,17 +99,30 @@ showing both versions with a few lines of context.
 |-----|--------|
 | ↑/↓, Enter | Choose and confirm |
 | 1 / 2 / 3 | Mine / Theirs / Both (mine, then theirs) |
+| 4 or e | Edit: open just this region in `$VISUAL` / `$EDITOR` |
 | q / Esc | Cancel the fuse — nothing has been changed |
 
 Whole-file collisions (binary; changed vs. deleted) offer Mine / Theirs, each
-spelled out. Nothing is written until the last question is answered, so
-cancelling never leaves a merge open.
+spelled out.
 
-There is no in-TUI `edit`: when the right answer is neither side, cancel and
-run `ivaldi fuse <timeline>` in a terminal, which opens just that region in
-`$EDITOR`. Collisions between the fuse and *uncommitted* work are not asked
-about in the TUI either; those files get conflict markers and the result
+**Two rounds, both before anything is written.** First the collisions between
+the two timelines. Those answers decide what the fused files are, so only then
+can it be known whether your *uncommitted* work collides with them — and if it
+does, a second round asks about that (`your uncommitted changes` vs. `fused
+from <timeline>`). Cancelling in either round leaves the repository exactly as
+it was: no seal, no set-aside, nothing for `oops` to undo. If a file is
+changed on disk while the modal is up, its answers no longer fit the question
+that was asked, so that file gets conflict markers instead and the result
 message says how many need a look.
+
+**Edit.** For when the right answer is neither side — typically both edits
+combined on one line. The TUI steps aside, the editor opens on the region
+(in conflict markers, with three lines of context either side), and the TUI
+returns when it closes. Leaving the markers in, or changing the context
+lines, is not taken as an answer: the same question stays up. Views cannot
+touch the terminal themselves; they return `Action::EditText { path_hint,
+text }`, the event loop runs the editor, and what was saved arrives at
+`TabView::edited`.
 
 `a` aborts a merge left open by `ivaldi fuse --markers` or a CLI sync
 `--markers`, giving back any uncommitted work it had set aside.

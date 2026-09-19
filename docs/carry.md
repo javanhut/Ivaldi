@@ -36,7 +36,7 @@ The result is left uncommitted, as it was.
 |-----------|-----------|---------|
 | did not touch the file | changed / added / deleted it | Change drops straight back in |
 | changed it | changed other lines | Both sets of edits, merged line by line |
-| changed it | changed the same lines | Asked about, like any collision ([resolve.md](resolve.md)); with nobody to ask, conflict markers: `your uncommitted changes` vs `fused from <source>` |
+| changed it | changed the same lines | Asked about, like any collision ([resolve.md](resolve.md)) — up front, before the fuse is sealed (`carry::preview`), so backing out is still free. With nobody to ask, conflict markers: `your uncommitted changes` vs `fused from <source>` |
 | made the identical change | — | Nothing left to carry |
 | deleted it | changed it | User's version kept (now a new file), reported |
 | changed it | deleted it | Fused version kept, reported |

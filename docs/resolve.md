@@ -66,10 +66,19 @@ that feeds answers on stdin.
 Whole-file conflicts (binary; changed vs. deleted) offer `m` / `t` / `q`, with
 each spelled out ("keep my changed file" / "delete it, as they did").
 
-What `q` means is stated in the prompt, because it depends on when it is
-asked: before the merge seal it cancels the fuse with nothing changed; while
-re-applying [carried](carry.md) uncommitted work — the fuse already sealed —
-it leaves conflict markers in that working file instead.
+**Every question is asked before anything is written** — including the ones
+about [carried](carry.md) uncommitted work. Whether that work collides with the
+fuse depends on what the fused files turn out to be, so it is worked out in
+memory (`fuse_op::carried_collisions`) once the first round of answers is in,
+asked as a second round, and the answers replayed (`Questions::into_resolver`)
+when the work is merged back on top. `q` therefore means the same thing at
+every question: the fuse is cancelled and nothing has changed.
+
+A replayed answer is only given back to the *same* collision it was given to.
+If a file changes between asking and replaying, that file gets conflict
+markers rather than an answer to a question nobody was asked. (The one place
+a question can still come *after* a seal is recovering a fuse that was
+interrupted mid-carry; its prompt says so.)
 
 ## Undo instead of abort
 
@@ -105,7 +114,13 @@ for conflict in &result.conflicts {
 that can stop and wait. An event loop cannot, so `Questions` lays the same
 questions out as a list instead — `get(i)`, `answer(i, …)`,
 `next_unanswered(from)`, and `apply(&store, &mut merged_files)`, which refuses
-while anything is unanswered. The TUI's Fuse tab is built on it.
+while anything is unanswered. `ask(resolver, labels)` fills one in from a
+blocking resolver; `from_merges` builds one for carried collisions. The TUI's
+Fuse tab is built on it.
+
+Editing a region is three separable steps — `edit_buffer`, `edit_text`,
+`parse_edited` — because front ends differ in the middle one: a prompt just
+runs the editor, a TUI has to give up the screen first.
 
 The steps around the merge — snapshot, set-aside, merge seal with the source
 as a parent, materialize, re-apply — live in `fuse_op` (`plan`, `set_aside`,
