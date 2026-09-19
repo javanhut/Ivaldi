@@ -132,6 +132,32 @@ pub fn set_aside(repo: &Repo, plan: &FusePlan) -> Result<usize, FuseOpError> {
         + snapshot.staged_deletions.len())
 }
 
+/// The collisions between uncommitted work and what `plan` would make the
+/// head — worked out in memory, so a front end can ask about them *before*
+/// sealing, while backing out still changes nothing. Call once the plan's own
+/// conflicts are settled into `merged_files`, since they decide what the fused
+/// files are.
+///
+/// Give the answers to [`reapply`] / [`complete`] as
+/// [`Questions::into_resolver`](crate::resolve::Questions::into_resolver).
+pub fn carried_collisions(
+    repo: &Repo,
+    plan: &FusePlan,
+) -> Result<Vec<(String, crate::fuse::Merge3)>, FuseOpError> {
+    // As in `set_aside`: a re-attempt of an open fuse carries nothing new.
+    if repo.has_merge_in_progress() {
+        return Ok(Vec::new());
+    }
+    // Captured, not saved: this is a look, not the snapshot `oops` restores.
+    let dirty = crate::snapshot::capture(repo, &repo.cas, "fuse (preview)")?;
+    Ok(crate::carry::preview(
+        repo,
+        &repo.cas,
+        &dirty,
+        &plan.merged_files,
+    )?)
+}
+
 /// Seal `plan.merged_files` as the fuse of source into target, and write the
 /// merged tree to the working directory. Every conflict must already be
 /// settled into `merged_files`.

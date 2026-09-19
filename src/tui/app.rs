@@ -4,6 +4,7 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
+use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
 
@@ -218,6 +219,26 @@ impl App {
                     TabId::Shelves => self.shelves_view.handle_event(&key, &mut self.ctx),
                 };
 
+                // The one action that needs the terminal itself.
+                let action = match action {
+                    Action::EditText { path_hint, text } => {
+                        let result = Self::run_editor(&mut terminal, &path_hint, &text)?;
+                        // Matched by field, like the dispatch above, so the
+                        // view and the context are borrowed disjointly.
+                        let ctx = &mut self.ctx;
+                        match self.active_tab {
+                            TabId::Status => self.status_view.edited(result, ctx),
+                            TabId::Log => self.log_view.edited(result, ctx),
+                            TabId::Diff => self.diff_view.edited(result, ctx),
+                            TabId::Timelines => self.timeline_view.edited(result, ctx),
+                            TabId::Remote => self.remote_view.edited(result, ctx),
+                            TabId::Fuse => self.fuse_view.edited(result, ctx),
+                            TabId::Review => self.review_view.edited(result, ctx),
+                            TabId::Shelves => self.shelves_view.edited(result, ctx),
+                        }
+                    }
+                    other => other,
+                };
                 self.handle_action(action);
             }
 
@@ -239,9 +260,41 @@ impl App {
         Ok(())
     }
 
+    /// Leave the TUI, run the user's editor on `text`, and come back.
+    ///
+    /// Two different things can fail and they must not be confused. The
+    /// *inner* result is the editor's: what was saved, or why it could not be
+    /// run — either way the TUI carries on. The *outer* one is the terminal's:
+    /// if the screen cannot be taken back there is no TUI to carry on with.
+    /// What the user wrote is read before the screen is touched again, so no
+    /// repaint problem can cost them their edit.
+    fn run_editor(
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        path_hint: &str,
+        text: &str,
+    ) -> io::Result<Result<String, String>> {
+        crate::tui::restore_terminal()?;
+        let edited =
+            crate::resolve::edit_text(&mut crate::resolve::system_editor(), path_hint, text)
+                .map_err(|e| format!("could not run editor: {e}"));
+
+        // A fresh `Terminal` has an empty back buffer, so its first draw
+        // repaints every cell. Wipe whatever the editor left by writing the
+        // clear sequence directly: `Terminal::clear` first *asks* the terminal
+        // where the cursor is, a round trip that times out on a slow terminal
+        // — most likely at exactly this moment, as an editor exits.
+        *terminal = crate::tui::init_terminal()?;
+        io::stdout().execute(crossterm::terminal::Clear(
+            crossterm::terminal::ClearType::All,
+        ))?;
+        Ok(edited)
+    }
+
     fn handle_action(&mut self, action: Action) {
         match action {
             Action::None | Action::Consumed => {}
+            // Serviced by the event loop, which owns the terminal.
+            Action::EditText { .. } => {}
             Action::Refresh => {
                 self.load_active_tab();
             }

@@ -194,6 +194,35 @@ pub(super) fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
     }
     let settled = plan.conflicts.is_empty() || !args.markers;
 
+    // With the fused files now known, so is whether uncommitted work collides
+    // with them. Ask about that too while backing out is still free; the
+    // answers are replayed when the work is merged back on top. With nobody
+    // to ask, those files get conflict markers instead — harmless, since they
+    // are uncommitted working files and no merge is left open.
+    let mut carried_answers = None;
+    if settled && let Some(resolver) = resolver.as_deref_mut() {
+        let collisions =
+            crate::fuse_op::carried_collisions(&repo, &plan).map_err(|e| e.to_string())?;
+        let mut questions = crate::resolve::Questions::from_merges(collisions);
+        if !questions.is_empty() {
+            let theirs = format!("fused from {source}");
+            let labels = crate::resolve::Labels {
+                mine: crate::carry::MINE_LABEL,
+                theirs: &theirs,
+                on_quit: "cancels the fuse; nothing has been changed",
+            };
+            match questions.ask(resolver, labels) {
+                Ok(()) => carried_answers = Some(questions.into_resolver()),
+                Err(crate::resolve::Stop::Cancelled) => {
+                    return Err("fuse cancelled — nothing was changed".into());
+                }
+                Err(crate::resolve::Stop::Unresolvable(why)) => {
+                    return Err(format!("{why}\nNothing was changed."));
+                }
+            }
+        }
+    }
+
     let set_aside = crate::fuse_op::set_aside(&repo, &plan).map_err(|e| e.to_string())?;
     if set_aside > 0 && !quiet {
         println!(
@@ -213,7 +242,10 @@ pub(super) fn cmd_fuse(args: FuseArgs, quiet: bool) -> Result<(), String> {
             );
         }
         crate::failpoint::fail_point("fuse.before_reapply");
-        let report = crate::fuse_op::reapply(&repo, source, resolver.as_deref_mut())
+        let replay = carried_answers
+            .as_mut()
+            .map(|r| r as &mut (dyn crate::resolve::Resolver + 'static));
+        let report = crate::fuse_op::reapply(&repo, source, replay)
             .map_err(|e| carry_failure(&e.to_string(), source))?;
         if !quiet {
             if let Some(report) = &report {

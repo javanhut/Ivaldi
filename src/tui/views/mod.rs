@@ -32,4 +32,11 @@ pub trait TabView {
 
     /// Whether this tab has an active text input (suppresses global key handling).
     fn has_active_input(&self) -> bool;
+
+    /// The editor opened by [`Action::EditText`] has closed: `Ok` is what was
+    /// saved, `Err` why the editor could not be run. Only a view that asks
+    /// for an editor needs this.
+    fn edited(&mut self, _result: Result<String, String>, _ctx: &mut AppContext) -> Action {
+        Action::None
+    }
 }
