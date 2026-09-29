@@ -644,12 +644,16 @@ impl Repo {
             return Ok(());
         }
 
-        // Check new name doesn't already exist
-        if self
-            .store
-            .get_timeline_head(new_name)
-            .map_err(RepoError::Store)?
-            .is_some()
+        // Check new name doesn't already exist. A bare marker for the new
+        // name is not a conflict: it is what an interrupted rename leaves
+        // behind, and retrying must complete the rename.
+        let current = self.current_timeline().ok();
+        if current.as_deref() == Some(new_name)
+            || self
+                .store
+                .get_timeline_head(new_name)
+                .map_err(RepoError::Store)?
+                .is_some()
         {
             return Err(RepoError::Other(format!(
                 "timeline '{}' already exists",
@@ -657,11 +661,16 @@ impl Repo {
             )));
         }
 
-        if self
+        // A timeline with no seals yet has no stored head. It still exists
+        // if it has a ref marker or is the unborn timeline HEAD points at
+        // (e.g. `master` right after `forge`).
+        let old_head = self
             .store
             .get_timeline_head(old_name)
-            .map_err(RepoError::Store)?
-            .is_none()
+            .map_err(RepoError::Store)?;
+        if old_head.is_none()
+            && !old_ref.exists()
+            && current.as_deref() != Some(old_name)
         {
             return Err(RepoError::Other(format!(
                 "timeline '{}' not found",
@@ -678,16 +687,17 @@ impl Repo {
         atomic_write(&new_ref, b"").map_err(RepoError::Io)?;
         crate::failpoint::fail_point("timeline.rename.after_marker");
 
-        self.store
-            .rename_timeline_head(old_name, new_name)
-            .map_err(RepoError::Store)?;
+        if old_head.is_some() {
+            self.store
+                .rename_timeline_head(old_name, new_name)
+                .map_err(RepoError::Store)?;
+        }
         crate::failpoint::fail_point("timeline.rename.after_store");
 
         // Update HEAD before removing the old marker: if we crash in between,
         // HEAD already points at the fully materialized new name and the old
         // marker is just a headless leftover.
-        let current = self.current_timeline()?;
-        if current == old_name {
+        if current.as_deref() == Some(old_name) {
             forge::write_head(&self.ivaldi_dir, &HeadRef::Timeline(new_name.to_string()))
                 .map_err(|e| RepoError::Other(e.to_string()))?;
         }
@@ -1998,6 +2008,41 @@ mod tests {
         let (_dir, repo) = setup_repo();
         let result = repo.rename_timeline("nope", "something");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rename_unborn_current_timeline() {
+        let (_dir, repo) = setup_repo();
+        let old = repo.current_timeline().unwrap();
+        assert!(repo.get_timeline_head(&old).unwrap().is_none());
+
+        repo.rename_timeline(&old, "primary").unwrap();
+
+        assert_eq!(repo.current_timeline().unwrap(), "primary");
+        assert!(repo.get_timeline_head("primary").unwrap().is_none());
+        // Renaming back by the new name works too.
+        repo.rename_timeline("primary", &old).unwrap();
+        assert_eq!(repo.current_timeline().unwrap(), old);
+    }
+
+    #[test]
+    fn rename_headless_marker_timeline() {
+        let (_dir, repo) = setup_repo();
+        repo.create_timeline("feature", None).unwrap();
+        assert!(repo.get_timeline_head("feature").unwrap().is_none());
+
+        repo.rename_timeline("feature", "feat-auth").unwrap();
+
+        repo.switch_timeline("feat-auth").unwrap();
+        assert!(repo.switch_timeline("feature").is_err());
+    }
+
+    #[test]
+    fn rename_onto_unborn_current_timeline_fails() {
+        let (_dir, repo) = setup_repo();
+        repo.create_timeline("feature", None).unwrap();
+        let current = repo.current_timeline().unwrap();
+        assert!(repo.rename_timeline("feature", &current).is_err());
     }
 
     #[test]
