@@ -668,10 +668,7 @@ impl Repo {
             .store
             .get_timeline_head(old_name)
             .map_err(RepoError::Store)?;
-        if old_head.is_none()
-            && !old_ref.exists()
-            && current.as_deref() != Some(old_name)
-        {
+        if old_head.is_none() && !old_ref.exists() && current.as_deref() != Some(old_name) {
             return Err(RepoError::Other(format!(
                 "timeline '{}' not found",
                 old_name
