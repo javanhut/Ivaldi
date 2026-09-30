@@ -25,7 +25,7 @@ and reuses already validated in-memory history for its advertised-tip
 index. Remote ancestry and snapshot reachability planning still require
 traversal; this is not a persistent reachability index.
 
-Native protocol v3 negotiates missing leaves and object hashes before
+Native protocol v3 and later negotiate missing leaves and object hashes before
 transferring payloads. Both peers must upgrade. Repeat pushes send no
 duplicate object bodies or leaf bundles; inventories still scale with
 reachable history and object counts. Receiver duplicate-leaf resolution

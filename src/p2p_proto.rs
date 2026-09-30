@@ -1,4 +1,4 @@
-//! Protobuf wire encoding for the `ivaldi://` protocol (v3).
+//! Protobuf wire encoding for the `ivaldi://` protocol (v4).
 //!
 //! Payloads on the Noise channel are protobuf-encoded [`Envelope`] values,
 //! defined with prost derives — pure Rust, no protoc or build.rs. The field
@@ -13,14 +13,23 @@
 //! handshake
 //! and refuse a mismatch explicitly; unknown protobuf fields are ignored by
 //! prost. Version 3 adds mandatory push inventory negotiation; both peers
-//! must upgrade. The protobuf framing and Noise prologue remain unchanged.
+//! must upgrade. Version 4 changes no message: it marks that transferred
+//! trees may name chunked large files (repository format 3), which a v3
+//! binary would land but could never read — so a v3 peer is refused at
+//! `Hello` instead of receiving an unmaterializable timeline. The protobuf
+//! framing and Noise prologue remain unchanged.
 
 use crate::p2p::{Message, WireBlob, WireLeaf};
 use prost::Message as _;
 
 /// Wire protocol version carried in `Hello`. Bump on breaking changes
 /// (also bump the Noise prologue in `p2p.rs` when the framing itself changes).
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
+
+// A v3 peer would land chunked files (format 3) it cannot read; v4 is the
+// first protocol allowed to carry them.
+const _: () = assert!(crate::forge::CHUNKED_FILES_FORMAT <= crate::forge::CURRENT_FORMAT);
+const _: () = assert!(PROTOCOL_VERSION >= 4);
 
 /// Sentinel for a leaf that arrived without its sender index. Landing such
 /// a leaf fails loudly instead of guessing at its lineage.

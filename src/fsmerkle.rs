@@ -7,7 +7,9 @@
 //! - Structural sharing enables efficient storage and comparison
 //!
 //! Canonical Encodings:
-//! - Blob: `"blob <size>\x00" || content` → `BLAKE3(canonical)`
+//! - Blob: `"blob <size>\x00" || content` → `BLAKE3(canonical)`, or, for a
+//!   file over `filechunk::CHUNKED_FILE_THRESHOLD` in a format-3
+//!   repository, the root of its chunk tree (see `filechunk`)
 //! - Tree: `uvarint(count) || entries...` → `BLAKE3(canonical)`
 
 use std::collections::{BTreeMap, HashMap};
@@ -80,11 +82,25 @@ impl BlobNode {
 
     /// Compute the BLAKE3 hash of blob canonical bytes.
     pub fn hash_content(content: &[u8]) -> B3Hash {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&Self::header_bytes(content.len()));
+        let mut hasher = Self::hasher(content.len() as u64);
         hasher.update(content);
         B3Hash::from_bytes(*hasher.finalize().as_bytes())
     }
+
+    /// A hasher primed with the header for `size` content bytes, for hashing
+    /// a whole blob as a stream. Feed exactly `size` bytes, then finalize.
+    pub fn hasher(size: u64) -> blake3::Hasher {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(format!("blob {}\x00", size).as_bytes());
+        hasher
+    }
+}
+
+/// Size recorded in a whole blob's header, from its first bytes.
+fn classic_blob_size(prefix: &[u8]) -> Option<u64> {
+    let rest = prefix.strip_prefix(b"blob ")?;
+    let end = rest.iter().position(|&b| b == 0)?;
+    std::str::from_utf8(&rest[..end]).ok()?.parse().ok()
 }
 
 /// A tree node representing a directory with sorted entries.
@@ -236,12 +252,110 @@ impl<'a> FsStore<'a> {
         self.cas
     }
 
-    /// Store a blob, returning its hash and size.
+    /// Whether a file of `size` bytes is stored chunked in this repository.
+    /// Deterministic on size and format, so the same content always gets the
+    /// same hash within a repository.
+    pub fn chunks_file(&self, size: u64) -> bool {
+        self.cas.chunked_files() && size > crate::filechunk::CHUNKED_FILE_THRESHOLD
+    }
+
+    /// Store a blob, returning its hash and size. Large files in a format-3
+    /// repository are stored as a chunk tree (`filechunk`); everything else
+    /// as one whole blob.
     pub fn put_blob(&self, content: &[u8]) -> Result<(B3Hash, usize), FsMerkleError> {
+        if self.chunks_file(content.len() as u64) {
+            let hash = crate::filechunk::put_chunked(self.cas, content)?;
+            return Ok((hash, content.len()));
+        }
         let canonical = BlobNode::canonical_bytes(content);
         let hash = B3Hash::digest(&canonical);
         self.cas.put(hash, &canonical)?;
         Ok((hash, content.len()))
+    }
+
+    /// The hash `put_blob` would return for `content`, without storing it.
+    pub fn blob_hash(&self, content: &[u8]) -> Result<B3Hash, FsMerkleError> {
+        if self.chunks_file(content.len() as u64) {
+            return Ok(crate::filechunk::chunked_hash(content)?);
+        }
+        Ok(BlobNode::hash_content(content))
+    }
+
+    /// Whether the blob `hash` names is stored as a chunk tree. Reads three
+    /// bytes, not the object.
+    pub fn is_chunked_blob(&self, hash: B3Hash) -> Result<bool, FsMerkleError> {
+        let prefix = self.cas.get_prefix(hash, 3)?;
+        Ok(crate::filechunk::is_chunked_root(&prefix))
+    }
+
+    /// Every object a blob consists of: the blob itself, or a chunk tree's
+    /// root, interior nodes and leaves. A missing object is still named —
+    /// callers that ship or check objects decide what absence means.
+    pub fn blob_objects(&self, hash: B3Hash) -> Result<Vec<B3Hash>, FsMerkleError> {
+        match self.is_chunked_blob(hash) {
+            Ok(true) => Ok(crate::filechunk::node_hashes(self.cas, hash)?),
+            Ok(false) | Err(FsMerkleError::Cas(CasError::NotFound(_))) => Ok(vec![hash]),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Stream a blob's content to `out` without holding a chunked file in
+    /// memory. Returns the number of bytes written.
+    pub fn write_blob_to(
+        &self,
+        hash: B3Hash,
+        out: &mut dyn std::io::Write,
+    ) -> Result<u64, FsMerkleError> {
+        let data = self.cas.get(hash)?;
+        if crate::filechunk::is_chunked_root(&data) {
+            return Ok(crate::filechunk::read_to(self.cas, hash, &mut |bytes| {
+                out.write_all(bytes).map_err(CasError::Io)
+            })?);
+        }
+        let (_, content) = parse_blob(&data)?;
+        out.write_all(&content).map_err(CasError::Io)?;
+        Ok(content.len() as u64)
+    }
+
+    /// Size of a blob stored whole although this repository would now chunk
+    /// a file that large — content sealed before a format-3 migration. Such a
+    /// blob and the chunk tree of the same bytes have different hashes;
+    /// callers use this to recognise the pair as unchanged content instead of
+    /// re-encoding it. `None` for every other blob.
+    pub fn unchunked_large_blob_size(&self, hash: B3Hash) -> Result<Option<u64>, FsMerkleError> {
+        if !self.cas.chunked_files() {
+            return Ok(None);
+        }
+        let prefix = match self.cas.get_prefix(hash, 32) {
+            Ok(prefix) => prefix,
+            Err(CasError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(classic_blob_size(&prefix).filter(|size| self.chunks_file(*size)))
+    }
+
+    /// Whether `whole` (a blob stored whole, see
+    /// [`Self::unchunked_large_blob_size`]) and `chunked` (a chunk tree) hold
+    /// the same bytes. Streams the chunk tree once, only when the sizes match.
+    pub fn same_content_as_unchunked(
+        &self,
+        whole: B3Hash,
+        chunked: B3Hash,
+    ) -> Result<bool, FsMerkleError> {
+        let Some(size) = self.unchunked_large_blob_size(whole)? else {
+            return Ok(false);
+        };
+        if !self.is_chunked_blob(chunked)?
+            || crate::filechunk::root_size(&self.cas.get(chunked)?)? != size
+        {
+            return Ok(false);
+        }
+        let mut hasher = BlobNode::hasher(size);
+        crate::filechunk::read_to(self.cas, chunked, &mut |bytes| {
+            hasher.update(bytes);
+            Ok(())
+        })?;
+        Ok(B3Hash::from_bytes(*hasher.finalize().as_bytes()) == whole)
     }
 
     /// Store a directory from entries, returning its hash. Directories over
@@ -272,9 +386,20 @@ impl<'a> FsStore<'a> {
         parse_tree(&data)
     }
 
-    /// Load a blob by hash, returning node and content.
+    /// Load a blob by hash, returning node and content. Reads both the whole
+    /// and the chunked encoding; prefer [`Self::write_blob_to`] where the
+    /// content does not need to be in memory.
     pub fn load_blob(&self, hash: B3Hash) -> Result<(BlobNode, Vec<u8>), FsMerkleError> {
         let data = self.cas.get(hash)?;
+        if crate::filechunk::is_chunked_root(&data) {
+            let content = crate::filechunk::read_all(self.cas, hash)?;
+            return Ok((
+                BlobNode {
+                    size: content.len(),
+                },
+                content,
+            ));
+        }
         parse_blob(&data)
     }
 
@@ -1255,5 +1380,98 @@ mod tests {
 
         // Both should produce the same root hash
         assert_eq!(root_content, root_hash);
+    }
+
+    /// Just over the chunking threshold, with distinct chunks.
+    fn big_content() -> Vec<u8> {
+        let len = crate::filechunk::CHUNKED_FILE_THRESHOLD as usize + 1_500_000;
+        (0..len)
+            .map(|i| (i % 251) as u8 ^ (i >> 20) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn put_blob_chunks_only_large_files_in_format3_stores() {
+        let content = big_content();
+
+        let cas = MemoryCas::with_chunked_files();
+        let store = FsStore::new(&cas);
+        let (big, size) = store.put_blob(&content).unwrap();
+        assert_eq!(size, content.len());
+        assert!(store.is_chunked_blob(big).unwrap());
+        assert_eq!(store.blob_hash(&content).unwrap(), big);
+        assert_eq!(store.load_blob(big).unwrap().1, content);
+        let (small, _) = store.put_blob(b"small").unwrap();
+        assert!(!store.is_chunked_blob(small).unwrap());
+        assert_eq!(small, BlobNode::hash_content(b"small"));
+
+        // Format 2: the same bytes stay one whole blob.
+        let cas2 = MemoryCas::with_hamt_dirs();
+        let store2 = FsStore::new(&cas2);
+        let (whole, _) = store2.put_blob(&content).unwrap();
+        assert_eq!(whole, BlobNode::hash_content(&content));
+        assert_eq!(store2.blob_hash(&content).unwrap(), whole);
+        assert_eq!(cas2.len(), 1);
+    }
+
+    #[test]
+    fn chunked_blob_streams_and_lists_its_objects() {
+        let cas = MemoryCas::with_chunked_files();
+        let store = FsStore::new(&cas);
+        let content = big_content();
+        let (big, _) = store.put_blob(&content).unwrap();
+
+        let mut out = Vec::new();
+        assert_eq!(
+            store.write_blob_to(big, &mut out).unwrap(),
+            content.len() as u64
+        );
+        assert_eq!(out, content);
+
+        let objects = store.blob_objects(big).unwrap();
+        assert_eq!(objects[0], big);
+        assert_eq!(objects.len(), cas.len()); // root + every leaf
+        let (small, _) = store.put_blob(b"x").unwrap();
+        assert_eq!(store.blob_objects(small).unwrap(), vec![small]);
+        let absent = B3Hash::digest(b"never stored");
+        assert_eq!(store.blob_objects(absent).unwrap(), vec![absent]);
+    }
+
+    #[test]
+    fn unchunked_large_blob_is_recognised_as_the_same_content() {
+        let cas = MemoryCas::with_chunked_files();
+        let store = FsStore::new(&cas);
+        let content = big_content();
+        let whole = BlobNode::hash_content(&content);
+        cas.put(whole, &BlobNode::canonical_bytes(&content))
+            .unwrap();
+        let (chunked, _) = store.put_blob(&content).unwrap();
+        assert_ne!(whole, chunked);
+
+        assert_eq!(
+            store.unchunked_large_blob_size(whole).unwrap(),
+            Some(content.len() as u64)
+        );
+        assert!(store.same_content_as_unchunked(whole, chunked).unwrap());
+
+        let mut other = content.clone();
+        other[10] ^= 1;
+        let (different, _) = store.put_blob(&other).unwrap();
+        assert!(!store.same_content_as_unchunked(whole, different).unwrap());
+
+        // Small whole blobs and chunk roots are not "unchunked large blobs".
+        let (small, _) = store.put_blob(b"small").unwrap();
+        assert_eq!(store.unchunked_large_blob_size(small).unwrap(), None);
+        assert_eq!(store.unchunked_large_blob_size(chunked).unwrap(), None);
+        // A format-2 store never asks the question.
+        let cas2 = MemoryCas::with_hamt_dirs();
+        cas2.put(whole, &BlobNode::canonical_bytes(&content))
+            .unwrap();
+        assert_eq!(
+            FsStore::new(&cas2)
+                .unchunked_large_blob_size(whole)
+                .unwrap(),
+            None
+        );
     }
 }

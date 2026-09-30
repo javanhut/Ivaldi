@@ -210,17 +210,22 @@ fn verify_reachable_content(ivaldi_dir: &Path, store: Option<&Store>) -> Check {
     /// What the referencing context says an object must be. `Tree` covers
     /// both directory encodings (a directory entry cannot know whether its
     /// child crossed the HAMT threshold); `HamtInterior` is a node referenced
-    /// by a HAMT branch, which must never be an empty branch.
+    /// by a HAMT branch, which must never be an empty branch. `Blob` covers
+    /// both file encodings; `Chunk` is a node below a chunked file's root,
+    /// checked by the walk from that root.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ObjKind {
         Blob,
         Tree,
         HamtInterior,
+        Chunk,
     }
     // A HAMT root is also a valid interior node of some other directory
     // whose trie happens to embed it — the two expectations are compatible.
+    // File content (blobs and chunk nodes) is never a directory.
     fn kinds_conflict(a: ObjKind, b: ObjKind) -> bool {
-        a != b && (a == ObjKind::Blob || b == ObjKind::Blob)
+        let content = |k| matches!(k, ObjKind::Blob | ObjKind::Chunk);
+        a != b && (content(a) != content(b))
     }
 
     let mut problems = Vec::new();
@@ -237,6 +242,8 @@ fn verify_reachable_content(ivaldi_dir: &Path, store: Option<&Store>) -> Check {
     }
 
     let objects_dir = ivaldi_dir.join("objects");
+    // Chunked files are walked through a CAS view of the same directory.
+    let chunk_cas = crate::cas::FileCas::new(&objects_dir);
     let mut seen: HashMap<B3Hash, ObjKind> = HashMap::new();
     while let Some((hash, expected_kind)) = queue.pop_front() {
         if let Some(previous_kind) = seen.get(&hash) {
@@ -317,11 +324,47 @@ fn verify_reachable_content(ivaldi_dir: &Path, store: Option<&Store>) -> Check {
                 }
                 Err(e) => problems.push(format!("tree {hash} does not decode as a tree: {e}")),
             },
+            ObjKind::Blob if crate::filechunk::is_chunked_root(&bytes) => {
+                // Walk the whole chunk tree: every node's hash, encoding,
+                // height, shape and size is checked on the way.
+                let cas = match &chunk_cas {
+                    Ok(cas) => cas,
+                    Err(e) => {
+                        problems.push(format!("cannot open objects to check {hash}: {e}"));
+                        continue;
+                    }
+                };
+                match crate::filechunk::node_hashes(cas, hash) {
+                    Ok(nodes) => {
+                        for node in nodes.into_iter().skip(1) {
+                            match seen.get(&node) {
+                                Some(previous) if kinds_conflict(*previous, ObjKind::Chunk) => {
+                                    problems.push(format!(
+                                        "object {node} is referenced as both {previous:?} and Chunk"
+                                    ));
+                                }
+                                Some(_) => {}
+                                None => {
+                                    seen.insert(node, ObjKind::Chunk);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        problems.push(format!("chunked file {hash} is incomplete: {e}"));
+                        continue;
+                    }
+                }
+                if let Err(e) = crate::filechunk::read_to(cas, hash, &mut |_| Ok(())) {
+                    problems.push(format!("chunked file {hash} does not decode: {e}"));
+                }
+            }
             ObjKind::Blob => {
                 if let Err(e) = crate::fsmerkle::parse_blob(&bytes) {
                     problems.push(format!("blob {hash} does not decode as a blob: {e}"));
                 }
             }
+            ObjKind::Chunk => {} // only ever inserted into `seen`, never queued
         }
     }
 
@@ -1037,5 +1080,63 @@ mod tests {
             .expect("full verification should include refs");
         assert!(!refs.ok);
         assert!(refs.detail.contains("has no ref marker"));
+    }
+
+    fn commit_chunked_file(dir: &Path) -> B3Hash {
+        crate::forge::forge(dir).unwrap();
+        let cas = FileCas::new(dir.join(".ivaldi/objects")).unwrap();
+        assert!(crate::cas::Cas::chunked_files(&cas));
+        let fs_store = FsStore::new(&cas);
+        let content: Vec<u8> = (0..crate::filechunk::CHUNKED_FILE_THRESHOLD as usize + 10)
+            .map(|i| (i % 241) as u8 ^ (i >> 20) as u8)
+            .collect();
+        let (blob, _) = fs_store.put_blob(&content).unwrap();
+        let tree = fs_store
+            .put_tree(vec![Entry {
+                name: "big.bin".into(),
+                mode: MODE_FILE,
+                kind: NodeKind::Blob,
+                hash: blob,
+            }])
+            .unwrap();
+        cas.flush().unwrap();
+        let mut repo = crate::repo::Repo::open(dir).unwrap();
+        repo.commit(tree, "A", "large").unwrap();
+        blob
+    }
+
+    fn reachable_check(dir: &Path) -> Check {
+        verify(dir, true)
+            .checks
+            .into_iter()
+            .find(|c| c.name == "reachable-content")
+            .expect("full verification should check reachable content")
+    }
+
+    #[test]
+    fn chunked_file_passes_reachable_content_check() {
+        let dir = tempfile::tempdir().unwrap();
+        commit_chunked_file(dir.path());
+        let check = reachable_check(dir.path());
+        assert!(check.ok, "{}", check.detail);
+        // Tree + chunk root + 5 leaves.
+        assert!(
+            check.detail.contains("7 reachable objects"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn missing_chunk_fails_reachable_content_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = commit_chunked_file(dir.path());
+        let cas = FileCas::new(dir.path().join(".ivaldi/objects")).unwrap();
+        let leaf = crate::filechunk::node_hashes(&cas, blob).unwrap()[2];
+        assert!(cas.remove(leaf).unwrap());
+
+        let check = reachable_check(dir.path());
+        assert!(!check.ok);
+        assert!(check.detail.contains("does not decode"), "{}", check.detail);
     }
 }

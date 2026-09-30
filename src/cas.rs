@@ -47,6 +47,22 @@ pub trait Cas: Send + Sync {
     fn hamt_dirs(&self) -> bool {
         false
     }
+
+    /// Whether files over `filechunk::CHUNKED_FILE_THRESHOLD` written through
+    /// this CAS are stored chunked (repository format >= 3). Carried like
+    /// `hamt_dirs`, for the same reason. Reading chunked files never depends
+    /// on it: objects that arrived from a newer peer stay readable.
+    fn chunked_files(&self) -> bool {
+        false
+    }
+
+    /// The first `len` bytes of an object (fewer if it is shorter). Lets
+    /// walkers tell encodings apart without reading large objects whole.
+    fn get_prefix(&self, hash: B3Hash, len: usize) -> Result<Vec<u8>, CasError> {
+        let mut data = self.get(hash)?;
+        data.truncate(len);
+        Ok(data)
+    }
 }
 
 /// Convenience method: hash data and store it, returning the hash.
@@ -64,6 +80,7 @@ pub fn put_and_hash(cas: &dyn Cas, data: &[u8]) -> Result<B3Hash, CasError> {
 pub struct MemoryCas {
     data: RwLock<HashMap<B3Hash, Vec<u8>>>,
     hamt_dirs: bool,
+    chunked_files: bool,
 }
 
 impl MemoryCas {
@@ -71,6 +88,7 @@ impl MemoryCas {
         Self {
             data: RwLock::new(HashMap::new()),
             hamt_dirs: false,
+            chunked_files: false,
         }
     }
 
@@ -80,6 +98,17 @@ impl MemoryCas {
         Self {
             data: RwLock::new(HashMap::new()),
             hamt_dirs: true,
+            chunked_files: false,
+        }
+    }
+
+    /// In-memory CAS with every format-3 encoding enabled (HAMT directories
+    /// and chunked large files), for tests that exercise that write path.
+    pub fn with_chunked_files() -> Self {
+        Self {
+            data: RwLock::new(HashMap::new()),
+            hamt_dirs: true,
+            chunked_files: true,
         }
     }
 
@@ -133,6 +162,10 @@ impl Cas for MemoryCas {
     fn hamt_dirs(&self) -> bool {
         self.hamt_dirs
     }
+
+    fn chunked_files(&self) -> bool {
+        self.chunked_files
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +183,8 @@ pub struct FileCas {
     dirty_shards: std::sync::Mutex<std::collections::BTreeSet<PathBuf>>,
     /// Repository format allows HAMT directories (see `Cas::hamt_dirs`).
     hamt_dirs: bool,
+    /// Repository format allows chunked files (see `Cas::chunked_files`).
+    chunked_files: bool,
 }
 
 impl FileCas {
@@ -158,19 +193,21 @@ impl FileCas {
     /// A repository's object store lives at `.ivaldi/objects`, so the
     /// repository FORMAT file sits in the parent directory; its version
     /// decides whether directories written through this CAS may use the
-    /// HAMT encoding. A root with no adjacent FORMAT (plain stores, tests)
-    /// reads as format 0 and stays pure fsmerkle.
+    /// HAMT encoding and large files the chunked one. A root with no
+    /// adjacent FORMAT (plain stores, tests) reads as format 0 and stays pure
+    /// fsmerkle with whole blobs.
     pub fn new(root: impl AsRef<Path>) -> Result<Self, CasError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
-        let hamt_dirs = root
+        let version = root
             .parent()
             .and_then(|ivaldi_dir| crate::forge::read_format(ivaldi_dir).ok())
-            .is_some_and(|fmt| fmt.version >= crate::forge::HAMT_DIRS_FORMAT);
+            .map_or(0, |fmt| fmt.version);
         Ok(Self {
             root,
             dirty_shards: std::sync::Mutex::new(std::collections::BTreeSet::new()),
-            hamt_dirs,
+            hamt_dirs: version >= crate::forge::HAMT_DIRS_FORMAT,
+            chunked_files: version >= crate::forge::CHUNKED_FILES_FORMAT,
         })
     }
 
@@ -362,6 +399,24 @@ impl Cas for FileCas {
 
     fn hamt_dirs(&self) -> bool {
         self.hamt_dirs
+    }
+
+    fn chunked_files(&self) -> bool {
+        self.chunked_files
+    }
+
+    fn get_prefix(&self, hash: B3Hash, len: usize) -> Result<Vec<u8>, CasError> {
+        use std::io::Read;
+        let file = match fs::File::open(self.object_path(hash)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(CasError::NotFound(hash));
+            }
+            Err(e) => return Err(CasError::Io(e)),
+        };
+        let mut data = Vec::with_capacity(len);
+        file.take(len as u64).read_to_end(&mut data)?;
+        Ok(data)
     }
 }
 

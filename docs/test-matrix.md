@@ -38,6 +38,7 @@ on repeat upload and correct parent remapping for the next incremental seal.
 | Uncommitted work survives workspace-rewriting commands | CLI process tests for fuse carry-through (clean merge, colliding edits, gathered files, conflicted fuse via `--continue` and `--abort`), `oops` undo/redo of fuse and reverse, re-apply outcome unit tests (binary, modify/delete), snapshot truncation and malformed-line refusal, and kill/reopen cases at every carry and `oops` boundary |
 | Automatic per-timeline shelving | CLI process tests and switch-journal tests verify dirty work is shelved, isolated, restored, and preserved through interruption |
 | Filesystem integrity | Canonical blob/tree encodings, structural sharing, additions, modifications, deletions, executable bits, symlinks, ignored files, dotfile controls, and materialization tests |
+| Chunked large-file correctness | Hand-built canonical shapes, every size across level boundaries at small parameters, stream-in-any-pieces determinism, single-chunk dedup and edit-rewrites-only-its-path object counts, rejection of short or partial non-final nodes, single-child and under-threshold roots, wrong heights, size mismatches, tampered children, and non-canonical varints; format-2/format-3 write gating; streamed gather, status, and materialize; pre-migration whole blobs kept unchanged until edited; native-transfer traversal, full verification (including a missing chunk), rescue, and a CLI lifecycle and format 2 → 3 migration |
 | HAMT directory correctness | Golden encodings, randomized `BTreeMap` mirroring, insertion/removal-order independence, malformed-node rejection, structural diff, format-1/format-2 lifecycle, rescue, and native-transfer traversal |
 | Fusion semantics | Three-way additions, changes, deletions, clean and conflicted results, every resolution strategy, fast-forward detection, large merges, and crash-interrupted fusion |
 | Native authenticated transfer | Real localhost fetch and push, Noise trust rejection, concurrent clients, protobuf round trips, parent-index remapping, received-tip verification, peer-namespace landing, and idempotent repeat transfer |
@@ -50,7 +51,7 @@ on repeat upload and correct parent remapping for the next incremental seal.
 | Command-level behavior | Multi-process CLI smoke tests cover forge, status, timelines, automatic shelving, divergent fusion, temporary staging exclusion (`skip`/`unskip`, including explicit-gather refusal and deletion guard), error exit status, and malformed-state reporting without repository damage |
 
 In addition to the deterministic suite, `fuzz/` contains targets for native
-readers and encodings, HAMT nodes, and compatibility-boundary pack and delta
+readers and encodings, HAMT and chunk nodes, and compatibility-boundary pack and delta
 formats. CI runs formatting, Clippy with warnings denied, the all-features test
 suite on Linux/macOS/Windows, the minimum supported Rust version, dependency
 policy checks, and scheduled fuzzing.

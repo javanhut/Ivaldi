@@ -336,8 +336,10 @@ untested; its stated evidence and acceptance criteria define what remains.
 - **Merkle Mountain Range** — append-only commit history with inclusion proofs
 - **Content-addressed Merkle trees** — unchanged directory subtrees retain
   the same hashes and are reused across seals
-- **Content-addressable storage** — deduplication across timelines, 64KB
-  file chunking for large files
+- **Content-addressable storage** — deduplication across timelines; files
+  over 4 MiB are stored as trees of 1 MiB chunks, so editing part of a large
+  file stores only the changed chunks (format 3, see
+  [`docs/filechunk.md`](docs/filechunk.md))
 - **redb** — pure-Rust, ACID, crash-safe embedded database for commits,
   timelines, and seal names
 - **Persistent HAMT directories** — format-2 repositories store directories

@@ -172,7 +172,7 @@ If you reach for one of these, here's the intended Ivaldi answer.
 | `git cherry-pick` | `ivaldi pluck <seal>` (the `cherry-pick` alias also works). See docs/undo.md. |
 | `git submodule` | Supported (`src/submodule.rs`); same semantics as git. |
 | `.git/hooks/*` | `.ivaldi/hooks/*` — same shape. |
-| `git lfs` | `filechunk` handles large files via content-defined chunking; no separate tool. |
+| `git lfs` | No separate tool: files over 4 MiB are stored as 1 MiB chunks in the repository itself (fixed-size chunking, so in-place edits and appends dedup; insertions shift later chunks). Git LFS pointer files pass through the Git bridge as ordinary small files; their content is not fetched. |
 
 ## Five-minute starter
 

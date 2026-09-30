@@ -37,6 +37,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "parse_chunk_node"
+path = "fuzz_targets/parse_chunk_node.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "apply_delta"
 path = "fuzz_targets/apply_delta.rs"
 test = false

@@ -284,7 +284,7 @@ fn corrupt_backup_is_never_used_for_rollback() {
         forge::read_format(&dir.path().join(".ivaldi"))
             .unwrap()
             .version,
-        2
+        forge::CURRENT_FORMAT
     );
 }
 
@@ -305,7 +305,7 @@ fn altered_manifest_is_rejected_by_independent_seal_before_restore() {
         forge::read_format(&dir.path().join(".ivaldi"))
             .unwrap()
             .version,
-        2
+        forge::CURRENT_FORMAT
     );
 }
 
@@ -403,7 +403,7 @@ fn crash_after_pending_clear_is_a_complete_verified_migration() {
         forge::read_format(&dir.path().join(".ivaldi"))
             .unwrap()
             .version,
-        2
+        forge::CURRENT_FORMAT
     );
     ok(dir.path(), &["verify", "--full"]);
     ok(dir.path(), &["migrate", "--rollback"]);
