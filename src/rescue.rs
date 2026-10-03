@@ -364,10 +364,18 @@ fn materialize_tree(
                         .push(format!("file {} missing ({})", entry.name, entry.hash));
                     continue;
                 };
-                let content = match fsmerkle::parse_blob(blob) {
+                let decoded = if crate::filechunk::is_chunked_root(blob) {
+                    crate::filechunk::read_all(&MapCas(objects), entry.hash)
+                        .map_err(|e| e.to_string())
+                } else {
+                    fsmerkle::parse_blob(blob)
+                        .map(|(_, content)| content)
+                        .map_err(|e| e.to_string())
+                };
+                let content = match decoded {
                     // ponytail: symlinks are written as regular files holding the
                     // link target — safe, avoids creating dangling/escaping links.
-                    Ok((_, content)) => content,
+                    Ok(content) => content,
                     Err(e) => {
                         report
                             .problems
@@ -387,6 +395,29 @@ fn materialize_tree(
         }
     }
     ancestors.remove(&tree_hash);
+}
+
+/// Read-only CAS view of the scanned objects, so chunked files are read by
+/// the same validating walk as everywhere else.
+struct MapCas<'a>(&'a HashMap<B3Hash, Vec<u8>>);
+
+impl crate::cas::Cas for MapCas<'_> {
+    fn put(&self, _: B3Hash, _: &[u8]) -> Result<(), crate::cas::CasError> {
+        Err(crate::cas::CasError::Io(std::io::Error::other(
+            "rescue reads objects, never writes them",
+        )))
+    }
+
+    fn get(&self, hash: B3Hash) -> Result<Vec<u8>, crate::cas::CasError> {
+        self.0
+            .get(&hash)
+            .cloned()
+            .ok_or(crate::cas::CasError::NotFound(hash))
+    }
+
+    fn has(&self, hash: B3Hash) -> Result<bool, crate::cas::CasError> {
+        Ok(self.0.contains_key(&hash))
+    }
 }
 
 /// A tree entry name must be exactly one safe path component.
@@ -730,5 +761,42 @@ mod tests {
         let short = &tree.to_hex()[..16];
         let recovered = std::fs::read(out.join("orphans").join(short).join("a.txt")).unwrap();
         assert_eq!(recovered, b"orphaned");
+    }
+
+    #[test]
+    fn recovers_chunked_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let ivaldi = dir.path().join(".ivaldi");
+        let cas = FileCas::new(ivaldi.join("objects")).unwrap();
+        let fs_store = FsStore::new(&cas);
+        let content: Vec<u8> = (0..crate::filechunk::CHUNKED_FILE_THRESHOLD as usize + 99)
+            .map(|i| (i % 239) as u8 ^ (i >> 20) as u8)
+            .collect();
+        let (blob, _) = fs_store.put_blob(&content).unwrap();
+        assert!(fs_store.is_chunked_blob(blob).unwrap());
+        let tree = fs_store
+            .put_tree(vec![Entry {
+                name: "big.bin".into(),
+                mode: MODE_FILE,
+                kind: NodeKind::Blob,
+                hash: blob,
+            }])
+            .unwrap();
+        cas.flush().unwrap();
+
+        let store = Store::open(&ivaldi.join("store.db")).unwrap();
+        let leaf = leaf::Leaf::new(tree, "main", "x", 0, "c");
+        store.put_leaf(0, &leaf.canonical_bytes()).unwrap();
+        drop(store);
+
+        let out = dir.path().join("rescued");
+        let report = rescue(&ivaldi, &out).unwrap();
+        assert!(report.problems.is_empty(), "{:?}", report.problems);
+        let short = &tree.to_hex()[..16];
+        assert_eq!(
+            std::fs::read(out.join(short).join("big.bin")).unwrap(),
+            content
+        );
     }
 }

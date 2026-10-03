@@ -64,9 +64,14 @@ fn head_tree_root(dir: &Path) -> ivaldi::hash::B3Hash {
 fn format2_repo_lifecycle_with_hamt_directory() {
     let dir = setup_repo();
 
-    // New repositories are stamped format 2.
+    // New repositories are stamped with the current format, which includes
+    // HAMT directories.
     let format = std::fs::read_to_string(dir.path().join(".ivaldi/FORMAT")).unwrap();
-    assert!(format.contains("format = 2"), "FORMAT was:\n{format}");
+    assert!(
+        format.contains(&format!("format = {}", ivaldi::forge::CURRENT_FORMAT)),
+        "FORMAT was:\n{format}"
+    );
+    const { assert!(ivaldi::forge::CURRENT_FORMAT >= ivaldi::forge::HAMT_DIRS_FORMAT) };
 
     write_big_dir(dir.path());
     ivaldi_ok(dir.path(), &["gather", "."]);

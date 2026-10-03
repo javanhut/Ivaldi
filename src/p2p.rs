@@ -1329,9 +1329,10 @@ fn serve_want(
     Ok(())
 }
 
-/// Collect every CAS object hash reachable from `tree_hash` — both blob
-/// hashes (`NodeKind::Blob` entries) and the tree-node hashes themselves.
-/// The receiver needs both to be able to load and materialize the tree.
+/// Collect every CAS object hash reachable from `tree_hash` — blob hashes
+/// (`NodeKind::Blob` entries, plus every node of a chunked file's tree) and
+/// the tree-node hashes themselves. The receiver needs all of them to be
+/// able to load and materialize the tree.
 fn collect_objects_from_tree(
     store: &crate::fsmerkle::FsStore<'_>,
     tree_hash: B3Hash,
@@ -1361,7 +1362,9 @@ fn collect_objects_from_tree(
     for entry in &entries {
         match entry.kind {
             crate::fsmerkle::NodeKind::Blob => {
-                out.insert(entry.hash);
+                // A chunked file's leaves and interior nodes are named only
+                // by its root, like HAMT interiors — ship them explicitly.
+                out.extend(store.blob_objects(entry.hash)?);
             }
             crate::fsmerkle::NodeKind::Tree => {
                 collect_objects_from_tree(store, entry.hash, seen_trees, out)?;
@@ -3347,5 +3350,67 @@ mod tests {
             }
             other => panic!("expected one Timelines reply, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn transfer_set_includes_every_chunk_of_a_large_file() {
+        use crate::fsmerkle::{Entry, FsStore, MODE_FILE, NodeKind};
+        let cas = crate::cas::MemoryCas::with_chunked_files();
+        let store = FsStore::new(&cas);
+        let content: Vec<u8> = (0..crate::filechunk::CHUNKED_FILE_THRESHOLD as usize + 10)
+            .map(|i| (i % 253) as u8 ^ (i >> 20) as u8)
+            .collect();
+        let (big, _) = store.put_blob(&content).unwrap();
+        let root = store
+            .put_tree(vec![Entry {
+                name: "big.bin".into(),
+                mode: MODE_FILE,
+                kind: NodeKind::Blob,
+                hash: big,
+            }])
+            .unwrap();
+
+        let mut seen = BTreeSet::new();
+        let mut out = BTreeSet::new();
+        collect_objects_from_tree(&store, root, &mut seen, &mut out).unwrap();
+        // Tree node + chunk root + 5 leaves: everything the CAS holds.
+        assert_eq!(out.len(), cas.len());
+        assert_eq!(out.len(), 7);
+    }
+
+    #[test]
+    fn peer_speaking_an_older_protocol_is_refused_at_hello() {
+        // A v3 binary predates chunked files: it would land them and then fail
+        // to materialize. It must be turned away before any object moves.
+        let server_id = Identity::generate().unwrap();
+        let client_id = Identity::generate().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            Channel::accept(stream, &server_id)
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        let noise = handshake_initiator(&stream, &client_id).unwrap();
+        let remote_static = extract_remote_static(&noise).unwrap();
+        let mut old_peer = Channel {
+            stream,
+            noise,
+            remote_static,
+            remote_repo: String::new(),
+        };
+        old_peer
+            .send(&Message::Hello {
+                version: crate::p2p_proto::PROTOCOL_VERSION - 1,
+                repo: String::new(),
+            })
+            .unwrap();
+
+        let refused = server.join().unwrap().err().expect("old peer accepted");
+        assert!(
+            refused.to_string().contains("upgrade the older peer"),
+            "{refused}"
+        );
     }
 }

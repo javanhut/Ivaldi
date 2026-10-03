@@ -31,6 +31,10 @@ fn make_agent() -> ureq::Agent {
         .timeout_connect(Some(std::time::Duration::from_secs(30)))
         .timeout_recv_response(Some(std::time::Duration::from_secs(60)))
         .http_status_as_error(false)
+        // A renamed or transferred repository answers with a redirect to
+        // `/repositories/<id>/...` on the same API host. ureq strips the token
+        // on every redirect by default, which turns a private repo into a 404.
+        .redirect_auth_headers(ureq::config::RedirectAuthHeaders::SameHost)
         .build()
         .new_agent()
 }
@@ -117,6 +121,12 @@ impl GitHubClient {
             api_base: api_base.into().trim_end_matches('/').to_string(),
             raw_base: raw_base.into().trim_end_matches('/').to_string(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_token(mut self, token: &str) -> Self {
+        self.token = Some(token.to_string());
+        self
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -246,6 +256,9 @@ impl GitHubClient {
         })
     }
 
+    /// Fetch repository metadata. Follows renames and transfers: `full_name`
+    /// is the repository's current `owner/repo`, which differs from the
+    /// requested one if it has moved.
     pub fn get_repo(&self, owner: &str, repo: &str) -> Result<RepoInfo, GitHubError> {
         let resp = self.get(&format!("/repos/{}/{}", owner, repo))?;
         resp.into_body().read_json().map_err(gh_err)

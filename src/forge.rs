@@ -111,10 +111,16 @@ pub fn forge(work_dir: &Path) -> Result<ForgeResult, ForgeError> {
 /// - 2: directories with more than `fsmerkle::HAMT_DIR_THRESHOLD` entries
 ///   are stored as HAMT roots (see docs/hamt.md). Format-1 repositories
 ///   remain fully supported read/write and never receive HAMT objects.
-pub const CURRENT_FORMAT: u32 = 2;
+/// - 3: files larger than `filechunk::CHUNKED_FILE_THRESHOLD` are stored as
+///   chunk trees (see docs/filechunk.md). Format-2 repositories keep writing
+///   whole blobs; every format reads both.
+pub const CURRENT_FORMAT: u32 = 3;
 
 /// First repository format whose directories may use the HAMT encoding.
 pub const HAMT_DIRS_FORMAT: u32 = 2;
+
+/// First repository format whose large files are stored chunked.
+pub const CHUNKED_FILES_FORMAT: u32 = 3;
 
 /// Oldest Ivaldi version that understands `CURRENT_FORMAT`. Written into
 /// `.ivaldi/FORMAT` purely so the "too new" error can name a version to

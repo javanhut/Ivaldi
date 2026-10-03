@@ -340,9 +340,7 @@ pub(super) fn run_patch_session(
     input: &mut dyn std::io::BufRead,
     quiet: bool,
 ) -> Result<Vec<String>, String> {
-    use crate::cas::Cas;
     use crate::diff::{LineOp, apply_selected_hunks, compute_hunks, compute_ops};
-    use crate::fsmerkle::BlobNode;
 
     let store = crate::fsmerkle::FsStore::new(cas);
     let mut staged_paths: Vec<String> = Vec::new();
@@ -391,9 +389,7 @@ pub(super) fn run_patch_session(
             };
             match read_patch_answer(&format!("Stage {} ({}) [y,n,q]?", path, label), input)? {
                 PatchAnswer::Yes | PatchAnswer::AllRest => {
-                    let canonical = BlobNode::canonical_bytes(&disk_content);
-                    let hash = crate::hash::B3Hash::digest(&canonical);
-                    cas.put(hash, &canonical).map_err(|e| e.to_string())?;
+                    let (hash, _) = store.put_blob(&disk_content).map_err(|e| e.to_string())?;
                     ws.staging.stage(&path, hash);
                     staged_paths.push(path.clone());
                 }
@@ -451,9 +447,9 @@ pub(super) fn run_patch_session(
 
         if selected.iter().any(|&s| s) {
             let synthetic = apply_selected_hunks(&old_text, &new_text, &ops, &hunks, &selected);
-            let canonical = BlobNode::canonical_bytes(synthetic.as_bytes());
-            let hash = crate::hash::B3Hash::digest(&canonical);
-            cas.put(hash, &canonical).map_err(|e| e.to_string())?;
+            let (hash, _) = store
+                .put_blob(synthetic.as_bytes())
+                .map_err(|e| e.to_string())?;
             ws.staging.stage(&path, hash);
             staged_paths.push(path.clone());
         }

@@ -178,6 +178,57 @@ struct PreparedFile {
     observed: Option<u64>,
 }
 
+/// Stream a file of `size` bytes into the chunked encoding, storing its
+/// nodes in `sink` when given (otherwise only hashing). Memory use is one
+/// chunk, whatever the file size.
+fn chunk_file(
+    file: &mut fs::File,
+    size: u64,
+    sink: Option<&dyn Cas>,
+    path: &Path,
+) -> Result<B3Hash, WorkspaceError> {
+    let mut writer = crate::filechunk::ChunkWriter::new(sink);
+    let mut buffer = vec![0u8; 256 * 1024];
+    let mut read = 0u64;
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        read += n as u64;
+        writer.write(&buffer[..n])?;
+    }
+    if read != size {
+        return Err(WorkspaceError::Io(std::io::Error::other(format!(
+            "file changed while hashing: {}",
+            path.display()
+        ))));
+    }
+    Ok(writer.finish()?.0)
+}
+
+/// Stream a file into the whole-blob hash for `size` bytes.
+fn hash_whole_file(file: &mut fs::File, size: u64, path: &Path) -> Result<B3Hash, WorkspaceError> {
+    let mut hasher = BlobNode::hasher(size);
+    let mut buffer = [0u8; 64 * 1024];
+    let mut read = 0u64;
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        read += n as u64;
+        hasher.update(&buffer[..n]);
+    }
+    if read != size {
+        return Err(WorkspaceError::Io(std::io::Error::other(format!(
+            "file changed while hashing: {}",
+            path.display()
+        ))));
+    }
+    Ok(B3Hash::from_bytes(*hasher.finalize().as_bytes()))
+}
+
 fn prepare_file(
     cas: &dyn Cas,
     path: &Path,
@@ -195,11 +246,20 @@ fn prepare_file(
         });
     }
     let observed = FileCache::now();
-    let content = fs::read(path)?;
-    let hash = BlobNode::hash_content(&content);
-    if !cas.has(hash)? {
-        cas.put(hash, &BlobNode::canonical_bytes(&content))?;
-    }
+    let mut file = fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let hash = if FsStore::new(cas).chunks_file(size) {
+        // Chunks are stored as they are read; the root goes in last, so a
+        // present root (the cached fast path above) implies a whole tree.
+        chunk_file(&mut file, size, Some(cas), path)?
+    } else {
+        let content = fs::read(path)?;
+        let hash = BlobNode::hash_content(&content);
+        if !cas.has(hash)? {
+            cas.put(hash, &BlobNode::canonical_bytes(&content))?;
+        }
+        hash
+    };
     Ok(PreparedFile {
         hash,
         before,
@@ -612,6 +672,16 @@ impl<'a> Workspace<'a> {
             file_map.remove(path);
         }
         for (path, hash) in self.staging.staged_files() {
+            // Unchanged content sealed whole before a format-3 migration
+            // keeps its old hash rather than being re-encoded as a change.
+            if let Some(&parent) = file_map.get(path)
+                && parent != *hash
+                && store
+                    .same_content_as_unchunked(parent, *hash)
+                    .map_err(WorkspaceError::FsMerkle)?
+            {
+                continue;
+            }
             file_map.insert(path.clone(), *hash);
         }
 
@@ -714,7 +784,7 @@ impl<'a> Workspace<'a> {
             let state = if self.staging.is_staged(path) {
                 FileState::Staged
             } else if let Some(known_hash) = known_files.get(path.as_str()) {
-                if *known_hash == current_hash {
+                if *known_hash == current_hash || self.matches_unchunked(path, *known_hash)? {
                     FileState::Unmodified
                 } else {
                     FileState::Modified
@@ -758,24 +828,11 @@ impl<'a> Workspace<'a> {
         let observed = FileCache::now();
         let mut file = fs::File::open(&full_path).map_err(WorkspaceError::Io)?;
         let size = file.metadata().map_err(WorkspaceError::Io)?.len();
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(format!("blob {}\0", size).as_bytes());
-        let mut buffer = [0u8; 64 * 1024];
-        let mut read = 0u64;
-        loop {
-            let n = file.read(&mut buffer).map_err(WorkspaceError::Io)?;
-            if n == 0 {
-                break;
-            }
-            read += n as u64;
-            hasher.update(&buffer[..n]);
-        }
-        if read != size {
-            return Err(WorkspaceError::Io(std::io::Error::other(format!(
-                "file changed while hashing: {path}"
-            ))));
-        }
-        let hash = B3Hash::from_bytes(*hasher.finalize().as_bytes());
+        let hash = if FsStore::new(self.cas).chunks_file(size) {
+            chunk_file(&mut file, size, None, &full_path)?
+        } else {
+            hash_whole_file(&mut file, size, &full_path)?
+        };
         let after = Stamp::read(&full_path);
         if before != after {
             return Err(WorkspaceError::Io(std::io::Error::other(format!(
@@ -786,6 +843,35 @@ impl<'a> Workspace<'a> {
             .borrow_mut()
             .record(path, before, after, hash, observed);
         Ok(hash)
+    }
+
+    /// Whether the working file at `path` holds the content of `known`,
+    /// given that its current-encoding hash did not match. True only for a
+    /// large file sealed whole before a format-3 migration: its bytes are
+    /// hashed the old way once, and a match is cached so later checks are
+    /// a stat again.
+    fn matches_unchunked(&self, path: &str, known: B3Hash) -> Result<bool, WorkspaceError> {
+        let store = FsStore::new(self.cas);
+        let Some(size) = store.unchunked_large_blob_size(known)? else {
+            return Ok(false);
+        };
+        let full_path = self.work_dir.join(path);
+        let before = Stamp::read(&full_path);
+        let observed = FileCache::now();
+        let mut file = fs::File::open(&full_path).map_err(WorkspaceError::Io)?;
+        if file.metadata().map_err(WorkspaceError::Io)?.len() != size {
+            return Ok(false);
+        }
+        if hash_whole_file(&mut file, size, &full_path)? != known {
+            return Ok(false);
+        }
+        let after = Stamp::read(&full_path);
+        if before == after {
+            self.file_cache
+                .borrow_mut()
+                .record(path, before, after, known, observed);
+        }
+        Ok(true)
     }
 
     /// Materialize a tree hash to the working directory.
@@ -817,14 +903,22 @@ impl<'a> Workspace<'a> {
         // Write/update files
         for (path, (blob_hash, mode)) in &target_files {
             let full_path = self.work_dir.join(path);
-            let (_, content) = store
-                .load_blob(*blob_hash)
-                .map_err(WorkspaceError::FsMerkle)?;
-
             if let Some(parent) = full_path.parent() {
                 fs::create_dir_all(parent).map_err(WorkspaceError::Io)?;
             }
 
+            if *mode != crate::fsmerkle::MODE_SYMLINK
+                && store
+                    .is_chunked_blob(*blob_hash)
+                    .map_err(WorkspaceError::FsMerkle)?
+            {
+                self.write_chunked_entry(&store, &full_path, *blob_hash, *mode)?;
+                continue;
+            }
+
+            let (_, content) = store
+                .load_blob(*blob_hash)
+                .map_err(WorkspaceError::FsMerkle)?;
             self.write_entry(&full_path, &content, *mode)?;
         }
 
@@ -968,6 +1062,57 @@ impl<'a> Workspace<'a> {
         }
     }
 
+    /// Like [`Self::write_entry`] for a chunked (large, regular or
+    /// executable) file: streamed from the store to disk, and skipped when
+    /// the file there already hashes to the same tree.
+    fn write_chunked_entry(
+        &self,
+        store: &FsStore<'_>,
+        full_path: &Path,
+        hash: B3Hash,
+        mode: u32,
+    ) -> Result<(), WorkspaceError> {
+        let is_symlink = full_path
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        let unchanged = !is_symlink
+            && match fs::File::open(full_path) {
+                Ok(mut file) => {
+                    let size = file.metadata().map_err(WorkspaceError::Io)?.len();
+                    store.chunks_file(size)
+                        && chunk_file(&mut file, size, None, full_path).ok() == Some(hash)
+                }
+                Err(_) => false,
+            };
+        if !unchanged {
+            if is_symlink {
+                let _ = fs::remove_file(full_path);
+            }
+            let mut out =
+                std::io::BufWriter::new(fs::File::create(full_path).map_err(WorkspaceError::Io)?);
+            store
+                .write_blob_to(hash, &mut out)
+                .map_err(WorkspaceError::FsMerkle)?;
+            std::io::Write::flush(&mut out).map_err(WorkspaceError::Io)?;
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perm = if mode == crate::fsmerkle::MODE_EXEC {
+                0o755
+            } else {
+                0o644
+            };
+            fs::set_permissions(full_path, fs::Permissions::from_mode(perm))
+                .map_err(WorkspaceError::Io)?;
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        Ok(())
+    }
+
     /// Save workspace state to disk.
     pub fn save(&self) -> Result<(), WorkspaceError> {
         self.file_cache.borrow_mut().save(&self.ivaldi_dir);
@@ -1005,14 +1150,17 @@ impl<'a> Workspace<'a> {
             // so the common case — an unchanged file — must cost a stat, not
             // a read. Only content that actually has to be saved is loaded.
             if let Some(known_hash) = known_files.get(path.as_str())
-                && *known_hash == self.hash_working_file(path)?
+                && (*known_hash == self.hash_working_file(path)?
+                    || self.matches_unchunked(path, *known_hash)?)
             {
                 continue;
             }
 
             let full_path = self.work_dir.join(path);
             let content = fs::read(&full_path).map_err(WorkspaceError::Io)?;
-            let current_hash = BlobNode::hash_content(&content);
+            let current_hash = store
+                .blob_hash(&content)
+                .map_err(WorkspaceError::FsMerkle)?;
 
             match known_files.get(path.as_str()) {
                 Some(known_hash) if *known_hash == current_hash => {
@@ -2115,5 +2263,202 @@ mod tests {
 
         assert!(dir.path().join("keep.txt").exists());
         assert!(!dir.path().join("extra.txt").exists());
+    }
+
+    // ---- Chunked large files (format 3) ----
+
+    /// Distinct content across chunk boundaries, just over the threshold.
+    fn large_content(seed: u8) -> Vec<u8> {
+        let len = crate::filechunk::CHUNKED_FILE_THRESHOLD as usize + 3 * 1024 * 1024 + 17;
+        (0..len)
+            .map(|i| (i as u32).wrapping_mul(2_654_435_761).to_le_bytes()[i % 4] ^ seed)
+            .collect()
+    }
+
+    fn setup_chunked_workspace() -> (tempfile::TempDir, MemoryCas) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".ivaldi")).unwrap();
+        (dir, MemoryCas::with_chunked_files())
+    }
+
+    #[test]
+    fn large_file_is_gathered_as_a_chunk_tree_and_reads_back() {
+        let (dir, cas) = setup_chunked_workspace();
+        let content = large_content(1);
+        fs::write(dir.path().join("big.bin"), &content).unwrap();
+        fs::write(dir.path().join("small.txt"), "small").unwrap();
+
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        let ignore = PatternCache::new(&[]);
+        ws.gather_all(&ignore).unwrap();
+        let tree = ws.build_seal_tree(None).unwrap();
+        ws.staging.clear();
+
+        let store = FsStore::new(&cas);
+        let files = ws.list_tree_files(tree).unwrap();
+        assert!(store.is_chunked_blob(files["big.bin"]).unwrap());
+        assert!(!store.is_chunked_blob(files["small.txt"]).unwrap());
+        assert_eq!(files["big.bin"], store.blob_hash(&content).unwrap());
+        assert_eq!(store.load_blob(files["big.bin"]).unwrap().1, content);
+
+        // Status hashes the working file the same way: clean.
+        let status = ws.status(Some(tree), &ignore).unwrap();
+        assert!(status.iter().all(|f| f.state == FileState::Unmodified));
+    }
+
+    #[test]
+    fn editing_a_large_file_stores_only_the_changed_chunk() {
+        let (dir, cas) = setup_chunked_workspace();
+        let mut content = large_content(2);
+        fs::write(dir.path().join("big.bin"), &content).unwrap();
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        let ignore = PatternCache::new(&[]);
+        ws.gather_all(&ignore).unwrap();
+        let first = ws.build_seal_tree(None).unwrap();
+        ws.staging.clear();
+        let before = cas.len();
+
+        content[crate::filechunk::CHUNK_SIZE * 2 + 5] ^= 0xFF;
+        fs::write(dir.path().join("big.bin"), &content).unwrap();
+        let status = ws.status(Some(first), &ignore).unwrap();
+        assert_eq!(status[0].state, FileState::Modified);
+        ws.gather_all(&ignore).unwrap();
+        ws.build_seal_tree(Some(first)).unwrap();
+
+        // New chunk leaf + new root + new tree node.
+        assert_eq!(cas.len() - before, 3);
+    }
+
+    #[test]
+    fn materialize_streams_large_files_and_skips_identical_ones() {
+        let (dir, cas) = setup_chunked_workspace();
+        let store = FsStore::new(&cas);
+        let content = large_content(3);
+        let (big, _) = store.put_blob(&content).unwrap();
+        let root = store
+            .put_tree(vec![Entry {
+                name: "tool".into(),
+                mode: crate::fsmerkle::MODE_EXEC,
+                kind: NodeKind::Blob,
+                hash: big,
+            }])
+            .unwrap();
+
+        let ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        ws.materialize(root).unwrap();
+        let path = dir.path().join("tool");
+        assert_eq!(fs::read(&path).unwrap(), content);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+
+        // Already identical: left alone (mtime unchanged).
+        let stamp = fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        ws.materialize(root).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), stamp);
+
+        // Changed on disk: rewritten.
+        fs::write(&path, b"clobbered").unwrap();
+        ws.materialize(root).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), content);
+    }
+
+    /// A large file sealed as one whole blob before a format-3 migration.
+    fn sealed_whole(cas: &MemoryCas, content: &[u8]) -> (B3Hash, B3Hash) {
+        let blob = BlobNode::hash_content(content);
+        cas.put(blob, &BlobNode::canonical_bytes(content)).unwrap();
+        let tree = FsStore::new(cas)
+            .put_tree(vec![Entry {
+                name: "big.bin".into(),
+                mode: MODE_FILE,
+                kind: NodeKind::Blob,
+                hash: blob,
+            }])
+            .unwrap();
+        (blob, tree)
+    }
+
+    #[test]
+    fn pre_migration_whole_blob_is_unmodified_not_re_encoded() {
+        let (dir, cas) = setup_chunked_workspace();
+        let content = large_content(4);
+        let (blob, tree) = sealed_whole(&cas, &content);
+        fs::write(dir.path().join("big.bin"), &content).unwrap();
+
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        let ignore = PatternCache::new(&[]);
+        let status = ws.status(Some(tree), &ignore).unwrap();
+        assert_eq!(status[0].state, FileState::Unmodified);
+        assert!(ws.capture_changes(Some(tree), &ignore).unwrap().is_empty());
+
+        // Gathering stages the new encoding, but sealing recognises the same
+        // bytes and keeps the tree identical.
+        ws.gather_all(&ignore).unwrap();
+        assert_ne!(ws.staging.staged_files()["big.bin"], blob);
+        assert_eq!(ws.build_seal_tree(Some(tree)).unwrap(), tree);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pre_migration_match_is_cached_so_later_checks_are_a_stat() {
+        let (dir, cas) = setup_chunked_workspace();
+        let content = large_content(8);
+        let (blob, tree) = sealed_whole(&cas, &content);
+        fs::write(dir.path().join("big.bin"), &content).unwrap();
+        // Settle mtime and ctime beyond the cache's conservative window.
+        std::thread::sleep(std::time::Duration::from_secs(4));
+
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        let ignore = PatternCache::new(&[]);
+        assert_eq!(
+            ws.status(Some(tree), &ignore).unwrap()[0].state,
+            FileState::Unmodified
+        );
+        assert_eq!(ws.hash_working_file("big.bin").unwrap(), blob);
+        // Gather takes the cached hash: nothing re-encoded, nothing stored.
+        let before = cas.len();
+        ws.gather_all(&ignore).unwrap();
+        assert_eq!(ws.staging.staged_files()["big.bin"], blob);
+        assert_eq!(cas.len(), before);
+    }
+
+    #[test]
+    fn pre_migration_whole_blob_with_new_content_is_a_real_change() {
+        let (dir, cas) = setup_chunked_workspace();
+        let (_, tree) = sealed_whole(&cas, &large_content(5));
+        let edited = large_content(6);
+        fs::write(dir.path().join("big.bin"), &edited).unwrap();
+
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        let ignore = PatternCache::new(&[]);
+        assert_eq!(
+            ws.status(Some(tree), &ignore).unwrap()[0].state,
+            FileState::Modified
+        );
+        ws.gather_all(&ignore).unwrap();
+        let next = ws.build_seal_tree(Some(tree)).unwrap();
+        let store = FsStore::new(&cas);
+        let files = ws.list_tree_files(next).unwrap();
+        assert!(store.is_chunked_blob(files["big.bin"]).unwrap());
+        assert_eq!(store.load_blob(files["big.bin"]).unwrap().1, edited);
+    }
+
+    #[test]
+    fn format2_workspace_keeps_large_files_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".ivaldi")).unwrap();
+        let cas = MemoryCas::with_hamt_dirs();
+        let content = large_content(7);
+        fs::write(dir.path().join("big.bin"), &content).unwrap();
+        let mut ws = Workspace::new(&cas, dir.path(), dir.path().join(".ivaldi"));
+        ws.gather_all(&PatternCache::new(&[])).unwrap();
+        let hash = ws.staging.staged_files()["big.bin"];
+        assert_eq!(hash, BlobNode::hash_content(&content));
     }
 }

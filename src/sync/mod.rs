@@ -22,9 +22,11 @@ use crate::repo::Repo;
 use crate::ssh_transport::SshClient;
 
 mod import;
+mod relocate;
 mod timeline_sync;
 
 pub use import::{ImportResult, import_full_history, parse_iso8601_to_unix};
+pub use relocate::{PortalRelocation, refresh_portal};
 pub use timeline_sync::{SyncResult, sync_timeline};
 
 pub use crate::resolve::Collisions;
