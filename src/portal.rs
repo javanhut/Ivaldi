@@ -429,6 +429,28 @@ impl PortalManager {
         Ok(true)
     }
 
+    /// Replace the portal matching `old` with `new` in place, so a renamed
+    /// remote keeps its position (and default status). An existing entry for
+    /// `new` is dropped rather than duplicated. Returns false if `old` is not
+    /// configured.
+    pub fn relocate(&self, old: &Portal, new: &Portal) -> Result<bool, PortalError> {
+        let mut portals = self.list()?;
+        let old_repr = old.to_string_repr();
+        let Some(pos) = portals.iter().position(|p| p.matches_repr(&old_repr)) else {
+            return Ok(false);
+        };
+        portals[pos] = new.clone();
+        let new_repr = new.to_string_repr();
+        let mut index = 0;
+        portals.retain(|p| {
+            let keep = index == pos || !p.matches_repr(&new_repr);
+            index += 1;
+            keep
+        });
+        self.save(&portals)?;
+        Ok(true)
+    }
+
     fn save(&self, portals: &[Portal]) -> Result<(), PortalError> {
         let mut lines = Vec::new();
         for portal in portals {
@@ -936,5 +958,26 @@ mod tests {
     fn empty_list() {
         let (_dir, mgr) = setup();
         assert!(mgr.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn relocate_keeps_position_and_drops_duplicates() {
+        let (_dir, mgr) = setup();
+        mgr.add(&Portal::parse("old/name").unwrap()).unwrap();
+        mgr.add(&Portal::parse("other/repo").unwrap()).unwrap();
+        mgr.add(&Portal::parse("new/name").unwrap()).unwrap();
+
+        let old = Portal::parse("old/name").unwrap();
+        let new = Portal::parse("new/name").unwrap();
+        assert!(mgr.relocate(&old, &new).unwrap());
+        let reprs: Vec<String> = mgr
+            .list()
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string_repr())
+            .collect();
+        assert_eq!(reprs, ["new/name", "other/repo"]);
+
+        assert!(!mgr.relocate(&old, &new).unwrap());
     }
 }

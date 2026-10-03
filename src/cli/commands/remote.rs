@@ -36,6 +36,24 @@ fn resolve_portal(mgr: &PortalManager, name: Option<&str>) -> Result<Portal, Str
     }
 }
 
+/// Follow the portal's repository if it was renamed or transferred remotely,
+/// updating the stored portal so the user never has to.
+fn follow_portal(
+    ivaldi_dir: &std::path::Path,
+    portal: &mut Portal,
+    client: &crate::github::GitHubClient,
+    quiet: bool,
+) {
+    if let Some(moved) = crate::sync::refresh_portal(ivaldi_dir, portal, client)
+        && !quiet
+    {
+        eprintln!(
+            "Portal {} moved on the remote to {}; portal updated.",
+            moved.from, moved.to
+        );
+    }
+}
+
 pub(super) fn cmd_portal(args: PortalArgs, quiet: bool) -> Result<(), String> {
     let ctx = find_repo()?;
     let mgr = PortalManager::new(&ctx.ivaldi_dir);
@@ -591,8 +609,10 @@ pub(super) fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
 
     let mut repo = open_repo()?;
 
+    let client = GitHubClient::new();
     let portal_mgr = PortalManager::new(&repo.ivaldi_dir);
-    let portal = resolve_portal(&portal_mgr, args.portal.as_deref())?;
+    let mut portal = resolve_portal(&portal_mgr, args.portal.as_deref())?;
+    follow_portal(&repo.ivaldi_dir, &mut portal, &client, quiet);
 
     // SSH push — bypass the GitHub auth check entirely.
     if let Transport::Ssh(target) = portal.transport() {
@@ -735,7 +755,6 @@ pub(super) fn cmd_upload(args: UploadArgs, quiet: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    let client = GitHubClient::new();
     if !client.is_authenticated() {
         return Err("not authenticated. Run 'ivaldi auth login' or set GITHUB_TOKEN.".into());
     }
@@ -812,10 +831,11 @@ pub(super) fn cmd_scout(_args: ScoutArgs) -> Result<(), String> {
     let repo = open_repo()?;
     let client = GitHubClient::new();
     let portal_mgr = PortalManager::new(&repo.ivaldi_dir);
-    let portal = portal_mgr
+    let mut portal = portal_mgr
         .get_default()
         .map_err(|e| e.to_string())?
         .ok_or("no portal configured. Run 'ivaldi portal add owner/repo'.")?;
+    follow_portal(&repo.ivaldi_dir, &mut portal, &client, false);
 
     let branches = sync::scout_with_status(&client, &repo, &portal).map_err(|e| e.to_string())?;
 
@@ -840,10 +860,11 @@ pub(super) fn cmd_harvest(args: HarvestArgs, quiet: bool) -> Result<(), String> 
     let mut repo = open_repo()?;
     let client = GitHubClient::new();
     let portal_mgr = PortalManager::new(&repo.ivaldi_dir);
-    let portal = portal_mgr
+    let mut portal = portal_mgr
         .get_default()
         .map_err(|e| e.to_string())?
         .ok_or("no portal configured. Run 'ivaldi portal add owner/repo'.")?;
+    follow_portal(&repo.ivaldi_dir, &mut portal, &client, quiet);
 
     if args.timelines.is_empty() {
         // List available and prompt
@@ -874,7 +895,8 @@ pub(super) fn cmd_sync(args: SyncArgs, quiet: bool) -> Result<(), String> {
     let mut repo = open_repo()?;
     let client = GitHubClient::new();
     let portal_mgr = PortalManager::new(&repo.ivaldi_dir);
-    let portal = resolve_portal(&portal_mgr, args.portal.as_deref())?;
+    let mut portal = resolve_portal(&portal_mgr, args.portal.as_deref())?;
+    follow_portal(&repo.ivaldi_dir, &mut portal, &client, quiet);
 
     let timeline = args
         .timeline

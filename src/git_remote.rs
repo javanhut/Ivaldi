@@ -21,6 +21,9 @@ use crate::remote::RemoteBranch;
 
 const GITHUB_BASE: &str = "https://github.com";
 
+/// Redirects followed during ref discovery before giving up.
+const MAX_REDIRECTS: usize = 5;
+
 /// Capabilities advertised on the first `want` line. `shallow` is what earns
 /// the right to send `deepen` and to receive the server's `shallow` boundary
 /// lines back; the rest are the framing/encoding we already handle.
@@ -166,6 +169,8 @@ pub struct SmartHttpClient {
     include_tags: bool,
     spool_dir: Option<PathBuf>,
     negotiation: Negotiation,
+    /// Base URL the server permanently redirected discovery to, if any.
+    relocated: std::sync::Mutex<Option<String>>,
 }
 
 /// What the local repository already holds, offered to the server so the
@@ -241,6 +246,12 @@ impl SmartHttpClient {
             .timeout_connect(Some(std::time::Duration::from_secs(30)))
             .timeout_recv_response(Some(std::time::Duration::from_secs(120)))
             .http_status_as_error(false)
+            // Redirects are followed by `discover_refs` itself, which keeps
+            // the token on same-host hops and learns where a renamed
+            // repository moved to. ureq would drop the token (so a private
+            // renamed repo 404s) and silently turn a redirected POST into a
+            // GET.
+            .max_redirects(0)
             .build()
             .new_agent();
         Self {
@@ -250,7 +261,22 @@ impl SmartHttpClient {
             include_tags: false,
             spool_dir: None,
             negotiation: Negotiation::default(),
+            relocated: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The base URL the remote permanently moved to (HTTP 301/308 during ref
+    /// discovery), e.g. after the repository was renamed or transferred.
+    /// `None` if no request so far was redirected, or only temporarily.
+    pub fn relocated_base(&self) -> Option<String> {
+        self.relocated.lock().ok().and_then(|r| r.clone())
+    }
+
+    /// Ask the server whether the repository at `base` has permanently moved,
+    /// returning its new base URL if so. Costs one ref advertisement.
+    pub fn find_relocation(&self, base: &str) -> Result<Option<String>, GitRemoteError> {
+        self.discover_refs(base.trim_end_matches('/'), "git-upload-pack")?;
+        Ok(self.relocated_base())
     }
 
     /// Tell the server what is already held locally so it sends only the
@@ -304,15 +330,15 @@ impl SmartHttpClient {
         base: &str,
         branch: Option<&str>,
     ) -> Result<FetchResult, GitRemoteError> {
-        let base = base.trim_end_matches('/');
-        let discovery = self.discover_refs(base, "git-upload-pack")?;
+        let (discovery, base) =
+            self.discover_refs(base.trim_end_matches('/'), "git-upload-pack")?;
         let (branch_name, head_sha) = select_branch_from_discovery(&discovery, branch)?;
         let extra_wants = if self.include_tags {
             tag_wants(&discovery.refs, &head_sha)
         } else {
             negotiated_tag_wants(&discovery.refs, &self.negotiation, &head_sha)
         };
-        let received = self.fetch_pack(base, &head_sha, &extra_wants)?;
+        let received = self.fetch_pack(&base, &head_sha, &extra_wants)?;
 
         Ok(FetchResult {
             branch: branch_name,
@@ -334,8 +360,7 @@ impl SmartHttpClient {
 
     /// List branch refs from an explicit smart-HTTP base URL (generic host).
     pub fn list_branch_refs_url(&self, base: &str) -> Result<Vec<RemoteBranch>, GitRemoteError> {
-        let base = base.trim_end_matches('/');
-        let discovery = self.discover_refs(base, "git-upload-pack")?;
+        let (discovery, _) = self.discover_refs(base.trim_end_matches('/'), "git-upload-pack")?;
         let mut branches: Vec<RemoteBranch> = discovery
             .refs
             .into_iter()
@@ -361,63 +386,141 @@ impl SmartHttpClient {
 
     /// Fetch the smart-HTTP ref advertisement for `service`
     /// (`git-upload-pack` for fetch, `git-receive-pack` for push).
-    fn discover_refs(&self, base: &str, service: &str) -> Result<Discovery, GitRemoteError> {
+    ///
+    /// Returns the advertisement and the base URL it was served from, which
+    /// differs from `base` when the server redirected (a renamed or
+    /// transferred repository). Later requests must go to that base: the
+    /// POST endpoints are not redirected by every host, and a client that
+    /// follows a redirected POST risks resending it as a GET.
+    fn discover_refs(
+        &self,
+        base: &str,
+        service: &str,
+    ) -> Result<(Discovery, String), GitRemoteError> {
         let pb = progress::spinner("Discovering remote refs");
         let url = format!("{}/info/refs?service={}", base, service);
         let accept = format!("application/x-{}-advertisement", service);
-        let do_call =
-            |token: Option<&str>| -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
-                let mut r = self
-                    .agent
-                    .get(&url)
-                    .header("Accept", accept.as_str())
-                    .header("User-Agent", "ivaldi-vcs/0.1.0");
-                if let Some(t) = token {
-                    r = r.header("Authorization", basic_auth_header(t));
-                }
-                r.call()
-            };
+        let do_call = |token: Option<&str>| -> Result<Redirected, GitRemoteError> {
+            self.get_following_redirects(&url, &accept, token)
+        };
 
-        let resp = match do_call(self.token.as_deref()) {
-            Ok(resp) => {
-                if !resp.status().is_success() {
-                    if self.token.is_some() && is_auth_failure(&resp) {
+        let fetched = match do_call(self.token.as_deref()) {
+            Ok(first) => {
+                if !first.response.status().is_success() {
+                    if self.token.is_some() && is_auth_failure(&first.response) {
                         crate::logging::warn(
                             "GitHub rejected the stored authentication token — retrying anonymously",
                         );
                         match do_call(None) {
-                            Ok(resp2) => {
-                                if !resp2.status().is_success() {
+                            Ok(second) => {
+                                if !second.response.status().is_success() {
                                     pb.finish_and_clear();
-                                    return Err(token_rejected_or(resp2));
+                                    return Err(token_rejected_or(second.response));
                                 }
-                                resp2
+                                second
                             }
                             Err(e2) => {
                                 pb.finish_and_clear();
-                                return Err(map_transport_error(e2));
+                                return Err(e2);
                             }
                         }
                     } else {
                         pb.finish_and_clear();
-                        return Err(map_response_error(resp));
+                        return Err(map_response_error(first.response));
                     }
                 } else {
-                    resp
+                    first
                 }
             }
             Err(err) => {
                 pb.finish_and_clear();
-                return Err(map_transport_error(err));
+                return Err(err);
             }
         };
+
+        let final_base = if fetched.url == url {
+            base.to_string()
+        } else {
+            let moved = smart_http_base(&fetched.url).ok_or_else(|| {
+                GitRemoteError::Protocol(format!(
+                    "{} redirected to {}, which is not a Git smart-HTTP endpoint",
+                    url, fetched.url
+                ))
+            })?;
+            if fetched.permanent
+                && let Ok(mut relocated) = self.relocated.lock()
+            {
+                *relocated = Some(moved.clone());
+            }
+            moved
+        };
+
         let mut bytes = Vec::new();
-        resp.into_body()
+        fetched
+            .response
+            .into_body()
             .into_reader()
             .read_to_end(&mut bytes)
             .map_err(|e| GitRemoteError::Io(e.to_string()))?;
         pb.finish_with_message("Remote refs discovered");
-        parse_discovery(&bytes)
+        Ok((parse_discovery(&bytes)?, final_base))
+    }
+
+    /// GET `url`, following up to [`MAX_REDIRECTS`] redirects by hand.
+    ///
+    /// The token travels only to the host it was meant for; a redirect to
+    /// another host proceeds anonymously, and a downgrade from `https` to
+    /// `http` is refused outright so the token can never leak in clear text.
+    fn get_following_redirects(
+        &self,
+        url: &str,
+        accept: &str,
+        token: Option<&str>,
+    ) -> Result<Redirected, GitRemoteError> {
+        let origin_host = crate::portal::http_host(url);
+        let mut current = url.to_string();
+        let mut permanent = true;
+        for _ in 0..=MAX_REDIRECTS {
+            let mut r = self
+                .agent
+                .get(&current)
+                .header("Accept", accept)
+                .header("User-Agent", "ivaldi-vcs/0.1.0");
+            if let Some(t) = token
+                && same_host(origin_host.as_deref(), &current)
+            {
+                r = r.header("Authorization", basic_auth_header(t));
+            }
+            let resp = r.call().map_err(map_transport_error)?;
+            let status = resp.status().as_u16();
+            if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+                return Ok(Redirected {
+                    response: resp,
+                    url: current,
+                    permanent,
+                });
+            }
+            let next = header_value(&resp, "Location")
+                .and_then(|loc| resolve_location(&current, loc))
+                .ok_or_else(|| {
+                    GitRemoteError::Protocol(format!(
+                        "HTTP {} redirect from {} without a usable Location",
+                        status, current
+                    ))
+                })?;
+            if is_downgrade(&current, &next) {
+                return Err(GitRemoteError::Protocol(format!(
+                    "refusing redirect from {} to insecure {}",
+                    current, next
+                )));
+            }
+            permanent &= matches!(status, 301 | 308);
+            current = next;
+        }
+        Err(GitRemoteError::Protocol(format!(
+            "too many redirects fetching {}",
+            url
+        )))
     }
 
     fn fetch_pack(
@@ -549,7 +652,8 @@ impl SmartHttpClient {
             })?;
 
         // ---- Discover the remote's receive-pack advertisement.
-        let discovery = self.discover_refs(base, "git-receive-pack")?;
+        let (discovery, base) = self.discover_refs(base, "git-receive-pack")?;
+        let base = base.as_str();
         let target_ref = format!("refs/heads/{}", branch);
         let old_sha1 = discovery
             .refs
@@ -903,6 +1007,53 @@ pub(crate) struct Discovery {
 
 fn header_value<'a>(resp: &'a ureq::http::Response<ureq::Body>, name: &str) -> Option<&'a str> {
     resp.headers().get(name).and_then(|v| v.to_str().ok())
+}
+
+/// A response reached by following redirects, and where it came from.
+struct Redirected {
+    response: ureq::http::Response<ureq::Body>,
+    /// URL that produced `response` (the original one if not redirected).
+    url: String,
+    /// Every hop was permanent (301/308), so the move should be remembered.
+    permanent: bool,
+}
+
+fn same_host(origin_host: Option<&str>, url: &str) -> bool {
+    match (origin_host, crate::portal::http_host(url)) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(&b),
+        _ => false,
+    }
+}
+
+/// Resolve a `Location` header against the URL that returned it. Handles
+/// absolute URLs and absolute paths, which is what Git hosts send.
+fn resolve_location(current: &str, location: &str) -> Option<String> {
+    let location = location.trim();
+    if location.starts_with("https://") || location.starts_with("http://") {
+        return Some(location.to_string());
+    }
+    let (scheme, rest) = current.split_once("://")?;
+    let authority = rest.split('/').next()?;
+    if let Some(net_path) = location.strip_prefix("//") {
+        return Some(format!("{}://{}", scheme, net_path));
+    }
+    if location.starts_with('/') {
+        return Some(format!("{}://{}{}", scheme, authority, location));
+    }
+    None
+}
+
+/// A redirect from `https` to anything else, which would expose the token.
+fn is_downgrade(current: &str, next: &str) -> bool {
+    current.starts_with("https://") && !next.starts_with("https://")
+}
+
+/// Smart-HTTP base URL of a ref-discovery URL: everything before
+/// `/info/refs`.
+fn smart_http_base(discovery_url: &str) -> Option<String> {
+    let path_end = discovery_url.find('?').unwrap_or(discovery_url.len());
+    let base = discovery_url[..path_end].strip_suffix("/info/refs")?;
+    (!base.is_empty()).then(|| base.to_string())
 }
 
 /// True for status codes that suggest the token was the problem, not the repo.
@@ -3660,5 +3811,137 @@ mod tests {
         let remote_tip = "ef".repeat(20);
         mapping.insert(&remote_tip, other.hash());
         assert!(check_push_fast_forward(&repo, &mapping, "main", &remote_tip, 0, false).is_err());
+    }
+
+    #[test]
+    fn location_resolves_against_the_redirecting_url() {
+        let cur = "https://github.com/old/repo.git/info/refs?service=git-upload-pack";
+        assert_eq!(
+            resolve_location(cur, "/new/repo.git/info/refs?service=git-upload-pack").as_deref(),
+            Some("https://github.com/new/repo.git/info/refs?service=git-upload-pack")
+        );
+        assert_eq!(
+            resolve_location(cur, "https://other.example/x.git/info/refs").as_deref(),
+            Some("https://other.example/x.git/info/refs")
+        );
+        assert_eq!(
+            resolve_location(cur, "//mirror.example/x.git/info/refs").as_deref(),
+            Some("https://mirror.example/x.git/info/refs")
+        );
+        assert_eq!(resolve_location(cur, "relative/path"), None);
+    }
+
+    #[test]
+    fn smart_http_base_strips_the_discovery_suffix() {
+        assert_eq!(
+            smart_http_base("https://github.com/new/repo.git/info/refs?service=git-receive-pack")
+                .as_deref(),
+            Some("https://github.com/new/repo.git")
+        );
+        assert_eq!(smart_http_base("https://github.com/login"), None);
+    }
+
+    /// One-connection-per-response HTTP server recording each request.
+    fn serve(responses: Vec<String>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for response in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut request = [0u8; 8192];
+                let n = stream.read(&mut request).unwrap();
+                log.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request[..n]).into_owned());
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (base, seen)
+    }
+
+    fn redirect_to(status: &str, location: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    fn receive_pack_advertisement() -> String {
+        let mut body = pkt_line("# service=git-receive-pack\n");
+        body.extend_from_slice(b"0000");
+        body.extend(pkt_line(&format!(
+            "{} refs/heads/main\0report-status\n",
+            "1".repeat(40)
+        )));
+        body.extend_from_slice(b"0000");
+        let body = String::from_utf8(body).unwrap();
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    #[test]
+    fn discovery_follows_a_rename_with_the_token_and_records_it() {
+        let (base, seen) = serve(vec![
+            redirect_to(
+                "301 Moved Permanently",
+                "/new/repo.git/info/refs?service=git-receive-pack",
+            ),
+            receive_pack_advertisement(),
+        ]);
+        let client = SmartHttpClient::new(Some("secret"));
+        let (discovery, final_base) = client
+            .discover_refs(&format!("{base}/old/repo.git"), "git-receive-pack")
+            .unwrap();
+
+        assert_eq!(final_base, format!("{base}/new/repo.git"));
+        assert_eq!(client.relocated_base(), Some(final_base));
+        assert!(discovery.refs.iter().any(|r| r.name == "refs/heads/main"));
+        let requests = seen.lock().unwrap();
+        assert!(requests[1].starts_with("GET /new/repo.git/info/refs?"));
+        assert!(requests[1].contains(&basic_auth_header("secret")));
+    }
+
+    #[test]
+    fn cross_host_redirect_drops_the_token() {
+        let (target, seen_target) = serve(vec![receive_pack_advertisement()]);
+        let (origin, _) = serve(vec![redirect_to(
+            "302 Found",
+            &format!("{target}/repo.git/info/refs?service=git-receive-pack"),
+        )]);
+        let client = SmartHttpClient::new(Some("secret"));
+        let (_, final_base) = client
+            .discover_refs(&format!("{origin}/repo.git"), "git-receive-pack")
+            .unwrap();
+
+        assert_eq!(final_base, format!("{target}/repo.git"));
+        // Temporary: used for this operation, not remembered.
+        assert_eq!(client.relocated_base(), None);
+        assert!(!seen_target.lock().unwrap()[0].contains("Authorization"));
+    }
+
+    #[test]
+    fn https_to_http_redirect_is_a_downgrade() {
+        assert!(is_downgrade(
+            "https://example.com/a",
+            "http://example.com/a"
+        ));
+        assert!(!is_downgrade(
+            "https://example.com/a",
+            "https://example.com/b"
+        ));
+        assert!(!is_downgrade(
+            "http://example.com/a",
+            "https://example.com/a"
+        ));
+        assert!(!is_downgrade(
+            "http://example.com/a",
+            "http://example.com/b"
+        ));
     }
 }

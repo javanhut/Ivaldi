@@ -251,12 +251,14 @@ impl RemoteView {
         self.busy = true;
         self.status_message = Some(("Scouting remote timelines...".into(), false));
 
-        let portal_clone = portal.clone();
+        let mut portal_clone = portal.clone();
+        let ivaldi_dir = ctx.ivaldi_dir.clone();
 
         if let Some(tx) = self.bg_sender.clone() {
             std::thread::spawn(move || {
                 let result = {
                     let client = crate::github::GitHubClient::new();
+                    crate::sync::refresh_portal(&ivaldi_dir, &mut portal_clone, &client);
                     crate::sync::scout(&client, &portal_clone).map_err(|e| e.to_string())
                 };
                 let _ = tx.send(BgResult::ScoutDone(result));
@@ -277,8 +279,8 @@ impl RemoteView {
         self.busy = true;
         self.status_message = Some(("Uploading...".into(), false));
 
-        let owner = portal.owner.clone();
-        let repo_name = portal.repo.clone();
+        let mut portal = portal;
+        let ivaldi_dir = ctx.ivaldi_dir.clone();
         let work_dir = ctx.work_dir.clone();
 
         if let Some(tx) = self.bg_sender.clone() {
@@ -288,6 +290,8 @@ impl RemoteView {
                     if !client.is_authenticated() {
                         return Err("Not authenticated".to_string());
                     }
+                    crate::sync::refresh_portal(&ivaldi_dir, &mut portal, &client);
+                    let (owner, repo_name) = (portal.owner.clone(), portal.repo.clone());
                     let mut repo = crate::repo::Repo::open(&work_dir).map_err(|e| e.to_string())?;
                     let timeline = repo.current_timeline().map_err(|e| e.to_string())?;
                     let report = crate::git_remote::SmartHttpClient::new(client.token())
@@ -326,8 +330,8 @@ impl RemoteView {
         self.busy = true;
         self.status_message = Some(("Syncing...".into(), false));
 
-        let owner = portal.owner.clone();
-        let repo_name = portal.repo.clone();
+        let mut portal = portal;
+        let ivaldi_dir = ctx.ivaldi_dir.clone();
         let work_dir = ctx.work_dir.clone();
 
         if let Some(tx) = self.bg_sender.clone() {
@@ -337,6 +341,8 @@ impl RemoteView {
                     if !client.is_authenticated() {
                         return Err("Not authenticated".to_string());
                     }
+                    crate::sync::refresh_portal(&ivaldi_dir, &mut portal, &client);
+                    let (owner, repo_name) = (portal.owner.clone(), portal.repo.clone());
                     let mut repo = crate::repo::Repo::open(&work_dir).map_err(|e| e.to_string())?;
                     let timeline = repo.current_timeline().map_err(|e| e.to_string())?;
                     // The user explicitly triggered this sync from the TUI,
@@ -385,13 +391,15 @@ impl RemoteView {
         self.busy = true;
         self.status_message = Some(("Harvesting...".into(), false));
 
-        let portal_clone = portal.clone();
+        let mut portal_clone = portal.clone();
+        let ivaldi_dir = ctx.ivaldi_dir.clone();
         let work_dir = ctx.work_dir.clone();
 
         if let Some(tx) = self.bg_sender.clone() {
             std::thread::spawn(move || {
                 let result = (|| -> Result<String, String> {
                     let client = crate::github::GitHubClient::new();
+                    crate::sync::refresh_portal(&ivaldi_dir, &mut portal_clone, &client);
                     let mut repo = crate::repo::Repo::open(&work_dir).map_err(|e| e.to_string())?;
                     crate::sync::harvest(&client, &mut repo, &portal_clone, &names)
                         .map(|harvested| format!("Harvested {} timeline(s)", harvested.len()))
