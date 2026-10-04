@@ -863,6 +863,19 @@ pub(crate) fn plan_push(
             .unwrap_or_else(|| ZERO_SHA1.to_string())
     };
 
+    // A remote tip mapped to a local fuse seal (written by older syncs) would
+    // make the fuse seal's own files look like they are already on the server,
+    // so they would be left out of the pack. Repair that before planning.
+    let mut healed_mapping = mapping.clone();
+    if crate::remote::heal_sync_fuse_aliases(repo, &mut healed_mapping)
+        && let Err(e) = healed_mapping.save()
+    {
+        crate::logging::warn(&format!(
+            "could not save the repaired Git identity map: {e}"
+        ));
+    }
+    let mapping = &healed_mapping;
+
     let (server_has, remote_tree_roots) = advertised_remote_state(repo, advertised, mapping)?;
 
     let tags = if include_tags {

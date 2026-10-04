@@ -29,6 +29,19 @@ collisions is the caller's choice, passed as `Collisions`:
 Except for `Markers`, a sync that does not integrate leaves no trace: no
 scratch timeline (bar `Park`'s), no journal, no open merge, no `oops` entry.
 
+**The fuse seal never borrows the remote tip's identity.** A diverged sync
+records the tip it merged in the fuse seal's `sync.remote_tip` metadata, is
+authored by the configured `user.name <user.email>` (falling back to
+`ivaldi-sync <ivaldi-sync@localhost>`), and keeps the remote tip's SHA-1
+mapped to the *imported* seal that really is that commit — the fuse seal's
+merge parent. The next sync still finds the tip there, because merge parents
+of the local chain count as reachable. Older versions mapped the tip to the
+fuse seal itself; push then believed the server already had the fuse seal
+and every file in it, left the merged files out of the pack, and the server
+rejected it with "index-pack failed". `remote::heal_sync_fuse_aliases`
+repairs such mappings: `plan_push` runs it before every push, and
+`sync_timeline` before every full ancestor search.
+
 All public paths are re-exported from `mod.rs`, so callers still use
 `crate::sync::upload(...)` etc. `SyncError` carries typed `#[from]`
 variants (`Repo`, `Forge`, `GitRemote`, `Cas`, `FsMerkle`, `Remote`,

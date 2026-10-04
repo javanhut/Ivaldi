@@ -123,6 +123,14 @@ pub fn sync_timeline(
         return Ok(up_to_date_result());
     }
 
+    // Older syncs mapped a remote tip to the local fuse seal. Undo that before
+    // classifying: the fuse seal is local work the remote does not have, so
+    // treating it as the remote tip would misread a diverged timeline as a
+    // fast-forward and lose the local side.
+    if crate::remote::heal_sync_fuse_aliases(repo, &mut hash_mapping) {
+        hash_mapping.save()?;
+    }
+
     // Track commits with stale mappings so we skip them on re-search
     let mut stale_shas: BTreeSet<String> = BTreeSet::new();
 
@@ -462,6 +470,12 @@ fn count_new_local_commits(
                 }
                 if let Ok(Some(leaf)) = repo.get_leaf(idx) {
                     count += 1;
+                    // A fuse seal merged the ancestor in as its second parent:
+                    // everything before it on this side is already accounted
+                    // for by the merge.
+                    if leaf.merge_idxs.contains(&ancestor) {
+                        break;
+                    }
                     cur = if leaf.has_parent() {
                         Some(leaf.prev_idx)
                     } else {
@@ -691,10 +705,17 @@ fn sync_diverged(
     // Create fuse commit
     let their_head = their_head_idx.unwrap_or(crate::leaf::NO_PARENT);
 
+    // The fuse seal is published like any other seal, so it needs a complete
+    // "Name <email>" identity; Git hosts reject a commit whose author has no
+    // email. Use whoever is running the sync, as `fuse` does.
+    let author = repo
+        .config()
+        .author()
+        .unwrap_or_else(|| SYNC_FALLBACK_AUTHOR.to_string());
     let mut fuse_leaf = Leaf::new(
         merged_tree,
         timeline,
-        "ivaldi-sync",
+        &author,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -731,9 +752,10 @@ fn sync_diverged(
     // Update workspace
     checkout_tree_to_workspace(repo, &store, timeline)?;
 
-    // Map remote tip SHA to the fuse commit so the next sync recognizes it
+    // The next sync recognizes the remote tip through the imported seal that
+    // carries its Git identity, which is the fuse seal's merge parent.
     crate::failpoint::fail_point("sync.before_tip_remap");
-    map_remote_tip_to_head(repo, timeline, remote_tip_sha)?;
+    map_remote_tip_to_imported_leaf(repo, remote_tip_sha, their_head)?;
 
     cleanup_temp_timeline(repo, &temp_timeline);
     let _ = fs::remove_file(repo.ivaldi_dir.join(SYNC_JOURNAL));
@@ -781,8 +803,8 @@ fn recover_interrupted_sync(repo: &mut Repo) -> Result<(), SyncError> {
     } else {
         None
     };
-    if landed.is_some() {
-        map_remote_tip_to_head(repo, &journal.timeline, &journal.remote_tip_sha)?;
+    if let (Some(_), Some(remote_head)) = (&landed, journal.remote_head) {
+        map_remote_tip_to_imported_leaf(repo, &journal.remote_tip_sha, remote_head)?;
         let cas = FileCas::new(repo.ivaldi_dir.join("objects"))?;
         let store = FsStore::new(&cas);
         checkout_tree_to_workspace(repo, &store, &journal.timeline)?;
@@ -846,22 +868,31 @@ fn cleanup_temp_timeline(repo: &Repo, temp_timeline: &str) {
     }
 }
 
-/// Map the remote tip SHA to the freshly created fuse commit at the timeline
-/// head.
-fn map_remote_tip_to_head(
+/// Author recorded on a fuse seal when `user.name`/`user.email` are not set.
+const SYNC_FALLBACK_AUTHOR: &str = "ivaldi-sync <ivaldi-sync@localhost>";
+
+/// Point the remote tip SHA at the imported seal that IS that commit.
+///
+/// The fuse seal must never take the tip's SHA: it is a different commit (it
+/// also carries the local side), and push treats a mapped SHA the server
+/// advertises as proof the server already holds that seal and every tree and
+/// blob in it — so the files only the fuse produced would never be sent.
+fn map_remote_tip_to_imported_leaf(
     repo: &Repo,
-    timeline: &str,
     remote_tip_sha: &str,
+    imported_tip_idx: u64,
 ) -> Result<(), SyncError> {
-    let head_idx = repo
-        .get_timeline_head(timeline)?
-        .ok_or_else(|| SyncError::Other("timeline head missing after merge".into()))?;
-    let merged_leaf = repo
-        .get_leaf(head_idx)?
-        .ok_or_else(|| SyncError::Other("merged leaf missing after merge".into()))?;
+    if imported_tip_idx == crate::leaf::NO_PARENT {
+        return Ok(());
+    }
+    let Some(imported_tip) = repo.get_leaf(imported_tip_idx)? else {
+        return Ok(());
+    };
     let mut hash_mapping = HashMapping::new(&repo.ivaldi_dir);
-    hash_mapping.insert(remote_tip_sha, merged_leaf.hash());
-    hash_mapping.save()?;
+    if hash_mapping.get_blake3(remote_tip_sha) != Some(imported_tip.hash()) {
+        hash_mapping.insert(remote_tip_sha, imported_tip.hash());
+        hash_mapping.save()?;
+    }
     Ok(())
 }
 
@@ -1153,5 +1184,259 @@ mod tests {
         drop(repo);
         let report = crate::verify::verify(dir.path(), true);
         assert!(report.ok, "verify --full failed: {:?}", report.checks);
+    }
+
+    const DIVERGED_BASE_COMMIT: &str = "1111111111111111111111111111111111111111";
+    const DIVERGED_REMOTE_TIP: &str = "2222222222222222222222222222222222222222";
+    const DIVERGED_BASE_TREE: &str = "3333333333333333333333333333333333333333";
+    const DIVERGED_TIP_TREE: &str = "4444444444444444444444444444444444444444";
+    const DIVERGED_BASE_BLOB: &str = "5555555555555555555555555555555555555555";
+    const DIVERGED_REMOTE_BLOB: &str = "6666666666666666666666666666666666666666";
+
+    /// A remote "main" of base → tip (tip adds remote.txt) and a local main
+    /// of base → local seal (adds local.txt), so the two have diverged.
+    fn diverged_repo() -> (tempfile::TempDir, Repo) {
+        use crate::fsmerkle::{Entry, MODE_FILE, NodeKind};
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let mut repo = Repo::open(dir.path()).unwrap();
+        let cas = FileCas::new(dir.path().join(".ivaldi/objects")).unwrap();
+        let store = FsStore::new(&cas);
+        let (base_blob, _) = store.put_blob(b"base\n").unwrap();
+        let base_entry = Entry {
+            name: "base.txt".into(),
+            mode: MODE_FILE,
+            kind: NodeKind::Blob,
+            hash: base_blob,
+        };
+        let base_tree = store.put_tree(vec![base_entry.clone()]).unwrap();
+        let mut base_leaf = Leaf::new(base_tree, "main", "Remote <r@example.com>", 1, "base");
+        base_leaf
+            .meta
+            .insert("git.sha1".into(), DIVERGED_BASE_COMMIT.into());
+        cas.flush().unwrap();
+        let base = repo.commit_raw(base_leaf, "main").unwrap();
+
+        let (local_blob, _) = store.put_blob(b"local\n").unwrap();
+        let local_tree = store
+            .put_tree(vec![
+                base_entry,
+                Entry {
+                    name: "local.txt".into(),
+                    mode: MODE_FILE,
+                    kind: NodeKind::Blob,
+                    hash: local_blob,
+                },
+            ])
+            .unwrap();
+        cas.flush().unwrap();
+        repo.commit(local_tree, "Local <l@example.com>", "local change")
+            .unwrap();
+        let mut mapping = HashMapping::new(&repo.ivaldi_dir);
+        mapping.insert(DIVERGED_BASE_COMMIT, base.hash);
+        mapping.insert(DIVERGED_BASE_BLOB, base_blob);
+        mapping.save().unwrap();
+        std::fs::write(dir.path().join("base.txt"), b"base\n").unwrap();
+        std::fs::write(dir.path().join("local.txt"), b"local\n").unwrap();
+        (dir, repo)
+    }
+
+    fn diverged_mock_response(path: &str) -> String {
+        if path.contains("/commits?") {
+            return format!(
+                r#"[
+{{"sha":"{DIVERGED_REMOTE_TIP}","commit":{{"message":"remote change","author":{{"name":"Remote","email":"r@example.com","date":"2024-01-02T00:00:00Z"}},"tree":{{"sha":"{DIVERGED_TIP_TREE}"}}}},"parents":[{{"sha":"{DIVERGED_BASE_COMMIT}"}}]}},
+{{"sha":"{DIVERGED_BASE_COMMIT}","commit":{{"message":"base","author":{{"name":"Remote","email":"r@example.com","date":"2024-01-01T00:00:00Z"}},"tree":{{"sha":"{DIVERGED_BASE_TREE}"}}}},"parents":[]}}
+]"#
+            );
+        }
+        if path.contains(&format!("/git/trees/{DIVERGED_TIP_TREE}")) {
+            return format!(
+                r#"{{"sha":"{DIVERGED_TIP_TREE}","truncated":false,"tree":[
+{{"path":"base.txt","mode":"100644","type":"blob","size":5,"sha":"{DIVERGED_BASE_BLOB}"}},
+{{"path":"remote.txt","mode":"100644","type":"blob","size":7,"sha":"{DIVERGED_REMOTE_BLOB}"}}
+]}}"#
+            );
+        }
+        if path.ends_with("/remote.txt") {
+            return "remote\n".into();
+        }
+        format!(r#"{{"message":"unexpected mock path: {path}"}}"#)
+    }
+
+    /// Run one sync of `main` against a mock GitHub serving the remote side
+    /// of [`diverged_repo`].
+    fn sync_diverged_against_mock(repo: &mut Repo) -> SyncResult {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let server_done = Arc::clone(&done);
+        let server = std::thread::spawn(move || {
+            while !server_done.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let mut request = [0u8; 8192];
+                        let read = stream.read(&mut request).unwrap_or(0);
+                        let first = String::from_utf8_lossy(&request[..read]);
+                        let path = first
+                            .lines()
+                            .next()
+                            .and_then(|line| line.split_whitespace().nth(1))
+                            .unwrap_or("/")
+                            .to_string();
+                        let body = diverged_mock_response(&path);
+                        let status = if body.contains("unexpected mock path") {
+                            "404 Not Found"
+                        } else {
+                            "200 OK"
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("mock server failed: {error}"),
+                }
+            }
+        });
+        let base = format!("http://{address}");
+        let client = GitHubClient::with_base_urls(&base, &base);
+        let result = sync_timeline(
+            &client,
+            repo,
+            "o",
+            "r",
+            "main",
+            &mut |_, _| true,
+            false,
+            Collisions::Refuse,
+        );
+        done.store(true, Ordering::Release);
+        server.join().unwrap();
+        result.unwrap()
+    }
+
+    fn plan_push_over_remote_tip(repo: &Repo) -> crate::git_remote::PushPlan {
+        let head = repo.get_timeline_head("main").unwrap().unwrap();
+        let advertised = vec![crate::git_remote::AdvertisedRef {
+            id: DIVERGED_REMOTE_TIP.into(),
+            name: "refs/heads/main".into(),
+        }];
+        let mapping = HashMapping::new(&repo.ivaldi_dir);
+        crate::git_remote::plan_push(repo, "main", head, &advertised, &mapping, false, false)
+            .unwrap()
+    }
+
+    fn assert_push_carries_the_local_side(plan: &crate::git_remote::PushPlan) {
+        use crate::git_remote::{GitObjectKind, git_object_id};
+        let local_blob = git_object_id(GitObjectKind::Blob, b"local\n");
+        assert!(
+            plan.objects
+                .keys()
+                .any(|sha| hex::encode(sha) == local_blob),
+            "the pack leaves out local.txt, which the server has never seen"
+        );
+        let fuse = plan
+            .objects
+            .values()
+            .find(|object| {
+                object.kind == GitObjectKind::Commit
+                    && String::from_utf8_lossy(&object.body).contains("Fused sync")
+            })
+            .expect("the fuse seal is not in the pack");
+        let body = String::from_utf8_lossy(&fuse.body);
+        assert!(
+            body.contains(&format!("parent {DIVERGED_REMOTE_TIP}")),
+            "the fuse commit does not merge the remote tip:\n{body}"
+        );
+        assert_eq!(body.lines().filter(|l| l.starts_with("parent ")).count(), 2);
+        let author = body.lines().find(|l| l.starts_with("author ")).unwrap();
+        assert!(
+            author.contains('<') && author.contains('>'),
+            "the fuse commit has no author email: {author}"
+        );
+    }
+
+    #[test]
+    fn diverged_sync_keeps_the_remote_tip_on_the_imported_seal() {
+        let (_dir, mut repo) = diverged_repo();
+        let result = sync_diverged_against_mock(&mut repo);
+        assert!(result.was_fused);
+
+        let head = repo.get_timeline_head("main").unwrap().unwrap();
+        let fuse = repo.get_leaf(head).unwrap().unwrap();
+        let mapping = HashMapping::new(&repo.ivaldi_dir);
+        let mapped = mapping.get_blake3(DIVERGED_REMOTE_TIP).unwrap();
+        assert_ne!(
+            mapped,
+            fuse.hash(),
+            "the remote tip was mapped to the fuse seal"
+        );
+        let imported_tip = repo.get_leaf(fuse.merge_idxs[0]).unwrap().unwrap();
+        assert_eq!(mapped, imported_tip.hash());
+        assert_eq!(
+            imported_tip.meta.get("git.sha1").map(String::as_str),
+            Some(DIVERGED_REMOTE_TIP)
+        );
+        assert_eq!(mapping.get_sha1(fuse.hash()), None);
+        assert!(fuse.author.contains('<'), "fuse author: {}", fuse.author);
+
+        assert_push_carries_the_local_side(&plan_push_over_remote_tip(&repo));
+    }
+
+    #[test]
+    fn push_repairs_a_remote_tip_mapped_to_a_fuse_seal_by_an_older_sync() {
+        let (dir, mut repo) = diverged_repo();
+        sync_diverged_against_mock(&mut repo);
+
+        // What older syncs left behind: the remote tip claims to be the fuse
+        // seal, which made push skip every file the fuse seal produced.
+        let head = repo.get_timeline_head("main").unwrap().unwrap();
+        let fuse = repo.get_leaf(head).unwrap().unwrap();
+        let mut mapping = HashMapping::new(&repo.ivaldi_dir);
+        mapping.insert(DIVERGED_REMOTE_TIP, fuse.hash());
+        mapping.save().unwrap();
+
+        assert_push_carries_the_local_side(&plan_push_over_remote_tip(&repo));
+        let repaired = HashMapping::new(&repo.ivaldi_dir);
+        assert_ne!(repaired.get_blake3(DIVERGED_REMOTE_TIP), Some(fuse.hash()));
+
+        // A later sync of the unchanged remote is still a no-op.
+        let again = sync_diverged_against_mock(&mut repo);
+        assert!(again.no_changes);
+        drop(repo);
+        assert!(crate::verify::verify(dir.path(), true).ok);
+    }
+
+    #[test]
+    fn sync_after_an_older_fuse_does_not_mistake_local_work_for_the_remote() {
+        let (_dir, mut repo) = diverged_repo();
+        sync_diverged_against_mock(&mut repo);
+        let head = repo.get_timeline_head("main").unwrap().unwrap();
+        let fuse = repo.get_leaf(head).unwrap().unwrap();
+        let mut mapping = HashMapping::new(&repo.ivaldi_dir);
+        mapping.insert(DIVERGED_REMOTE_TIP, fuse.hash());
+        mapping.save().unwrap();
+
+        assert!(crate::remote::heal_sync_fuse_aliases(&repo, &mut mapping));
+        assert_eq!(
+            mapping.get_blake3(DIVERGED_REMOTE_TIP),
+            Some(repo.get_leaf(fuse.merge_idxs[0]).unwrap().unwrap().hash())
+        );
+        assert_eq!(mapping.get_sha1(fuse.hash()), None);
+        assert!(!crate::remote::heal_sync_fuse_aliases(&repo, &mut mapping));
+        assert_eq!(
+            count_new_local_commits(&repo, "main", Some(head), Some(fuse.merge_idxs[0])).unwrap(),
+            1,
+            "only the fuse seal is local work on top of the imported remote tip"
+        );
     }
 }

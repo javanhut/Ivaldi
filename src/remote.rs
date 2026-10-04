@@ -56,6 +56,7 @@ pub struct RemoteTreeEntry {
 /// Bidirectional SHA1 ↔ BLAKE3 hash mapping.
 ///
 /// Used ONLY during remote sync operations. Never used in internal pipeline.
+#[derive(Clone)]
 pub struct HashMapping {
     /// SHA1 → BLAKE3
     sha1_to_blake3: BTreeMap<String, B3Hash>,
@@ -117,6 +118,16 @@ impl HashMapping {
             self.blake3_to_sha1.remove(&blake3);
         }
         self.verified_sha1.remove(sha1);
+    }
+
+    /// Drop the BLAKE3 → SHA1 direction for `blake3`, but only while it still
+    /// names `sha1`. The SHA1 → BLAKE3 direction is left alone.
+    pub fn forget_sha1_of(&mut self, blake3: B3Hash, sha1: &str) -> bool {
+        if self.blake3_to_sha1.get(&blake3).map(String::as_str) != Some(sha1) {
+            return false;
+        }
+        self.blake3_to_sha1.remove(&blake3);
+        true
     }
 
     /// Record that a commit mapping's local tree has been checked against the
@@ -237,6 +248,49 @@ impl HashMapping {
             ));
         }
     }
+}
+
+/// Undo the false Git identity that older `sync` versions gave fuse seals.
+///
+/// A diverged sync used to map the remote tip's SHA-1 to the local fuse seal
+/// so the next sync would recognise the tip. That fuse seal is a different
+/// commit — it adds the local side of the merge — so the mapping told push
+/// the server already had the fuse seal and every tree and blob in it. Files
+/// the fuse produced (merged versions that exist on neither side) were then
+/// left out of the pack and the server rejected it (`index-pack failed`).
+///
+/// A fuse seal records the tip it merged in `sync.remote_tip`, and the remote
+/// side of the merge is an imported seal whose `git.sha1` is that tip. This
+/// points the tip back at the imported seal and drops the fuse seal's borrowed
+/// identity. Returns whether anything changed.
+pub fn heal_sync_fuse_aliases(repo: &crate::repo::Repo, mapping: &mut HashMapping) -> bool {
+    let mut changed = false;
+    for (_, leaf) in repo.verified_leaves() {
+        let Some(remote_tip) = leaf.meta.get("sync.remote_tip") else {
+            continue;
+        };
+        if leaf.merge_idxs.is_empty() || leaf.meta.get("git.sha1") == Some(remote_tip) {
+            continue;
+        }
+        let fuse_hash = leaf.hash();
+        if mapping.get_blake3(remote_tip) == Some(fuse_hash) {
+            let imported_tip = leaf.merge_idxs.iter().find_map(|&idx| {
+                repo.get_leaf(idx)
+                    .ok()
+                    .flatten()
+                    .filter(|parent| parent.meta.get("git.sha1") == Some(remote_tip))
+            });
+            match imported_tip {
+                Some(parent) => mapping.insert(remote_tip, parent.hash()),
+                None => mapping.remove_sha1(remote_tip),
+            }
+            changed = true;
+        }
+        if mapping.forget_sha1_of(fuse_hash, remote_tip) {
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Metadata for converting between Ivaldi seals and remote commits.

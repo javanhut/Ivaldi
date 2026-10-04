@@ -574,7 +574,8 @@ fn mint_git_commit_body(leaf: &Leaf, tree_sha1: &[u8; 20], parents: &[[u8; 20]])
         .get("git.author_tz")
         .map(String::as_str)
         .unwrap_or("+0000");
-    let _ = writeln!(s, "author {} {} {}", leaf.author, leaf.time_unix, author_tz);
+    let author = git_identity(&leaf.author);
+    let _ = writeln!(s, "author {} {} {}", author, leaf.time_unix, author_tz);
 
     let (committer_line, committer_time, committer_tz) = match (
         leaf.meta.get("git.committer"),
@@ -589,7 +590,7 @@ fn mint_git_commit_body(leaf: &Leaf, tree_sha1: &[u8; 20], parents: &[[u8; 20]])
                 .unwrap_or("+0000");
             (c.clone(), time, tz.to_string())
         }
-        _ => (leaf.author.clone(), leaf.time_unix, author_tz.to_string()),
+        _ => (author, leaf.time_unix, author_tz.to_string()),
     };
     let _ = writeln!(
         s,
@@ -607,6 +608,20 @@ fn mint_git_commit_body(leaf: &Leaf, tree_sha1: &[u8; 20], parents: &[[u8; 20]])
 // =====================================================================
 // Helpers
 // =====================================================================
+
+/// A seal author as a Git identity line. Git requires "Name <email>" and
+/// receivers reject a commit without the angle brackets (fsck
+/// `missingEmail`, reported as "index-pack failed"). Older fuse seals were
+/// authored as a bare name; give those an empty email rather than refuse to
+/// publish them. Authors that already have an email are written unchanged, so
+/// the Git identity of every other seal stays the same.
+fn git_identity(author: &str) -> String {
+    let author = author.trim();
+    if author.contains('<') && author.ends_with('>') {
+        return author.to_string();
+    }
+    format!("{author} <>")
+}
 
 /// Order two tree entries the way git canonicalizes a tree object: by name,
 /// but with a directory compared as though its name ended in '/' (git's
@@ -789,6 +804,28 @@ mod tests {
         let s = std::str::from_utf8(&body).unwrap();
         assert!(s.contains("\nauthor Solo <solo@x> 1700000000 +0000\n"));
         assert!(s.contains("\ncommitter Solo <solo@x> 1700000000 +0000\n"));
+    }
+
+    #[test]
+    fn mint_commit_body_gives_a_bare_author_name_an_email_slot() {
+        let leaf = Leaf::new(
+            B3Hash::digest(b"t"),
+            "main",
+            "ivaldi-sync",
+            1_700_000_000,
+            "Fused sync from o/r (branch: main)",
+        );
+        let body = mint_git_commit_body(&leaf, &[0u8; 20], &[]);
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(
+            s.contains("\nauthor ivaldi-sync <> 1700000000 +0000\n"),
+            "{s}"
+        );
+        assert!(
+            s.contains("\ncommitter ivaldi-sync <> 1700000000 +0000\n"),
+            "{s}"
+        );
+        assert_eq!(git_identity("Solo <solo@x>"), "Solo <solo@x>");
     }
 
     #[test]

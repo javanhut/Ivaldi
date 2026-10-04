@@ -63,6 +63,12 @@ round-tripping a git-imported repo:
    `leaf.meta`. These are read back here verbatim. For native Ivaldi
    commits with no `git.*` meta, committer mirrors author and timezone
    defaults to `+0000`.
+3. **Every identity has an email slot.** Receivers reject a commit whose
+   author or committer has no `<email>` (fsck `missingEmail`, reported as
+   "index-pack failed"). A leaf author that is a bare name — fuse seals
+   written by older `sync` versions were authored `ivaldi-sync` — is
+   written as `Name <>`. Authors that already have an email are written
+   unchanged, so no existing seal's Git identity moves.
 
 ## Server-aware skip
 
