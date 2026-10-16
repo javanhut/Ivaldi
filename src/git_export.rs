@@ -75,8 +75,12 @@ pub struct ExportResult {
 /// skipped (i.e. their tree+blob translation is also skipped, since the
 /// server already has them). Pass an empty set for an empty remote.
 ///
-/// `known_mapping` is consulted only for the SHA-1 lookup; nothing is
-/// skipped purely because it was seen on *some* prior remote.
+/// A seal that already is a Git commit — imported (`git.sha1`) or exported
+/// before (`known_mapping`) — keeps that exact SHA-1. It is never minted
+/// again: it is sent only when its bytes reproduce byte-for-byte, and is
+/// otherwise referenced as a parent the server must already hold. Minting a
+/// fresh commit for it would put a second, parallel copy of history on the
+/// portal. Only seals with no Git identity get new commits.
 pub fn export_chain(
     repo: &Repo,
     head_idx: u64,
@@ -124,28 +128,99 @@ pub(crate) fn export_roots_incremental(
         .map_err(|e| ExportError::Other(format!("cas: {}", e)))?;
     let store = FsStore::new(&cas);
 
-    // Topological order of leaves to translate: deepest-ancestor-first so
-    // each leaf's parents already have their git SHA-1s by the time we
-    // mint the commit object.
-    let order = collect_topological(repo, roots, known_mapping, server_has_sha1)?;
+    // Per-translation state.
+    let mut objects: BTreeMap<[u8; 20], GitObject> = BTreeMap::new();
+    let mut leaf_to_git: BTreeMap<u64, [u8; 20]> = BTreeMap::new();
+    let mut tree_translation_cache: BTreeMap<B3Hash, [u8; 20]> = BTreeMap::new();
+    // Reload independently so identities computed during this export can be
+    // persisted without changing the caller's remote-state snapshot. The map
+    // records deterministic object identity, not proof that any one portal
+    // has the object.
+    let mut identity_mapping = crate::remote::HashMapping::new(&repo.ivaldi_dir);
+    let identity_count_before = identity_mapping.len();
+
+    // Seals the server holds a commit for, by whatever SHA it advertised.
+    // With a map that is already many-to-one (one seal, two Git commits) this
+    // is how the copy the server actually has is preferred.
+    let server_leaves = server_leaves(known_mapping, server_has_sha1);
+    let identity = |leaf: &Leaf| seal_git_identity_on(leaf, known_mapping, &server_leaves);
 
     // A Git receiver already has every tree/blob reachable from each
     // advertised commit. Build that set using Ivaldi's Merkle metadata only;
-    // blob bodies are not read. Avoid even this metadata walk for an up-to-date
-    // timeline, where `order` is empty and no pack will be built.
-    let remote_objects = if order.is_empty() {
-        BTreeSet::new()
-    } else {
-        collect_remote_objects(&store, remote_tree_roots)?
-    };
+    // blob bodies are not read, and an up-to-date timeline never needs it.
+    let mut remote_objects: Option<BTreeSet<B3Hash>> = None;
+
+    // Walk back from the roots. A seal that already has a Git identity is
+    // never re-minted: it either reproduces that exact commit (and is sent,
+    // with its ancestry walked further) or it is referenced by SHA as a
+    // boundary. Only seals with no identity at all get new commits.
+    let mut order: Vec<u64> = Vec::new();
+    let mut boundaries: Vec<(u64, [u8; 20])> = Vec::new();
+    let mut visited: BTreeSet<u64> = BTreeSet::new();
+    let mut stack: Vec<u64> = roots.to_vec();
+    while let Some(idx) = stack.pop() {
+        if !visited.insert(idx) {
+            continue;
+        }
+        let Some(leaf) = repo
+            .get_leaf(idx)
+            .map_err(|e| ExportError::Other(e.to_string()))?
+        else {
+            continue;
+        };
+        let Some(sha1) = identity(&leaf) else {
+            order.push(idx);
+            stack.extend(leaf.all_parents());
+            continue;
+        };
+        leaf_to_git.insert(idx, sha1);
+        if server_has_sha1.contains(&sha1) {
+            continue;
+        }
+        let parent_shas: Option<Vec<[u8; 20]>> = leaf
+            .all_parents()
+            .into_iter()
+            .map(|p| {
+                repo.get_leaf(p)
+                    .ok()
+                    .flatten()
+                    .and_then(|parent| identity(&parent))
+            })
+            .collect();
+        // A shallow boundary lost its parents locally, so it can never
+        // reproduce its commit; it stays a reference to the original.
+        let reproduced = match parent_shas {
+            Some(parents) if !leaf.meta.contains_key("git.shallow") => {
+                let remote = remote_objects_for(&mut remote_objects, &store, remote_tree_roots)?;
+                reproduce_commit(
+                    &store,
+                    &leaf,
+                    sha1,
+                    &dedup_parents(parents),
+                    &mut tree_translation_cache,
+                    &mut objects,
+                    remote,
+                    &mut identity_mapping,
+                )?
+            }
+            _ => false,
+        };
+        if reproduced {
+            stack.extend(leaf.all_parents());
+        } else {
+            boundaries.push((idx, sha1));
+        }
+    }
+    // Indices are monotonic in commit order, so ascending is
+    // parents-before-children.
+    order.sort_unstable();
 
     // A shallow-boundary leaf is a root only because `--depth` told the server
     // to withhold its ancestry. Exporting one mints a parentless git commit,
     // so publishing it would replace the remote's real history with a
     // truncated copy — and `--force` would make that stick. Reaching one here
-    // means the server does NOT already have it (`collect_topological` stops
-    // at commits the server advertised), so this only fires when the push
-    // would actually rewrite history, not when adding work on top of a
+    // means the server does NOT already have it, so this only fires when the
+    // push would actually rewrite history, not when adding work on top of a
     // shallow clone.
     for idx in &order {
         if let Ok(Some(leaf)) = repo.get_leaf(*idx)
@@ -160,38 +235,27 @@ pub(crate) fn export_roots_incremental(
         }
     }
 
-    // Per-translation state.
-    let mut objects: BTreeMap<[u8; 20], GitObject> = BTreeMap::new();
-    let mut leaf_to_git: BTreeMap<u64, [u8; 20]> = BTreeMap::new();
-    let mut tree_translation_cache: BTreeMap<B3Hash, [u8; 20]> = BTreeMap::new();
-    // Reload independently so identities computed during this export can be
-    // persisted without changing the caller's remote-state snapshot. The map
-    // records deterministic object identity, not proof that any one portal
-    // has the object.
-    let mut identity_mapping = crate::remote::HashMapping::new(&repo.ivaldi_dir);
-    let identity_count_before = identity_mapping.len();
-
-    // Only roots and parents of outgoing commits need pre-existing identities.
-    // Avoid a second full-history seed scan for a one-commit or no-op push.
-    let mut required: BTreeSet<u64> = roots.iter().copied().collect();
-    for idx in &order {
-        if let Some(leaf) = repo
-            .get_leaf(*idx)
-            .map_err(|e| ExportError::Other(e.to_string()))?
-        {
-            required.extend(leaf.all_parents());
-        }
-    }
-    for idx in required {
-        if let Some(leaf) = repo
+    // An empty portal has none of the referenced commits, so a boundary there
+    // can only end in a rejected pack. Say why instead.
+    if server_has_sha1.is_empty()
+        && let Some(&(idx, sha1)) = boundaries.first()
+    {
+        let short = repo
             .get_leaf(idx)
-            .map_err(|e| ExportError::Other(e.to_string()))?
-            && let Some(sha_str) = known_mapping.get_sha1(leaf.hash())
-            && let Some(b) = sha1_hex_to_bytes(sha_str)
-        {
-            leaf_to_git.insert(idx, b);
-        }
+            .ok()
+            .flatten()
+            .map(|l| l.hash().short8())
+            .unwrap_or_default();
+        return Err(ExportError::Other(format!(
+            "seal {short} is git commit {}, which this portal does not have, and that commit \
+             cannot be reproduced exactly from the local seal (import does not keep every \
+             dotfile); push this history to the new portal with git from a clone of the \
+             original, then upload on top of it",
+            hex::encode(sha1)
+        )));
     }
+
+    refuse_reminted_copies(repo, &order, &server_leaves)?;
 
     for idx in &order {
         let leaf = repo
@@ -200,34 +264,28 @@ pub(crate) fn export_roots_incremental(
             .ok_or_else(|| ExportError::Other(format!("leaf {} vanished", idx)))?;
 
         // Translate the tree first — commit body needs the tree SHA-1.
+        let remote = remote_objects_for(&mut remote_objects, &store, remote_tree_roots)?;
         let tree_sha1 = translate_tree_incremental(
             &store,
             leaf.tree_root,
+            &BTreeMap::new(),
             &mut tree_translation_cache,
             &mut objects,
-            &remote_objects,
+            remote,
             &mut identity_mapping,
         )?;
 
-        // Resolve parent SHA-1s from already-translated map.
+        // Every parent is either minted earlier in `order` or has an identity.
         let mut parents: Vec<[u8; 20]> = Vec::new();
-        if leaf.has_parent()
-            && let Some(p) = leaf_to_git.get(&leaf.prev_idx).copied()
-        {
-            parents.push(p);
-        }
-        for &midx in &leaf.merge_idxs {
-            if let Some(p) = leaf_to_git.get(&midx).copied()
-                && !parents.contains(&p)
-            {
-                parents.push(p);
+        for p in leaf.all_parents() {
+            if let Some(sha) = leaf_to_git.get(&p).copied() {
+                parents.push(sha);
             }
         }
+        let parents = dedup_parents(parents);
 
         let body = mint_git_commit_body(&leaf, &tree_sha1, &parents);
-        let sha1: [u8; 20] = git_object_id(GitObjectKind::Commit, &body)
-            .as_str()
-            .pipe(|hex| sha1_hex_to_bytes(hex).expect("git_object_id returns 40-hex"));
+        let sha1 = commit_sha1(&body);
         objects.insert(
             sha1,
             GitObject {
@@ -237,7 +295,7 @@ pub(crate) fn export_roots_incremental(
             },
         );
         leaf_to_git.insert(*idx, sha1);
-        identity_mapping.insert(&hex::encode(sha1), leaf.hash());
+        identity_mapping.insert_identity(&hex::encode(sha1), leaf.hash());
     }
 
     // This cache is an optimization and every entry is reproducible from the
@@ -371,61 +429,177 @@ fn mint_git_tag_body(tag: &crate::tags::Tag, target: &[u8; 20]) -> Vec<u8> {
 // Topological traversal
 // =====================================================================
 
-fn collect_topological(
-    repo: &Repo,
-    roots: &[u64],
-    known_mapping: &crate::remote::HashMapping,
-    server_has_sha1: &BTreeSet<[u8; 20]>,
-) -> Result<Vec<u64>, ExportError> {
-    // BFS to discover all unmapped ancestors, then reverse-prev_idx
-    // ordering produces parent-before-child chronology.
-    let mut chain: Vec<u64> = Vec::new();
-    let mut visited: BTreeSet<u64> = BTreeSet::new();
-    let mut stack: Vec<u64> = roots.to_vec();
-    while let Some(idx) = stack.pop() {
-        if !visited.insert(idx) {
-            continue;
-        }
-        let leaf = match repo
-            .get_leaf(idx)
-            .map_err(|e| ExportError::Other(e.to_string()))?
-        {
-            Some(l) => l,
-            None => continue,
-        };
-        // Stop descending only when this leaf's mapped git SHA-1 is in
-        // the *server's* advertised set — i.e. the server already has
-        // this exact commit + everything it transitively references.
-        if let Some(sha_str) = known_mapping.get_sha1(leaf.hash())
-            && let Some(b) = sha1_hex_to_bytes(sha_str)
-            && server_has_sha1.contains(&b)
-        {
-            continue;
-        }
-        chain.push(idx);
-        for p in leaf.all_parents() {
-            stack.push(p);
+/// The Git commit a seal already is, if any.
+///
+/// An imported seal's authenticated `git.sha1` wins: it is the commit the
+/// seal was made from, and the hash map may also name re-minted copies of it.
+/// Otherwise the identity export recorded in the hash map is used.
+pub(crate) fn seal_git_identity(
+    leaf: &Leaf,
+    mapping: &crate::remote::HashMapping,
+) -> Option<[u8; 20]> {
+    seal_git_identity_on(leaf, mapping, &BTreeMap::new())
+}
+
+/// [`seal_git_identity`], preferring a commit the server advertised for the
+/// seal over the map's reverse entry when the seal has no imported identity.
+fn seal_git_identity_on(
+    leaf: &Leaf,
+    mapping: &crate::remote::HashMapping,
+    server_leaves: &BTreeMap<B3Hash, [u8; 20]>,
+) -> Option<[u8; 20]> {
+    if let Some(sha) = leaf.meta.get("git.sha1").and_then(|s| sha1_hex_to_bytes(s)) {
+        return Some(sha);
+    }
+    if let Some(sha) = server_leaves.get(&leaf.hash()) {
+        return Some(*sha);
+    }
+    mapping.get_sha1(leaf.hash()).and_then(sha1_hex_to_bytes)
+}
+
+/// Seal hash → a commit the server has for it, read through the SHA1 → BLAKE3
+/// direction of the map, which stays right even where the reverse direction
+/// has been overwritten by a duplicate.
+fn server_leaves(
+    mapping: &crate::remote::HashMapping,
+    server_has: &BTreeSet<[u8; 20]>,
+) -> BTreeMap<B3Hash, [u8; 20]> {
+    let mut out = BTreeMap::new();
+    for sha in server_has {
+        if let Some(b3) = mapping.get_blake3(&hex::encode(sha)) {
+            out.entry(b3).or_insert(*sha);
         }
     }
-    // Sort by index ascending — for an Ivaldi MMR, indices are monotonic
-    // in commit order so ascending == parents-before-children.
-    chain.sort_unstable();
-    Ok(chain)
+    out
+}
+
+/// Last line of defence against duplicated history: refuse to mint a commit
+/// for a seal that is already a Git commit, either because it was imported
+/// or because the server holds a commit for it. Export never chooses to do
+/// that; this keeps a future regression from reaching a portal.
+fn refuse_reminted_copies(
+    repo: &Repo,
+    order: &[u64],
+    server_leaves: &BTreeMap<B3Hash, [u8; 20]>,
+) -> Result<(), ExportError> {
+    for idx in order {
+        let Some(leaf) = repo
+            .get_leaf(*idx)
+            .map_err(|e| ExportError::Other(e.to_string()))?
+        else {
+            continue;
+        };
+        let existing = leaf
+            .meta
+            .get("git.sha1")
+            .cloned()
+            .or_else(|| server_leaves.get(&leaf.hash()).map(hex::encode));
+        if let Some(existing) = existing {
+            return Err(ExportError::Other(format!(
+                "refusing to upload: seal {} is already git commit {existing}, and pushing would \
+                 create a second copy of it on the portal",
+                leaf.hash().short8()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn dedup_parents(parents: Vec<[u8; 20]>) -> Vec<[u8; 20]> {
+    let mut out: Vec<[u8; 20]> = Vec::with_capacity(parents.len());
+    for p in parents {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+fn commit_sha1(body: &[u8]) -> [u8; 20] {
+    sha1_hex_to_bytes(&git_object_id(GitObjectKind::Commit, body))
+        .expect("git_object_id returns 40-hex")
+}
+
+fn remote_objects_for<'a>(
+    slot: &'a mut Option<BTreeSet<B3Hash>>,
+    store: &FsStore<'_>,
+    remote_tree_roots: &[B3Hash],
+) -> Result<&'a BTreeSet<B3Hash>, ExportError> {
+    if slot.is_none() {
+        *slot = Some(collect_remote_objects(store, remote_tree_roots)?);
+    }
+    Ok(slot.as_ref().expect("filled above"))
+}
+
+/// Rebuild the commit a seal already is. When the bytes hash to `expected`,
+/// its objects join the pack and `true` is returned; otherwise nothing is
+/// kept, since sending a different commit would duplicate history.
+///
+/// Import's dotfile policy (see `imported_entry_name` in `git_remote`) is why
+/// this can fail for an imported seal: the original tree held files the seal
+/// does not.
+#[allow(clippy::too_many_arguments)]
+fn reproduce_commit(
+    store: &FsStore<'_>,
+    leaf: &Leaf,
+    expected: [u8; 20],
+    parents: &[[u8; 20]],
+    cache: &mut BTreeMap<B3Hash, [u8; 20]>,
+    objects: &mut BTreeMap<[u8; 20], GitObject>,
+    remote_objects: &BTreeSet<B3Hash>,
+    identity_mapping: &mut crate::remote::HashMapping,
+) -> Result<bool, ExportError> {
+    let mut scratch_cache = BTreeMap::new();
+    let mut scratch_objects = BTreeMap::new();
+    let tree_sha1 = translate_tree_incremental(
+        store,
+        leaf.tree_root,
+        cache,
+        &mut scratch_cache,
+        &mut scratch_objects,
+        remote_objects,
+        identity_mapping,
+    )?;
+    let body = mint_git_commit_body(leaf, &tree_sha1, parents);
+    if commit_sha1(&body) != expected {
+        return Ok(false);
+    }
+    cache.extend(scratch_cache);
+    for (sha, object) in scratch_objects {
+        objects.entry(sha).or_insert(object);
+    }
+    objects.insert(
+        expected,
+        GitObject {
+            sha1: expected,
+            kind: GitObjectKind::Commit,
+            body,
+        },
+    );
+    Ok(true)
 }
 
 // =====================================================================
 // Tree translation (Ivaldi → git)
 // =====================================================================
 
+/// `known` holds translations whose objects are already in the pack being
+/// built; `cache` receives this call's own. They are separate so a trial
+/// translation (see [`reproduce_commit`]) can be thrown away whole.
 fn translate_tree_incremental(
     store: &FsStore<'_>,
     tree_hash: B3Hash,
+    known: &BTreeMap<B3Hash, [u8; 20]>,
     cache: &mut BTreeMap<B3Hash, [u8; 20]>,
     objects: &mut BTreeMap<[u8; 20], GitObject>,
     remote_objects: &BTreeSet<B3Hash>,
     identity_mapping: &mut crate::remote::HashMapping,
 ) -> Result<[u8; 20], ExportError> {
-    if let Some(s) = cache.get(&tree_hash).copied() {
+    if let Some(s) = known
+        .get(&tree_hash)
+        .or_else(|| cache.get(&tree_hash))
+        .copied()
+    {
         return Ok(s);
     }
     // If this exact Merkle tree belongs to an advertised remote snapshot and
@@ -473,6 +647,7 @@ fn translate_tree_incremental(
                 let sha = translate_tree_incremental(
                     store,
                     entry.hash,
+                    known,
                     cache,
                     objects,
                     remote_objects,
@@ -490,7 +665,7 @@ fn translate_tree_incremental(
 
     let sha1 = sha1_hex_to_bytes(git_object_id(GitObjectKind::Tree, &body).as_str())
         .expect("git_object_id always returns 40 hex chars");
-    identity_mapping.insert(&hex::encode(sha1), tree_hash);
+    identity_mapping.insert_identity(&hex::encode(sha1), tree_hash);
     if !remote_objects.contains(&tree_hash) {
         objects.insert(
             sha1,
@@ -517,6 +692,7 @@ fn translate_tree(
     translate_tree_incremental(
         store,
         tree_hash,
+        &BTreeMap::new(),
         cache,
         objects,
         &BTreeSet::new(),
@@ -546,7 +722,7 @@ fn translate_blob(
         .map_err(|e| ExportError::Other(e.to_string()))?;
     let sha1 = sha1_hex_to_bytes(git_object_id(GitObjectKind::Blob, &content).as_str())
         .expect("git_object_id always returns 40 hex chars");
-    identity_mapping.insert(&hex::encode(sha1), blob_hash);
+    identity_mapping.insert_identity(&hex::encode(sha1), blob_hash);
     if !remote_objects.contains(&blob_hash) {
         objects.entry(sha1).or_insert(GitObject {
             sha1,
@@ -658,13 +834,6 @@ fn sha1_hex_to_bytes(hex: &str) -> Option<[u8; 20]> {
     Some(out)
 }
 
-trait Pipe: Sized {
-    fn pipe<R>(self, f: impl FnOnce(Self) -> R) -> R {
-        f(self)
-    }
-}
-impl<T> Pipe for T {}
-
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
     #[error("git export: {0}")]
@@ -740,6 +909,42 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("no git identity"), "{}", err);
+    }
+
+    #[test]
+    fn minting_a_commit_for_an_already_imported_seal_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::forge::forge(dir.path()).unwrap();
+        let mut repo = Repo::open(dir.path()).unwrap();
+        let mut leaf = Leaf::new(B3Hash::digest(b"t"), "main", "A <a@x>", 1, "imported");
+        leaf.meta.insert("git.sha1".into(), "ab".repeat(20));
+        let imported = repo.commit_raw(leaf, "main").unwrap().index;
+        let native = Leaf::new(B3Hash::digest(b"u"), "main", "A <a@x>", 2, "native");
+        let native = repo.commit_raw(native, "main").unwrap().index;
+
+        let err = refuse_reminted_copies(&repo, &[imported], &BTreeMap::new()).unwrap_err();
+        assert!(err.to_string().contains("second copy"), "{err}");
+
+        // A native seal the server already has a commit for is refused too.
+        let hash = repo.get_leaf(native).unwrap().unwrap().hash();
+        let on_server = BTreeMap::from([(hash, [0xcd; 20])]);
+        assert!(refuse_reminted_copies(&repo, &[native], &on_server).is_err());
+        assert!(refuse_reminted_copies(&repo, &[native], &BTreeMap::new()).is_ok());
+    }
+
+    #[test]
+    fn imported_identity_wins_over_a_duplicate_in_the_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mapping = crate::remote::HashMapping::new(dir.path());
+        let mut leaf = Leaf::new(B3Hash::digest(b"t"), "main", "A <a@x>", 1, "imported");
+        leaf.meta.insert("git.sha1".into(), "11".repeat(20));
+        mapping.insert(&"11".repeat(20), leaf.hash());
+        mapping.insert(&"ff".repeat(20), leaf.hash());
+        assert_eq!(
+            mapping.get_sha1(leaf.hash()),
+            Some("ff".repeat(20).as_str())
+        );
+        assert_eq!(seal_git_identity(&leaf, &mapping), Some([0x11; 20]));
     }
 
     #[test]

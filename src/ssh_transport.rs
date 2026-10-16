@@ -388,12 +388,8 @@ impl SshClient {
             && report.refs.iter().all(|r| r.error.is_none())
             // None when only tags moved — there is then no new tip to map.
             && let Some(new_sha1_hex) = branch_new_sha1
-            && let Ok(Some(leaf)) = repo.get_leaf(head_idx)
         {
-            let mut mapping = HashMapping::new(&repo.ivaldi_dir);
-            mapping.insert(&new_sha1_hex, leaf.hash());
-            mapping.mark_verified(&new_sha1_hex);
-            let _ = mapping.save();
+            crate::git_remote::record_pushed_tip(repo, head_idx, &new_sha1_hex);
         }
 
         Ok(report)

@@ -39,6 +39,8 @@ pub mod p2p_proto;
 pub mod pack;
 pub mod peers;
 pub mod pick;
+#[cfg(test)]
+mod push_identity_tests;
 pub mod portal;
 pub mod progress;
 pub mod proof;
