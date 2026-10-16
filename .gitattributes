@@ -1,0 +1,3 @@
+# Historical repository fixtures are byte-exact contract inputs. Never let a
+# checkout (e.g. core.autocrlf on Windows) rewrite their line endings.
+tests/fixtures/** -text

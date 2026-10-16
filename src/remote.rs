@@ -102,6 +102,22 @@ impl HashMapping {
         self.blake3_to_sha1.insert(blake3, sha1.to_string());
     }
 
+    /// Record `sha1` as the Git identity of `blake3` unless `blake3` already
+    /// has a different one. Export uses this: a seal (or tree, or blob) is one
+    /// Git object, and giving it a second SHA1 makes the reverse lookup pick
+    /// between them arbitrarily. Returns whether the entry was recorded.
+    pub fn insert_identity(&mut self, sha1: &str, blake3: B3Hash) -> bool {
+        if self
+            .blake3_to_sha1
+            .get(&blake3)
+            .is_some_and(|existing| existing != sha1)
+        {
+            return false;
+        }
+        self.insert(sha1, blake3);
+        true
+    }
+
     /// Look up BLAKE3 hash by SHA1.
     pub fn get_blake3(&self, sha1: &str) -> Option<B3Hash> {
         self.sha1_to_blake3.get(sha1).copied()
@@ -112,9 +128,13 @@ impl HashMapping {
         self.blake3_to_sha1.get(&blake3).map(|s| s.as_str())
     }
 
-    /// Remove a mapping by SHA1 key.
+    /// Remove a mapping by SHA1 key. The reverse entry goes only if it named
+    /// this SHA1: where several SHA1s map to one hash, dropping one of them
+    /// must not leave the hash with no identity at all.
     pub fn remove_sha1(&mut self, sha1: &str) {
-        if let Some(blake3) = self.sha1_to_blake3.remove(sha1) {
+        if let Some(blake3) = self.sha1_to_blake3.remove(sha1)
+            && self.blake3_to_sha1.get(&blake3).map(String::as_str) == Some(sha1)
+        {
             self.blake3_to_sha1.remove(&blake3);
         }
         self.verified_sha1.remove(sha1);
@@ -323,6 +343,36 @@ pub enum RemoteError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removing_a_duplicate_sha1_keeps_the_other_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mapping = HashMapping::new(dir.path());
+        let leaf = B3Hash::digest(b"seal");
+        mapping.insert(&"aa".repeat(20), leaf);
+        mapping.insert(&"bb".repeat(20), leaf);
+        // The reverse entry names "bb"; dropping "aa" must not take it along.
+        mapping.remove_sha1(&"aa".repeat(20));
+        assert_eq!(mapping.get_sha1(leaf), Some("bb".repeat(20).as_str()));
+        mapping.remove_sha1(&"bb".repeat(20));
+        assert_eq!(mapping.get_sha1(leaf), None);
+    }
+
+    #[test]
+    fn insert_identity_never_gives_a_hash_a_second_sha1() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mapping = HashMapping::new(dir.path());
+        let leaf = B3Hash::digest(b"seal");
+        assert!(mapping.insert_identity(&"aa".repeat(20), leaf));
+        assert!(
+            mapping.insert_identity(&"aa".repeat(20), leaf),
+            "same identity again is fine"
+        );
+        assert!(!mapping.insert_identity(&"bb".repeat(20), leaf));
+        assert_eq!(mapping.get_sha1(leaf), Some("aa".repeat(20).as_str()));
+        assert_eq!(mapping.get_blake3(&"bb".repeat(20)), None);
+        assert_eq!(mapping.len(), 1);
+    }
 
     #[test]
     fn hash_mapping_insert_and_lookup() {

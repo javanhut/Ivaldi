@@ -42,6 +42,8 @@ pub mod pick;
 pub mod portal;
 pub mod progress;
 pub mod proof;
+#[cfg(test)]
+mod push_identity_tests;
 pub mod reader;
 pub mod recover;
 pub mod refname;

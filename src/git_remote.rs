@@ -717,12 +717,8 @@ impl SmartHttpClient {
         if report.unpack_ok
             && report.refs.iter().all(|r| r.error.is_none())
             && let Some(new_sha1_hex) = branch_new_sha1
-            && let Ok(Some(leaf)) = repo.get_leaf(head_idx)
         {
-            let mut mapping = HashMapping::new(&repo.ivaldi_dir);
-            mapping.insert(&new_sha1_hex, leaf.hash());
-            mapping.mark_verified(&new_sha1_hex);
-            let _ = mapping.save();
+            record_pushed_tip(repo, head_idx, &new_sha1_hex);
         }
 
         Ok(report)
@@ -762,6 +758,20 @@ pub(crate) struct PushPlan {
     pub updates: Vec<(String, String, String)>,
     /// Tags deliberately left out, with the reason, for the caller to report.
     pub skipped_tags: Vec<String>,
+}
+
+/// Remember that the seal at `head_idx` is now the commit `sha1_hex` on the
+/// server, so the next push and sync recognise it. Best effort: the push has
+/// already succeeded, and a lost entry only costs a re-check next time.
+pub(crate) fn record_pushed_tip(repo: &crate::repo::Repo, head_idx: u64, sha1_hex: &str) {
+    let Ok(Some(leaf)) = repo.get_leaf(head_idx) else {
+        return;
+    };
+    let mut mapping = crate::remote::HashMapping::new(&repo.ivaldi_dir);
+    if mapping.insert_identity(sha1_hex, leaf.hash()) {
+        mapping.mark_verified(sha1_hex);
+        let _ = mapping.save();
+    }
 }
 
 /// The 40 zeros git uses for "this ref does not exist yet".
@@ -817,7 +827,7 @@ fn advertised_remote_state(
         else {
             continue;
         };
-        if let Some(sha) = mapping.get_sha1(leaf.hash()).and_then(sha1_hex_to_array) {
+        if let Some(sha) = crate::git_export::seal_git_identity(&leaf, mapping) {
             server_has.insert(sha);
         }
         stack.extend(leaf.all_parents());
@@ -2512,6 +2522,14 @@ fn collect_commit_order(
 /// - Every other dotfile is dropped — ivaldi auto-ignores dotfiles in the
 ///   workspace, and importing them would just create phantom "deleted"
 ///   entries in status/auto-shelf. Dot-directories are kept.
+///
+/// The policy is lossy: a seal imported from a commit that had dotfiles can
+/// never be translated back into that commit. That is safe only because
+/// upload never re-translates such a seal — it keeps the authenticated
+/// `git.sha1` the seal was imported from (see `git_export::export_roots`).
+/// Translating it again would mint a parallel copy of the history. What the
+/// policy still costs is that a new seal's tree, minted fresh, omits the
+/// dotfiles of every directory it touches.
 fn imported_entry_name(entry: &TreeEntry) -> Option<String> {
     match entry.name.as_str() {
         ".ivaldiignore" => Some(entry.name.clone()),
