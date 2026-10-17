@@ -28,8 +28,13 @@ pub(super) fn cmd_forge(quiet: bool) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn cmd_gather(args: GatherArgs, quiet: bool) -> Result<(), String> {
-    use crate::workspace::DotfileAllowlist;
+pub(super) fn cmd_gather(mut args: GatherArgs, quiet: bool) -> Result<(), String> {
+    use crate::workspace::{DotfileAllowlist, normalize_rel_path};
+
+    // Clean arguments up front (`./src/x` -> `src/x`, `./` -> `.`) so they
+    // match tree paths, skip entries and staged keys, and so a stray `.`
+    // component never reaches the stage file.
+    args.files = args.files.iter().map(|f| normalize_rel_path(f)).collect();
 
     let ctx = find_repo()?;
     let cas = FileCas::new(ctx.ivaldi_dir.join("objects")).map_err(|e| e.to_string())?;

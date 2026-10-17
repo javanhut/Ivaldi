@@ -43,6 +43,22 @@ pub struct WorkspaceFile {
     pub hash: Option<B3Hash>,
 }
 
+/// Lexically clean a workspace-relative path: drop `.` and empty components
+/// (`./a`, `a//b`, `a/./b`, trailing `/`). An argument that names the
+/// workspace root itself (`./`, `.`) comes back as `"."`. Staged paths must be
+/// in this form, since seal splits them into tree entry names and rejects `.`.
+pub fn normalize_rel_path(path: &str) -> String {
+    let cleaned: Vec<&str> = path
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    if cleaned.is_empty() {
+        ".".to_string()
+    } else {
+        cleaned.join("/")
+    }
+}
+
 /// The staging area tracks files gathered for the next seal.
 ///
 /// A staged change is either an addition/modification (a `path → blob hash`
@@ -66,7 +82,7 @@ impl StagingArea {
     /// Stage a file by path and content hash. Cancels any pending deletion
     /// for the same path.
     pub fn stage(&mut self, path: impl Into<String>, hash: B3Hash) {
-        let p = path.into();
+        let p = normalize_rel_path(&path.into());
         self.deletions.remove(&p);
         self.staged.insert(p, hash);
     }
@@ -74,7 +90,7 @@ impl StagingArea {
     /// Stage a path for deletion in the next seal. Cancels any pending
     /// addition for the same path.
     pub fn stage_deletion(&mut self, path: impl Into<String>) {
-        let p = path.into();
+        let p = normalize_rel_path(&path.into());
         self.staged.remove(&p);
         self.deletions.insert(p);
     }
@@ -82,8 +98,9 @@ impl StagingArea {
     /// Unstage a specific path (whether it was staged for addition or
     /// deletion). Returns true if anything was actually removed.
     pub fn unstage(&mut self, path: &str) -> bool {
-        let was_staged = self.staged.remove(path).is_some();
-        let was_deletion = self.deletions.remove(path);
+        let path = normalize_rel_path(path);
+        let was_staged = self.staged.remove(&path).is_some();
+        let was_deletion = self.deletions.remove(&path);
         was_staged || was_deletion
     }
 
@@ -95,12 +112,12 @@ impl StagingArea {
 
     /// Check if a file is staged for addition.
     pub fn is_staged(&self, path: &str) -> bool {
-        self.staged.contains_key(path)
+        self.staged.contains_key(&normalize_rel_path(path))
     }
 
     /// Check if a path is staged for deletion.
     pub fn is_staged_for_deletion(&self, path: &str) -> bool {
-        self.deletions.contains(path)
+        self.deletions.contains(&normalize_rel_path(path))
     }
 
     /// Get all files staged for addition.
@@ -145,7 +162,9 @@ impl StagingArea {
         crate::atomic_io::atomic_write(&stage_file, content.as_bytes())
     }
 
-    /// Load staging area from disk.
+    /// Load staging area from disk. Paths are normalized on the way in, so a
+    /// stage file written before gather cleaned its arguments (`./a` beside
+    /// `a`) collapses to one entry instead of failing the next seal.
     pub fn load(ivaldi_dir: &Path) -> Self {
         let stage_file = ivaldi_dir.join("stage").join("files");
         let content = match fs::read_to_string(&stage_file) {
@@ -1557,6 +1576,46 @@ mod tests {
         staging.stage("X", h);
         assert!(staging.is_staged("X"));
         assert!(!staging.is_staged_for_deletion("X"));
+    }
+
+    #[test]
+    fn normalize_rel_path_drops_dot_and_empty_components() {
+        assert_eq!(normalize_rel_path("./scripts/bench.sh"), "scripts/bench.sh");
+        assert_eq!(normalize_rel_path("a//b/./c/"), "a/b/c");
+        assert_eq!(normalize_rel_path("src/main.rs"), "src/main.rs");
+        assert_eq!(normalize_rel_path("./"), ".");
+        assert_eq!(normalize_rel_path("."), ".");
+    }
+
+    #[test]
+    fn staging_area_normalizes_dot_slash_paths() {
+        let mut staging = StagingArea::new();
+        let h = B3Hash::digest(b"x");
+        staging.stage("./scripts/bench.sh", h);
+        staging.stage("scripts/bench.sh", h);
+        assert_eq!(staging.len(), 1);
+        assert!(staging.staged_files().contains_key("scripts/bench.sh"));
+        assert!(staging.is_staged("./scripts/bench.sh"));
+        assert!(staging.unstage("./scripts/bench.sh"));
+        assert!(staging.is_empty());
+    }
+
+    #[test]
+    fn staging_area_load_collapses_dot_slash_duplicates() {
+        // Older gathers stored `./path` verbatim beside `path`; seal then
+        // failed with `invalid filename: "."`. Loading must heal that.
+        let dir = tempfile::tempdir().unwrap();
+        let ivaldi_dir = dir.path().join(".ivaldi");
+        fs::create_dir_all(ivaldi_dir.join("stage")).unwrap();
+
+        let h = B3Hash::digest(b"content");
+        let content = format!("{h} ./scripts/bench.sh\n{h} scripts/bench.sh\ndel ./old.txt\n");
+        fs::write(ivaldi_dir.join("stage/files"), content).unwrap();
+
+        let loaded = StagingArea::load(&ivaldi_dir);
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.staged_files().contains_key("scripts/bench.sh"));
+        assert!(loaded.staged_deletions().contains("old.txt"));
     }
 
     #[test]
