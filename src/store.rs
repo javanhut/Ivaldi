@@ -356,6 +356,28 @@ impl Store {
         Ok(v)
     }
 
+    /// Write and remove butterfly records in one transaction, so a change that
+    /// touches several (a cascade, children orphaned by a removal) lands whole
+    /// or not at all.
+    pub fn write_butterflies(
+        &self,
+        puts: &[(String, Vec<u8>)],
+        removes: &[String],
+    ) -> Result<(), StoreError> {
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(BUTTERFLY_DATA)?;
+            for name in removes {
+                t.remove(name.as_str())?;
+            }
+            for (name, data) in puts {
+                t.insert(name.as_str(), data.as_slice())?;
+            }
+        }
+        w.commit()?;
+        Ok(())
+    }
+
     pub fn set_butterfly_children(
         &self,
         parent: &str,
@@ -676,6 +698,19 @@ mod tests {
         assert_eq!(s.get_butterfly("exp").unwrap().unwrap(), b"json");
         assert!(s.delete_butterfly("exp").unwrap());
         assert!(s.get_butterfly("exp").unwrap().is_none());
+    }
+
+    #[test]
+    fn write_butterflies_puts_and_removes_together() {
+        let (_d, s) = setup();
+        s.put_butterfly("old", b"1").unwrap();
+        s.put_butterfly("kept", b"2").unwrap();
+
+        s.write_butterflies(&[("new".into(), b"3".to_vec())], &["old".into()])
+            .unwrap();
+
+        assert_eq!(s.list_butterflies().unwrap(), vec!["kept", "new"]);
+        assert_eq!(s.get_butterfly("new").unwrap().unwrap(), b"3");
     }
 
     #[test]

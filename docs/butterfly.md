@@ -14,7 +14,38 @@ Butterflies are lightweight experimental timelines that branch from a parent. Th
 - **Cascade delete**: Recursively delete entire butterfly trees
 - **Orphan detection**: When a parent is deleted, children are marked orphaned
 
-## Usage
+## Commands
+
+```bash
+ivaldi tl bf create experiment        # butterfly of the current timeline; switches to it
+# ... make changes, seal ...
+ivaldi tl bf up                       # merge the butterfly's sealed work into its parent
+ivaldi tl bf down                     # merge the parent's sealed work into the butterfly
+ivaldi tl bf rm experiment            # remove it; its own butterflies become orphans
+ivaldi tl bf rm experiment --cascade  # remove it and everything nested under it
+```
+
+- **`up` and `down` are fuses.** Each merges per file and per line, exactly
+  as `ivaldi fuse` does, so neither side loses a seal: work the parent sealed
+  after the butterfly was made survives `up`, and the butterfly's own seals
+  survive `down`. Running either when the other side already has everything
+  seals nothing.
+- **`up` sends sealed work only.** Uncommitted changes stay on the butterfly,
+  and the working directory is not touched.
+- **`down` updates the working directory** to the merged result and carries
+  uncommitted work through it, like `ivaldi fuse`. `ivaldi oops` undoes it.
+- **What collides is settled by the layer rules** (below) instead of by a
+  prompt, and the command lists every file it settled that way. The fuse
+  engine treats edits within a few lines of a collision as part of it, so
+  that whole stretch is settled together.
+- **`rm` only removes butterflies** (`ivaldi timeline remove` is for other
+  timelines) and refuses, before removing anything, if the checked-out
+  timeline would go with it.
+- **Records follow the timelines.** `ivaldi timeline remove` of a parent
+  orphans its butterflies, and `ivaldi timeline rename` of a butterfly or a
+  parent keeps every link intact.
+
+## Library usage
 
 ```rust
 use ivaldi::butterfly::ButterflyManager;
@@ -62,7 +93,7 @@ assert!(!mgr.is_butterfly("sub-experiment")); // gone
 When a parent butterfly is deleted without cascade:
 - Child butterflies remain functional
 - Marked as `is_orphaned = true`
-- `original_parent` preserves the deleted parent's name
+- `parent_name` still names the deleted parent; `original_parent` records the timeline that parent was itself made from (`None` when the deleted parent was not a butterfly)
 - Cannot sync up/down while orphaned
 
 ```rust
@@ -87,6 +118,10 @@ assert!(!meta.is_butterfly);
 
 ## Conflict Resolution Rules (for sync)
 
+"Theirs" is the incoming side: the butterfly on `up`, the parent on `down`.
+Changes that do not collide merge as in any fuse; these rules settle only
+what does.
+
 | Scenario | Resolution |
 |----------|-----------|
 | Both added same file | Layer: keep theirs on top |
@@ -96,7 +131,7 @@ assert!(!meta.is_butterfly);
 
 ## Design Decisions
 
-- **In-memory metadata**: BTreeMap-based storage. Persistent storage (`.ivaldi/butterflies/`) deferred to persistence layer.
+- **Stored metadata**: one JSON record per butterfly in the repository store (`store.db`). `ButterflyManager` is the in-memory model: `butterfly::load` builds it from the records, and each change is written back in one store transaction.
 - **Parent-child tracking**: Bidirectional — parent knows children, children know parent.
 - **Cascade delete is recursive**: Deletes entire subtree depth-first.
 - **Orphan preservation**: Orphaned butterflies remain usable, just can't sync with deleted parent.

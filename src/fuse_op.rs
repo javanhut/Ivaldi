@@ -55,7 +55,19 @@ pub enum Planned {
 /// Work out the fuse of `source` into the current timeline. Read-only, apart
 /// from merged blobs the engine adds to the CAS.
 pub fn plan(repo: &Repo, source: &str, strategy: Strategy) -> Result<Planned, FuseOpError> {
-    let target = repo.current_timeline()?;
+    plan_into(repo, source, &repo.current_timeline()?, strategy)
+}
+
+/// [`plan`] with the target named rather than taken from HEAD, for fusing
+/// into a timeline that is not checked out (a butterfly's parent). Seal such
+/// a plan with [`seal_onto`].
+pub fn plan_into(
+    repo: &Repo,
+    source: &str,
+    target: &str,
+    strategy: Strategy,
+) -> Result<Planned, FuseOpError> {
+    let target = target.to_string();
     let head = |timeline: &str| -> Result<(u64, crate::leaf::Leaf), FuseOpError> {
         let idx = repo
             .get_timeline_head(timeline)?
@@ -162,6 +174,40 @@ pub fn carried_collisions(
 /// merged tree to the working directory. Every conflict must already be
 /// settled into `merged_files`.
 pub fn seal(repo: &mut Repo, plan: &FusePlan) -> Result<CommitResult, FuseOpError> {
+    let (committed, merged_tree) = commit_fused(repo, plan)?;
+
+    // Without this the seal exists but the working tree still shows
+    // pre-merge content — which reads as uncommitted edits undoing the fuse.
+    Workspace::new(&repo.cas, &repo.work_dir, &repo.ivaldi_dir)
+        .materialize(merged_tree)
+        .map_err(|e| FuseOpError::Other(format!("merge sealed but failed to materialize: {e}")))?;
+
+    // A re-attempt that succeeds settles a merge an earlier one left open.
+    repo.clear_merge_state()?;
+    // The scratch timeline a diverged sync parks remote seals on has no
+    // further use once a merge references them; the seals stay in history.
+    if plan.source.starts_with("__sync_") {
+        let _ = repo.remove_timeline(&plan.source);
+    }
+    Ok(committed)
+}
+
+/// Seal `plan.merged_files` onto a target that is not checked out. Nothing in
+/// the working directory belongs to that timeline, so nothing there is
+/// touched: no materializing, no carry, and no merge state to settle.
+pub fn seal_onto(repo: &mut Repo, plan: &FusePlan) -> Result<CommitResult, FuseOpError> {
+    if repo.current_timeline().ok().as_deref() == Some(plan.target.as_str()) {
+        return Err(FuseOpError::Other(format!(
+            "'{}' is checked out; fuse into it with the working directory, not around it",
+            plan.target
+        )));
+    }
+    Ok(commit_fused(repo, plan)?.0)
+}
+
+/// The merge seal itself, shared by [`seal`] and [`seal_onto`]. Returns the
+/// seal and the merged tree.
+fn commit_fused(repo: &mut Repo, plan: &FusePlan) -> Result<(CommitResult, B3Hash), FuseOpError> {
     let merged_tree = FsStore::new(&repo.cas).build_tree_from_hash_map(&plan.merged_files)?;
 
     let author = repo.config().author().unwrap_or_else(|| "ivaldi".into());
@@ -184,21 +230,7 @@ pub fn seal(repo: &mut Repo, plan: &FusePlan) -> Result<CommitResult, FuseOpErro
     crate::failpoint::fail_point("fuse.before_commit");
     let committed = repo.commit_raw(leaf, &plan.target)?;
     crate::failpoint::fail_point("fuse.after_commit");
-
-    // Without this the seal exists but the working tree still shows
-    // pre-merge content — which reads as uncommitted edits undoing the fuse.
-    Workspace::new(&repo.cas, &repo.work_dir, &repo.ivaldi_dir)
-        .materialize(merged_tree)
-        .map_err(|e| FuseOpError::Other(format!("merge sealed but failed to materialize: {e}")))?;
-
-    // A re-attempt that succeeds settles a merge an earlier one left open.
-    repo.clear_merge_state()?;
-    // The scratch timeline a diverged sync parks remote seals on has no
-    // further use once a merge references them; the seals stay in history.
-    if plan.source.starts_with("__sync_") {
-        let _ = repo.remove_timeline(&plan.source);
-    }
-    Ok(committed)
+    Ok((committed, merged_tree))
 }
 
 /// Step three of the carry: merge set-aside work onto the freshly

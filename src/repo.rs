@@ -631,7 +631,27 @@ impl Repo {
             Err(e) => return Err(RepoError::Io(e)),
         }
 
+        // A butterfly record outliving its timeline would make a new
+        // timeline of the same name look like one, and leave the butterflies
+        // made from it syncing with nothing.
+        crate::butterfly::on_timeline_removed(&self.store, name)
+            .map_err(|e| RepoError::Other(e.to_string()))?;
+
         Ok(())
+    }
+
+    /// Whether timeline `name` exists: it has a head, or a marker (a timeline
+    /// with no seals yet), or HEAD names it (the unborn first timeline).
+    pub fn timeline_exists(&self, name: &str) -> Result<bool, RepoError> {
+        let ref_path = timeline_ref_path(&self.ivaldi_dir, name)
+            .map_err(|e| RepoError::Other(e.to_string()))?;
+        Ok(self
+            .store
+            .get_timeline_head(name)
+            .map_err(RepoError::Store)?
+            .is_some()
+            || ref_path.exists()
+            || self.current_timeline().ok().as_deref() == Some(name))
     }
 
     /// Rename a timeline. If it's the current timeline, HEAD is updated too.
@@ -705,6 +725,9 @@ impl Repo {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(RepoError::Io(e)),
         }
+
+        crate::butterfly::on_timeline_renamed(&self.store, old_name, new_name)
+            .map_err(|e| RepoError::Other(e.to_string()))?;
 
         Ok(())
     }
@@ -1182,109 +1205,19 @@ impl Repo {
         Ok(reviews)
     }
 
-    // -- Butterfly sync --
+    // -- Butterflies --
 
-    /// Sync butterfly up: merge butterfly changes into parent timeline.
-    /// Uses the fuse engine with auto strategy (fast-forward preferred).
-    pub fn butterfly_sync_up(&mut self, butterfly_name: &str) -> Result<CommitResult, RepoError> {
-        // Get butterfly and parent head trees
-        let bf_head = self.get_timeline_head(butterfly_name)?.ok_or_else(|| {
-            RepoError::Other(format!("butterfly '{}' has no commits", butterfly_name))
-        })?;
-        let bf_leaf = self
-            .get_leaf(bf_head)?
-            .ok_or_else(|| RepoError::Other("corrupt butterfly head".into()))?;
-
-        // Find parent name from store metadata
-        let parent_data = self
-            .store
-            .get_butterfly(butterfly_name)
-            .map_err(RepoError::Store)?
-            .ok_or_else(|| RepoError::Other(format!("'{}' is not a butterfly", butterfly_name)))?;
-        let parent_name: String = serde_json::from_slice::<serde_json::Value>(&parent_data)
-            .map_err(|e| RepoError::Other(e.to_string()))?
-            .get("parent_name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| RepoError::Other("corrupt butterfly metadata".into()))?
-            .to_string();
-
-        // Use butterfly's tree as the merge result (fast-forward)
-        let tree_root = bf_leaf.tree_root;
-        let author = bf_leaf.author.clone();
-        let message = format!(
-            "Merged butterfly '{}' into '{}'",
-            butterfly_name, parent_name
-        );
-
-        // Switch to parent and commit
-        let prev_current = self.current_timeline()?;
-        self.switch_timeline(&parent_name)?;
-        let result = self.commit(tree_root, &author, &message)?;
-        // Switch back if we were on the butterfly
-        if prev_current == butterfly_name {
-            self.switch_timeline(butterfly_name)?;
-        }
-
-        Ok(result)
-    }
-
-    /// Sync butterfly down: merge parent changes into butterfly.
-    pub fn butterfly_sync_down(&mut self, butterfly_name: &str) -> Result<CommitResult, RepoError> {
-        let parent_data = self
-            .store
-            .get_butterfly(butterfly_name)
-            .map_err(RepoError::Store)?
-            .ok_or_else(|| RepoError::Other(format!("'{}' is not a butterfly", butterfly_name)))?;
-        let parent_name: String = serde_json::from_slice::<serde_json::Value>(&parent_data)
-            .map_err(|e| RepoError::Other(e.to_string()))?
-            .get("parent_name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| RepoError::Other("corrupt butterfly metadata".into()))?
-            .to_string();
-
-        let parent_head = self
-            .get_timeline_head(&parent_name)?
-            .ok_or_else(|| RepoError::Other(format!("parent '{}' has no commits", parent_name)))?;
-        let parent_leaf = self
-            .get_leaf(parent_head)?
-            .ok_or_else(|| RepoError::Other("corrupt parent head".into()))?;
-
-        // Use parent's tree as the merge result (fast-forward down)
-        let tree_root = parent_leaf.tree_root;
-        let author = parent_leaf.author.clone();
-        let message = format!(
-            "Synced from parent '{}' into '{}'",
-            parent_name, butterfly_name
-        );
-
-        let prev_current = self.current_timeline()?;
-        self.switch_timeline(butterfly_name)?;
-        let result = self.commit(tree_root, &author, &message)?;
-        if prev_current != butterfly_name {
-            self.switch_timeline(&prev_current)?;
-        }
-
-        Ok(result)
-    }
-
-    /// Store butterfly metadata in redb for persistence.
+    /// Record `name` as a butterfly of `parent_name`, diverging at
+    /// `divergence_hash`. Syncing lives in [`crate::butterfly`].
     pub fn store_butterfly_meta(
         &self,
         name: &str,
         parent_name: &str,
         divergence_hash: B3Hash,
     ) -> Result<(), RepoError> {
-        let data = serde_json::json!({
-            "name": name,
-            "parent_name": parent_name,
-            "divergence_hash": divergence_hash.to_hex(),
-            "is_orphaned": false,
-        });
-        let bytes = serde_json::to_vec(&data).map_err(|e| RepoError::Other(e.to_string()))?;
-        self.store
-            .put_butterfly(name, &bytes)
-            .map_err(RepoError::Store)?;
-        Ok(())
+        crate::butterfly::record_new(&self.store, name, parent_name, divergence_hash)
+            .map(|_| ())
+            .map_err(|e| RepoError::Other(e.to_string()))
     }
 }
 

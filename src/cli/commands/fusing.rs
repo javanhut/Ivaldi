@@ -7,30 +7,17 @@ pub(super) fn cmd_butterfly(
     _ctx: &RepoContext,
     quiet: bool,
 ) -> Result<(), String> {
+    use crate::butterfly::Synced;
+
     match args.command {
         ButterflyCommands::Create(create_args) => {
             let repo = open_repo()?;
-            let parent = repo.current_timeline().unwrap_or_else(|_| "main".into());
-
-            // Store butterfly metadata
-            let divergence_hash = repo
-                .get_timeline_head(&parent)
-                .map_err(|e| e.to_string())?
-                .and_then(|idx| repo.get_leaf(idx).ok().flatten())
-                .map(|l| l.hash())
-                .unwrap_or(crate::hash::B3Hash::ZERO);
-
-            repo.create_timeline(&create_args.name, Some(&parent))
-                .map_err(|e| e.to_string())?;
-            repo.store_butterfly_meta(&create_args.name, &parent, divergence_hash)
-                .map_err(|e| e.to_string())?;
-            repo.switch_timeline(&create_args.name)
-                .map_err(|e| e.to_string())?;
-
+            let bf =
+                crate::butterfly::create(&repo, &create_args.name).map_err(|e| e.to_string())?;
             if !quiet {
                 println!(
                     "Creating butterfly timeline '{}' from '{}'",
-                    create_args.name, parent
+                    bf.name, bf.parent_name
                 );
                 println!("Switched to butterfly timeline");
             }
@@ -39,44 +26,107 @@ pub(super) fn cmd_butterfly(
         ButterflyCommands::Up => {
             let mut repo = open_repo()?;
             let current = repo.current_timeline().map_err(|e| e.to_string())?;
-            let result = repo
-                .butterfly_sync_up(&current)
-                .map_err(|e| e.to_string())?;
+            let parent = butterfly_parent(&repo, &current)?;
+            let dirty = !crate::snapshot::capture(&repo, &repo.cas, "butterfly up (preview)")
+                .map_err(|e| e.to_string())?
+                .is_clean();
+            // The parent is not checked out, so nothing is carried.
+            let synced =
+                crate::butterfly::up(&mut repo, &current, None).map_err(|e| e.to_string())?;
             if !quiet {
-                println!("Synced butterfly '{}' up to parent", current);
-                println!(
-                    "  Parent updated: {} ({})",
-                    result.seal_name,
-                    result.hash.short8()
-                );
+                match synced {
+                    Synced::Nothing => {
+                        println!(
+                            "Nothing to sync: '{parent}' already has everything sealed on '{current}'."
+                        )
+                    }
+                    Synced::Sealed { seal, layered, .. } => {
+                        println!("Synced butterfly '{}' up to '{}'", current, parent);
+                        println!(
+                            "  Parent updated: {} ({})",
+                            seal.seal_name,
+                            seal.hash.short8()
+                        );
+                        print_layered(&layered, &current);
+                    }
+                }
+                if dirty {
+                    println!(
+                        "  Uncommitted changes stay on '{current}': only sealed work goes up."
+                    );
+                }
             }
             Ok(())
         }
         ButterflyCommands::Down => {
             let mut repo = open_repo()?;
             let current = repo.current_timeline().map_err(|e| e.to_string())?;
-            let result = repo
-                .butterfly_sync_down(&current)
+            let parent = butterfly_parent(&repo, &current)?;
+            let mut carry = make_resolver(None);
+            let synced = crate::butterfly::down(&mut repo, &current, carry.as_deref_mut())
                 .map_err(|e| e.to_string())?;
             if !quiet {
-                println!("Synced butterfly '{}' down from parent", current);
-                println!(
-                    "  Butterfly updated: {} ({})",
-                    result.seal_name,
-                    result.hash.short8()
-                );
+                match synced {
+                    Synced::Nothing => {
+                        println!(
+                            "Nothing to sync: '{current}' already has everything sealed on '{parent}'."
+                        )
+                    }
+                    Synced::Sealed {
+                        seal,
+                        layered,
+                        carry,
+                    } => {
+                        println!("Synced butterfly '{}' down from '{}'", current, parent);
+                        println!(
+                            "  Butterfly updated: {} ({})",
+                            seal.seal_name,
+                            seal.hash.short8()
+                        );
+                        print_layered(&layered, &parent);
+                        if let Some(report) = &carry {
+                            print_carry_report(report);
+                        }
+                        println!("  Not what you wanted? 'ivaldi oops' undoes the whole sync.");
+                    }
+                }
             }
             Ok(())
         }
         ButterflyCommands::Remove(remove_args) => {
             let repo = open_repo()?;
-            repo.remove_timeline(&remove_args.name)
+            let removed = crate::butterfly::remove(&repo, &remove_args.name, remove_args.cascade)
                 .map_err(|e| e.to_string())?;
             if !quiet {
-                println!("Removed butterfly '{}'", remove_args.name);
+                for name in &removed {
+                    println!("Removed butterfly '{}'", name);
+                }
             }
             Ok(())
         }
+    }
+}
+
+/// The parent butterfly `name` syncs with, for messages. The sync itself
+/// checks again and reports a missing or orphaned record properly.
+fn butterfly_parent(repo: &crate::repo::Repo, name: &str) -> Result<String, String> {
+    let mgr = crate::butterfly::load(&repo.store).map_err(|e| e.to_string())?;
+    Ok(mgr.get_parent(name).map(str::to_string).unwrap_or_default())
+}
+
+/// Name the files the layer rules settled: nothing is picked by rule silently.
+fn print_layered(layered: &[String], on_top: &str) {
+    if layered.is_empty() {
+        return;
+    }
+    println!(
+        "  {} file(s) changed on both sides in ways that collide; '{}' went on top \
+         (an edit beats a deletion):",
+        layered.len(),
+        on_top
+    );
+    for path in layered {
+        println!("       {path}");
     }
 }
 

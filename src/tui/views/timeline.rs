@@ -321,38 +321,16 @@ impl TabView for TimelineView {
 
 impl TimelineView {
     fn create_butterfly(&mut self, ctx: &mut AppContext, name: &str) -> Action {
-        let parent = match ctx.repo.current_timeline() {
-            Ok(t) => t,
-            Err(e) => return Action::Error(format!("Failed to read HEAD: {}", e)),
-        };
-
-        // Capture the parent's tip hash so the butterfly knows where it
-        // diverged. ZERO is a valid sentinel for "parent has no commits yet".
-        let divergence_hash = match ctx.repo.get_timeline_head(&parent) {
-            Ok(Some(idx)) => match ctx.repo.get_leaf(idx) {
-                Ok(Some(leaf)) => leaf.hash(),
-                _ => crate::hash::B3Hash::ZERO,
-            },
-            _ => crate::hash::B3Hash::ZERO,
-        };
-
-        if let Err(e) = ctx.repo.create_timeline(name, Some(&parent)) {
-            return Action::Error(format!("Create failed: {}", e));
+        match crate::butterfly::create(&ctx.repo, name) {
+            Ok(bf) => {
+                self.message = Some((
+                    format!("Created butterfly '{}' from '{}'", bf.name, bf.parent_name),
+                    false,
+                ));
+                Action::Refresh
+            }
+            Err(e) => Action::Error(format!("Create failed: {}", e)),
         }
-        if let Err(e) = ctx
-            .repo
-            .store_butterfly_meta(name, &parent, divergence_hash)
-        {
-            return Action::Error(format!("Butterfly metadata failed: {}", e));
-        }
-        if let Err(e) = ctx.repo.switch_timeline(name) {
-            return Action::Error(format!("Switch failed: {}", e));
-        }
-        self.message = Some((
-            format!("Created butterfly '{}' from '{}'", name, parent),
-            false,
-        ));
-        Action::Refresh
     }
 
     fn butterfly_up(&mut self, ctx: &mut AppContext) -> Action {
@@ -365,7 +343,9 @@ impl TimelineView {
             return Action::Consumed;
         }
         let name = row.name.clone();
-        match ctx.repo.butterfly_sync_up(&name) {
+        // No prompting inside the TUI: carried work that collides gets
+        // conflict markers, as an unattended fuse does.
+        match crate::butterfly::up(&mut ctx.repo, &name, None) {
             Ok(_) => {
                 self.message = Some((format!("Synced butterfly '{}' up to parent", name), false));
                 Action::Refresh
@@ -387,7 +367,7 @@ impl TimelineView {
             return Action::Consumed;
         }
         let name = row.name.clone();
-        match ctx.repo.butterfly_sync_down(&name) {
+        match crate::butterfly::down(&mut ctx.repo, &name, None) {
             Ok(_) => {
                 self.message = Some((
                     format!("Synced butterfly '{}' down from parent", name),
