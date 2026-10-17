@@ -107,7 +107,8 @@ ivaldi log --format json | jq '.[0].seal_name'
 ivaldi tl create feature
 ivaldi tl sw feature
 ivaldi tl ls
-ivaldi tl rm feature
+ivaldi tl rm feature                      # refused if feature has shelved work
+ivaldi tl rm feature --force              # ...unless you mean to discard it
 
 # Rename a timeline — three accepted forms
 ivaldi tl rename main-v2                  # rename the current timeline

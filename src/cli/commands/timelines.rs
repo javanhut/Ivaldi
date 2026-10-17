@@ -333,8 +333,12 @@ pub(super) fn cmd_timeline(args: TimelineArgs, quiet: bool) -> Result<(), String
         }
         TimelineCommands::Remove(remove_args) => {
             let repo = open_repo()?;
-            repo.remove_timeline(&remove_args.name)
-                .map_err(|e| e.to_string())?;
+            if remove_args.force {
+                repo.remove_timeline_discarding_shelf(&remove_args.name)
+            } else {
+                repo.remove_timeline(&remove_args.name)
+            }
+            .map_err(|e| e.to_string())?;
             if !quiet {
                 println!("Removed timeline: {}", remove_args.name);
             }

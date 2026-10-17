@@ -16,6 +16,7 @@ use crate::leaf::{self, Leaf, NO_PARENT};
 use crate::mmr::Mmr;
 use crate::refname::{tag_ref_path, timeline_ref_path, validate_timeline_name};
 use crate::seal;
+use crate::shelf::ShelfManager;
 use crate::store::{MMR_ROOT_KEY, MMR_SIZE_KEY, Store, StoreError};
 
 /// A persistent repository backed by redb + file CAS.
@@ -608,13 +609,53 @@ impl Repo {
         Ok(())
     }
 
-    /// Remove a timeline.
+    /// Remove a timeline. Refused while it has shelved work, which nothing
+    /// could reach once the timeline is gone; see
+    /// [`Repo::remove_timeline_discarding_shelf`].
     pub fn remove_timeline(&self, name: &str) -> Result<(), RepoError> {
+        self.remove_timeline_inner(name, false)
+    }
+
+    /// Remove a timeline and discard its shelved work, if it has any.
+    pub fn remove_timeline_discarding_shelf(&self, name: &str) -> Result<(), RepoError> {
+        self.remove_timeline_inner(name, true)
+    }
+
+    /// Refuse if any of `names` has shelved work: uncommitted changes set
+    /// aside when it was switched away from. Checked up front by removals
+    /// that take several timelines, so a refusal removes none of them.
+    pub fn ensure_nothing_shelved<S: AsRef<str>>(&self, names: &[S]) -> Result<(), RepoError> {
+        let shelves = ShelfManager::new(&self.ivaldi_dir);
+        let shelved: Vec<String> = names
+            .iter()
+            .map(AsRef::as_ref)
+            .filter(|name| shelves.has_shelf(name))
+            .map(str::to_string)
+            .collect();
+        if shelved.is_empty() {
+            Ok(())
+        } else {
+            Err(RepoError::ShelvedWork(shelved))
+        }
+    }
+
+    fn remove_timeline_inner(&self, name: &str, discard_shelf: bool) -> Result<(), RepoError> {
         let ref_path = timeline_ref_path(&self.ivaldi_dir, name)
             .map_err(|e| RepoError::Other(e.to_string()))?;
         let current = self.current_timeline()?;
         if current == name {
             return Err(RepoError::Other("cannot remove current timeline".into()));
+        }
+
+        // The shelf goes first: a crash after it leaves the timeline, and a
+        // retry removes it. The reverse order could strand the shelf, for a
+        // new timeline of the same name to pick up.
+        if discard_shelf {
+            ShelfManager::new(&self.ivaldi_dir)
+                .remove_shelf(name)
+                .map_err(|e| RepoError::Other(e.to_string()))?;
+        } else {
+            self.ensure_nothing_shelved(&[name])?;
         }
 
         // Remove the stored head before the marker file. A crash in between
@@ -695,14 +736,26 @@ impl Repo {
             )));
         }
 
+        let shelves = ShelfManager::new(&self.ivaldi_dir);
+        shelves
+            .check_rename(old_name, new_name)
+            .map_err(|e| RepoError::Other(format!("cannot rename '{old_name}': {e}")))?;
+
         // Ordered so every crash window leaves at worst a harmless orphan
-        // marker: (1) create the new marker, (2) move the head in one store
-        // transaction, (3) repoint HEAD, (4) remove the old marker.
+        // marker: (1) create the new marker, (2) move the shelf, (3) move the
+        // head in one store transaction, (4) repoint HEAD, (5) remove the old
+        // marker. The shelf moves while the old name still exists, so a crash
+        // after it is finished by retrying the rename, which moves the rest.
         if let Some(parent) = new_ref.parent() {
             std::fs::create_dir_all(parent).map_err(RepoError::Io)?;
         }
         atomic_write(&new_ref, b"").map_err(RepoError::Io)?;
         crate::failpoint::fail_point("timeline.rename.after_marker");
+
+        shelves
+            .rename_shelf(old_name, new_name)
+            .map_err(|e| RepoError::Other(format!("cannot rename '{old_name}': {e}")))?;
+        crate::failpoint::fail_point("timeline.rename.after_shelf");
 
         if old_head.is_some() {
             self.store
@@ -1231,8 +1284,33 @@ pub enum RepoError {
     Io(#[from] std::io::Error),
     #[error("repository integrity error: {0}")]
     Integrity(String),
+    /// Removing these timelines would strand their shelved work.
+    #[error("{}", shelved_work_message(.0))]
+    ShelvedWork(Vec<String>),
     #[error("{0}")]
     Other(String),
+}
+
+/// Name every timeline whose shelved work a removal would lose, and say how
+/// to get it back or let it go.
+fn shelved_work_message(names: &[String]) -> String {
+    let quoted: Vec<String> = names.iter().map(|name| format!("'{name}'")).collect();
+    let (has, it, them, each) = if names.len() == 1 {
+        ("has", "it", "them", "it")
+    } else {
+        ("have", "them", "that work", "each")
+    };
+    let mut message = format!(
+        "{} {has} shelved work: uncommitted changes set aside when you switched away \
+         from {it}. Removing {it} would lose {them}, so nothing was removed.\n\
+         To keep {them}, switch to {each} and seal:",
+        quoted.join(", ")
+    );
+    for name in names {
+        message.push_str(&format!("\n  ivaldi timeline switch {name}"));
+    }
+    message.push_str(&format!("\nTo discard {them}, rerun with --force."));
+    message
 }
 
 #[cfg(test)]
@@ -1797,6 +1875,65 @@ mod tests {
 
         repo.remove_timeline("feature").unwrap();
         assert!(repo.get_timeline_head("feature").unwrap().is_none());
+    }
+
+    fn shelve(repo: &Repo, timeline: &str, file: &str) {
+        ShelfManager::new(&repo.ivaldi_dir)
+            .save_shelf(&crate::shelf::Shelf {
+                timeline: timeline.into(),
+                staged_files: BTreeMap::from([(file.into(), B3Hash::digest(file.as_bytes()))]),
+                workspace_changes: Vec::new(),
+                created_at: 100,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn remove_refuses_a_shelved_timeline_and_forced_remove_discards_the_shelf() {
+        let (_dir, mut repo) = setup_repo();
+        repo.commit(B3Hash::digest(b"t"), "A", "init").unwrap();
+        repo.create_timeline("feature", None).unwrap();
+        shelve(&repo, "feature", "draft.txt");
+        let shelves = ShelfManager::new(&repo.ivaldi_dir);
+
+        let err = repo.remove_timeline("feature").unwrap_err();
+        assert!(matches!(&err, RepoError::ShelvedWork(names) if names == &["feature"]));
+        assert!(repo.get_timeline_head("feature").unwrap().is_some());
+        assert!(shelves.has_shelf("feature"));
+
+        repo.remove_timeline_discarding_shelf("feature").unwrap();
+        assert!(repo.get_timeline_head("feature").unwrap().is_none());
+        assert!(!shelves.has_shelf("feature"));
+    }
+
+    #[test]
+    fn forced_remove_of_the_current_timeline_keeps_its_shelf() {
+        let (_dir, mut repo) = setup_repo();
+        repo.commit(B3Hash::digest(b"t"), "A", "init").unwrap();
+        shelve(&repo, "main", "draft.txt");
+
+        assert!(repo.remove_timeline_discarding_shelf("main").is_err());
+        assert!(ShelfManager::new(&repo.ivaldi_dir).has_shelf("main"));
+    }
+
+    #[test]
+    fn rename_refused_over_different_shelved_work_changes_nothing() {
+        let (dir, mut repo) = setup_repo();
+        repo.commit(B3Hash::digest(b"t"), "A", "init").unwrap();
+        repo.create_timeline("feature", None).unwrap();
+        shelve(&repo, "feature", "mine.txt");
+        // Stranded by a removal from before shelves were guarded.
+        shelve(&repo, "renamed", "stranded.txt");
+
+        assert!(repo.rename_timeline("feature", "renamed").is_err());
+
+        assert!(repo.get_timeline_head("feature").unwrap().is_some());
+        assert!(!dir.path().join(".ivaldi/refs/heads/renamed").exists());
+        let shelves = ShelfManager::new(&repo.ivaldi_dir);
+        let mine = shelves.load_shelf("feature").unwrap().unwrap();
+        assert!(mine.staged_files.contains_key("mine.txt"));
+        let stranded = shelves.load_shelf("renamed").unwrap().unwrap();
+        assert!(stranded.staged_files.contains_key("stranded.txt"));
     }
 
     #[test]

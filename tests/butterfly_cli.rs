@@ -7,8 +7,10 @@
 //!   top, and an edit beats a deletion.
 //! - `rm --cascade` removes a butterfly with everything nested under it;
 //!   plain `rm` leaves the children, orphaned and unable to sync.
+//! - Shelved work is never lost with its timeline: removal refuses until it
+//!   is sealed or `--force` discards it, and a rename takes it along.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn ivaldi(dir: &Path, args: &[&str]) -> Output {
@@ -114,6 +116,12 @@ fn seal_count(dir: &Path) -> usize {
     let log: serde_json::Value =
         serde_json::from_slice(&ivaldi_ok(dir, &["log", "--format", "json"]).stdout).unwrap();
     log.as_array().unwrap().len()
+}
+
+/// Where switching away from `timeline` shelves its uncommitted work.
+fn shelf(dir: &Path, timeline: &str) -> PathBuf {
+    dir.join(".ivaldi/shelves")
+        .join(format!("{timeline}.shelf"))
 }
 
 /// A repository with `a.txt` sealed on main and a butterfly `exp` made from
@@ -515,6 +523,192 @@ fn rm_refuses_a_timeline_that_is_not_a_butterfly() {
     let stderr = ivaldi_fails(d, &["tl", "bf", "rm", "feature"]);
     assert!(stderr.contains("not a butterfly"), "{stderr}");
     assert_eq!(timelines(d), ["exp", "feature", "main"]);
+}
+
+// -- shelved work ------------------------------------------------------------
+
+#[test]
+fn rm_refuses_a_butterfly_with_shelved_work_and_says_how_to_get_it_back() {
+    let dir = with_butterfly();
+    let d = dir.path();
+    write(d, "dirty.txt", "not sealed\n");
+    switch(d, "main");
+    assert!(shelf(d, "exp").exists());
+
+    let stderr = ivaldi_fails(d, &["tl", "bf", "rm", "exp"]);
+    assert!(stderr.contains("'exp' has shelved work"), "{stderr}");
+    assert!(stderr.contains("ivaldi timeline switch exp"), "{stderr}");
+    assert!(stderr.contains("seal"), "{stderr}");
+    assert!(stderr.contains("--force"), "{stderr}");
+
+    assert_eq!(timelines(d), ["exp", "main"]);
+    switch(d, "exp");
+    assert_eq!(read(d, "dirty.txt"), "not sealed\n");
+}
+
+#[test]
+fn rm_force_removes_a_butterfly_and_its_shelved_work() {
+    let dir = with_butterfly();
+    let d = dir.path();
+    write(d, "dirty.txt", "not sealed\n");
+    switch(d, "main");
+
+    ivaldi_ok(d, &["tl", "bf", "rm", "exp", "--force"]);
+
+    assert_eq!(timelines(d), ["main"]);
+    assert!(!shelf(d, "exp").exists());
+}
+
+#[test]
+fn rm_cascade_with_shelved_work_anywhere_in_the_tree_removes_nothing() {
+    let dir = with_butterfly();
+    let d = dir.path();
+    ivaldi_ok(d, &["tl", "bf", "create", "exp2"]);
+    ivaldi_ok(d, &["tl", "bf", "create", "exp3"]);
+    write(d, "deep.txt", "not sealed\n");
+    switch(d, "main");
+
+    let stderr = ivaldi_fails(d, &["tl", "bf", "rm", "exp", "--cascade"]);
+    assert!(stderr.contains("'exp3' has shelved work"), "{stderr}");
+    assert!(stderr.contains("ivaldi timeline switch exp3"), "{stderr}");
+
+    // Checked before anything went: the whole tree is still there and linked.
+    assert_eq!(timelines(d), ["exp", "exp2", "exp3", "main"]);
+    switch(d, "exp3");
+    assert_eq!(read(d, "deep.txt"), "not sealed\n");
+    seal_all(d, "exp3 seals it");
+    ivaldi_ok(d, &["tl", "bf", "up"]);
+    switch(d, "exp2");
+    assert_eq!(files(d), ["a.txt", "deep.txt"]);
+}
+
+#[test]
+fn rm_cascade_names_every_timeline_with_shelved_work() {
+    let dir = with_butterfly();
+    let d = dir.path();
+    ivaldi_ok(d, &["tl", "bf", "create", "exp2"]);
+    write(d, "two.txt", "not sealed\n");
+    switch(d, "exp");
+    write(d, "one.txt", "not sealed\n");
+    switch(d, "main");
+
+    let stderr = ivaldi_fails(d, &["tl", "bf", "rm", "exp", "--cascade"]);
+    assert!(stderr.contains("'exp'"), "{stderr}");
+    assert!(stderr.contains("'exp2'"), "{stderr}");
+    assert_eq!(timelines(d), ["exp", "exp2", "main"]);
+}
+
+#[test]
+fn rm_cascade_force_removes_every_shelf_in_the_tree() {
+    let dir = with_butterfly();
+    let d = dir.path();
+    ivaldi_ok(d, &["tl", "bf", "create", "exp2"]);
+    write(d, "two.txt", "not sealed\n");
+    switch(d, "exp");
+    write(d, "one.txt", "not sealed\n");
+    switch(d, "main");
+
+    ivaldi_ok(d, &["tl", "bf", "rm", "exp", "--cascade", "--force"]);
+
+    assert_eq!(timelines(d), ["main"]);
+    assert!(!shelf(d, "exp").exists());
+    assert!(!shelf(d, "exp2").exists());
+}
+
+#[test]
+fn rm_without_cascade_only_checks_the_butterfly_it_removes() {
+    let dir = with_butterfly();
+    let d = dir.path();
+    ivaldi_ok(d, &["tl", "bf", "create", "exp2"]);
+    write(d, "deep.txt", "not sealed\n");
+    switch(d, "main");
+
+    // exp2 stays (orphaned), so its shelved work is not at risk.
+    ivaldi_ok(d, &["tl", "bf", "rm", "exp"]);
+
+    assert_eq!(timelines(d), ["exp2", "main"]);
+    switch(d, "exp2");
+    assert_eq!(read(d, "deep.txt"), "not sealed\n");
+}
+
+#[test]
+fn timeline_remove_refuses_a_timeline_with_shelved_work() {
+    let dir = forged();
+    let d = dir.path();
+    write(d, "a.txt", "base\n");
+    seal_all(d, "base");
+    ivaldi_ok(d, &["timeline", "create", "feature"]);
+    write(d, "dirty.txt", "not sealed\n");
+    switch(d, "main");
+
+    let stderr = ivaldi_fails(d, &["timeline", "remove", "feature"]);
+    assert!(stderr.contains("'feature' has shelved work"), "{stderr}");
+    assert!(
+        stderr.contains("ivaldi timeline switch feature"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--force"), "{stderr}");
+
+    assert_eq!(timelines(d), ["feature", "main"]);
+    switch(d, "feature");
+    assert_eq!(read(d, "dirty.txt"), "not sealed\n");
+    // Once the work is sealed there is nothing shelved to lose.
+    seal_all(d, "keep it");
+    switch(d, "main");
+    ivaldi_ok(d, &["timeline", "remove", "feature"]);
+    assert_eq!(timelines(d), ["main"]);
+}
+
+#[test]
+fn timeline_remove_force_removes_the_shelved_work_too() {
+    let dir = forged();
+    let d = dir.path();
+    write(d, "a.txt", "base\n");
+    seal_all(d, "base");
+    ivaldi_ok(d, &["timeline", "create", "feature"]);
+    write(d, "dirty.txt", "not sealed\n");
+    switch(d, "main");
+
+    ivaldi_ok(d, &["tl", "rm", "feature", "--force"]);
+
+    assert_eq!(timelines(d), ["main"]);
+    assert!(!shelf(d, "feature").exists());
+}
+
+#[test]
+fn renaming_a_timeline_takes_its_shelved_work_along() {
+    let dir = with_butterfly();
+    let d = dir.path();
+    write(d, "dirty.txt", "not sealed\n");
+    switch(d, "main");
+
+    ivaldi_ok(d, &["timeline", "rename", "exp", "experiment"]);
+
+    assert!(!shelf(d, "exp").exists());
+    switch(d, "experiment");
+    assert_eq!(read(d, "dirty.txt"), "not sealed\n");
+    // And it is still guarded under the new name.
+    switch(d, "main");
+    let stderr = ivaldi_fails(d, &["tl", "bf", "rm", "experiment"]);
+    assert!(stderr.contains("'experiment' has shelved work"), "{stderr}");
+}
+
+#[test]
+fn renaming_into_a_nested_name_takes_the_shelved_work_along() {
+    let dir = with_butterfly();
+    let d = dir.path();
+    write(d, "dirty.txt", "not sealed\n");
+    switch(d, "main");
+
+    ivaldi_ok(d, &["timeline", "rename", "exp", "work/exp"]);
+
+    assert!(shelf(d, "work/exp").exists());
+    switch(d, "work/exp");
+    assert_eq!(read(d, "dirty.txt"), "not sealed\n");
+    // Shelving under the nested name works too.
+    switch(d, "main");
+    switch(d, "work/exp");
+    assert_eq!(read(d, "dirty.txt"), "not sealed\n");
 }
 
 // -- metadata follows the timelines ------------------------------------------

@@ -51,6 +51,13 @@ impl Shelf {
     pub fn is_empty(&self) -> bool {
         self.staged_files.is_empty() && self.workspace_changes.is_empty()
     }
+
+    /// True if both shelves hold the same work, whatever timeline they name.
+    fn same_work(&self, other: &Shelf) -> bool {
+        self.staged_files == other.staged_files
+            && self.workspace_changes == other.workspace_changes
+            && self.created_at == other.created_at
+    }
 }
 
 /// Manages auto-shelving operations.
@@ -92,6 +99,10 @@ impl ShelfManager {
             }
         }
 
+        // A nested timeline name (`feature/parser`) shelves into a subdirectory.
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(ShelfError::Io)?;
+        }
         crate::atomic_io::atomic_write(&path, lines.join("\n").as_bytes())
             .map_err(ShelfError::Io)?;
         Ok(())
@@ -163,6 +174,43 @@ impl ShelfManager {
         }
     }
 
+    /// Move `old`'s shelf to `new`, for a timeline rename. Returns whether
+    /// there was one to move. Refused if `new` already holds a different
+    /// shelf, which moving would overwrite.
+    ///
+    /// The new shelf is written before the old one is removed, so a crash in
+    /// between leaves both; a retry finds them identical and finishes.
+    pub fn rename_shelf(&self, old: &str, new: &str) -> Result<bool, ShelfError> {
+        let Some((shelf, already_there)) = self.renamed(old, new)? else {
+            return Ok(false);
+        };
+        if !already_there {
+            self.save_shelf(&shelf)?;
+        }
+        self.remove_shelf(old)?;
+        Ok(true)
+    }
+
+    /// Refuse what [`rename_shelf`](Self::rename_shelf) would refuse, before
+    /// a rename has changed anything.
+    pub fn check_rename(&self, old: &str, new: &str) -> Result<(), ShelfError> {
+        self.renamed(old, new).map(|_| ())
+    }
+
+    /// `old`'s shelf under `new`'s name, and whether `new` already holds it.
+    fn renamed(&self, old: &str, new: &str) -> Result<Option<(Shelf, bool)>, ShelfError> {
+        let Some(mut shelf) = self.load_shelf(old)? else {
+            return Ok(None);
+        };
+        shelf.timeline = new.to_string();
+        let already_there = match self.load_shelf(new)? {
+            Some(existing) if existing.same_work(&shelf) => true,
+            Some(_) => return Err(ShelfError::Occupied(new.to_string())),
+            None => false,
+        };
+        Ok(Some((shelf, already_there)))
+    }
+
     /// Check if a shelf exists for the given timeline.
     pub fn has_shelf(&self, timeline: &str) -> bool {
         self.shelf_path(timeline).exists()
@@ -197,6 +245,8 @@ impl ShelfManager {
 pub enum ShelfError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("'{0}' already has shelved work (.ivaldi/shelves/{0}.shelf)")]
+    Occupied(String),
 }
 
 #[cfg(test)]
@@ -322,6 +372,72 @@ mod tests {
 
         mgr.remove_shelf("feature").unwrap();
         assert!(!mgr.has_shelf("feature"));
+    }
+
+    #[test]
+    fn rename_moves_the_shelf_and_its_timeline_name() {
+        let (_dir, mgr) = setup();
+        let shelf = Shelf {
+            timeline: "old".into(),
+            staged_files: BTreeMap::from([("a.txt".into(), B3Hash::digest(b"a"))]),
+            workspace_changes: Vec::new(),
+            created_at: 100,
+        };
+        mgr.save_shelf(&shelf).unwrap();
+
+        assert!(mgr.rename_shelf("old", "new").unwrap());
+
+        assert!(!mgr.has_shelf("old"));
+        let moved = mgr.load_shelf("new").unwrap().unwrap();
+        assert_eq!(moved.timeline, "new");
+        assert!(moved.same_work(&shelf));
+    }
+
+    #[test]
+    fn rename_without_a_shelf_does_nothing() {
+        let (_dir, mgr) = setup();
+        assert!(!mgr.rename_shelf("old", "new").unwrap());
+        assert!(!mgr.has_shelf("new"));
+    }
+
+    #[test]
+    fn rename_finishes_after_a_crash_left_both_copies() {
+        let (_dir, mgr) = setup();
+        let mut shelf = Shelf {
+            timeline: "old".into(),
+            staged_files: BTreeMap::from([("a.txt".into(), B3Hash::digest(b"a"))]),
+            workspace_changes: Vec::new(),
+            created_at: 100,
+        };
+        mgr.save_shelf(&shelf).unwrap();
+        shelf.timeline = "new".into();
+        mgr.save_shelf(&shelf).unwrap();
+
+        assert!(mgr.rename_shelf("old", "new").unwrap());
+        assert!(!mgr.has_shelf("old"));
+        assert!(mgr.has_shelf("new"));
+    }
+
+    #[test]
+    fn rename_refuses_to_overwrite_different_work() {
+        let (_dir, mgr) = setup();
+        for (name, file) in [("old", "a.txt"), ("new", "b.txt")] {
+            mgr.save_shelf(&Shelf {
+                timeline: name.into(),
+                staged_files: BTreeMap::from([(file.into(), B3Hash::digest(b"x"))]),
+                workspace_changes: Vec::new(),
+                created_at: 100,
+            })
+            .unwrap();
+        }
+
+        assert!(matches!(
+            mgr.rename_shelf("old", "new"),
+            Err(ShelfError::Occupied(name)) if name == "new"
+        ));
+        let kept = mgr.load_shelf("new").unwrap().unwrap();
+        assert!(kept.staged_files.contains_key("b.txt"));
+        assert!(mgr.has_shelf("old"));
     }
 
     #[test]

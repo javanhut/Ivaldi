@@ -95,8 +95,13 @@ pub(super) fn cmd_butterfly(
         }
         ButterflyCommands::Remove(remove_args) => {
             let repo = open_repo()?;
-            let removed = crate::butterfly::remove(&repo, &remove_args.name, remove_args.cascade)
-                .map_err(|e| e.to_string())?;
+            let removed = crate::butterfly::remove(
+                &repo,
+                &remove_args.name,
+                remove_args.cascade,
+                remove_args.force,
+            )
+            .map_err(|e| e.to_string())?;
             if !quiet {
                 for name in &removed {
                     println!("Removed butterfly '{}'", name);

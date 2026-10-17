@@ -49,13 +49,28 @@ if let Some(shelf) = mgr.load_shelf("feature")? {
 mgr.has_shelf("feature");
 mgr.list_shelves()?;
 mgr.remove_shelf("feature")?;
+
+// Move a shelf with its timeline (refuses to overwrite different work)
+mgr.rename_shelf("feature", "feature-v2")?;
 ```
+
+## Lifecycle
+
+A shelf is keyed by its timeline's name, and only switching back to that
+timeline restores it, so a shelf must never outlive its timeline:
+
+- **Remove**: `ivaldi tl rm` and `ivaldi tl bf rm` refuse while a timeline
+  they would remove has a shelf. `--force` removes the shelf with it.
+- **Rename**: `ivaldi tl rename` moves the shelf to the new name.
+- **Nested names** (`feature/parser`) shelve to
+  `.ivaldi/shelves/feature/parser.shelf`.
 
 ## Properties
 
 - **Per-timeline**: Each timeline has at most one shelf
 - **Overwrite on re-save**: New shelf replaces old one
 - **Idempotent remove**: Removing nonexistent shelf is a no-op
+- **Retryable rename**: `rename_shelf` writes the new shelf before removing the old one; a retry after a crash in between finds them identical and finishes
 - **Sorted listing**: `list_shelves()` returns timeline names in sorted order
 
 ## Design Decisions

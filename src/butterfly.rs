@@ -561,9 +561,15 @@ fn layer(repo: &Repo, plan: &mut FusePlan) -> Result<Vec<String>, ButterflyError
 
 /// Remove butterfly `name`. With `cascade`, everything nested under it goes
 /// too; without, its children stay, orphaned. Refused before anything is
-/// removed if that would take the checked-out timeline. Returns what was
+/// removed if that would take the checked-out timeline, or, unless `force`
+/// discards it, shelved work on any timeline that would go. Returns what was
 /// removed, `name` first.
-pub fn remove(repo: &Repo, name: &str, cascade: bool) -> Result<Vec<String>, ButterflyError> {
+pub fn remove(
+    repo: &Repo,
+    name: &str,
+    cascade: bool,
+    force: bool,
+) -> Result<Vec<String>, ButterflyError> {
     let mgr = load(&repo.store)?;
     if !mgr.is_butterfly(name) {
         return Err(ButterflyError::NotAButterfly(name.to_string()));
@@ -578,10 +584,17 @@ pub fn remove(repo: &Repo, name: &str, cascade: bool) -> Result<Vec<String>, But
             "'{current}' is checked out. Switch to a timeline that is not being removed first."
         )));
     }
+    if !force {
+        repo.ensure_nothing_shelved(&doomed)?;
+    }
     // Deepest first, so no removal orphans a butterfly that is about to go
     // anyway. The records follow through `on_timeline_removed`.
     for timeline in doomed.iter().rev() {
-        repo.remove_timeline(timeline)?;
+        if force {
+            repo.remove_timeline_discarding_shelf(timeline)?;
+        } else {
+            repo.remove_timeline(timeline)?;
+        }
     }
     Ok(doomed)
 }

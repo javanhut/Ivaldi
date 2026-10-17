@@ -273,6 +273,39 @@ fn timeline_rename_crash_windows_are_old_or_new() {
 }
 
 #[test]
+fn timeline_rename_crash_after_moving_the_shelf_keeps_the_work_and_retry_finishes() {
+    let dir = setup_repo();
+    let shelves = dir.path().join(".ivaldi/shelves");
+    ivaldi_ok(dir.path(), &["timeline", "create", "feature"]);
+    std::fs::write(dir.path().join("draft.txt"), "not sealed\n").unwrap();
+    ivaldi_ok(dir.path(), &["timeline", "switch", "main"]);
+
+    let output = ivaldi(
+        dir.path(),
+        Some("timeline.rename.after_shelf"),
+        &["timeline", "rename", "feature", "renamed"],
+    );
+    assert_aborted(&output, "timeline.rename.after_shelf");
+    verify_full_ok(dir.path(), "timeline.rename.after_shelf");
+    // The work moved ahead of the head, but the half-made new name still
+    // guards it: removing it is refused instead of losing the shelf.
+    assert!(timeline_head(dir.path(), "feature").is_some());
+    assert!(shelves.join("renamed.shelf").exists());
+    assert!(!shelves.join("feature.shelf").exists());
+    let refused = ivaldi(dir.path(), None, &["timeline", "remove", "renamed"]);
+    assert!(!refused.status.success());
+
+    ivaldi_ok(dir.path(), &["timeline", "rename", "feature", "renamed"]);
+    assert!(timeline_head(dir.path(), "renamed").is_some());
+    verify_full_ok(dir.path(), "rename retry");
+    ivaldi_ok(dir.path(), &["timeline", "switch", "renamed"]);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("draft.txt")).unwrap(),
+        "not sealed\n"
+    );
+}
+
+#[test]
 fn crashed_writer_never_blocks_the_next_writer() {
     // The aborted child held the exclusive repo lock when it died; the OS
     // must have released it, so an immediate new writer succeeds.

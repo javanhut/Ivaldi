@@ -23,6 +23,7 @@ ivaldi tl bf up                       # merge the butterfly's sealed work into i
 ivaldi tl bf down                     # merge the parent's sealed work into the butterfly
 ivaldi tl bf rm experiment            # remove it; its own butterflies become orphans
 ivaldi tl bf rm experiment --cascade  # remove it and everything nested under it
+ivaldi tl bf rm experiment --force    # remove it even with shelved work, discarding that
 ```
 
 - **`up` and `down` are fuses.** Each merges per file and per line, exactly
@@ -41,9 +42,18 @@ ivaldi tl bf rm experiment --cascade  # remove it and everything nested under it
 - **`rm` only removes butterflies** (`ivaldi timeline remove` is for other
   timelines) and refuses, before removing anything, if the checked-out
   timeline would go with it.
+- **`rm` never strands shelved work.** Switching away from a timeline with
+  uncommitted changes shelves them (`.ivaldi/shelves/<timeline>.shelf`), and
+  nothing could reach that shelf once the timeline is gone. So `rm` checks
+  every timeline it would remove, `--cascade` included, and refuses before
+  removing any if one has shelved work. The error names each of them: switch
+  to it and seal to keep the work, or rerun with `--force` to remove the
+  shelves with the timelines. Plain `rm` checks only the butterfly itself;
+  its children stay, shelves and all.
 - **Records follow the timelines.** `ivaldi timeline remove` of a parent
   orphans its butterflies, and `ivaldi timeline rename` of a butterfly or a
-  parent keeps every link intact.
+  parent keeps every link intact. A renamed timeline takes its shelved work
+  along.
 
 ## Library usage
 
@@ -133,6 +143,8 @@ what does.
 
 - **Stored metadata**: one JSON record per butterfly in the repository store (`store.db`). `ButterflyManager` is the in-memory model: `butterfly::load` builds it from the records, and each change is written back in one store transaction.
 - **Parent-child tracking**: Bidirectional — parent knows children, children know parent.
-- **Cascade delete is recursive**: Deletes entire subtree depth-first.
+- **Cascade delete is recursive**: Deletes entire subtree depth-first, after
+  checking the whole subtree for the checked-out timeline and for shelved
+  work, so a refusal removes nothing.
 - **Orphan preservation**: Orphaned butterflies remain usable, just can't sync with deleted parent.
 - **Tree visualization**: `get_tree()` returns (name, depth) pairs for display.

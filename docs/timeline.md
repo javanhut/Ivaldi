@@ -59,14 +59,49 @@ mgr.remove_timeline("feature")?;
 
 Backed by `Repo::rename_timeline(old, new)`, which:
 
-1. Refuses if NEW already exists.
-2. Copies the timeline head from OLD to NEW in the store.
-3. Removes the OLD head entry.
-4. Renames `.ivaldi/refs/heads/OLD` → `.ivaldi/refs/heads/NEW` (or creates the new ref file if the old one was missing).
+1. Refuses if NEW already exists, or if OLD has shelved work and NEW already
+   holds a different shelf (one stranded by an older Ivaldi), before
+   changing anything.
+2. Creates the `.ivaldi/refs/heads/NEW` marker.
+3. Moves OLD's shelf, if it has one, to `.ivaldi/shelves/NEW.shelf`, so
+   uncommitted work shelved on OLD comes back on switching to NEW.
+4. Moves the head from OLD to NEW in one store transaction.
 5. Updates HEAD if the renamed timeline was the current one.
+6. Removes the OLD marker, and moves OLD's butterfly records and links to NEW.
+
+Every crash window leaves at worst a headless leftover marker, and rerunning
+the rename finishes it. The shelf moves while OLD still exists for that
+reason: a rename interrupted after it is completed by the retry.
 
 Connectors other than `to` are rejected with a clear error
 (`expected 'tl rename OLD to NEW' (got '<word>' between names)`).
+
+## Remove (CLI)
+
+```bash
+ivaldi tl rm feature           # refused while 'feature' has shelved work
+ivaldi tl rm feature --force   # remove it and discard its shelved work
+```
+
+Switching away from a timeline with uncommitted changes shelves them in
+`.ivaldi/shelves/<timeline>.shelf` (see [shelf.md](shelf.md)). Only switching
+back to that timeline restores them, so removing the timeline would leave the
+shelf where nothing can reach it. `Repo::remove_timeline` therefore refuses
+while the timeline has a shelf, with an error that names it and says how to
+get the work back:
+
+```
+error: 'feature' has shelved work: uncommitted changes set aside when you switched away from it. Removing it would lose them, so nothing was removed.
+To keep them, switch to it and seal:
+  ivaldi timeline switch feature
+To discard them, rerun with --force.
+```
+
+`--force` (`Repo::remove_timeline_discarding_shelf`) removes the shelf first
+and then the timeline, so an interrupted removal leaves the timeline, which a
+retry removes. The current timeline is refused either way, before anything
+is discarded. `ivaldi tl bf rm` applies the same rule to every butterfly it
+would remove (see [butterfly.md](butterfly.md)).
 
 ## Commit Behavior
 
@@ -119,3 +154,4 @@ pub enum TimelineError {
 - **Sorted listing**: `list_timelines()` always returns names in sorted order
 - **Default "main"**: New managers start with "main" as the current timeline
 - **Cannot remove current**: Safety check prevents orphaning the active workspace
+- **Cannot strand shelved work**: Removal refuses while the timeline has a shelf unless `--force` discards it; renaming moves the shelf

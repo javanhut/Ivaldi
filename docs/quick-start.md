@@ -132,7 +132,8 @@ ivaldi timeline create feature     # Create timeline (alias: tl)
 ivaldi timeline switch feature     # Switch (auto-shelves changes)
 ivaldi timeline list               # List all timelines
 ivaldi timeline rename old new     # Rename
-ivaldi timeline remove feature     # Remove
+ivaldi timeline remove feature     # Remove (refused while it has shelved changes;
+                                   #   --force discards them)
 ivaldi fuse feature to main        # Merge
 ```
 
@@ -152,6 +153,7 @@ ivaldi tl bf up                       # Merge changes to parent
 ivaldi tl bf down                     # Pull parent changes
 ivaldi tl bf rm experiment            # Remove
 ivaldi tl bf rm experiment --cascade  # Remove with all nested butterflies
+ivaldi tl bf rm experiment --force    # Remove even with shelved changes, discarding them
 ```
 
 More detail: [butterfly.md](butterfly.md).

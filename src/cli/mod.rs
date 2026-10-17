@@ -664,6 +664,10 @@ pub struct TimelineSwitchArgs {
 pub struct TimelineRemoveArgs {
     /// Timeline to remove
     pub name: String,
+
+    /// Remove it even if it has shelved work, which is discarded with it
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -714,6 +718,10 @@ pub struct ButterflyRemoveArgs {
     /// Recursively delete nested butterflies
     #[arg(long)]
     pub cascade: bool,
+
+    /// Remove even if shelved work would go too, and discard it
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(clap::Args, Debug)]
