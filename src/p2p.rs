@@ -153,6 +153,84 @@ impl PeerUrl {
         })
     }
 
+    /// Read an address a person typed: `ivaldi://…`, or the same thing with
+    /// the scheme left off — `hub.example.com/atmo/main`, `localhost/atmo`,
+    /// `10.0.0.5:9500/main`.
+    ///
+    /// Without the scheme, the first segment has to be unmistakably a host,
+    /// because the same position holds the owner in a GitHub `owner/repo`:
+    /// it carries a dot (a domain or an IPv4 address — GitHub names cannot
+    /// contain one), an explicit port, or is `localhost`. Anything a Git
+    /// form already claims is left alone: another scheme, `user@host`,
+    /// `github.com/…` and `gitlab.com/…`.
+    pub fn detect(input: &str) -> Option<Self> {
+        let raw = input.trim();
+        if raw.starts_with("ivaldi://") {
+            return Self::parse(raw);
+        }
+        if raw.is_empty()
+            || raw.contains("://")
+            || raw.contains('@')
+            || raw.contains(char::is_whitespace)
+        {
+            return None;
+        }
+        let hostport = raw.split('/').next().unwrap_or("");
+        let host = match hostport.rsplit_once(':') {
+            // A colon is only a port here; `host:owner/repo` is SCP-style SSH.
+            Some((h, port)) => {
+                port.parse::<u16>().ok()?;
+                h
+            }
+            None => hostport,
+        };
+        let lower = host.to_ascii_lowercase();
+        let is_host = lower == "localhost"
+            || (lower.contains('.') && !lower.starts_with('.') && !lower.ends_with('.'));
+        let git_host = matches!(
+            lower.as_str(),
+            "github.com" | "www.github.com" | "gitlab.com" | "www.gitlab.com"
+        );
+        let explicit_port = hostport.contains(':');
+        if !(is_host || explicit_port) || git_host {
+            return None;
+        }
+        Self::parse(&format!("ivaldi://{}", raw))
+    }
+
+    /// Where `ivaldi download` puts a clone when not told: the repo's name on
+    /// a hub, else the timeline's last segment, else the host. Never the
+    /// whole timeline — `release/1.0` must not become nested directories.
+    pub fn default_dir(&self) -> String {
+        let last = |s: &str| {
+            s.trim_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        };
+        self.repo
+            .as_deref()
+            .map(last)
+            .or_else(|| self.timeline.as_deref().map(last))
+            .filter(|d| !d.is_empty() && d != "." && d != "..")
+            .unwrap_or_else(|| self.host.clone())
+    }
+
+    /// The canonical `ivaldi://` spelling, for storing what [`detect`] read.
+    ///
+    /// [`detect`]: Self::detect
+    pub fn to_url(&self) -> String {
+        let mut url = format!("ivaldi://{}:{}", self.host, self.port);
+        match (&self.repo, &self.timeline) {
+            (Some(r), Some(t)) => url.push_str(&format!("/{}/{}", r, t)),
+            (Some(r), None) => url.push_str(&format!("/{}/", r)),
+            (None, Some(t)) => url.push_str(&format!("/{}", t)),
+            (None, None) => {}
+        }
+        url
+    }
+
     pub fn socket_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
@@ -2190,6 +2268,90 @@ mod tests {
     fn parse_url_rejects_non_ivaldi_scheme() {
         assert!(PeerUrl::parse("https://example.com").is_none());
         assert!(PeerUrl::parse("example.com").is_none());
+    }
+
+    #[test]
+    fn detect_reads_a_hub_address_without_the_scheme() {
+        let u = PeerUrl::detect("ivaldihub.com/ProjectUltron/main").unwrap();
+        assert_eq!(u.host, "ivaldihub.com");
+        assert_eq!(u.port, DEFAULT_PORT);
+        assert_eq!(u.repo.as_deref(), Some("ProjectUltron"));
+        assert_eq!(u.timeline.as_deref(), Some("main"));
+
+        // Same meaning as with the scheme, segment for segment.
+        for bare in [
+            "ivaldihub.com",
+            "ivaldihub.com/main",
+            "ivaldihub.com/atmo/",
+            "hub.example.org:9500/atmo/main",
+            "localhost/testRepo/main",
+            "localhost:9418",
+            "10.0.0.5/atmo/main",
+            "LOCALHOST/main",
+        ] {
+            assert!(PeerUrl::detect(bare).is_some(), "{bare} should be detected");
+            assert_eq!(
+                PeerUrl::detect(bare),
+                PeerUrl::parse(&format!("ivaldi://{}", bare)),
+                "{bare}"
+            );
+        }
+        // And the scheme still works as it always did.
+        assert_eq!(
+            PeerUrl::detect("ivaldi://hub/atmo/main"),
+            PeerUrl::parse("ivaldi://hub/atmo/main")
+        );
+    }
+
+    #[test]
+    fn detect_leaves_every_git_form_to_git() {
+        for git in [
+            "owner/repo", // GitHub shorthand
+            "github.com/owner/repo",
+            "gitlab.com/group/project",
+            "https://git.example.com/owner/repo",
+            "http://example.com/owner/repo",
+            "git@github.com:owner/repo.git",
+            "ssh://git@example.com/owner/repo",
+            "example.com:owner/repo", // SCP-style SSH
+            "github:owner/repo",
+            "",
+            ".hidden/repo",
+            "with space.com/repo",
+        ] {
+            assert!(
+                PeerUrl::detect(git).is_none(),
+                "{git} must not be taken for ivaldi://"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clone_is_named_for_the_repo_not_the_timeline_path() {
+        let dir = |u: &str| PeerUrl::detect(u).unwrap().default_dir();
+        // A hub repo: its name, whatever timeline was asked for.
+        assert_eq!(dir("hub.io/testRepo/peers/Myself/main"), "testRepo");
+        assert_eq!(dir("hub.io/ProjectUltron/main"), "ProjectUltron");
+        assert_eq!(dir("hub.io/ProjectUltron/"), "ProjectUltron");
+        // A single-repo peer (one path segment): the timeline, as before.
+        assert_eq!(dir("ivaldi://peer.lan/main"), "main");
+        // Two segments make the first one the repo, by the URL's own rule.
+        assert_eq!(dir("ivaldi://peer.lan/release/1.0"), "release");
+        // Nothing to go on: the host.
+        assert_eq!(dir("peer.lan"), "peer.lan");
+    }
+
+    #[test]
+    fn a_detected_address_round_trips_through_its_canonical_url() {
+        for bare in [
+            "ivaldihub.com/ProjectUltron/main",
+            "localhost:9500/atmo/",
+            "10.0.0.5/main",
+            "hub.io",
+        ] {
+            let u = PeerUrl::detect(bare).unwrap();
+            assert_eq!(PeerUrl::parse(&u.to_url()), Some(u.clone()), "{bare}");
+        }
     }
 
     #[test]

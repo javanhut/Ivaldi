@@ -34,13 +34,21 @@ impl Portal {
     /// since the Ivaldi P2P transport doesn't have an owner/repo concept.
     pub fn parse(s: &str) -> Option<Self> {
         // Ivaldi P2P URLs don't go through `parse_repo_spec` (which
-        // requires owner/repo segments). Handle them up front.
-        if let Some(peer) = crate::p2p::PeerUrl::parse(s) {
+        // requires owner/repo segments). Handle them up front — with or
+        // without the scheme, when the address starts with a host.
+        if let Some(peer) = crate::p2p::PeerUrl::detect(s) {
+            // Stored with its scheme, so everything that reads `base_url`
+            // back (`transport()`, the portal list) sees an ivaldi:// URL.
+            let base_url = if s.trim().starts_with("ivaldi://") {
+                s.to_string()
+            } else {
+                peer.to_url()
+            };
             return Some(Self {
                 owner: "peer".to_string(),
                 repo: format!("{}:{}", peer.host, peer.port),
                 platform: Platform::GitHub, // unused for P2P transport
-                base_url: Some(s.to_string()),
+                base_url: Some(base_url),
             });
         }
         let spec = parse_repo_spec(s).ok()?;
@@ -498,6 +506,28 @@ mod tests {
         assert_eq!(p.owner, "javanhut");
         assert_eq!(p.repo, "IvaldiVCS");
         assert_eq!(p.platform, Platform::GitHub);
+    }
+
+    #[test]
+    fn a_portal_to_a_hub_needs_no_scheme() {
+        let bare = Portal::parse("ivaldihub.com/ProjectUltron/main").unwrap();
+        let full = Portal::parse("ivaldi://ivaldihub.com:9418/ProjectUltron/main").unwrap();
+        // The same portal either way: same name, same transport target.
+        assert_eq!(bare.to_string_repr(), "peer/ivaldihub.com:9418");
+        assert_eq!(bare.to_string_repr(), full.to_string_repr());
+        assert_eq!(
+            bare.base_url.as_deref(),
+            Some("ivaldi://ivaldihub.com:9418/ProjectUltron/main")
+        );
+        match bare.transport() {
+            Transport::Peer(p) => assert_eq!(p.repo.as_deref(), Some("ProjectUltron")),
+            _ => panic!("a bare hub address must use the ivaldi:// transport"),
+        }
+        // GitHub shorthand is untouched.
+        assert!(matches!(
+            Portal::parse("javanhut/IvaldiVCS").unwrap().transport(),
+            Transport::Https
+        ));
     }
 
     #[test]

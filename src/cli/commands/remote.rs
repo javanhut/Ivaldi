@@ -393,14 +393,15 @@ pub(super) fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<(), String
     };
 
     // `ivaldi://host[:port][/timeline]` — peer-to-peer transport, no
-    // GitHub / GitLab in the loop.
-    if let Some(url) = crate::p2p::PeerUrl::parse(&args.repo) {
+    // GitHub / GitLab in the loop. The scheme may be left off when the
+    // address starts with a host (`hub.example.com/atmo/main`).
+    if let Some(url) = crate::p2p::PeerUrl::detect(&args.repo) {
         use crate::identity;
         use crate::known_peers::TofuPolicy;
         let id_path =
             identity::default_path().ok_or("could not resolve $HOME for ~/.ivaldi/identity")?;
         let id = identity::Identity::load_or_create(&id_path).map_err(|e| e.to_string())?;
-        let default_dir = url.timeline.clone().unwrap_or_else(|| url.host.clone());
+        let default_dir = url.default_dir();
         let target_dir =
             std::path::PathBuf::from(args.directory.as_deref().unwrap_or(&default_dir));
         let policy = if args.accept_new_peer {
@@ -410,15 +411,25 @@ pub(super) fn cmd_download(args: DownloadArgs, quiet: bool) -> Result<(), String
         } else {
             TofuPolicy::Prompt
         };
-        let summary = crate::p2p::fetch_into_with_policy(&url, &target_dir, &id, policy)
-            .map_err(|e| e.to_string())?;
+        let summary =
+            crate::p2p::fetch_into_with_policy(&url, &target_dir, &id, policy).map_err(|e| {
+                // Without the scheme, the address was read as Ivaldi's because
+                // it starts with a host. Say so: a Git server at that host
+                // needs its https:// URL instead.
+                if args.repo.trim().starts_with("ivaldi://") {
+                    e.to_string()
+                } else {
+                    format!(
+                        "{}\n  '{}' was read as {} — for a Git server, use https://{}",
+                        e,
+                        args.repo.trim(),
+                        url.to_url(),
+                        args.repo.trim()
+                    )
+                }
+            })?;
         if !quiet {
-            println!(
-                "Cloned ivaldi://{}:{} → {}",
-                url.host,
-                url.port,
-                target_dir.display()
-            );
+            println!("Cloned {} → {}", url.to_url(), target_dir.display());
             println!(
                 "  timeline: {}, {} leaves, {} objects",
                 summary.timeline, summary.leaves_imported, summary.blobs_imported
