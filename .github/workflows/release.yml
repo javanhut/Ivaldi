@@ -67,9 +67,8 @@ jobs:
           # (GitHub is retiring its Intel macOS runners).
           - { target: x86_64-apple-darwin,        os: macos-15,         slug: macos-x86_64 }
           - { target: aarch64-apple-darwin,       os: macos-15,         slug: macos-arm64 }
-          # Windows — native on each arch.
+          # Windows — x86_64 only.
           - { target: x86_64-pc-windows-msvc,     os: windows-latest,   slug: windows-x86_64 }
-          - { target: aarch64-pc-windows-msvc,    os: windows-11-arm,   slug: windows-arm64 }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -169,7 +168,7 @@ jobs:
             ${{ env.BIN }}-${{ env.TAG }}-source.zip.cosign.bundle
 
   # Once every archive is attached, produce a single signed checksums file
-  # covering all eight artifacts (six binaries, two source archives).
+  # covering all seven artifacts (five binaries, two source archives).
   checksums:
     needs: [build, source]
     runs-on: ubuntu-latest

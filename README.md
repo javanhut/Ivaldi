@@ -99,8 +99,8 @@ trying to do:
 ### Prebuilt releases
 
 Prebuilt, signed binaries are attached to each
-[GitHub release](https://github.com/javanhut/ivaldi/releases) for Linux,
-macOS, and Windows on both `x86_64` and `arm64`, alongside signed source
+[GitHub release](https://github.com/javanhut/ivaldi/releases) for Linux and
+macOS on both `x86_64` and `arm64`, and for Windows on `x86_64`, alongside signed source
 archives (`ivaldi-<tag>-source.tar.gz` and `.zip`). See
 [Verifying releases](#verifying-releases) for how to check them.
 
