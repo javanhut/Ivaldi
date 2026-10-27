@@ -24,9 +24,28 @@ env:
   TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  # Run the full test suite on the tagged tree first; nothing is created or
+  # published unless it passes on every OS. Mirrors the test job in ci.yml.
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # --all-features enables the test-only `failpoints` feature so the
+      # crash-consistency matrix (tests/crash_matrix.rs) runs on every OS.
+      - run: cargo test --locked --all-targets --all-features
+
   # Create the release once, up front, so the parallel build jobs below all
   # attach to the same release instead of racing to create it.
   release:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Create release
