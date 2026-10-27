@@ -1,22 +1,42 @@
 name: Release
 
-# Cuts signed, multi-architecture binaries when the maintainer publishes a
-# GitHub release. Releases are maintainer-determined (see VERSIONING.md):
-# nothing here runs on a normal push — only on a published release.
+# Cuts a GitHub release with signed, multi-architecture binaries when the
+# maintainer uploads a version tag (v*). Releases are maintainer-determined
+# (see VERSIONING.md): nothing here runs on a normal push — only on a tag.
+# Run it by hand with a tag name to build a release for a tag that already
+# exists (e.g. one uploaded before this workflow ran on tag push).
 on:
-  release:
-    types: [published]
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release (e.g. v0.1.3)
+        required: true
 
 permissions:
-  contents: write   # attach assets to the release
+  contents: write   # create the release and attach assets
   id-token: write   # OIDC identity for keyless (Sigstore) signing
 
 env:
   CARGO_TERM_COLOR: always
   BIN: ivaldi
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  # Create the release once, up front, so the parallel build jobs below all
+  # attach to the same release instead of racing to create it.
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          generate_release_notes: true
+
   build:
+    needs: release
     strategy:
       fail-fast: false
       matrix:
@@ -24,15 +44,18 @@ jobs:
           # Linux — static musl, portable across distros. Built natively per arch.
           - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest,    slug: linux-x86_64 }
           - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, slug: linux-arm64 }
-          # macOS — native on each arch.
-          - { target: x86_64-apple-darwin,        os: macos-13,         slug: macos-x86_64 }
-          - { target: aarch64-apple-darwin,       os: macos-14,         slug: macos-arm64 }
+          # macOS — both on an Apple Silicon runner; x86_64 is cross-compiled
+          # (GitHub is retiring its Intel macOS runners).
+          - { target: x86_64-apple-darwin,        os: macos-15,         slug: macos-x86_64 }
+          - { target: aarch64-apple-darwin,       os: macos-15,         slug: macos-arm64 }
           # Windows — native on each arch.
           - { target: x86_64-pc-windows-msvc,     os: windows-latest,   slug: windows-x86_64 }
           - { target: aarch64-pc-windows-msvc,    os: windows-11-arm,   slug: windows-arm64 }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -54,7 +77,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          dist="${BIN}-${{ github.event.release.tag_name }}-${{ matrix.slug }}"
+          dist="${BIN}-${{ env.TAG }}-${{ matrix.slug }}"
           rel="target/${{ matrix.target }}/release"
           strip "${rel}/${BIN}" || true
           tar -czf "${dist}.tar.gz" -C "${rel}" "${BIN}"
@@ -64,7 +87,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $dist = "$env:BIN-${{ github.event.release.tag_name }}-${{ matrix.slug }}"
+          $dist = "$env:BIN-${{ env.TAG }}-${{ matrix.slug }}"
           $bin  = "target/${{ matrix.target }}/release/$env:BIN.exe"
           Compress-Archive -Path $bin -DestinationPath "$dist.zip"
           "ASSET=$dist.zip" | Out-File -Encoding ascii -Append $env:GITHUB_ENV
@@ -83,21 +106,60 @@ jobs:
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG }}
           files: |
             ${{ env.ASSET }}
             ${{ env.ASSET }}.cosign.bundle
 
+  # Source archives (.tar.gz and .zip) of the tagged tree, signed like the
+  # binaries. GitHub's own "Source code" links are unsigned and not covered
+  # by SHA256SUMS, so these are the ones to verify against.
+  source:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Package source
+        run: |
+          set -euo pipefail
+          dist="${BIN}-${TAG}-source"
+          git archive --format=tar.gz --prefix="${dist}/" -o "${dist}.tar.gz" HEAD
+          git archive --format=zip    --prefix="${dist}/" -o "${dist}.zip"    HEAD
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign archives (keyless)
+        run: |
+          set -euo pipefail
+          for f in "${BIN}-${TAG}-source".tar.gz "${BIN}-${TAG}-source".zip; do
+            cosign sign-blob --yes --bundle "${f}.cosign.bundle" "${f}"
+          done
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          files: |
+            ${{ env.BIN }}-${{ env.TAG }}-source.tar.gz
+            ${{ env.BIN }}-${{ env.TAG }}-source.tar.gz.cosign.bundle
+            ${{ env.BIN }}-${{ env.TAG }}-source.zip
+            ${{ env.BIN }}-${{ env.TAG }}-source.zip.cosign.bundle
+
   # Once every archive is attached, produce a single signed checksums file
-  # covering all six artifacts.
+  # covering all eight artifacts (six binaries, two source archives).
   checksums:
-    needs: build
+    needs: [build, source]
     runs-on: ubuntu-latest
     steps:
       - name: Download release archives
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release download "${{ github.event.release.tag_name }}" \
+          gh release download "${{ env.TAG }}" \
             --repo "${{ github.repository }}" \
             --pattern '*.tar.gz' --pattern '*.zip'
 
@@ -113,6 +175,7 @@ jobs:
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.TAG }}
           files: |
             SHA256SUMS
             SHA256SUMS.cosign.bundle

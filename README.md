@@ -100,7 +100,8 @@ trying to do:
 
 Prebuilt, signed binaries are attached to each
 [GitHub release](https://github.com/javanhut/ivaldi/releases) for Linux,
-macOS, and Windows on both `x86_64` and `arm64`. See
+macOS, and Windows on both `x86_64` and `arm64`, alongside signed source
+archives (`ivaldi-<tag>-source.tar.gz` and `.zip`). See
 [Verifying releases](#verifying-releases) for how to check them.
 
 ### From source
@@ -151,7 +152,7 @@ produced by Ivaldi's own release workflow. Install
 # 1. Verify the checksums file was signed by Ivaldi's release workflow.
 cosign verify-blob \
   --bundle SHA256SUMS.cosign.bundle \
-  --certificate-identity-regexp 'https://github.com/javanhut/ivaldi/.*' \
+  --certificate-identity-regexp 'https://github.com/javanhut/Ivaldi/.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 
